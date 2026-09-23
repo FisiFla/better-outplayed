@@ -30,7 +30,7 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::pump_until_span;
+use localplay_cli::{pump_until_span, FramePacer};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
@@ -43,9 +43,13 @@ const SEGMENT_MS: u64 = 1_000;
 const PRE_MS: u64 = 2_000;
 const POST_MS: u64 = 2_000;
 /// Timeline handed to the encoder up front, so the buffer has content to extend.
+///
+/// This is now *wall-clock* time, not a frame count: the encoder's media timeline is the
+/// wall clock (see the module comment in `localplay_encoder::ffmpeg`), so the fixture feeds
+/// its stubs in real time — through the same `pump_once` the CLI uses — for this long.
+/// Feeding the same frames in a burst instead would produce almost no footage, which is the
+/// behaviour that was fixed, not a property to test around.
 const PRE_FED: Duration = Duration::from_secs(3);
-/// Granularity of that feed. See the note in `Fixture::new`.
-const FEED_SLICE: Duration = Duration::from_millis(100);
 
 /// A live pipeline over stub sources: capture → encoder → ring buffer.
 ///
@@ -58,6 +62,9 @@ struct Fixture {
     capture: StubCapture,
     audio: StubAudio,
     encoder: FfmpegEncoder,
+    /// The same rate limit the CLI's own loop applies, at the stub's frame rate, so the
+    /// wait under test is driven exactly as the CLI drives it.
+    pacer: FramePacer,
 }
 
 impl Fixture {
@@ -93,27 +100,19 @@ impl Fixture {
         )
         .expect("start ring buffer");
 
-        // Start the paced stubs *before* feeding. `drain_for` advances the stub's frame
-        // index without sleeping, so afterwards the stub clock has this much timeline
-        // to catch up on before it produces anything new — real time, exactly as a live
-        // capture source would.
+        // Feed the pipeline in real time, through the same `pump_once` the CLI's loop
+        // and the post-roll wait use. The media timeline comes from the wall clock, so
+        // this is what makes the stubs produce footage at all: an unpaced burst of the
+        // same frames lands within a few milliseconds of capture time and encodes as a
+        // few milliseconds of media — legitimately, but uselessly for a fixture that
+        // needs seconds of buffer.
         capture.start().unwrap();
         audio.start().unwrap();
-        // Feed the timeline in slices, ~10x faster than real time, rather than in one
-        // burst. `submit_*` hands bytes to a writer thread and seconds of audio at once
-        // is enough to overrun the audio socket's buffers; the slices keep each write
-        // within what the encoder drains between them, and they still leave the
-        // fixture's stub clock ahead of real time, so the catch-up below is real.
-        let mut fed = Duration::ZERO;
-        while fed < PRE_FED {
-            for frame in capture.drain_for(FEED_SLICE) {
-                encoder.submit_video(&frame).unwrap();
-            }
-            for block in audio.drain_for(FEED_SLICE) {
-                encoder.submit_audio(&block).unwrap();
-            }
-            fed += FEED_SLICE;
-            std::thread::sleep(Duration::from_millis(10));
+        let mut pacer = FramePacer::new(FPS);
+        let feed_until = Instant::now() + PRE_FED;
+        while Instant::now() < feed_until {
+            localplay_cli::pump_once(&mut pacer, &mut capture, &mut audio, &mut encoder)
+                .expect("feeding the fixture's stubs");
         }
 
         // Submits hand the bytes to the encoder's writer threads, so segment files
@@ -131,12 +130,13 @@ impl Fixture {
             ring.scan_once().expect("scan scratch dir");
         }
 
-        Self { _scratch: scratch, _clips: clips, bin, ring, capture, audio, encoder }
+        Self { _scratch: scratch, _clips: clips, bin, ring, capture, audio, encoder, pacer }
     }
 
     /// Exactly the call the hotkey branch makes.
     fn pump(&mut self, need_ms: u64, budget: Duration) -> anyhow::Result<()> {
         pump_until_span(
+            &mut self.pacer,
             &mut self.ring,
             &mut self.capture,
             &mut self.audio,
@@ -152,10 +152,10 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     let mut fx = Fixture::new();
 
     // One iteration of the steady-state pump the CLI loop uses and `pump_until_span`
-    // shares. Nothing is due yet — the stub clock was left ahead of real time by the
-    // fixture's feed — so this must be a no-op that succeeds, not an error.
-    localplay_cli::pump_once(&mut fx.capture, &mut fx.audio, &mut fx.encoder)
-        .expect("a pump iteration with nothing due must not fail");
+    // shares. The stub clock has caught up with real time by now, so whether a frame is
+    // due does not matter: what matters is that a pump iteration cannot fail.
+    localplay_cli::pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+        .expect("a pump iteration must not fail");
 
     let before = fx.ring.stats();
     assert!(
@@ -195,11 +195,20 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
         before.segments,
         after.segments
     );
-    // Sanity check that it really waited for real-time capture rather than skipping
-    // ahead: the remaining post-roll cannot be conjured up faster than it is captured.
+    // Sanity check that the wait really ran rather than skipping ahead. This used to read
+    // `waited >= 2s` — "the 2s of post-roll cannot be captured instantly" — which held
+    // while the media timeline was a frame count fed only by this pump. It is not a
+    // property of the system any more, and the change is not the wait's: the media timeline
+    // is now the wall clock, so media time and wall time are only equal *at the capture
+    // source*. ffmpeg holds frames in its own lookahead and in the pipe between the two
+    // (measured here: the wait returned after 1.10s having covered 2000ms of media), so a
+    // wait may legitimately finish sooner than `post_ms` of wall clock once that buffer is
+    // drained. What must hold — "the media covering need_ms is on disk" — is asserted
+    // above, and it is the assertion that fails when the wait does not pump. The floor
+    // below only says the wait was not instantaneous.
     assert!(
-        waited >= Duration::from_secs(2),
-        "the 2s of post-roll cannot be captured instantly; only {waited:?} elapsed"
+        waited >= Duration::from_millis(100),
+        "the wait must take real time at all; it returned after {waited:?}"
     );
 
     // What the wait is *for*. The CLI's next step is `ring.trigger(trigger_ms, ..)`,

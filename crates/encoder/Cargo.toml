@@ -19,12 +19,18 @@ tempfile.workspace = true
 # release builds, and the project has no CPU fallback by design (spec §3.2).
 test-encoders = []
 
-# The integration test builds a software encoder, so it needs the feature. Declaring
+# The integration tests build a software encoder, so they need the feature. Declaring
 # that here (rather than making the feature a default) is what lets a bare
-# `cargo test` compile: Cargo skips this target instead of failing on a constructor
+# `cargo test` compile: Cargo skips these targets instead of failing on a constructor
 # that `cfg(feature = "test-encoders")` keeps out of the library.
 [[test]]
 name = "segmenting"
+required-features = ["test-encoders"]
+
+# The media timeline can only be observed against a wall clock, so this one needs the
+# same gate as `segmenting`.
+[[test]]
+name = "timeline"
 required-features = ["test-encoders"]
 
 [lints]

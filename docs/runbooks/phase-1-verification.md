@@ -135,13 +135,21 @@ Within a few seconds, `seg-000000.mp4`, `seg-000001.mp4`, … appear in
 With `RUST_LOG=debug`, every ~200 ms you get a line:
 
 ```
-frames=<n> segments=<n> bytes=<b> span=<ms>ms
+frames=<n> segments=<n> bytes=<b> span=<ms>ms dropped=<n> dropped_audio=<n>
 ```
 
 `frames=` is a literal counter of the video frames actually submitted to the encoder
 since startup — not a proxy. At startup the CLI also prints a one-line geometry summary,
 `capture geometry <W>x<H> at <fps>fps (frame counter starts at 0)`, so the resolution
 being captured is visible up front.
+
+`dropped=` (video frames) and `dropped_audio=` (10 ms audio blocks) are the encoder's own
+count of payloads it had to discard because its queue was full during that run: a live
+capture cannot be slowed down, so ffmpeg falling behind costs frames rather than memory.
+Zero is the expected value on a machine that keeps up; **a non-zero and rising
+`dropped=` means the encoder is the bottleneck** — the recording has holes in it, and the
+run should not be reported as clean. The queue is bounded (4 video frames, 32 audio
+blocks), so these counters can never be traded for unbounded RAM.
 
 Over a run of `T` seconds:
 

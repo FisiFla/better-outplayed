@@ -1,10 +1,17 @@
 //! Drives the encoder with stub sources and asserts it produces segments
 //! containing BOTH a video and an audio stream.
+//!
+//! Fed in real time, because the encoder's media timeline is the wall clock (see the
+//! module comment in `localplay_encoder::ffmpeg`): handing 3 seconds of stubbed frames over
+//! in one burst puts every one of them within a few milliseconds of arrival and encodes,
+//! correctly, as a few milliseconds of media. A live capture delivers frames over the
+//! seconds they represent, and that is what this test now does — with the assertions
+//! unchanged.
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, FfmpegEncoder, Encoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn produces_segments_with_both_a_video_and_an_audio_stream() {
@@ -28,13 +35,21 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     video.start().unwrap();
     audio.start().unwrap();
 
-    // 3 seconds of timeline => at least 2 completed segments.
-    for frame in video.drain_for(Duration::from_secs(3)) {
-        enc.submit_video(&frame).expect("submit video");
+    // 3 seconds of *wall clock* of stub capture => at least 2 completed segments. Both
+    // stubs are paced by real time and `next_frame` waits at most 5ms for the next frame,
+    // so this loop drives them exactly as the CLI's capture loop does.
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut frames = 0u64;
+    while Instant::now() < until {
+        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+            enc.submit_video(&frame).expect("submit video");
+            frames += 1;
+        }
+        while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
+            enc.submit_audio(&block).expect("submit audio");
+        }
     }
-    for block in audio.drain_for(Duration::from_secs(3)) {
-        enc.submit_audio(&block).expect("submit audio");
-    }
+    assert!(frames >= 60, "30fps for 3s must deliver ~90 frames, got {frames}");
     enc.finish().expect("flush encoder");
 
     let mut segments: Vec<_> = std::fs::read_dir(dir.path())
@@ -58,3 +73,4 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         info.duration_ms
     );
 }
+

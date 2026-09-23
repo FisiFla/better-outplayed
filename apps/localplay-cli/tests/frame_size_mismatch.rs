@@ -25,7 +25,7 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::{pump_once, pump_once_counted};
+use localplay_cli::{pump_once, pump_once_counted, FramePacer};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 
@@ -80,7 +80,8 @@ fn a_frame_that_disagrees_with_the_declared_pipe_size_is_refused_by_name() {
         "sanity: the encoder's pipe is declared with the configured source size"
     );
 
-    let err = pump_once(&mut fx.capture, &mut fx.audio, &mut fx.encoder).expect_err(
+    let mut pacer = FramePacer::new(FPS);
+    let err = pump_once(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder).expect_err(
         "a 64x48 frame on a pipe declared 32x24 must fail, not be fed to ffmpeg",
     );
     let msg = format!("{err:#}");
@@ -108,7 +109,10 @@ fn a_frame_that_matches_the_declared_pipe_size_is_still_submitted() {
     // The same machine, correctly wired: pipe and frames agree. The guard must be
     // invisible here — a guard that refuses everything is not a guard.
     let mut fx = Fixture::new(PIPE, PIPE);
-    let submitted = pump_once_counted(&mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    // The pacer admits the first frame immediately, so this is the frame's own guard that
+    // is being exercised here — not the rate limiter.
+    let mut pacer = FramePacer::new(FPS);
+    let submitted = pump_once_counted(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
         .expect("a frame the pipe was declared for must be submitted");
     assert_eq!(submitted, 1, "the matching frame must reach the encoder");
     fx.encoder.finish().expect("flush encoder");

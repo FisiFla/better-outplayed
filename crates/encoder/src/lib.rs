@@ -128,4 +128,24 @@ pub trait Encoder: Send {
     /// encoder compares each frame against this value and refuses a mismatch out loud
     /// (see `pump_once_counted` in the CLI), because the failure is otherwise silent.
     fn source_size(&self) -> (u32, u32);
+
+    /// Video frames discarded because the encoder could not keep up.
+    ///
+    /// A live capture has no way to slow the world down: when the encoder's queue is
+    /// full the correct behaviour is to drop the frame and carry on (see the queue note
+    /// in [`crate::ffmpeg`]), not to block the capture loop and not to fail. Dropping is
+    /// only defensible if it is *counted*, so a soak can tell a clean run from one that
+    /// silently lost a third of its frames — hence this accessor, which the CLI logs.
+    ///
+    /// Defaults to 0 for encoders that queue nothing. It counts video frames only;
+    /// audio drops are reported separately by [`Encoder::dropped_audio_blocks`].
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
+
+    /// Audio blocks discarded because the encoder could not keep up — see
+    /// [`Encoder::dropped_frames`], which this mirrors for the other stream.
+    fn dropped_audio_blocks(&self) -> u64 {
+        0
+    }
 }

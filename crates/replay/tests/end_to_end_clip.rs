@@ -1,10 +1,10 @@
 //! The PoC's core loop, exercised end to end off-Windows with stub sources.
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::AudioFormat;
+use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Initialise a subscriber so the clip's A/V drift line (spec §11 criterion 8,
 /// emitted by `ClipSplicer::splice` at `info`) is observable. `try_init` keeps this
@@ -50,13 +50,26 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
     )
     .expect("start ring buffer");
 
-    // 6 seconds of timeline: segments 0..5 exist, so 0..4 are complete.
-    for frame in video.drain_for(Duration::from_secs(6)) {
-        encoder.submit_video(&frame).unwrap();
+    // 6 seconds of *wall clock* of stub capture: segments 0..5 are written, so 0..4 are
+    // complete by the time the encoder is flushed. Fed in real time — the encoder's media
+    // timeline is the wall clock (see `localplay_encoder::ffmpeg`), so a burst of the same
+    // frames would encode as a few milliseconds of media, which is a property of the fix
+    // rather than something to assert around. `next_frame` waits at most 5ms for the next
+    // frame, so this loop runs at the stub's own 10fps.
+    video.start().unwrap();
+    audio.start().unwrap();
+    let until = Instant::now() + Duration::from_secs(6);
+    let mut frames = 0u64;
+    while Instant::now() < until {
+        if let Some(frame) = video.next_frame(Duration::from_millis(5)).unwrap() {
+            encoder.submit_video(&frame).unwrap();
+            frames += 1;
+        }
+        while let Some(block) = audio.next_buffer(Duration::ZERO).unwrap() {
+            encoder.submit_audio(&block).unwrap();
+        }
     }
-    for block in audio.drain_for(Duration::from_secs(6)) {
-        encoder.submit_audio(&block).unwrap();
-    }
+    assert!(frames >= 50, "10fps for 6s must deliver ~60 frames, got {frames}");
     encoder.finish().unwrap();
 
     ring.scan_once().expect("scan scratch dir");

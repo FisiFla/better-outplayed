@@ -66,6 +66,92 @@ const POST_ROLL_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 /// user just asked for, and the wait is invisible to them.
 const POST_ROLL_MARGIN: Duration = Duration::from_secs(5);
 
+/// How far the pacer may fall behind the wall clock before it resynchronises.
+///
+/// Two frame intervals. Anything below one interval is ordinary scheduling jitter and
+/// must be absorbed by the next frame being admitted a little early; anything above this
+/// means the loop genuinely stalled (a slow scan of a full scratch directory, a GC-like
+/// pause, a page fault), and catching up frame by frame from there would mean submitting
+/// faster than `fps` for as long as the deficit lasts — a burst that re-creates exactly
+/// the timeline skew the pacer exists to remove. See [`FramePacer::admit`].
+const PACER_RESYNC_AFTER_INTERVALS: u32 = 2;
+
+/// Admits at most `fps` frames per second into the encoder, and drops the rest.
+///
+/// A capture backend is not obliged to deliver frames at the rate the encoder was
+/// configured for. On the Windows box the primary display delivered ~36fps while
+/// `encode.fps` was 30, and the pump fed every one of them: ffmpeg then assigned a
+/// timestamp per frame at the declared rate, so 25.4s of wall clock produced 19.0s of
+/// media (`span=19000ms` against `need=28690ms`), the post-roll could never be reached
+/// and every hotkey press timed out. Media time is now taken from the wall clock instead
+/// (`-use_wallclock_as_timestamps`, see `localplay_encoder::ffmpeg`), and this pacer keeps
+/// the two rates the same in the ordinary case so that fix is conservative rather than
+/// load-bearing: the encoder is asked to encode `fps` frames per second, and it is given
+/// `fps` frames per second.
+///
+/// Frames that arrive early are **dropped, not queued**: the buffer is a ring of already
+/// encoded footage on disk, so holding surplus frames in memory would trade the project's
+/// flat RAM for nothing at all — the encoder would still have to drop them later.
+///
+/// Deliberately has no backlog: it is a rate limiter, not a scheduler. Nothing downstream
+/// needs the frames it drops (each one is superseded by the next).
+pub struct FramePacer {
+    /// When the next frame may be submitted.
+    next_due: Instant,
+    /// `1 / fps`. Exact enough as a `Duration` (ns resolution), and unlike an accumulator
+    /// of `f64` seconds it cannot drift.
+    interval: Duration,
+    /// Deficit beyond which `admit` resynchronises instead of catching up.
+    resync_after: Duration,
+}
+
+impl FramePacer {
+    /// A pacer for `fps` frames per second, with the first frame due immediately.
+    ///
+    /// `fps` is clamped to at least 1: the same value drives the encoder's arguments and
+    /// `-rate`-style arithmetic, and a zero would be a division by zero rather than a
+    /// meaningful "no limit".
+    pub fn new(fps: u32) -> Self {
+        let fps = fps.max(1);
+        let interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
+        Self {
+            next_due: Instant::now(),
+            interval,
+            resync_after: interval * PACER_RESYNC_AFTER_INTERVALS,
+        }
+    }
+
+    /// Whether the frame that arrived at `now` should be submitted to the encoder.
+    ///
+    /// `false` means *drop it*: it arrived before its slot. Note that a dropped frame is
+    /// not deferred to the next call — the caller has already taken it off the capture
+    /// backend, so nothing anywhere is waiting for it, and the encoder's media timeline
+    /// comes from arrival time rather than from a frame count, so a gap is a repeat of the
+    /// previous picture for one interval, not a shift of everything after it.
+    ///
+    /// The schedule advances by exactly one interval per admitted frame, so the long-run
+    /// rate is `fps` with no accumulating drift from the time each call happens to be made.
+    /// The exception is the resync below, and it exists so that a stall cannot turn into a
+    /// burst: when the deficit is [`PACER_RESYNC_AFTER_INTERVALS`] intervals or more, this
+    /// frame is admitted but the schedule jumps to `now + interval` rather than staying in
+    /// the past. Catching up instead would submit as fast as the capture backend hands
+    /// frames over until the deficit was paid off, which is the timeline skew this type
+    /// exists to prevent (and, at the encoder's bounded queue, would mostly be dropped
+    /// there instead — see `localplay_encoder::ffmpeg`).
+    pub fn admit(&mut self, now: Instant) -> bool {
+        if now < self.next_due {
+            // Arrived early: dropped, not deferred. The caller has already taken it off
+            // the capture backend, so no one is holding it for later.
+            return false;
+        }
+        self.next_due += self.interval;
+        if now.saturating_duration_since(self.next_due) >= self.resync_after {
+            self.next_due = now + self.interval;
+        }
+        true
+    }
+}
+
 /// The `buffer` subcommand: capture → encode → segment ring → hotkey → clip.
 pub fn run_buffer() -> Result<()> {
     let app_dir = app_data_dir();
@@ -142,6 +228,9 @@ pub fn run_buffer() -> Result<()> {
 
     let hotkeys = localplay_events::hotkey::listen(hotkey)?;
     let clock = localplay_events::CaptureClock::new();
+    // One pacer for every path that pumps: the steady-state loop and the post-roll wait
+    // share the encoder's timeline, so they have to share its rate limit too.
+    let mut pacer = FramePacer::new(cfg.encode.fps);
     tracing::info!(
         "buffering {}s pre / {}s post at {}fps; press {} to clip",
         cfg.buffer.pre_seconds,
@@ -158,7 +247,8 @@ pub fn run_buffer() -> Result<()> {
     // logs its own total rather than folding it in here.
     let mut frames: u64 = 0;
     loop {
-        frames += pump_once_counted(capture.as_mut(), audio.as_mut(), encoder.as_mut())?;
+        frames +=
+            pump_once_counted(&mut pacer, capture.as_mut(), audio.as_mut(), encoder.as_mut())?;
 
         if last_scan.elapsed() >= Duration::from_millis(200) {
             ring.scan_once().context("scanning scratch")?;
@@ -166,12 +256,22 @@ pub fn run_buffer() -> Result<()> {
             last_scan = Instant::now();
 
             let stats = ring.stats();
+            // `dropped=` is the encoder's own count of frames it had to discard because
+            // its queue was full (it cannot slow the capture down, see the queue note in
+            // `localplay-encoder`). It belongs next to `frames=` because the two together
+            // say whether the pipeline is keeping up: a run that quietly loses a third of
+            // its frames must not look like a clean one. `dropped_audio=` is the same
+            // count for audio blocks; it is logged separately because a drop there is a
+            // hole in the sound rather than a repeated picture, and the two have different
+            // acceptable rates.
             tracing::debug!(
-                "frames={} segments={} bytes={} span={}ms",
+                "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={}",
                 frames,
                 stats.segments,
                 stats.bytes_on_disk,
-                stats.span_ms
+                stats.span_ms,
+                encoder.dropped_frames(),
+                encoder.dropped_audio_blocks()
             );
             if stats.bytes_on_disk > cfg.buffer.scratch_cap_bytes {
                 bail!(
@@ -196,6 +296,7 @@ pub fn run_buffer() -> Result<()> {
             let need_ms = trigger_ms + buffer_cfg.post_ms;
             let budget = Duration::from_millis(buffer_cfg.post_ms) + POST_ROLL_MARGIN;
             pump_until_span(
+                &mut pacer,
                 &mut ring,
                 capture.as_mut(),
                 audio.as_mut(),
@@ -222,11 +323,12 @@ pub fn run_buffer() -> Result<()> {
 /// See [`pump_once_counted`], which is the implementation; this is the same call for
 /// callers that do not need the frame count.
 pub fn pump_once(
+    pacer: &mut FramePacer,
     capture: &mut dyn CaptureBackend,
     audio: &mut dyn AudioBackend,
     encoder: &mut dyn Encoder,
 ) -> Result<()> {
-    pump_once_counted(capture, audio, encoder)?;
+    pump_once_counted(pacer, capture, audio, encoder)?;
     Ok(())
 }
 
@@ -237,17 +339,28 @@ pub fn pump_once(
 /// can keep criterion 1's `frames=` counter while that rule stays centralised.
 ///
 /// Video: submit the next frame if one is due, after `guard_frame_size` has checked it
-/// against the size the encoder's rawvideo pipe was declared with. `next_frame` waits
-/// at most [`FRAME_POLL`] for it, so the caller's loop is paced by the capture backend
-/// rather than spinning.
+/// against the size the encoder's rawvideo pipe was declared with, and after `pacer`
+/// has admitted it for this instant. `next_frame` waits at most [`FRAME_POLL`] for it,
+/// so the caller's loop is paced by the capture backend rather than spinning.
 ///
-/// Audio: drain **every** block that is already due. Audio blocks are 10ms while video
-/// frames are 16.7ms at 60fps, so submitting a single block per iteration would run
-/// audio at ~60% speed and desync the clip. A zero timeout makes `next_buffer` a
-/// non-blocking "is anything due?" check.
+/// The pacer is what keeps the encoder's media timeline honest. A capture backend
+/// delivers frames at its own rate, which is not necessarily `encode.fps` (on real
+/// hardware it was ~36fps against a configured 30); submitting all of them asks the
+/// encoder to encode a timeline that advances faster than the wall clock, and the
+/// post-roll then never arrives. A frame the pacer drops is *not counted* as submitted,
+/// which is the honest reading of `frames=`: it counts frames the encoder received.
+///
+/// Audio: drain **every** block that is already due, unpaced. Audio blocks are 10ms
+/// while video frames are 16.7ms at 60fps, so submitting a single block per iteration
+/// would run audio at ~60% speed and desync the clip. A zero timeout makes
+/// `next_buffer` a non-blocking "is anything due?" check. Audio is not rate-limited
+/// because its timeline is the exact 48kHz sample count rather than an arrival
+/// timestamp: throttling it to the video rate would *create* the desync it looks like
+/// it is preventing.
 ///
 /// A frame the backend did not produce is not counted; a submit that errors aborts.
 pub fn pump_once_counted(
+    pacer: &mut FramePacer,
     capture: &mut dyn CaptureBackend,
     audio: &mut dyn AudioBackend,
     encoder: &mut dyn Encoder,
@@ -255,8 +368,10 @@ pub fn pump_once_counted(
     let mut frames: u64 = 0;
     if let Some(frame) = capture.next_frame(FRAME_POLL)? {
         guard_frame_size(&frame, encoder.source_size())?;
-        encoder.submit_video(&frame)?;
-        frames += 1;
+        if pacer.admit(Instant::now()) {
+            encoder.submit_video(&frame)?;
+            frames += 1;
+        }
     }
     while let Some(block) = audio.next_buffer(Duration::ZERO)? {
         encoder.submit_audio(&block)?;
@@ -276,7 +391,7 @@ pub fn pump_once_counted(
 /// declared 2560x1440 (logical pixels, from a DPI-virtualised `GetSystemMetrics`) while
 /// the capture item was 3840x2160 physical pixels — the size every frame carries.
 ///
-/// The two values are derived from one another in `build_encoder` — `native_size`
+/// The two values are derived from one another in `build_encode_config` — `native_size`
 /// builds the `EncodeConfig` and this compares the frames against it — so a mismatch
 /// means that link is broken (a resolution change mid-capture, or a backend reporting a
 /// size it does not deliver). Either way the safe answer is to stop, loudly, rather than
@@ -308,7 +423,9 @@ fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 /// had no test that could run it (the hotkey is Windows-only).
 ///
 /// Each iteration therefore pumps capture → encoder exactly as the main loop does,
-/// then re-scans the scratch directory for segments that have been completed.
+/// through the same [`FramePacer`] the main loop uses: the two paths feed one encoder and
+/// so share one rate limit, otherwise the wait would quietly submit at the raw capture
+/// rate and drift the timeline it is waiting on.
 ///
 /// `budget` bounds the wait, measured from this call. Callers size it from the
 /// post-roll they are waiting for plus a margin ([`POST_ROLL_MARGIN`]) rather than from
@@ -318,6 +435,7 @@ fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 /// `need_ms` on entry returns immediately. Errors if the budget elapses first, or if
 /// the capture/encode path fails.
 pub fn pump_until_span(
+    pacer: &mut FramePacer,
     ring: &mut RingBuffer,
     capture: &mut dyn CaptureBackend,
     audio: &mut dyn AudioBackend,
@@ -333,7 +451,7 @@ pub fn pump_until_span(
     let mut next_scan = started;
 
     loop {
-        frames += pump_once_counted(capture, audio, encoder)?;
+        frames += pump_once_counted(pacer, capture, audio, encoder)?;
 
         if Instant::now() >= next_scan {
             ring.scan_once().context("scanning scratch for the post-roll")?;
@@ -478,4 +596,104 @@ fn unix_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pacer plus the instant its schedule is measured from.
+    ///
+    /// `FramePacer::new` stamps `next_due` from the clock itself, so the returned `t0` is a
+    /// few microseconds *after* that stamp: every instant below is expressed relative to
+    /// `t0`, and every margin is at least a millisecond, which is orders of magnitude
+    /// wider than the difference. Nothing here sleeps — `admit` only ever reads the instant
+    /// it is handed, so these tests are deterministic and instant.
+    fn pacer(fps: u32) -> (FramePacer, Instant) {
+        let p = FramePacer::new(fps);
+        (p, Instant::now())
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_frame_that_is_due_is_admitted() {
+        let (mut p, t0) = pacer(10);
+        assert!(p.admit(t0), "the first frame is due immediately");
+        assert!(p.admit(t0 + 100 * MS), "the frame at the next slot is due");
+    }
+
+    #[test]
+    fn a_frame_that_arrives_early_is_dropped() {
+        let (mut p, t0) = pacer(10);
+        assert!(p.admit(t0));
+        // Half a frame interval early: the capture backend ran ahead of the encoder's
+        // rate. This is the frame that made 36fps of capture look like 30fps of media.
+        assert!(
+            !p.admit(t0 + 50 * MS),
+            "a frame before its slot must be dropped, not queued and not submitted"
+        );
+        // And dropping it did not move the schedule: the slot is still at t0 + 100ms.
+        assert!(!p.admit(t0 + 99 * MS), "still early");
+        assert!(p.admit(t0 + 100 * MS), "the slot itself is admitted");
+    }
+
+    #[test]
+    fn a_capture_running_faster_than_configured_is_limited_to_the_configured_rate() {
+        // A 60fps capture against a 30fps configuration: half the frames must be dropped,
+        // and `frames=` must not report them as submitted.
+        let (mut p, t0) = pacer(30);
+        let mut admitted = 0;
+        for i in 0..60 {
+            if p.admit(t0 + Duration::from_micros(i * 1_000_000 / 60)) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            (29..=31).contains(&admitted),
+            "one second of 60fps capture must yield ~30 admitted frames, got {admitted}"
+        );
+    }
+
+    #[test]
+    fn a_long_stall_resynchronises_instead_of_bursting() {
+        // 10fps: 100ms per frame, so the resync threshold is 200ms of deficit.
+        let (mut p, t0) = pacer(10);
+        assert!(p.admit(t0));
+
+        // The loop stalls for five seconds (a full scratch scan, a page-fault storm, the
+        // process being descheduled). The frame that finally arrives is due, so it is
+        // admitted — but the schedule must not stay five seconds in the past.
+        let after_stall = t0 + Duration::from_secs(5);
+        assert!(p.admit(after_stall), "a late frame is still a frame to encode");
+
+        // A catch-up burst would admit every frame until the five seconds were paid off.
+        // Nothing in the next 50ms may be admitted: the pacer resynchronised to
+        // `after_stall + interval`, so the next frame is due a whole interval later.
+        let burst = (1..=5)
+            .filter(|i| p.admit(after_stall + Duration::from_micros(i * 10_000)))
+            .count();
+        assert_eq!(
+            burst, 0,
+            "a stalled pacer must resume at the configured rate, not emit a catch-up burst"
+        );
+        assert!(
+            p.admit(after_stall + 100 * MS),
+            "the schedule resumed one interval after the stall"
+        );
+    }
+
+    #[test]
+    fn a_small_lag_is_absorbed_without_resynchronising() {
+        let (mut p, t0) = pacer(10);
+        assert!(p.admit(t0));
+        // 50ms late: within the threshold, so this is jitter, and the schedule stays on
+        // the original grid rather than being nudged forward by the delay.
+        assert!(p.admit(t0 + 150 * MS));
+        assert!(
+            p.admit(t0 + 205 * MS),
+            "the grid must still be at t0 + 200ms: a resync here would have pushed it to \
+             t0 + 250ms and dropped this frame"
+        );
+    }
 }
