@@ -1,12 +1,40 @@
 # xtask/sidecars.toml
 #
+# The ffmpeg sidecars localplay ships. No binary is committed: this file is the *pin* — a
+# URL plus the SHA-256 of the archive that URL is expected to serve — and
+# `cargo xtask sidecars fetch` downloads the archive, checks it against the recorded hash,
+# and extracts only the paths in `binaries` into <repo>/binaries/ (gitignored).
+#
+# `cargo xtask sidecars record` produces the hashes: it downloads each archive and rewrites
+# the `sha256` lines below. The first recorded hash is trust on first use — nothing
+# cryptographic attests that download — so read the URL, check it against the upstream
+# project's own download instructions, and review the diff before committing it. Every later
+# fetch is then checked against it and fails loudly on a mismatch instead of extracting.
+#
 # LGPL ffmpeg builds only: localplay never uses libx264/libx265, so GPL builds are
 # unnecessary and would impose GPL obligations on the distributed app (README).
+#
+# Only the Windows target is required for shipping; the PoC's target is Windows 10 1903+.
+# It is the only entry here on purpose: adding one is only worth doing when the URL's
+# provenance can be named confidently, and that has not been established for a macOS or
+# Linux build, so none is invented.
+#
+# `--target` exists so that this Windows sidecar can be fetched and inspected from any host,
+# which is also how it is tested:
+#   cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
 
 [[platform]]
 target = "x86_64-pc-windows-msvc"
+# Gyan's "essentials" build — the LGPL Windows build the ffmpeg download page itself points
+# at (https://www.gyan.dev/ffmpeg/builds/). No libx264/libx265.
 archive_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-# Recorded on first fetch via `cargo xtask sidecars record`. Reviewed in the PR.
-sha256 = "RECORD_ME"
+# Recorded with `cargo xtask sidecars record`, reviewed in the PR. `fetch` refuses to run
+# while this still reads RECORD_ME.
+sha256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
 archive_kind = "zip"
+# Paths *inside the archive*. Upstream wraps everything in a versioned top-level directory
+# whose name changes with every release, so each entry is matched as a path suffix and only
+# the file name is kept: `bin/ffmpeg.exe` matches
+# `ffmpeg-<version>-essentials_build/bin/ffmpeg.exe` and lands at `binaries/ffmpeg.exe`. Nothing
+# outside this list is ever extracted, and an entry that is not in the archive is an error.
 binaries = ["bin/ffmpeg.exe", "bin/ffprobe.exe"]

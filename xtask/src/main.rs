@@ -1,5 +1,7 @@
 //! Build helpers: sidecar acquisition and encoder probing.
 
+mod sidecars;
+
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -15,46 +17,84 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    match std::env::args().nth(1).as_deref() {
-        Some("sidecars") => match std::env::args().nth(2).as_deref() {
-            Some("fetch") => sidecars_fetch(),
-            Some("record") => sidecars_record(),
-            other => bail!("usage: xtask sidecars <fetch|record>, got {other:?}"),
-        },
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("sidecars") => sidecars_command(&args[1..]),
         Some("probe") => probe_encoders(),
-        _ => bail!("usage: xtask <sidecars|probe>"),
+        _ => bail!(usage()),
     }
 }
 
+fn usage() -> &'static str {
+    "usage:\n  \
+     xtask sidecars record [--target <triple>]   # download, hash, rewrite sidecars.toml\n  \
+     xtask sidecars fetch  [--target <triple>]   # verify the recorded hash, then extract\n  \
+     xtask probe                                 # which hardware encoders this machine can run"
+}
+
+/// The repository root. `xtask` is a workspace member, so its manifest sits one level down.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Where the extracted sidecars go: next to the executable in a packaged build, and next to
+/// the repository root in a checkout, where `localplay-media`'s development fallback finds it.
 fn binaries_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../binaries")
+    repo_root().join("binaries")
 }
 
-fn sidecars_fetch() -> Result<()> {
-    let manifest = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecars.toml"),
-    )
-    .context("reading sidecars.toml")?;
+/// Scratch space for downloads. Under `target/`, which is gitignored, so a 120 MB archive
+/// cannot be committed by accident.
+fn work_dir() -> PathBuf {
+    repo_root().join("target/sidecars")
+}
 
-    if manifest.contains("RECORD_ME") {
-        bail!(
-            "sidecars.toml has an unrecorded sha256. Run `cargo xtask sidecars record` on a \
-             trusted network, review the diff, and commit the recorded hash. Fetching will \
-             then extract the archives into {}.",
-            binaries_dir().display()
-        );
+fn manifest_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecars.toml")
+}
+
+/// `--target <triple>` / `--target=<triple>`, or nothing.
+fn parse_target(args: &[String]) -> Result<Option<String>> {
+    let mut target = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(value) = arg.strip_prefix("--target=") {
+            target = Some(value.to_string());
+        } else if arg == "--target" {
+            let value = it
+                .next()
+                .context("--target needs a value, e.g. --target x86_64-pc-windows-msvc")?;
+            target = Some(value.clone());
+        } else {
+            bail!("unexpected argument {arg:?}\n{}", usage());
+        }
     }
-    // Download to a temp file, verify sha256, then extract into binaries/.
-    // Deliberately not implemented with a placeholder: see the note below.
-    bail!(
-        "not implemented in this task; when implemented it will verify the archive against \
-         the recorded sha256 and extract into {} — see the note in the plan",
-        binaries_dir().display()
-    )
+    Ok(target)
 }
 
-fn sidecars_record() -> Result<()> {
-    bail!("not implemented in this task; see the note in the plan")
+fn sidecars_command(args: &[String]) -> Result<()> {
+    let (sub, rest) = args
+        .split_first()
+        .context("usage: xtask sidecars <fetch|record> [--target <triple>]")?;
+    let target = parse_target(rest)?;
+    match sub.as_str() {
+        // `--target` on `record` exists for the same reason it does on `fetch`: a machine
+        // that is not the packaging machine records, reviews and fetches the Windows entry.
+        "record" => {
+            sidecars::record(&manifest_path(), &binaries_dir(), &work_dir(), target.as_deref())
+        }
+        "fetch" => sidecars::fetch(
+            &manifest_path(),
+            &binaries_dir(),
+            target.as_deref(),
+            sidecars::host_target().as_deref(),
+            &work_dir(),
+        ),
+        other => bail!("usage: xtask sidecars <fetch|record>, got {other:?}"),
+    }
 }
 
 fn probe_encoders() -> Result<()> {

@@ -11,6 +11,25 @@ anyhow.workspace = true
 # Duplicating it here would let the two answers drift apart, which is exactly the failure
 # this command exists to make visible.
 localplay-media.workspace = true
+# `sidecars.toml` is parsed with the same TOML stack the rest of the workspace uses.
+serde.workspace = true
+toml.workspace = true
+# SHA-256 of the downloaded archive. Pure Rust (RustCrypto): no `shasum`/`sha256sum`
+# subprocess, whose presence and output format differ per platform.
+sha2 = "0.10"
+# Archives are read in-process with `zip` rather than by shelling out to `tar`/`unzip`.
+# Two reasons, both load-bearing: Windows ships no `unzip.exe`, and the security rules
+# that matter here (reject absolute paths, `..` components and symlinks; extract only
+# allowlisted entries) then live in *this repository's own tested code* instead of in an
+# external tool's behaviour. Default features off — localplay only ever reads stored or
+# deflated entries, so the other decoders would be dead weight.
+zip = { version = "5", default-features = false, features = ["deflate-flate2"] }
+# The inflate backend behind `deflate-flate2` above: flate2's pure-Rust `miniz_oxide`
+# backend, so building the sidecar tooling needs no C toolchain.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

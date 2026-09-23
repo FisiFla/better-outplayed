@@ -168,6 +168,26 @@ and the Phase 1 task breakdown at
 > macOS or Linux, and the development host is macOS — so the capture path is
 > unverified until it runs on real Windows hardware.
 
+### Getting the sidecars
+
+The last item is a command, not a manual download. The URL and the SHA-256 of the archive
+it must serve live in `xtask/sidecars.toml`; `fetch` verifies the archive against that hash
+and extracts only the two binaries it lists, into `binaries/` (gitignored):
+
+```sh
+cargo xtask sidecars record    # download, print and record each archive's sha256 (once)
+cargo xtask sidecars fetch     # verify the recorded hash, then extract
+# a Windows sidecar can be fetched and inspected from macOS or Linux:
+cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+```
+
+`record` writes a **trust-on-first-use** pin: it cannot attest who served the archive, only
+the bytes to expect from then on, so the URL and the hash are meant to be reviewed in the
+diff and committed. At runtime the app looks for `binaries/` next to the executable first
+(that is where packaging will put it), then — for a `cargo run` checkout only — for a
+`binaries/` directory at the root of the project the executable lives under, and finally on
+`PATH`. Installing `ffmpeg` system-wide is therefore not required, which is the point.
+
 ---
 
 ## Roadmap
