@@ -165,6 +165,18 @@ impl RingBuffer {
         }
     }
 
+    /// The ledger's own position, in ms, of this run's zero.
+    ///
+    /// `stats().span_ms` and `trigger`'s `trigger_ms` are run-relative media time; adding
+    /// this turns either into a position on the ledger's timeline, which is the timeline
+    /// segment numbers (and so a clip's footage) are actually measured on. A caller that
+    /// persists a position — the clip index does, as `clips.started_at` — wants the
+    /// ledger's, so that clips spliced in successive runs against the same scratch
+    /// directory keep their order.
+    pub fn ledger_origin_ms(&self) -> u64 {
+        self.origin_ms
+    }
+
     /// Persist the ledger so the index survives a crash (spec §6.4).
     pub fn save_ledger(&self) -> Result<()> {
         self.ledger.save_atomic(&self.scratch_dir.join("ledger.toml"))
