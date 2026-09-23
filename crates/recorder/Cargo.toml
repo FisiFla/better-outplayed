@@ -1,0 +1,41 @@
+[package]
+name = "localplay-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "localplay's recording engine: capture → audio → encode → segment ring → clip"
+publish = false
+
+# The recording engine both front-ends drive. It owns the capture backend, the audio
+# backend, the encoder, the ring buffer and the clip index, and it owns nothing else: no
+# hotkey (that is a driver concern) and no UI (see the crate docs).
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tracing.workspace = true
+localplay-capture = { path = "../capture" }
+localplay-encoder = { path = "../encoder" }
+localplay-replay  = { path = "../replay" }
+localplay-media   = { path = "../media" }
+localplay-events  = { path = "../events" }
+localplay-store   = { path = "../store" }
+
+[features]
+# Forwards to the encoder's test-only software-encoder path, which is what
+# `dev_software_encoder` (the CLI's `--dev-software-encoder`) needs in a non-test build.
+# Never enabled in a release build: a silent CPU fallback would violate principle 3
+# (spec §3.2), and this feature is opt-in for exactly that reason.
+test-encoders = ["localplay-encoder/test-encoders"]
+
+[dev-dependencies]
+tempfile.workspace = true
+# Enables `EncodeConfig::for_tests_software` for this package's TEST builds only: dev
+# dependencies are not built for `cargo build`, so the shipping path keeps no CPU
+# fallback (that guard is this package's own `test-encoders` feature, which stays opt-in).
+# The end-to-end test lives in `src/tests.rs` — a unit test — precisely so it can use the
+# software encoder path without a `cfg` gate that the suite's command line
+# (`--features localplay-encoder/test-encoders`) would compile away.
+localplay-encoder = { path = "../encoder", features = ["test-encoders"] }
+
+[lints]
+workspace = true

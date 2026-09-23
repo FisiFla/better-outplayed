@@ -286,6 +286,7 @@ dependencies = [
  "localplay-encoder",
  "localplay-events",
  "localplay-media",
+ "localplay-recorder",
  "localplay-replay",
  "localplay-store",
  "serde",
@@ -324,6 +325,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "localplay-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "localplay-capture",
+ "localplay-encoder",
+ "localplay-events",
+ "localplay-media",
+ "localplay-replay",
+ "localplay-store",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

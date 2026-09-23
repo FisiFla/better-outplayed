@@ -4,6 +4,7 @@ members = [
     "crates/capture",
     "crates/encoder",
     "crates/replay",
+    "crates/recorder",
     "crates/media",
     "crates/events",
     "crates/store",
