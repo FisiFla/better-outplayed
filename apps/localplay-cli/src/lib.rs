@@ -44,6 +44,21 @@
 //! engine, on the thread that owns the counters, so the same line is observable whichever
 //! front-end started the recording; a second copy here would be a second source of truth.
 //! What this loop owns is the one thing the engine deliberately does not: the hotkey.
+//!
+//! # Taking a clip without touching the keyboard
+//!
+//! `Ctrl+F8` is the shipping trigger, and it stays that way. It is also the reason the clip
+//! path could never be verified from a script: pressing it requires synthesising input, and
+//! a machine running kernel-level anti-cheat treats synthetic input as hostile — so the
+//! verification that matters most was the one that could not safely be run.
+//!
+//! `buffer --self-test-clip-after <SECONDS>` is the way out. It is a *diagnostic*, not a
+//! feature: it waits until the ring holds a full window, calls the same
+//! [`Recorder::clip_now`] the hotkey calls (once), and stops. No keyboard or mouse input is
+//! sent, simulated or injected anywhere in this crate, and nothing enumerates windows; the
+//! only trigger is an in-process function call on the engine's own media-time path. The
+//! lines it produces are the hotkey's own lines, so the runbook's criteria read the same
+//! way in either mode.
 
 pub mod config;
 
@@ -67,9 +82,131 @@ use std::time::Duration;
 /// below is what keeps the process idle.
 const HOTKEY_POLL: Duration = Duration::from_millis(10);
 
-/// The `buffer` subcommand: capture → encode → segment ring → hotkey → clip.
+/// The `buffer` subcommand's own help text (see `main.rs`).
+///
+/// It documents `--self-test-clip-after` next to the flags a user may actually pass, and
+/// says what the flag does *not* do, because "does this touch my input?" is the first
+/// question a diagnostic that takes a clip has to answer.
+pub fn help() -> String {
+    let mut text = String::from(
+        "\
+localplay — Phase 1 headless replay buffer
+
+usage:
+  localplay-cli buffer [OPTIONS]
+
+options:
+  --self-test-clip-after <SECONDS>
+        Verification aid, not an end-user feature. Once the ring holds SECONDS of
+        media — and never before it holds a full pre-roll plus post-roll — take
+        exactly one clip through the same media-time trigger the clip hotkey
+        uses, log what that path logs (the trigger instant with its media time,
+        wall time and drift, then the written clip), and stop. The clip hotkey
+        remains the shipping mechanism; this flag is an *additional* trigger.
+
+        It sends, simulates and injects no keyboard or mouse input, and it does
+        not enumerate windows. It exists so that a machine whose anti-cheat
+        treats synthetic input as hostile can still have its clip path verified.
+  --dev-software-encoder
+        Only in builds carrying the `test-encoders` feature (never a release
+        build): use libx264 instead of a GPU hardware encoder, for pipeline
+        smoke tests on a host with no GPU encoder.
+
+configuration:
+  %LOCALAPPDATA%\\localplay\\config.toml on Windows (the directory
+  $LOCALAPPDATA points at may be redirected for a scratch run); the example
+  file is `config.example.toml`. localplay never reads configuration from
+  environment variables.
+",
+    );
+    // The hotkey is part of the runtime, not of the flag list; naming the configured
+    // chord here would mean reading the config for `--help`, which the flag parser does
+    // not do.
+    text.push_str("\nThe clip hotkey (config `[hotkeys] clip`, default Ctrl+F8) is unchanged.\n");
+    text
+}
+
+/// Options for the `buffer` subcommand, from the command line (and the environment for the
+/// data directory only).
+#[derive(Debug, Clone)]
+pub struct BufferOptions {
+    /// The application data directory: `config.toml`, `scratch/`, `clips/` and the index.
+    /// `app_data_dir()` by default; a verification harness points it somewhere disposable.
+    pub app_dir: PathBuf,
+    /// `--self-test-clip-after <SECONDS>`. `None` is the shipping behaviour.
+    pub self_test_clip_after: Option<u64>,
+    /// `--dev-software-encoder`.
+    pub dev_software_encoder: bool,
+}
+
+/// Parse the flags the `buffer` subcommand accepts (everything after `buffer`).
+///
+/// Strict on purpose: an unrecognised argument is an error rather than something quietly
+/// ignored, because the one thing this parser exists for is a verification flag that must
+/// provably have been understood.
+pub fn parse_buffer_args(args: &[String]) -> Result<(Option<u64>, bool)> {
+    let mut self_test_clip_after = None;
+    let mut dev_software_encoder = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value_of = |it: &mut std::slice::Iter<'_, String>, flag: &str| -> Result<String> {
+            it.next()
+                .cloned()
+                .with_context(|| format!("{flag} needs a value"))
+        };
+        match arg.as_str() {
+            "--self-test-clip-after" => {
+                let value = value_of(&mut it, "--self-test-clip-after")?;
+                self_test_clip_after = Some(parse_self_test_seconds(&value)?);
+            }
+            "--dev-software-encoder" => dev_software_encoder = true,
+            other => match other.strip_prefix("--self-test-clip-after=") {
+                Some(value) => self_test_clip_after = Some(parse_self_test_seconds(value)?),
+                None => bail!("unexpected argument {other:?}\n\n{}", help()),
+            },
+        }
+    }
+    Ok((self_test_clip_after, dev_software_encoder))
+}
+
+fn parse_self_test_seconds(value: &str) -> Result<u64> {
+    let seconds: u64 = value.parse().with_context(|| {
+        format!("--self-test-clip-after expects whole seconds, e.g. 45 (got {value:?})")
+    })?;
+    if seconds == 0 {
+        bail!("--self-test-clip-after must be at least 1 second");
+    }
+    Ok(seconds)
+}
+
+/// How much media the ring must hold before a self-test clip is taken, in ms.
+///
+/// The requested hold (`--self-test-clip-after`) is a floor, not the whole rule: a clip
+/// spliced before the pre-roll is complete would be short and would say nothing about the
+/// configured window, so the wait is never shorter than one full pre-roll plus post-roll.
+/// Pure, so the rule is pinned by a unit test rather than by reading the wait loop.
+pub fn self_test_need_ms(after_seconds: u64, pre_seconds: u64, post_seconds: u64) -> u64 {
+    (after_seconds * 1000).max((pre_seconds + post_seconds) * 1000)
+}
+
+/// The `buffer` subcommand, as `main.rs` calls it: flags from the process's own arguments.
 pub fn run_buffer() -> Result<()> {
-    let app_dir = app_data_dir();
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let (self_test_clip_after, dev_software_encoder) = parse_buffer_args(&args)?;
+    run_buffer_with(BufferOptions {
+        app_dir: app_data_dir(),
+        self_test_clip_after,
+        dev_software_encoder,
+    })
+}
+
+/// The `buffer` subcommand: capture → encode → segment ring → hotkey → clip.
+///
+/// Split from [`run_buffer`] so an integration test can drive the whole command in-process
+/// with its own data directory — the self-test trigger has to be reachable from a test, or
+/// it is the same kind of unverifiable code the hotkey path has always been.
+pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
+    let app_dir = opts.app_dir;
     let cfg_path = app_dir.join("config.toml");
     let cfg = if cfg_path.is_file() {
         Config::load(&cfg_path)?
@@ -91,7 +228,7 @@ pub fn run_buffer() -> Result<()> {
     // `--dev-software-encoder` only exists when built with the test-encoders feature; it
     // selects libx264, needs no GPU vendor at all, and is never reachable from the config
     // file. The engine applies the gate (see `localplay_recorder::resolve_encoder`).
-    let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
+    let dev_software = opts.dev_software_encoder;
 
     let recorder = Recorder::start(RecorderConfig {
         bin,
@@ -121,9 +258,32 @@ pub fn run_buffer() -> Result<()> {
     // The game-event sources. Started after the recorder (a source cannot ask for a clip
     // before there is anything to clip) and before the hotkey, so that an event arriving in
     // the first moments is not lost to a wait that is already running.
-    let sources = start_event_sources(&data_dir, &events);
+    //
+    // Self-test mode does not start them: the self-test takes **exactly one** clip, and a
+    // source that asked for one of its own would break that guarantee (as well as binding a
+    // port or polling a game on a run that exists to touch nothing but its own capture).
+    let sources = match opts.self_test_clip_after {
+        Some(_) => {
+            tracing::info!(
+                "self-test mode: the game-event sources are not started (the run takes \
+                 exactly one clip)"
+            );
+            let (_sink, events) = mpsc::channel();
+            EventSources { events, _lol: None, _gsi: None }
+        }
+        None => start_event_sources(&data_dir, &events),
+    };
 
+    // The hotkey listener is installed in both modes: it is part of the shipping startup
+    // path, and self-test mode must not be a different program. What self-test mode does
+    // *not* do is read it — the trigger below is the only thing that takes a clip.
     let hotkeys = hotkey::listen(hotkey)?;
+
+    // The verification-only trigger (`--self-test-clip-after`). It never synthesises input:
+    // it is an in-process call to the same media-time trigger the hotkey drives.
+    if let Some(after_seconds) = opts.self_test_clip_after {
+        return self_test_clip(&recorder, after_seconds, pre_seconds, post_seconds);
+    }
 
     // The driver loop. Everything below either waits for a press, hands the trigger to the
     // engine, or leaves — and every path out of it stops the recorder, which flushes the
@@ -157,6 +317,61 @@ pub fn run_buffer() -> Result<()> {
             bail!("the recorder stopped; see the log above");
         }
     }
+}
+
+/// The verification-only self-test trigger: wait for a full window, take one clip, stop.
+///
+/// This is the whole reason the flag exists. A `Ctrl+F8` press is the shipping way to take
+/// a clip, but pressing it requires *synthesising input* on a machine whose anti-cheat
+/// treats that as hostile — and a verification that gets the machine banned is not
+/// verification. So the same trigger is reachable from inside the process:
+///
+/// * the wait is on the ring's media timeline (`span_ms`), the clock the trigger itself
+///   uses, and it is never shorter than a full pre-roll plus post-roll
+///   ([`self_test_need_ms`]);
+/// * the trigger is [`Recorder::clip_now`] — the hotkey's own call, not a copy of it, so
+///   the trigger line (`hotkey pressed: media=… wall=… (drift …ms)`) and the `wrote …`
+///   line are exactly the lines the runbook's criteria 3–5 and 8 already read;
+/// * nothing here sends, simulates or injects a keyboard or mouse event, and nothing
+///   enumerates windows ([`Recorder`] is the only thing touched).
+///
+/// After the clip is written and indexed the recorder is stopped and the process exits
+/// with the clip's own outcome as its exit code, which is what makes the run scriptable.
+fn self_test_clip(
+    recorder: &Recorder,
+    after_seconds: u64,
+    pre_seconds: u64,
+    post_seconds: u64,
+) -> Result<()> {
+    let need_ms = self_test_need_ms(after_seconds, pre_seconds, post_seconds);
+    tracing::info!(
+        "self-test: one clip will be taken once the ring holds {need_ms}ms of media \
+         (--self-test-clip-after {after_seconds}s, at least {pre_seconds}s pre + \
+         {post_seconds}s post); no keyboard or mouse input is sent, simulated or injected, \
+         and no window is enumerated"
+    );
+
+    loop {
+        let span_ms = recorder.status().span_ms;
+        if span_ms >= need_ms {
+            tracing::info!("self-test: the ring holds {span_ms}ms of media; taking the clip");
+            break;
+        }
+        if !recorder.is_running() {
+            // The engine stopped on its own and kept the reason in its status.
+            recorder.stop()?;
+            bail!("the recorder stopped while the self-test was waiting for {need_ms}ms of media");
+        }
+        std::thread::sleep(HOTKEY_POLL);
+    }
+
+    if let Err(err) = recorder.clip_now() {
+        let _ = recorder.stop();
+        return Err(err.context("taking the self-test clip"));
+    }
+    // Flush the encoder and close the capture session before exiting, so the process's
+    // exit code is decided by the engine's own shutdown and not by a drop().
+    recorder.stop()
 }
 
 /// The event sources a front-end was configured to run, and the channel they report on.
@@ -283,4 +498,95 @@ fn app_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("localplay")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_buffer_flags_default_to_the_shipping_behaviour() {
+        // No flags: nothing about the hotkey path changes, and the self-test trigger is
+        // not armed. This is the case a user runs.
+        let (self_test, dev) = parse_buffer_args(&[]).expect("no flags is a valid command line");
+        assert_eq!(self_test, None);
+        assert!(!dev);
+    }
+
+    #[test]
+    fn the_self_test_flag_parses_seconds_in_either_form() {
+        assert_eq!(
+            parse_buffer_args(&args(&["--self-test-clip-after", "45"])).expect("spaced form").0,
+            Some(45)
+        );
+        assert_eq!(
+            parse_buffer_args(&args(&["--self-test-clip-after=45"])).expect("= form").0,
+            Some(45)
+        );
+        // The two forms are one setting, not two: the last one wins, and an unrelated flag
+        // is unaffected.
+        assert_eq!(
+            parse_buffer_args(&args(&[
+                "--self-test-clip-after=10",
+                "--dev-software-encoder",
+                "--self-test-clip-after",
+                "20",
+            ]))
+            .expect("last one wins"),
+            (Some(20), true)
+        );
+    }
+
+    #[test]
+    fn a_bad_self_test_value_is_refused_rather_than_defaulted() {
+        // A verification flag that silently did nothing would be worse than a crash: the
+        // run would look like it verified the trigger when it never armed it.
+        for bad in [
+            args(&["--self-test-clip-after"]),
+            args(&["--self-test-clip-after", "0"]),
+            args(&["--self-test-clip-after", "five"]),
+            args(&["--self-test-clip-after=-1"]),
+        ] {
+            let err = parse_buffer_args(&bad)
+                .expect_err("a bad value must be refused, never defaulted")
+                .to_string();
+            assert!(
+                err.contains("self-test-clip-after"),
+                "the error must name the flag, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_flag_is_an_error_that_prints_the_help() {
+        let err = parse_buffer_args(&args(&["--clip-after", "5"]))
+            .expect_err("an unknown flag must be refused")
+            .to_string();
+        assert!(err.contains("--clip-after"), "must name the bad argument: {err}");
+        assert!(err.contains("usage:"), "must show the usage: {err}");
+    }
+
+    #[test]
+    fn the_help_documents_that_no_input_is_synthesised() {
+        // The flag's whole justification. If this sentence is ever dropped, the reason the
+        // flag exists has been lost with it.
+        let help = help();
+        assert!(help.contains("--self-test-clip-after"));
+        assert!(help.contains("no keyboard or mouse input"));
+        assert!(help.contains("not enumerate windows"));
+    }
+
+    #[test]
+    fn the_self_test_wait_is_never_shorter_than_the_configured_window() {
+        // Requested hold above the window: the request wins.
+        assert_eq!(self_test_need_ms(45, 5, 3), 45_000);
+        // Requested hold below it: a full pre-roll plus post-roll is the floor, because a
+        // clip spliced before the pre-roll is complete would not be the configured window.
+        assert_eq!(self_test_need_ms(2, 5, 3), 8_000);
+        assert_eq!(self_test_need_ms(8, 5, 3), 8_000);
+    }
 }
