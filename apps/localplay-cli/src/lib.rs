@@ -196,8 +196,36 @@ pub fn run_buffer() -> Result<()> {
 
     // `--dev-software-encoder` only exists when built with the test-encoders feature.
     let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
-    let (mut encoder, encoder_name) =
-        build_encoder(&bin, &cfg, &scratch_dir, dev_software, native)?;
+    let mut encode_cfg = build_encode_config(&bin, &cfg, &scratch_dir, dev_software, native)?;
+
+    // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
+    // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
+    // there is no stub fallback to hide it behind.
+    //
+    // The ring is built and adopted *before* the encoder is spawned (where this used to
+    // be the other way round) because the segment number the encoder must continue from
+    // is decided from what is already on disk, and that number is one of ffmpeg's
+    // arguments. Nothing is captured in between: the capture backend has not been
+    // started yet, so no frame can be missed by the reordering.
+    let mut ring = RingBuffer::start(
+        &bin,
+        buffer_cfg.clone(),
+        scratch_dir.clone(),
+        encode_cfg.encoder_name().to_string(),
+    )?;
+    let adopted = ring.adopt_existing()?;
+    if adopted > 0 {
+        tracing::info!("adopted {adopted} segments from a previous run");
+    }
+    encode_cfg.start_number = ring.reserve_segment_number()?;
+    if encode_cfg.start_number > 0 {
+        tracing::info!(
+            "segment numbering continues at {} (previous material is on disk)",
+            encode_cfg.start_number
+        );
+    }
+
+    let (mut encoder, encoder_name) = spawn_encoder(&bin, &encode_cfg)?;
     tracing::info!("encoding with {encoder_name}");
     // One-line capture-geometry summary so a reader can see the resolution being
     // captured and that the frame counter starts from zero (criterion 1).
@@ -207,20 +235,6 @@ pub fn run_buffer() -> Result<()> {
         native.1,
         cfg.encode.fps
     );
-
-    // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
-    // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
-    // there is no stub fallback to hide it behind.
-    let mut ring = RingBuffer::start(
-        &bin,
-        buffer_cfg.clone(),
-        scratch_dir.clone(),
-        encoder_name.clone(),
-    )?;
-    let adopted = ring.adopt_existing()?;
-    if adopted > 0 {
-        tracing::info!("adopted {adopted} segments from a previous run");
-    }
 
     let mut audio = default_audio_backend(AudioFormat::default())?;
     capture.start()?;
@@ -487,7 +501,8 @@ fn app_data_dir() -> PathBuf {
     base.join("localplay")
 }
 
-/// Build the encoder. Hardware is the only shipping path.
+/// Decide everything the encoder needs, without starting it. Hardware is the only
+/// shipping path.
 ///
 /// `native_size` is the capture backend's own frame geometry: the monitor for WGC,
 /// the configured size for the stub. The encoder's rawvideo pipe is declared from it.
@@ -497,13 +512,18 @@ fn app_data_dir() -> PathBuf {
 /// `dev_software` exists solely so the pipeline can be smoke-tested on a host with
 /// no GPU encoder, and is only reachable when the CLI is built with
 /// `--features test-encoders`. It is never reachable from the config file.
-fn build_encoder(
+///
+/// Separate from [`spawn_encoder`] because the process has to know the encoder's name
+/// (for the ring's clip metadata) and, more importantly, has to decide the segment
+/// numbering from the scratch directory *before* the child starts: the number is an
+/// ffmpeg argument, so it cannot be changed afterwards.
+fn build_encode_config(
     bin: &FfmpegBinaries,
     cfg: &Config,
     scratch_dir: &Path,
     dev_software: bool,
     native_size: (u32, u32),
-) -> Result<(Box<dyn Encoder>, String)> {
+) -> Result<EncodeConfig> {
     let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
     let codec = match cfg.encode.codec.as_str() {
         "h264" => VideoCodec::H264,
@@ -564,7 +584,16 @@ fn build_encoder(
         );
     }
 
-    let encoder = FfmpegEncoder::spawn(bin, &encode_cfg)?;
+    Ok(encode_cfg)
+}
+
+/// Start the ffmpeg child for a configuration whose `start_number` has already been
+/// decided (see [`build_encode_config`] and `RingBuffer::reserve_segment_number`).
+fn spawn_encoder(
+    bin: &FfmpegBinaries,
+    encode_cfg: &EncodeConfig,
+) -> Result<(Box<dyn Encoder>, String)> {
+    let encoder = FfmpegEncoder::spawn(bin, encode_cfg)?;
     tracing::info!(
         "rawvideo -s={}x{} (capture native), encode output {}x{}{}",
         encode_cfg.source_size.0,

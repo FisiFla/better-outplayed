@@ -52,6 +52,21 @@ pub struct EncodeConfig {
     pub segment_ms: u64,
     pub scratch_dir: PathBuf,
     pub audio_bitrate_kbps: u32,
+    /// Sequence number of the first segment this encoder writes (`seg-%06d.mp4`).
+    ///
+    /// ffmpeg's segment muxer numbers files from 0 *every time it is spawned*, so a
+    /// second run would write `seg-000000.mp4` straight over the file the adopted
+    /// ledger still points at — the ledger then names footage the new run has replaced.
+    /// The caller computes the first free number from what is already on disk
+    /// (`RingBuffer::reserve_segment_number`) and passes it here.
+    ///
+    /// Fields are threaded through this struct rather than added as an argument to
+    /// [`crate::FfmpegEncoder::spawn`] so that every caller of `spawn` (tests included)
+    /// keeps compiling unchanged, and because this struct is already the one place that
+    /// holds the ffmpeg arguments. `hardware` has no room for a ninth parameter without
+    /// another clippy `too_many_arguments` warning. Default `0`: a first run on an empty
+    /// scratch directory, and every test.
+    pub start_number: u64,
     /// `None` means "real hardware encoder" — the only shipping configuration.
     pub(crate) software_encoder: Option<&'static str>,
 }
@@ -76,6 +91,9 @@ impl EncodeConfig {
             segment_ms,
             scratch_dir,
             audio_bitrate_kbps: 192,
+            // A first run (and every test) writes `seg-000000.mp4`; the CLI overrides
+            // this from what it finds on disk before spawning.
+            start_number: 0,
             software_encoder: Some(codec.hw_encoder_name(vendor)),
         }
     }
@@ -103,11 +121,18 @@ impl EncodeConfig {
             segment_ms,
             scratch_dir,
             audio_bitrate_kbps: 128,
+            start_number: 0,
             software_encoder: None,
         }
     }
 
-    pub(crate) fn encoder_name(&self) -> &'static str {
+    /// The ffmpeg encoder this configuration selects — the same string
+    /// [`Encoder::active_encoder`] reports once the child is running.
+    ///
+    /// Public because a caller has to be able to name the encoder *before* spawning it
+    /// (the CLI records it on every clip), which is what lets the replay ring be built
+    /// and the segment numbering be reserved before the ffmpeg child exists.
+    pub fn encoder_name(&self) -> &'static str {
         self.software_encoder.unwrap_or("libx264")
     }
 }

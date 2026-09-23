@@ -151,6 +151,14 @@ Zero is the expected value on a machine that keeps up; **a non-zero and rising
 run should not be reported as clean. The queue is bounded (4 video frames, 32 audio
 blocks), so these counters can never be traded for unbounded RAM.
 
+Segment numbering **continues across runs**. A run started on a scratch directory that
+already holds `seg-000000.mp4`…`seg-000018.mp4` writes `seg-000019.mp4` onward (the CLI
+logs `segment numbering continues at <n>`) instead of restarting at `seg-000000.mp4` and
+overwriting files the adopted ledger still names. The previous run's segments are still
+adopted, though, so a clip taken shortly after startup can include footage from before the
+restart — delete or rename the scratch directory when you want a run that cannot see any
+earlier material.
+
 Over a run of `T` seconds:
 
 - `frames=` should grow by roughly `T × <fps>` (as fast as the capture-and-encode path

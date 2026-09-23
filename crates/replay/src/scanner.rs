@@ -1,4 +1,5 @@
-//! Deciding which scratch segments are finished being written.
+//! Deciding which scratch segments are finished being written, and where the next
+//! encoder's numbering must continue from.
 
 use std::collections::BTreeSet;
 
@@ -16,6 +17,45 @@ pub fn newly_complete(observed: &[u64], highest_known: Option<u64>) -> Vec<u64> 
         .filter(|seq| *seq < max)
         .filter(|seq| highest_known.is_none_or(|known| *seq > known))
         .collect()
+}
+
+/// The sequence number in a `seg-%06d.mp4` filename, if it is one.
+///
+/// Anything else in the scratch directory (a ledger, a concat list, a stray file) is
+/// not a segment and yields `None`.
+pub fn segment_seq(name: &str) -> Option<u64> {
+    name.strip_prefix("seg-")?.strip_suffix(".mp4")?.parse().ok()
+}
+
+/// The sequence number a fresh encoder must start writing at, given the seqs in the
+/// adopted ledger and the filenames actually present in the scratch directory.
+///
+/// ffmpeg's segment muxer numbers from its `-segment_start_number` every time it is
+/// spawned, so without this a second run of the application would write
+/// `seg-000000.mp4` over the file the adopted ledger still points at: the ledger then
+/// names footage the new run has replaced, and a clip cut from it contains the wrong
+/// picture (measured: a stale segment from the previous run turned up in a clip as
+/// black frames). Continuing the numbering instead makes overwriting impossible.
+///
+/// Both sources are consulted, and the maximum of the two wins:
+///
+/// * the **ledger** may hold entries whose files were deleted or evicted, so it is the
+///   floor for "numbers already used";
+/// * the **disk** may hold a file the ledger never recorded — a crash between ffmpeg
+///   writing a segment and the next `save_ledger` leaves exactly that — so the disk is
+///   the floor for "numbers already present".
+///
+/// A number is never reused, so the encoder can only ever create new files. Pure
+/// function: the caller reads the directory and parses the names (or uses
+/// [`segment_seq`]). An empty ledger and an empty directory give 0, i.e. the first run
+/// writes `seg-000000.mp4` exactly as it always did.
+pub fn next_segment_number<S: AsRef<str>>(ledger_seqs: &[u64], observed_names: &[S]) -> u64 {
+    let from_ledger = ledger_seqs.iter().copied().max();
+    let from_disk = observed_names.iter().filter_map(|n| segment_seq(n.as_ref())).max();
+    match from_ledger.max(from_disk) {
+        Some(highest) => highest + 1,
+        None => 0,
+    }
 }
 
 #[cfg(test)]
@@ -46,5 +86,73 @@ mod tests {
     #[test]
     fn empty_directory_yields_nothing() {
         assert_eq!(newly_complete(&[], None), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_segment_name_parses_to_its_sequence_number() {
+        assert_eq!(segment_seq("seg-000000.mp4"), Some(0));
+        assert_eq!(segment_seq("seg-000009.mp4"), Some(9));
+        assert_eq!(segment_seq("seg-123456.mp4"), Some(123_456));
+    }
+
+    #[test]
+    fn things_that_are_not_segment_names_are_not_numbers() {
+        // The scratch directory also holds the ledger and, transiently, a concat list.
+        assert_eq!(segment_seq("ledger.toml"), None);
+        assert_eq!(segment_seq("clip-1.concat.txt"), None);
+        assert_eq!(segment_seq("seg-000000.mkv"), None);
+        assert_eq!(segment_seq("seg-.mp4"), None);
+        assert_eq!(segment_seq("seg-abc.mp4"), None);
+    }
+
+    #[test]
+    fn a_fresh_scratch_directory_and_an_empty_ledger_start_at_zero() {
+        let empty: [&str; 0] = [];
+        assert_eq!(next_segment_number(&[], &empty), 0);
+    }
+
+    #[test]
+    fn numbering_continues_past_the_ledgers_highest_sequence() {
+        // A clean previous run: the ledger has segments 0..=5, the disk the same.
+        let names = [
+            "seg-000000.mp4",
+            "seg-000001.mp4",
+            "seg-000002.mp4",
+            "seg-000003.mp4",
+            "seg-000004.mp4",
+            "seg-000005.mp4",
+        ];
+        assert_eq!(next_segment_number(&[0, 1, 2, 3, 4, 5], &names), 6);
+    }
+
+    #[test]
+    fn numbering_continues_past_a_segment_the_ledger_never_recorded() {
+        // The crash case: ffmpeg wrote 6..=9 but the ledger was last saved at 5 (it was
+        // saved every 200ms, so a crash loses the tail). Starting at 6 would overwrite
+        // seg-000006.mp4, which the adopted ledger is about to index and could splice
+        // into a clip; the disk therefore has to be consulted as well.
+        let names = [
+            "seg-000005.mp4",
+            "seg-000006.mp4",
+            "seg-000007.mp4",
+            "seg-000008.mp4",
+            "seg-000009.mp4",
+        ];
+        assert_eq!(next_segment_number(&[0, 1, 2, 3, 4, 5], &names), 10);
+    }
+
+    #[test]
+    fn a_ledger_entry_with_no_file_still_reserves_its_number() {
+        // Nothing on disk, but the ledger claims 7. Reusing 7 would make the ledger's
+        // entry name the new file, i.e. splice this run's footage where an old clip was
+        // expected; skipping it costs seven unused numbers.
+        let empty: [&str; 0] = [];
+        assert_eq!(next_segment_number(&[3, 7], &empty), 8);
+    }
+
+    #[test]
+    fn a_non_segment_file_does_not_shift_the_numbering() {
+        let names = ["ledger.toml", "seg-000000.mp4", "clip-1.concat.txt"];
+        assert_eq!(next_segment_number(&[0], &names), 1);
     }
 }

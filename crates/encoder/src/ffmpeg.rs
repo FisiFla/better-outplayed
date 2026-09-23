@@ -222,6 +222,12 @@ impl FfmpegEncoder {
             // Each segment starts at zero, which is what the concat at clip time relies
             // on (spec §6.3): every segment is a self-contained unit starting at t=0.
             .args(["-reset_timestamps", "1"])
+            // Continue the numbering instead of restarting it. ffmpeg's segment muxer
+            // supports this as `segment_start_number`; plain `-start_number` is *not* an
+            // option of this muxer and is silently ignored (measured: with
+            // `-start_number 5` the first file was still `seg-000000.mp4`), which would
+            // leave the encoder overwriting files the adopted ledger still names.
+            .args(["-segment_start_number", &cfg.start_number.to_string()])
             .arg(&pattern)
             .stdin(Stdio::piped())
             // Nothing is expected on stdout any more (it used to carry the audio
