@@ -73,6 +73,14 @@ pub trait CaptureBackend: Send {
     fn start(&mut self) -> anyhow::Result<()>;
     fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>>;
     fn stop(&mut self) -> anyhow::Result<()>;
+
+    /// The frame geometry this backend delivers.
+    ///
+    /// Infallible by design: the size is fixed once the backend is constructed (the
+    /// monitor's native resolution for WGC, the configured size for the stub), so
+    /// there is no state that can be "not started yet" to report around. The encoder
+    /// declares its rawvideo pipe with exactly this size, so the two never disagree.
+    fn native_size(&self) -> (u32, u32);
 }
 
 pub trait AudioBackend: Send {

@@ -49,12 +49,19 @@ impl FfmpegEncoder {
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
             // Video input: raw BGRA frames on stdin.
             .args(["-f", "rawvideo", "-pix_fmt", "bgra"])
-            .args(["-s", &format!("{}x{}", cfg.width, cfg.height)])
+            // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size
+            // (what the capture backend delivers), never the encode output size.
+            .args(["-s", &format!("{}x{}", cfg.source_size.0, cfg.source_size.1)])
             .args(["-r", &cfg.fps.to_string()])
             .args(["-i", "pipe:0"])
             // Audio input: raw s16le PCM on the child's stdout.
-            .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:1"])
-            .args(["-c:v", cfg.encoder_name()])
+            .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:1"]);
+        // Frames arrive at `source_size`; when the caller asked for a different output
+        // size, scale to it. Equal sizes add no filter, which avoids a pointless pass.
+        if cfg.source_size != cfg.output_size {
+            cmd.args(["-vf", &format!("scale={}:{}", cfg.output_size.0, cfg.output_size.1)]);
+        }
+        cmd.args(["-c:v", cfg.encoder_name()])
             .args(["-b:v", &format!("{}k", cfg.bitrate_kbps)])
             .args(["-g", &gop.to_string()])
             // Forced keyframes are what make segment boundaries cuttable (spec §6.3).

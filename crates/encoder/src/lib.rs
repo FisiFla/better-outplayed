@@ -40,8 +40,13 @@ pub enum Vendor {
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub codec: VideoCodec,
-    pub width: u32,
-    pub height: u32,
+    /// The frame size that arrives on the rawvideo pipe — the capture backend's
+    /// native size. ffmpeg's `-s` is set from this, because it describes the
+    /// incoming stream; if it is wrong the pipe desyncs.
+    pub source_size: (u32, u32),
+    /// The size of the encoded output. When this differs from `source_size` the
+    /// encoder inserts a `scale` filter; when they are equal it adds none.
+    pub output_size: (u32, u32),
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub segment_ms: u64,
@@ -55,8 +60,8 @@ impl EncodeConfig {
     pub fn hardware(
         codec: VideoCodec,
         vendor: Vendor,
-        width: u32,
-        height: u32,
+        source_size: (u32, u32),
+        output_size: (u32, u32),
         fps: u32,
         bitrate_kbps: u32,
         segment_ms: u64,
@@ -64,8 +69,8 @@ impl EncodeConfig {
     ) -> Self {
         Self {
             codec,
-            width,
-            height,
+            source_size,
+            output_size,
             fps,
             bitrate_kbps,
             segment_ms,
@@ -77,6 +82,9 @@ impl EncodeConfig {
 
     /// Only available to tests and dev builds. The CLI cannot construct this from
     /// a user config file, which is what keeps "no CPU fallback" honest.
+    ///
+    /// Source and output are the same size: the stub sources feed the encoder at
+    /// exactly the size it encodes, so no scaling is involved.
     #[cfg(any(test, feature = "test-encoders"))]
     pub fn for_tests_software(
         codec: VideoCodec,
@@ -88,8 +96,8 @@ impl EncodeConfig {
     ) -> Self {
         Self {
             codec,
-            width,
-            height,
+            source_size: (width, height),
+            output_size: (width, height),
             fps,
             bitrate_kbps: 2_000,
             segment_ms,

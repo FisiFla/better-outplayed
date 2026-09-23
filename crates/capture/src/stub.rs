@@ -83,6 +83,10 @@ impl CaptureBackend for StubCapture {
     fn stop(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    fn native_size(&self) -> (u32, u32) {
+        (self.cfg.width, self.cfg.height)
+    }
 }
 
 /// Synthetic audio: silence, so A/V muxing is exercised without needing real audio.

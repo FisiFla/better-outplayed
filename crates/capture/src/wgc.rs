@@ -186,6 +186,11 @@ impl CaptureBackend for WgcCapture {
         self.release_com();
         Ok(())
     }
+
+    fn native_size(&self) -> (u32, u32) {
+        // The size queried at construction, same as `size()`.
+        self.size()
+    }
 }
 
 impl Drop for WgcCapture {

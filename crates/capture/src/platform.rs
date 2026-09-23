@@ -19,27 +19,18 @@ use anyhow::Result;
 
 /// The video backend for this platform.
 ///
-/// `stub` describes the synthetic source used off Windows, and on Windows it is only
-/// read to check the encoder's expected frame size against the size WGC will actually
-/// deliver — see the warning below.
+/// `stub` describes the synthetic source used off Windows. On Windows the real
+/// backend reports the monitor's own native size through
+/// [`CaptureBackend::native_size`], so `stub` is not consulted there.
 pub fn default_video_backend(stub: StubConfig) -> Result<Box<dyn CaptureBackend>> {
     #[cfg(windows)]
     {
-        let capture = crate::wgc::WgcCapture::new(0)?;
-        let (width, height) = capture.size();
-        if (width, height) != (stub.width, stub.height) {
-            // ffmpeg's rawvideo input is declared with the configured `encode.output_size`,
-            // so a monitor that does not match corrupts the stream rather than being
-            // scaled. Say so at startup instead of producing garbage segments.
-            tracing::warn!(
-                "the primary monitor is {width}x{height} but encoding is configured for \
-                 {}x{}; set `encode.output_size` to {width}x{height} (or leave it empty \
-                 once native-size encoding lands) or the raw video pipe will be mis-read",
-                stub.width,
-                stub.height
-            );
-        }
-        Ok(Box::new(capture))
+        // The stub's size is irrelevant here: WGC reports the monitor it will capture,
+        // and the caller reads that back via `native_size`. No warning, because a
+        // configured `encode.output_size` that differs from the monitor is now scaled
+        // rather than mis-read.
+        let _ = stub;
+        Ok(Box::new(crate::wgc::WgcCapture::new(0)?))
     }
     #[cfg(not(windows))]
     {

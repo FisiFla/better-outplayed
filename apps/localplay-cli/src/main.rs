@@ -38,6 +38,14 @@ fn app_data_dir() -> PathBuf {
     base.join("localplay")
 }
 
+/// The frame size the synthetic capture backend produces off Windows.
+///
+/// Real Windows capture (WGC) reports the primary monitor's native resolution; there
+/// is no monitor to query on macOS, so the stub stands in at a fixed, representative
+/// size. It is deliberately not the old 1920x1080 encoder default, so a macOS run
+/// makes it plain that the rawvideo pipe is sized from the backend, not a constant.
+const STUB_CAPTURE_SIZE: (u32, u32) = (1280, 720);
+
 fn run_buffer() -> Result<()> {
     let app_dir = app_data_dir();
     let cfg_path = app_dir.join("config.toml");
@@ -69,9 +77,20 @@ fn run_buffer() -> Result<()> {
         clips_dir: clips_dir.clone(),
     };
 
+    // The capture backend is built first so the encoder can be told the true frame
+    // size the pipe will carry. On Windows WGC reports the primary monitor; off
+    // Windows the stub stands in at a fixed size.
+    let mut capture = default_video_backend(StubConfig {
+        width: STUB_CAPTURE_SIZE.0,
+        height: STUB_CAPTURE_SIZE.1,
+        fps: cfg.encode.fps,
+    })?;
+    let native = capture.native_size();
+
     // `--dev-software-encoder` only exists when built with the test-encoders feature.
     let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
-    let (mut encoder, encoder_name) = build_encoder(&bin, &cfg, &scratch_dir, dev_software)?;
+    let (mut encoder, encoder_name) =
+        build_encoder(&bin, &cfg, &scratch_dir, dev_software, native)?;
     tracing::info!("encoding with {encoder_name}");
 
     // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
@@ -88,9 +107,6 @@ fn run_buffer() -> Result<()> {
         tracing::info!("adopted {adopted} segments from a previous run");
     }
 
-    let (width, height) = parse_output_size(&cfg.encode.output_size, 1920, 1080);
-    let mut capture =
-        default_video_backend(StubConfig { width, height, fps: cfg.encode.fps })?;
     let mut audio = default_audio_backend(AudioFormat::default())?;
     capture.start()?;
     audio.start()?;
@@ -170,6 +186,11 @@ fn run_buffer() -> Result<()> {
 
 /// Build the encoder. Hardware is the only shipping path.
 ///
+/// `native_size` is the capture backend's own frame geometry: the monitor for WGC,
+/// the configured size for the stub. The encoder's rawvideo pipe is declared from it.
+/// Empty `encode.output_size` means "encode at native resolution" (config.example.toml,
+/// spec §10); any other value is the output size, scaled from the native frames.
+///
 /// `dev_software` exists solely so the pipeline can be smoke-tested on a host with
 /// no GPU encoder, and is only reachable when the CLI is built with
 /// `--features test-encoders`. It is never reachable from the config file.
@@ -178,8 +199,9 @@ fn build_encoder(
     cfg: &Config,
     scratch_dir: &Path,
     dev_software: bool,
+    native_size: (u32, u32),
 ) -> Result<(Box<dyn Encoder>, String)> {
-    let (width, height) = parse_output_size(&cfg.encode.output_size, 1920, 1080);
+    let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
     let codec = match cfg.encode.codec.as_str() {
         "h264" => VideoCodec::H264,
         "hevc" => VideoCodec::Hevc,
@@ -194,14 +216,18 @@ fn build_encoder(
                 "--dev-software-encoder: using libx264. This is for smoke-testing the \
                  pipeline only and is NOT a supported configuration."
             );
-            EncodeConfig::for_tests_software(
+            let mut c = EncodeConfig::for_tests_software(
                 codec,
-                width,
-                height,
+                native_size.0,
+                native_size.1,
                 cfg.encode.fps,
                 scratch_dir.to_path_buf(),
                 segment_ms,
-            )
+            );
+            // The dev encoder scales the same way the hardware one does: frames arrive
+            // at the native size, the output is `output_size`.
+            c.output_size = output_size;
+            c
         }
         #[cfg(not(feature = "test-encoders"))]
         {
@@ -212,8 +238,8 @@ fn build_encoder(
         EncodeConfig::hardware(
             codec,
             vendor,
-            width,
-            height,
+            native_size, // source: the frames the capture pipe delivers
+            output_size, // output: scaled from the source when they differ
             cfg.encode.fps,
             cfg.encode.bitrate_kbps,
             segment_ms,
@@ -221,24 +247,45 @@ fn build_encoder(
         )
     };
 
+    // The rawvideo pipe is declared from `source_size`; if it did not equal the
+    // backend's native size ffmpeg would mis-read every frame. The CLI derives it from
+    // `native_size`, so this guards against a future edit breaking that link.
+    if encode_cfg.source_size != native_size {
+        bail!(
+            "encoder source size {}x{} does not match the capture backend's native size \
+             {}x{}; the raw video pipe would be mis-read",
+            encode_cfg.source_size.0,
+            encode_cfg.source_size.1,
+            native_size.0,
+            native_size.1
+        );
+    }
+
     let encoder = FfmpegEncoder::spawn(bin, &encode_cfg)?;
+    tracing::info!(
+        "rawvideo -s={}x{} (capture native), encode output {}x{}{}",
+        encode_cfg.source_size.0,
+        encode_cfg.source_size.1,
+        encode_cfg.output_size.0,
+        encode_cfg.output_size.1,
+        if encode_cfg.source_size == encode_cfg.output_size { "" } else { " (scaled)" }
+    );
     let name = encoder.active_encoder().to_string();
     Ok((Box::new(encoder), name))
 }
 
-/// `"1920x1080"`, or `""` for the supplied default.
-fn parse_output_size(spec: &str, default_w: u32, default_h: u32) -> (u32, u32) {
+/// `"1920x1080"`, or `None` for the empty string (documented as "native capture
+/// resolution", config.example.toml / spec §10).
+fn parse_output_size(spec: &str) -> Result<Option<(u32, u32)>> {
     if spec.trim().is_empty() {
-        return (default_w, default_h);
+        return Ok(None);
     }
     spec.split_once('x')
-        .and_then(|(w, h)| {
-            Some((
-                w.trim().parse::<u32>().ok()?,
-                h.trim().parse::<u32>().ok()?,
-            ))
+        .and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
+        .map(Some)
+        .with_context(|| {
+            format!("encode.output_size must be \"WIDTHxHEIGHT\", e.g. \"1920x1080\", got {spec:?}")
         })
-        .unwrap_or((default_w, default_h))
 }
 
 fn unix_seconds() -> u64 {
