@@ -246,13 +246,15 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // From here the engine is capturing: the encoder is spawned, the ring is built and
     // adopted, and the capture session is open. This line is the CLI's own — the hotkey is
     // what only it knows about — and it is emitted at the same point in the sequence it
-    // always was.
+    // always was. The chord printed is the *parsed* one (its `Display`), so a config that
+    // says `ctrl+f8` reads back as `Ctrl+F8` and matches what the desktop shell shows for
+    // the same file.
     tracing::info!(
         "buffering {}s pre / {}s post at {}fps; press {} to clip",
         pre_seconds,
         post_seconds,
         fps,
-        hotkeys.clip
+        hotkey
     );
 
     // The game-event sources. Started after the recorder (a source cannot ask for a clip
@@ -277,7 +279,12 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // The hotkey listener is installed in both modes: it is part of the shipping startup
     // path, and self-test mode must not be a different program. What self-test mode does
     // *not* do is read it — the trigger below is the only thing that takes a clip.
-    let hotkeys = hotkey::listen(hotkey)?;
+    //
+    // `listen` fails loudly when the chord cannot be registered (it may be held by another
+    // application, or by the desktop app running against this same `config.toml`), and a
+    // buffer run with a hotkey that silently does nothing is not worth starting: the
+    // context below is what turns that into an error the user can read.
+    let hotkeys = hotkey::listen(hotkey).context("installing the clip hotkey")?;
 
     // The verification-only trigger (`--self-test-clip-after`). It never synthesises input:
     // it is an in-process call to the same media-time trigger the hotkey drives.
