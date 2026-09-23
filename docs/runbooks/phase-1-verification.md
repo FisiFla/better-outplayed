@@ -135,15 +135,24 @@ Within a few seconds, `seg-000000.mp4`, `seg-000001.mp4`, … appear in
 With `RUST_LOG=debug`, every ~200 ms you get a line:
 
 ```
-segments=<n> bytes=<b> span=<ms>ms
+frames=<n> segments=<n> bytes=<b> span=<ms>ms
 ```
 
-Over a run of `T` seconds, `span=` should grow by roughly `1000` ms per second of wall
-clock, and `segments=` should advance by one every `segment_time` seconds. That is the
-rate check: `span` tracks the capture timeline, so if capture keeps up with `<fps>`,
-`span` tracks real time. (The CLI prints no literal per-frame counter; `segments` and
-`span` are the observable proxy for "frames are flowing at the configured rate", and the
-`WGC … width/height` and `rawvideo -s=` lines confirm the resolution and the pipe size.)
+`frames=` is a literal counter of the video frames actually submitted to the encoder
+since startup — not a proxy. At startup the CLI also prints a one-line geometry summary,
+`capture geometry <W>x<H> at <fps>fps (frame counter starts at 0)`, so the resolution
+being captured is visible up front.
+
+Over a run of `T` seconds:
+
+- `frames=` should grow by roughly `T × <fps>` (as fast as the capture-and-encode path
+  sustains; if it lags the encoder is the bottleneck, not the counter).
+- `span=` should grow by roughly `1000` ms per second of wall clock.
+- `segments=` should advance by one every `segment_time` seconds.
+
+That is the rate check: `frames` counts the frames, `span` tracks the capture timeline,
+and the `WGC … width=<W> height=<H>` and `rawvideo -s=<W>x<H>` lines confirm the
+resolution and the pipe size.
 
 **FAILURE looks like**
 
@@ -152,9 +161,10 @@ rate check: `span` tracks the capture timeline, so if capture keeps up with `<fp
 - `WGC capture started on the primary monitor` appears but `width=`/`height=` is **not**
   your monitor's resolution (e.g. `1280x720` would mean the synthetic stub ran, i.e. the
   real backend was not selected on this build).
-- After 30 s, `span=` is still `0`, `segments=` is still `0`, and no `seg-*.mp4` files
-  exist — frames are not flowing.
-- `span=` grows materially slower than 1000 ms per wall-clock second — capture is not
+- After 30 s, `frames=` is still `0`, `span=` is still `0`, `segments=` is still `0`, and
+  no `seg-*.mp4` files exist — frames are not flowing.
+- `frames=` grows materially slower than `T × <fps>` (e.g. well under half of `<fps>`),
+  or `span=` grows materially slower than 1000 ms per wall-clock second — capture is not
   keeping up at the configured fps (or the pipeline is stalling).
 
 **Do not misread:** if `segments=` has stopped climbing but `span` still grows, that is
@@ -451,17 +461,37 @@ player — and listen.
 - On playback the audio is **audible** and **lip-sync is correct** — play a sound that is
   tied to a visible on-screen event and check the sound lines up with the picture.
 
-**Drift:** the design says A/V drift is logged per clip. **As implemented, no per-clip
-drift line is emitted** — there is no drift log in the code today (see
-[Known gaps](#known-gaps)). So you cannot confirm the "drift is logged" clause from a run;
-verify the stream count and lip-sync by playback, and record that drift could not be
-checked.
+**Drift:** the design says A/V drift is logged per clip, and it is. Every splice emits an
+`info`-level line, so it is visible at the default `RUST_LOG=info`:
+
+```
+clip clip-<ts>: video <v>ms audio <a>ms drift <delta>ms
+```
+
+`<v>` and `<a>` are the two streams' durations in the produced clip. `<delta>` is
+`(video start + video duration) − (audio start + audio duration)` — how much later the
+video timeline ends than the audio's. **A negative `<delta>` means the audio outlasts the
+video.**
+
+What is healthy: on the real 60 fps pipeline both streams are cut on the same segment
+boundaries, so the offset is small — **tens of milliseconds, comfortably under ~100 ms** —
+and it does **not grow** with clip length. What is unhealthy: a **multi-hundred-ms or
+second-scale** offset, above all one that **grows** as `pre_seconds + post_seconds`
+increases — that is the two live sources genuinely desyncing, not muxing quantisation.
+
+**Honest limitation:** this drift is measured **within the produced clip**. It does **not**
+measure the QPC-clock divergence between the two *live* capture sources (the WGC video
+clock vs the WASAPI audio clock); that would require instrumenting the capture path
+itself, which this build does not do. The line proves the muxed clip's two streams line up;
+it is not a check of the live source clocks. (See [Known gaps](#known-gaps).)
 
 **FAILURE looks like**
 
 - Zero audio streams, more than one audio stream, or more than one video stream.
 - An audio stream is present but **silent** — WASAPI loopback captured nothing.
 - Lip-sync is visibly/tangibly off (audio leads or trails the video).
+- The drift line reports a **multi-hundred-ms or second-scale** `<delta>`, or `<delta>`
+  grows with clip length across successive clips — a real desync.
 - `ffprobe` errors on the clip.
 
 **Do not misread:** a normal clip has exactly two streams (one video, one audio). The
@@ -485,9 +515,12 @@ not softened; do not read a pass elsewhere as coverage of them.
   whose shared-mode mix format is not 48 kHz is refused **by name** at startup ("… is
   <rate>Hz, but localplay captures at 48000Hz and does not resample yet …"). Set the
   device to 48000 Hz in Windows Sound settings.
-- **A/V drift is not measured.** The spec says drift is logged per clip, but no drift log
-  line exists in the code, so in this build drift is neither logged nor measured.
-  Criterion 8's "drift is logged" clause cannot be satisfied by this build.
+- **Live-source clock divergence is still unmeasured.** A/V drift *within each produced
+  clip* is now logged (see criterion 8), but that only checks that the two muxed streams
+  line up. The divergence between the two *live* capture clocks — the WGC video clock and
+  the WASAPI audio clock, both nominally QPC-based — is **not** instrumented anywhere, so
+  a slow live-source desync that the segment muxing happens to reshape would not be
+  caught here.
 - **The capture frame pool is never recreated on a display mode change.**
   `Direct3D11CaptureFramePool::Recreate` is not called; a mid-capture resolution or
   refresh-rate change is not handled. The backend copies whatever size the incoming
@@ -511,7 +544,8 @@ specifically:
 - **Environment:** ffmpeg version (`ffmpeg -version`) and the GPU + driver version, because
   encoder behaviour is driver-dependent.
 - **Criterion 1:** the WGC display name and the captured `W×H`; the configured `fps`; and
-  whether `span=` tracked real time over the run (yes/no).
+  whether `frames=` grew at roughly `fps × seconds` and `span=` tracked real time over the
+  run (yes/no).
 - **Criterion 2:** the configured `scratch_cap_bytes`; the largest `bytes=` seen; and the
   largest the scratch directory measured (note if it was exactly one segment over).
 - **Criterion 3:** `post_seconds`; the measured keypress→`wrote` delta; pass/fail against
@@ -524,7 +558,8 @@ specifically:
   interpret Task Manager).
 - **Criterion 7:** the forced `vendor`; the process exit code; and the exact error text.
 - **Criterion 8:** the stream counts (video/audio); the codec names; whether lip-sync was
-  correct on playback; and note that drift could not be checked.
+  correct on playback; and the `<delta>` from each clip's `clip … drift` log line (note
+  whether it stayed sub-100 ms or grew).
 
 Do **not** mark a criterion PASS unless you personally observed it on Windows. Where a run
 was skipped or blocked, write that down.

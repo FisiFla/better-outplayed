@@ -92,6 +92,14 @@ fn run_buffer() -> Result<()> {
     let (mut encoder, encoder_name) =
         build_encoder(&bin, &cfg, &scratch_dir, dev_software, native)?;
     tracing::info!("encoding with {encoder_name}");
+    // One-line capture-geometry summary so a reader can see the resolution being
+    // captured and that the frame counter starts from zero (criterion 1).
+    tracing::info!(
+        "capture geometry {}x{} at {}fps (frame counter starts at 0)",
+        native.0,
+        native.1,
+        cfg.encode.fps
+    );
 
     // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
     // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
@@ -123,9 +131,13 @@ fn run_buffer() -> Result<()> {
 
     // Capture loop. Frames go to the encoder; the ring scans for completed segments.
     let mut last_scan = Instant::now();
+    // Frames actually submitted to the encoder (criterion 1's frame counter). A frame
+    // that the backend did not produce is not counted; a submit that errors aborts.
+    let mut frames: u64 = 0;
     loop {
         if let Some(frame) = capture.next_frame(Duration::from_millis(5))? {
             encoder.submit_video(&frame)?;
+            frames += 1;
         }
         // Drain every audio block that is already due. Audio blocks are 10ms while
         // video frames are 16.7ms at 60fps, so submitting a single block per loop
@@ -142,7 +154,8 @@ fn run_buffer() -> Result<()> {
 
             let stats = ring.stats();
             tracing::debug!(
-                "segments={} bytes={} span={}ms",
+                "frames={} segments={} bytes={} span={}ms",
+                frames,
                 stats.segments,
                 stats.bytes_on_disk,
                 stats.span_ms

@@ -5,4 +5,4 @@ pub mod edit;
 pub mod probe;
 
 pub use binaries::FfmpegBinaries;
-pub use probe::MediaInfo;
+pub use probe::{AvDrift, MediaInfo};

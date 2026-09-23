@@ -16,6 +16,7 @@ tracing.workspace = true
 localplay-capture = { path = "../capture" }
 localplay-encoder = { path = "../encoder" }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 # Forwards to the encoder's feature so the pipeline is testable off-Windows.
 [features]

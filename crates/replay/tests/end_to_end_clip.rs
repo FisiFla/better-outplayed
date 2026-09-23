@@ -6,8 +6,19 @@ use localplay_media::{FfmpegBinaries, MediaInfo};
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
 use std::time::Duration;
 
+/// Initialise a subscriber so the clip's A/V drift line (spec §11 criterion 8,
+/// emitted by `ClipSplicer::splice` at `info`) is observable. `try_init` keeps this
+/// idempotent; with no `RUST_LOG` the default `warn` keeps ordinary runs quiet.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .try_init();
+}
+
 #[test]
 fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
+    init_tracing();
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let scratch = tempfile::tempdir().unwrap();
     let clips = tempfile::tempdir().unwrap();
@@ -65,6 +76,22 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
         (3_000..=4_500).contains(&info.duration_ms),
         "clip duration {}ms unexpected",
         info.duration_ms
+    );
+    // Criterion 8: the clip's A/V offset must be computable from the probe (both
+    // streams report a per-stream duration). The drift line itself is logged by
+    // `ClipSplicer::splice`; this asserts the number behind it is sane. The tiny
+    // 10 fps stub clip reliably lands around 200 ms, while the real 60 fps pipeline
+    // measures tens of ms (verified against crate-produced segments); both are well
+    // under this bound.
+    let drift = info
+        .av_drift()
+        .expect("both streams must report a duration so A/V drift is computable");
+    assert!(
+        drift.delta_ms.abs() < 500,
+        "stub clip A/V drift {}ms looks wrong (video {}ms, audio {}ms)",
+        drift.delta_ms,
+        drift.video_ms,
+        drift.audio_ms
     );
     assert_eq!(clip.encoder, "libx264");
 }
