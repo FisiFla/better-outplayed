@@ -77,6 +77,10 @@ pub struct FfmpegEncoder {
     video_writer: Option<WriterHandle>,
     audio_writer: Option<WriterHandle>,
     encoder_name: &'static str,
+    /// The geometry the rawvideo pipe was declared with (`-s {w}x{h}`), reported back to
+    /// the caller so a frame of any other size can be refused instead of being sliced
+    /// into the pipe at the wrong stride (see `Encoder::source_size`).
+    source_size: (u32, u32),
 }
 
 impl FfmpegEncoder {
@@ -172,6 +176,7 @@ impl FfmpegEncoder {
             video_writer: Some(video_writer),
             audio_writer: Some(audio_writer),
             encoder_name: cfg.encoder_name(),
+            source_size: cfg.source_size,
         })
     }
 }
@@ -274,6 +279,8 @@ fn accept_within(
 
 impl Encoder for FfmpegEncoder {
     fn submit_video(&mut self, frame: &Frame) -> Result<()> {
+        // The frame's geometry is checked by the caller (`pump_once_counted`), which is
+        // the only place that holds both the frame and the pipe's declared size.
         let tx = self.video_tx.as_ref().context("encoder already finished")?;
         tx.send(frame.data.clone())
             .map_err(|_| anyhow::anyhow!("video writer thread has stopped"))
@@ -331,6 +338,10 @@ impl Encoder for FfmpegEncoder {
 
     fn active_encoder(&self) -> &'static str {
         self.encoder_name
+    }
+
+    fn source_size(&self) -> (u32, u32) {
+        self.source_size
     }
 }
 

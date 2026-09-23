@@ -118,4 +118,14 @@ pub trait Encoder: Send {
     fn finish(&mut self) -> anyhow::Result<()>;
     /// Codec actually in use, for ffprobe assertions and the UI.
     fn active_encoder(&self) -> &'static str;
+    /// The frame size this encoder's raw video input was declared with —
+    /// [`EncodeConfig::source_size`].
+    ///
+    /// It is not a hint. The input is a flat byte stream that the encoder's ffmpeg child
+    /// slices into frames of exactly this size, so a frame of any other geometry is not
+    /// rejected by anything: it is *mis-read*, and the picture comes apart in bands while
+    /// the segment files still look healthy. A caller that pumps capture into this
+    /// encoder compares each frame against this value and refuses a mismatch out loud
+    /// (see `pump_once_counted` in the CLI), because the failure is otherwise silent.
+    fn source_size(&self) -> (u32, u32);
 }

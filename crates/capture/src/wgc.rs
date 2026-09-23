@@ -7,10 +7,16 @@
 //! # What has been verified about this code
 //!
 //! It type-checks for `x86_64-pc-windows-msvc` from macOS (`cargo check` does not
-//! link), which is a real gate for API shape, ownership and HRESULT plumbing. It has
-//! **never been executed on Windows**: no frame has ever come through it, and neither
-//! the pixel data, the frame pacing nor the caption/format of what the compositor
-//! hands back has been observed. Task 17's runbook is the first place this gets a run.
+//! link), which is a real gate for API shape, ownership and HRESULT plumbing.
+//!
+//! It was run on Windows 11 for the first time on a 4K/150%-scaled desktop with a
+//! full-screen game up. Capture started, frames arrived, and every segment carried both
+//! a video and an audio stream — but every video frame was **pure black**, because
+//! `copy_out` mapped a freshly created staging texture without ever copying the captured
+//! texture into it. That `CopyResource` is now issued before the `Map`; the module also
+//! reports the capture item's size rather than a DPI-virtualised guess. **Neither fix has
+//! been re-run on Windows** (there is no Windows host here), so whether frames now carry
+//! real pixels is unverified at runtime — see `copy_out`.
 //!
 //! # Frame arrival
 //!
@@ -24,7 +30,9 @@
 //! - A display mode change mid-capture normally needs
 //!   `Direct3D11CaptureFramePool::Recreate`. This backend does not call it: it copies
 //!   whatever size the incoming texture actually is (re-creating its staging texture
-//!   when that changes) and reports that size, but the pool itself is never resized.
+//!   when that changes), while [`WgcCapture::size`] keeps reporting the capture item's
+//!   size. If the two ever diverge, the CLI refuses the frame and names both sizes
+//!   rather than feeding a differently sized frame to ffmpeg.
 //! - Only the primary monitor is captured, and monitor selection is not wired to
 //!   configuration.
 //! - Frames are copied through a staging texture on every frame. That is the cost this
@@ -45,6 +53,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface};
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DisplayId;
+use windows::Graphics::SizeInt32;
 use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -63,7 +72,6 @@ use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 /// Buffers in the frame pool. A pull consumer that copies every frame into system
 /// memory before asking for the next one needs no more than a couple.
@@ -76,21 +84,39 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Primary-monitor screen capture.
 pub struct WgcCapture {
-    /// Only monitor 0 (the primary monitor) is supported; `create_capture_item` says
-    /// so explicitly rather than quietly capturing the wrong display.
+    /// Only monitor 0 (the primary monitor) is supported; the constructor says so
+    /// explicitly rather than quietly capturing the wrong display.
     monitor_index: usize,
-    width: u32,
-    height: u32,
+    /// The geometry of the frames this backend produces: the capture item's size in
+    /// **physical pixels** (`GraphicsCaptureItem::Size()`), which is the size the frame
+    /// pool is created with and therefore the size of every texture WGC hands back.
+    ///
+    /// Deliberately not `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`: that call is
+    /// DPI-virtualised, so a process that is not per-monitor DPI aware gets the
+    /// monitor's size in *logical* pixels. Measured on Windows 11: a 4K display at
+    /// 150% scaling answered 2560x1440 there while the capture item — what is actually
+    /// captured — was 3840x2160. Sizing the rawvideo pipe from the former is what
+    /// defect B was.
+    size: (u32, u32),
     session: Option<Session>,
+    /// Whether `start` has been called and `stop` has not.
+    ///
+    /// Tracked separately from `session` because the session is built in [`Self::new`]
+    /// (its item size has to be known before the encoder is configured, which happens
+    /// between construction and `start`).
+    started: bool,
     /// Whether this thread's COM apartment was taken by us and must be given back.
     com_owned: bool,
 }
 
-/// Everything `start` acquires, so there is one thing to release.
+/// Everything a session acquires, so there is one thing to release.
 struct Session {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     pool: Direct3D11CaptureFramePool,
+    /// The capture item's size in physical pixels, taken from the item itself: the frame
+    /// pool is created with this value, so it is the size of the frames to come.
+    size: (u32, u32),
     /// Held deliberately: the pool and the session capture *this* item, and dropping
     /// our reference to it while they are running is not something WGC documents as
     /// safe. Nothing below `start` reads it, hence the underscore.
@@ -105,44 +131,41 @@ type Staging = (u32, u32, ID3D11Texture2D);
 
 impl WgcCapture {
     /// `monitor_index` is 0 for the primary monitor.
-    pub fn new(monitor_index: usize) -> Result<Self> {
-        let (width, height) = primary_monitor_size()?;
-        Ok(Self { monitor_index, width, height, session: None, com_owned: false })
-    }
-
-    /// Primary-monitor dimensions as reported by `GetSystemMetrics`.
     ///
-    /// A WGC frame carries its own size: at a different resolution or scale the texture
-    /// can differ from this, and `next_frame` always reports the size it actually
-    /// copied.
-    pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    fn release_com(&mut self) {
-        if self.com_owned {
-            // SAFETY: `start` took the apartment on this thread.
-            unsafe { CoUninitialize() };
-            self.com_owned = false;
-        }
-    }
-}
-
-impl CaptureBackend for WgcCapture {
-    fn start(&mut self) -> Result<()> {
-        if self.session.is_some() {
-            bail!("WGC capture is already started");
-        }
-        if self.monitor_index != 0 {
+    /// The WGC session is created here rather than in [`CaptureBackend::start`]: the
+    /// capture item's size is what the CLI sizes the ffmpeg rawvideo pipe from, and the
+    /// encoder is spawned between this call and `start`, so the size has to be known
+    /// (and be the real one) before the pipeline is wired up.
+    pub fn new(monitor_index: usize) -> Result<Self> {
+        if monitor_index != 0 {
             bail!(
                 "monitor {} was requested, but localplay only captures the primary \
                  monitor (index 0)",
-                self.monitor_index
+                monitor_index
             );
         }
+        let mut this = Self {
+            monitor_index,
+            size: (0, 0),
+            session: None,
+            started: false,
+            com_owned: false,
+        };
+        this.start_session()?;
+        Ok(this)
+    }
+
+    /// Take this thread's COM apartment and build the WGC session on it.
+    fn start_session(&mut self) -> Result<()> {
         self.com_owned = init_com()?;
         match Session::new() {
             Ok(session) => {
+                self.size = session.size;
+                tracing::info!(
+                    width = self.size.0,
+                    height = self.size.1,
+                    "the primary monitor's capture item measures these physical pixels"
+                );
                 self.session = Some(session);
                 Ok(())
             }
@@ -155,10 +178,56 @@ impl CaptureBackend for WgcCapture {
         }
     }
 
+    /// The capture item's size in physical pixels — see the `size` field.
+    ///
+    /// This is the geometry of every frame the backend produces (the frame's own
+    /// texture is what `copy_out` measures), so it is what the rawvideo pipe must be
+    /// declared with. A WGC frame carries its own size, and after a resolution or
+    /// scaling change that size can differ from this: the CLI refuses such a frame.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn release_com(&mut self) {
+        if self.com_owned {
+            // SAFETY: `start_session` took the apartment on this thread.
+            unsafe { CoUninitialize() };
+            self.com_owned = false;
+        }
+    }
+}
+
+impl CaptureBackend for WgcCapture {
+    fn start(&mut self) -> Result<()> {
+        if self.started {
+            bail!("WGC capture is already started");
+        }
+        if self.monitor_index != 0 {
+            bail!(
+                "monitor {} was requested, but localplay only captures the primary \
+                 monitor (index 0)",
+                self.monitor_index
+            );
+        }
+        // `new` already built the session. This arm covers a restart after `stop`,
+        // which tears the session down and gives the COM apartment back.
+        if self.session.is_none() {
+            self.start_session()?;
+        }
+        self.started = true;
+        Ok(())
+    }
+
     /// Polls for the next frame. Returns `Ok(None)` when no frame arrives within
     /// `timeout`, per the `CaptureBackend` contract.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
-        let session = self.session.as_mut().context("WGC capture is not started")?;
+        if !self.started {
+            bail!("WGC capture is not started");
+        }
+        let session = self
+            .session
+            .as_mut()
+            .context("WGC capture has no session (already stopped)")?;
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(frame) = session.poll_frame()? {
@@ -173,6 +242,7 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn stop(&mut self) -> Result<()> {
+        self.started = false;
         if let Some(session) = self.session.take() {
             // Close the session before the pool, which is the order every WGC sample
             // uses, and say so if either refuses rather than pretending it stopped.
@@ -188,8 +258,12 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn native_size(&self) -> (u32, u32) {
-        // The size queried at construction, same as `size()`.
-        self.size()
+        // The invariant this method owes its caller: the value returned here is the size
+        // of every frame `next_frame` produces, because both come from the capture item
+        // (the frames are the frame pool's textures, and the pool is created with
+        // `item.Size()`). The rawvideo pipe is declared from this value, so a mismatch
+        // is not a cosmetic problem — see `copy_out` and the CLI's frame guard.
+        self.size
     }
 }
 
@@ -206,7 +280,8 @@ impl Session {
     fn new() -> Result<Self> {
         let (device, context) = create_device()?;
         let item = create_capture_item()?;
-        let size = item.Size().context("GraphicsCaptureItem::Size")?;
+        let item_size = item.Size().context("GraphicsCaptureItem::Size")?;
+        let size = pixel_size(item_size)?;
         match item.DisplayName() {
             Ok(name) => tracing::info!(display = %name, "capturing the primary monitor"),
             Err(e) => tracing::debug!("the capture item has no display name: {e}"),
@@ -218,7 +293,7 @@ impl Session {
             // The encoder pipe is BGRA8; the pool must produce the same layout.
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             BUFFER_COUNT,
-            size,
+            item_size,
         )
         .context("Direct3D11CaptureFramePool::CreateFreeThreaded")?;
         let capture = pool
@@ -235,12 +310,12 @@ impl Session {
         }
         capture.StartCapture().context("GraphicsCaptureSession::StartCapture")?;
         tracing::info!(
-            width = size.Width,
-            height = size.Height,
+            width = size.0,
+            height = size.1,
             "WGC capture started on the primary monitor"
         );
 
-        Ok(Self { device, context, pool, _item: item, capture, staging: None })
+        Ok(Self { device, context, pool, size, _item: item, capture, staging: None })
     }
 
     /// One poll of the frame pool. `Ok(None)` means "nothing available yet".
@@ -288,12 +363,25 @@ impl Session {
         let (width, height) = (desc.Width, desc.Height);
         let row_bytes = width as usize * 4;
         let staging = self.staging_texture(width, height, desc.Format)?;
+        let dst: &ID3D11Resource = &staging;
+
+        // SAFETY: the immediate context, the captured texture and the staging texture
+        // all belong to the same device (`create_device` builds the one device the
+        // frame pool, and therefore `texture`, belongs to; `staging_texture` builds the
+        // staging copy on it). This is the device-side copy without which the map below
+        // would read a freshly created, zero-filled texture — the black-frame bug found
+        // on the first real Windows run. It is issued on the immediate context, on the
+        // same context the `Map` below is ordered against, so by the time the mapped
+        // bytes are read the copy is complete. The textures match in size, format,
+        // mip level, array size and sample count, which is what makes the whole-resource
+        // copy valid.
+        unsafe { self.context.CopyResource(dst, &texture) };
+
         let mut data = vec![0u8; row_bytes * height as usize];
 
-        // SAFETY: the immediate context, the source texture and the staging texture
-        // all belong to the same device. `Map` is checked before the copy and the
-        // `Unmap` below runs on every path that successfully mapped.
-        let dst: &ID3D11Resource = &staging;
+        // SAFETY: as above, `dst` belongs to this immediate context's device. `Map` is
+        // checked before the copy and the `Unmap` below runs on every path that
+        // successfully mapped.
         let mapped = unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
@@ -490,12 +578,19 @@ fn create_item_via_display_id(monitor: HMONITOR) -> Result<GraphicsCaptureItem> 
         .context("GraphicsCaptureItem::TryCreateFromDisplayId for the primary monitor")
 }
 
-/// Primary-monitor dimensions from `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`.
-fn primary_monitor_size() -> Result<(u32, u32)> {
-    // SAFETY: GetSystemMetrics is a pure query.
-    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    if width <= 0 || height <= 0 {
-        bail!("GetSystemMetrics reported a {width}x{height} primary monitor");
+/// The capture item's size as whole physical pixels.
+///
+/// `GraphicsCaptureItem::Size()` is the size of what is actually captured, in
+/// **physical** pixels (this binding types it `SizeInt32`), and it is the value the
+/// frame pool is created with — so it is the geometry of the frames that follow.
+/// `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` is not a substitute: it is
+/// DPI-virtualised, so a process that is not per-monitor DPI aware gets back the
+/// monitor's size in *logical* pixels. Measured on Windows 11: the same 4K/150%-scaled
+/// desktop answered 2560x1440 there while the capture item was 3840x2160, which is how
+/// the rawvideo pipe came to be declared differently from the frames arriving on it.
+fn pixel_size(size: SizeInt32) -> Result<(u32, u32)> {
+    if size.Width < 1 || size.Height < 1 {
+        bail!("the capture item reported a {}x{} physical size", size.Width, size.Height);
     }
-    Ok((width as u32, height as u32))
+    Ok((size.Width as u32, size.Height as u32))
 }

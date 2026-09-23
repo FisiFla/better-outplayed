@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use config::Config;
 use localplay_capture::platform::{default_audio_backend, default_video_backend};
 use localplay_capture::stub::StubConfig;
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame};
 use localplay_encoder::probe::select_vendor;
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_events::hotkey::Hotkey;
@@ -236,9 +236,10 @@ pub fn pump_once(
 /// "keep the encoder fed" lives in exactly one place. The count exists so the binary
 /// can keep criterion 1's `frames=` counter while that rule stays centralised.
 ///
-/// Video: submit the next frame if one is due. `next_frame` waits at most
-/// [`FRAME_POLL`] for it, so the caller's loop is paced by the capture backend rather
-/// than spinning.
+/// Video: submit the next frame if one is due, after `guard_frame_size` has checked it
+/// against the size the encoder's rawvideo pipe was declared with. `next_frame` waits
+/// at most [`FRAME_POLL`] for it, so the caller's loop is paced by the capture backend
+/// rather than spinning.
 ///
 /// Audio: drain **every** block that is already due. Audio blocks are 10ms while video
 /// frames are 16.7ms at 60fps, so submitting a single block per iteration would run
@@ -253,6 +254,7 @@ pub fn pump_once_counted(
 ) -> Result<u64> {
     let mut frames: u64 = 0;
     if let Some(frame) = capture.next_frame(FRAME_POLL)? {
+        guard_frame_size(&frame, encoder.source_size())?;
         encoder.submit_video(&frame)?;
         frames += 1;
     }
@@ -260,6 +262,39 @@ pub fn pump_once_counted(
         encoder.submit_audio(&block)?;
     }
     Ok(frames)
+}
+
+/// Refuse a frame whose geometry disagrees with the rawvideo pipe's declared size.
+///
+/// The pipe is a flat byte stream that ffmpeg slices into frames of the size it was
+/// spawned with (`EncodeConfig::source_size`, i.e. [`Encoder::source_size`]); it carries
+/// no framing of its own, so a frame of a different size is not rejected by anything.
+/// It is *mis-read*: every boundary after the first lands mid-frame, and the picture
+/// comes apart in diagonal bands while the segment files still look healthy and the
+/// logs stay clean. That is a silent-corruption class of bug, and this project found
+/// it the hard way: on Windows 11 a 4K desktop at 150% scaling had the rawvideo pipe
+/// declared 2560x1440 (logical pixels, from a DPI-virtualised `GetSystemMetrics`) while
+/// the capture item was 3840x2160 physical pixels — the size every frame carries.
+///
+/// The two values are derived from one another in `build_encoder` — `native_size`
+/// builds the `EncodeConfig` and this compares the frames against it — so a mismatch
+/// means that link is broken (a resolution change mid-capture, or a backend reporting a
+/// size it does not deliver). Either way the safe answer is to stop, loudly, rather than
+/// hand ffmpeg bytes it will misread.
+fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
+    if (frame.width, frame.height) != configured {
+        bail!(
+            "capture produced a {}x{} frame, but the encoder's raw video pipe was \
+             declared for the configured source size {}x{}: ffmpeg reads that pipe as a \
+             flat byte stream, so a frame of any other size would be mis-read (garbled \
+             bands, stream desync) rather than reported",
+            frame.width,
+            frame.height,
+            configured.0,
+            configured.1
+        );
+    }
+    Ok(())
 }
 
 /// Wait until the ring's segment span reaches `need_ms`, keeping the encoder fed.
