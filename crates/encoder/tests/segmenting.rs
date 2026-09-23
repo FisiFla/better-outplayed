@@ -17,7 +17,9 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         48,
         30,
         dir.path().to_path_buf(),
-        1, // 1s segments
+        // MILLISECONDS. See the note in Task 10 — this unit is easy to get wrong
+        // and a ">= 2 segments" assertion will not catch it.
+        1_000,
     );
 
     let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
@@ -47,4 +49,12 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     let info = localplay_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
     assert!(info.video.is_some(), "segment must contain video");
     assert!(info.audio.is_some(), "segment must contain audio");
+    // Guards the `segment_ms` unit. Passing 1 instead of 1_000 silently produces
+    // 1ms segments, which still satisfies the ">= 2 segments" check above — so
+    // without this assertion the unit error goes unnoticed.
+    assert!(
+        (900..=1300).contains(&info.duration_ms),
+        "segment duration {}ms should be ~1000ms (segment_ms is milliseconds)",
+        info.duration_ms
+    );
 }
