@@ -38,7 +38,8 @@
 
 use crate::platform::init_com;
 use crate::{
-    clock_base, AudioBackend, AudioBuffer, AudioFormat, NativeAudioFormat, SampleEncoding,
+    clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
+    NativeAudioFormat, SampleEncoding,
 };
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
@@ -98,12 +99,20 @@ pub struct WasapiLoopback {
     last_pts: Duration,
     /// Whether this thread's COM apartment was taken by us and must be given back.
     com_owned: bool,
+    /// The diagnostic for the reported `AUTOCONVERTPCM`-delivers-silence failure mode (see
+    /// [`ConvertedSilenceWatch`]). Armed when the endpoint needed engine conversion; it only
+    /// ever logs, and never fails or stops the capture.
+    silence_watch: ConvertedSilenceWatch,
 }
 
 struct Client {
     audio: IAudioClient,
     capture: IAudioCaptureClient,
     event: EventHandle,
+    /// Whether the endpoint's native format needed the engine's converter (i.e. was not
+    /// already 48kHz stereo s16). Recorded here so the capture loop can decide whether a
+    /// run of silence is worth blaming on the conversion.
+    converting: bool,
 }
 
 // SAFETY: the backend is used from one thread at a time — the thread that called
@@ -146,6 +155,8 @@ impl WasapiLoopback {
             pending_pts: Duration::ZERO,
             last_pts: Duration::ZERO,
             com_owned: false,
+            // Disarmed until `start` learns whether the endpoint needed conversion.
+            silence_watch: ConvertedSilenceWatch::new(false),
         })
     }
 
@@ -169,6 +180,9 @@ impl AudioBackend for WasapiLoopback {
                 self.pending.clear();
                 self.pending_pts = Duration::ZERO;
                 self.last_pts = Duration::ZERO;
+                // A fresh session gets a fresh watch, armed only if this endpoint actually
+                // needed the engine's converter. Moved before `client` is stored below.
+                self.silence_watch = ConvertedSilenceWatch::new(client.converting);
                 self.client = Some(client);
                 Ok(())
             }
@@ -185,7 +199,7 @@ impl AudioBackend for WasapiLoopback {
     /// `timeout`. A zero timeout makes this a non-blocking "is anything due?" check,
     /// which is how the CLI drains audio without starving video.
     fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-        let Self { client, format, pending, pending_pts, last_pts, .. } = self;
+        let Self { client, format, pending, pending_pts, last_pts, silence_watch, .. } = self;
         let client = client.as_ref().context("WASAPI loopback capture is not started")?;
         let block_bytes = format.bytes_per_10ms();
         let block_frames = format.sample_rate as usize / 100;
@@ -217,7 +231,30 @@ impl AudioBackend for WasapiLoopback {
                 let pts = (*pending_pts).max(*last_pts);
                 *last_pts = pts;
                 *pending_pts = pts + block_duration;
-                return Ok(Some(AudioBuffer { data, frames: block_frames, pts, format: *format }));
+                let buffer = AudioBuffer { data, frames: block_frames, pts, format: *format };
+
+                // Diagnostic only: if the endpoint was engine-converted and every block so
+                // far has been pure silence, this is the reported AUTOCONVERTPCM failure
+                // mode, and the user needs to hear about it rather than discover it in a
+                // silent clip. The watch latches, so this warns at most once per session.
+                // It never errors and never stops capture: the clip is recorded either way.
+                if silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
+                    tracing::warn!(
+                        silent_run_secs = silence_watch.silent_run().as_secs_f64(),
+                        capture_secs = silence_watch.elapsed().as_secs_f64(),
+                        "WASAPI loopback has captured only silence, and the default render \
+                         endpoint is not natively 48kHz stereo s16, so the audio engine's \
+                         sample-rate conversion (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM) is in \
+                         the path. That configuration has been reported to deliver silence \
+                         instead of audio on some Windows 11 builds. This is a suspicion, \
+                         not a confirmed diagnosis: the clip is still being recorded and \
+                         capture has NOT been stopped, but the clip may have no audio. To \
+                         rule the conversion out, set the default playback endpoint to \
+                         48000 Hz (Settings > System > Sound > the device > Advanced > \
+                         Default Format), or report it so the failure mode can be confirmed."
+                    );
+                }
+                return Ok(Some(buffer));
             }
 
             let now = Instant::now();
@@ -372,7 +409,7 @@ fn open_client() -> Result<Client> {
         converting = native.needs_conversion(),
         "WASAPI loopback capture started on the default render endpoint"
     );
-    Ok(Client { audio, capture, event })
+    Ok(Client { audio, capture, event, converting: native.needs_conversion() })
 }
 
 /// Frees the mix-format blob the audio engine hands back.

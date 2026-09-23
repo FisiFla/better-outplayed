@@ -106,6 +106,127 @@ impl NativeAudioFormat {
     }
 }
 
+/// How long an unbroken run of silence must last before the absence of audio is worth a
+/// warning, when the endpoint is being sample-rate-converted.
+///
+/// This is a judgement call, not a measurement. The failure mode being looked for is
+/// external and **unverified at runtime**: on some Windows 11 builds a loopback capture
+/// stream opened with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` has been reported to deliver
+/// only silence (Rust/cpal and screenpipe users). We cannot tell "the converter delivered
+/// nothing" apart from "the machine was genuinely quiet" by looking at samples: a muted
+/// game, a paused desktop and a broken converter all yield the same all-zero stream.
+///
+/// Thirty seconds is chosen to be:
+/// - **long enough** that a clip whose game does produce sound will have produced at least
+///   one non-silent sample and cleared the watch (games play their first SFX within a
+///   second or two of launching), and that ordinary transients — a silent splash or
+///   loading screen, the gap before the first sound, a brief mute toggle — cannot
+///   accumulate to it, because the run resets the moment any real audio arrives;
+/// - **short enough** that a broken converter is named in the first half-minute of a clip
+///   rather than after a whole session; and
+/// - a round number a human reading the log can reason about.
+///
+/// The residual false positive — a machine that is legitimately silent (muted, idle) for
+/// the whole window — is exactly why this warns and neither fails nor stops the capture.
+pub const CONVERTED_SILENCE_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Watches a capture session for the reported failure mode where an auto-converted WASAPI
+/// loopback stream delivers only silence.
+///
+/// Pure and platform-independent on purpose: it consumes a stream of `(duration, silent)`
+/// observations and decides whether to raise the warning, so the decision is unit-testable
+/// on a host with no audio APIs. The WASAPI backend owns one and feeds it each 10ms block;
+/// nothing here touches WASAPI.
+///
+/// The watch raises **at most one** warning per session, and only when *all* of these hold:
+/// - the endpoint needed engine-side conversion (`converting`): if it was already 48kHz
+///   stereo s16 there is no conversion to blame, and silence is just silence;
+/// - the audio is a single unbroken run of silence at least [`CONVERTED_SILENCE_THRESHOLD`]
+///   long; and
+/// - no real (non-silent) audio has ever been observed — one real sample proves the
+///   converter is delivering audio, which permanently disarms the warning.
+#[derive(Debug, Clone)]
+pub struct ConvertedSilenceWatch {
+    /// Whether the audio engine was doing sample-rate conversion for this session.
+    converting: bool,
+    /// Whether the single warning has already been raised.
+    warned: bool,
+    /// Whether any real (non-silent) audio has been observed: if so, conversion works.
+    proven_audible: bool,
+    /// Total audio observed, over the whole session.
+    elapsed: Duration,
+    /// Length of the unbroken run of silence currently in progress.
+    silent_run: Duration,
+}
+
+impl ConvertedSilenceWatch {
+    /// A watch for a session whose endpoint did (`converting = true`) or did not require
+    /// engine-side conversion.
+    pub fn new(converting: bool) -> Self {
+        Self {
+            converting,
+            warned: false,
+            proven_audible: false,
+            elapsed: Duration::ZERO,
+            silent_run: Duration::ZERO,
+        }
+    }
+
+    /// Observe one block of audio of length `block`, and report whether the warning should
+    /// be raised *now*.
+    ///
+    /// Returns `true` at most once in the watch's lifetime: the first call that sees the
+    /// unbroken silence cross the threshold — with conversion in play and no audio ever
+    /// heard — returns `true` and latches, and every later call returns `false`. A block
+    /// containing any real audio resets the silence run to zero and disarms the watch
+    /// permanently (a non-silent sample falsifies the hypothesis it exists to test).
+    pub fn observe(&mut self, block: Duration, silent: bool) -> bool {
+        self.elapsed += block;
+        if !silent {
+            // Real audio proves the conversion is working; from here on silence is just
+            // silence and the warning would be a false positive. Clear it for good.
+            self.silent_run = Duration::ZERO;
+            self.proven_audible = true;
+            return false;
+        }
+        self.silent_run += block;
+        if self.converting
+            && !self.proven_audible
+            && !self.warned
+            && self.silent_run >= CONVERTED_SILENCE_THRESHOLD
+        {
+            self.warned = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether this watch has already raised its warning.
+    pub fn has_warned(&self) -> bool {
+        self.warned
+    }
+
+    /// Total audio observed so far, over the whole session.
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Length of the unbroken run of silence currently in progress.
+    pub fn silent_run(&self) -> Duration {
+        self.silent_run
+    }
+}
+
+/// Whether a block of interleaved s16le audio is entirely silent — every sample zero.
+///
+/// The engine's own silent flag is turned into explicit zeros before a block reaches this
+/// (see the WASAPI backend's `append_packet`), so an all-zero block is the single
+/// representation of "no audio" the pipeline has. An empty slice is vacuously silent; real
+/// blocks are never empty.
+pub fn is_silent_block(samples: &[u8]) -> bool {
+    samples.iter().all(|&byte| byte == 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioBuffer {
     /// Interleaved PCM, s16le.
@@ -195,5 +316,105 @@ mod tests {
         assert!(native(48_000, 2, SampleEncoding::F32).needs_conversion());
         assert!(native(48_000, 2, SampleEncoding::I32).needs_conversion());
         assert!(native(48_000, 2, SampleEncoding::Other).needs_conversion());
+    }
+
+    // --- Converted-silence watch -------------------------------------------------------
+    //
+    // The failure mode is externally reported and unverified at runtime; these tests pin
+    // the *decision*, not the report. They run off Windows because the logic is pure.
+
+    /// Seconds, so the tests read in the units the threshold is documented in.
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn short_silence_does_not_warn() {
+        // One second short of the threshold, in 1s blocks: a silent splash screen or the gap
+        // before a game's first sound must not be mistaken for a broken converter.
+        let mut watch = ConvertedSilenceWatch::new(true);
+        for _ in 0..CONVERTED_SILENCE_THRESHOLD.as_secs() - 1 {
+            assert!(!watch.observe(secs(1), true), "under the threshold: no warning");
+        }
+        assert!(!watch.has_warned());
+    }
+
+    #[test]
+    fn sustained_silence_with_conversion_warns_exactly_once() {
+        // The reported failure mode: a converted endpoint that never delivers audio.
+        // 4000 blocks of 10ms is 40s — well past the 30s threshold.
+        let mut watch = ConvertedSilenceWatch::new(true);
+        let mut warnings = 0;
+        for _ in 0..4_000 {
+            if watch.observe(Duration::from_millis(10), true) {
+                warnings += 1;
+            }
+        }
+        assert_eq!(warnings, 1, "warn once per session, not once per 10ms block");
+        assert!(watch.has_warned());
+    }
+
+    #[test]
+    fn the_warning_fires_at_the_threshold_and_not_before() {
+        // The boundary, block by block: 30s of one-second blocks.
+        let mut watch = ConvertedSilenceWatch::new(true);
+        for second in 0..CONVERTED_SILENCE_THRESHOLD.as_secs() {
+            let warned = watch.observe(secs(1), true);
+            if second + 1 < CONVERTED_SILENCE_THRESHOLD.as_secs() {
+                assert!(!warned, "second {} is still under the threshold", second + 1);
+            } else {
+                assert!(warned, "the crossing second must warn");
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_silence_without_conversion_never_warns() {
+        // An endpoint already at 48kHz stereo s16: silence is just silence. There is no
+        // conversion to blame, so a muted game or an idle desktop must never be flagged.
+        let mut watch = ConvertedSilenceWatch::new(false);
+        for _ in 0..10_000 {
+            assert!(!watch.observe(Duration::from_millis(10), true), "nothing to blame");
+        }
+        assert!(!watch.has_warned());
+    }
+
+    #[test]
+    fn silence_broken_by_real_audio_resets_and_never_warns() {
+        // A run of silence UNDER the threshold, one block of real audio, then a run of
+        // silence WELL OVER it. Real audio proves the converter works, so the watch is both
+        // reset and permanently disarmed: the later silence is a mute, not the failure mode.
+        let mut watch = ConvertedSilenceWatch::new(true);
+        for _ in 0..20 {
+            assert!(!watch.observe(secs(1), true));
+        }
+        assert_eq!(watch.silent_run(), secs(20), "the run accumulated");
+        assert!(!watch.observe(secs(1), false), "real audio must never warn");
+        assert_eq!(watch.silent_run(), Duration::ZERO, "the run resets on real audio");
+        for _ in 0..120 {
+            assert!(!watch.observe(secs(1), true), "audio was heard; silence is now benign");
+        }
+        assert!(!watch.has_warned());
+    }
+
+    #[test]
+    fn the_watch_counts_both_total_elapsed_and_the_current_silent_run() {
+        // The two durations the decision is made from, kept separately: total time observed
+        // and the unbroken silent run within it.
+        let mut watch = ConvertedSilenceWatch::new(true);
+        watch.observe(secs(5), false); // real audio
+        watch.observe(secs(3), true); //  silence begins
+        assert_eq!(watch.elapsed(), secs(8), "elapsed spans the whole session");
+        assert_eq!(watch.silent_run(), secs(3), "only the trailing run is silent");
+        assert!(!watch.has_warned());
+    }
+
+    #[test]
+    fn is_silent_block_is_true_only_for_an_all_zero_block() {
+        assert!(is_silent_block(&[0, 0, 0, 0]));
+        // A single non-zero byte anywhere is real audio — even a sample of -1 (0xFFFF) or +1.
+        assert!(!is_silent_block(&[0, 0, 1, 0]));
+        assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
+        assert!(!is_silent_block(&[0, 0, 0, 0x80]));
     }
 }
