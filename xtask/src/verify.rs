@@ -451,6 +451,7 @@ impl Session {
     /// Run every check, recording a failed check rather than aborting wherever possible:
     /// a report that stops at the first problem hides the rest.
     fn execute(&mut self) {
+        self.reset_sandbox();
         if let Err(err) = self.environment() {
             self.record_step_error("environment", err);
         }
@@ -468,6 +469,44 @@ impl Session {
         }
         if let Err(err) = self.criterion_seven() {
             self.record_step_error("criterion7_startup_failure", err);
+        }
+    }
+
+    /// Empty the sandbox before the run, so the eviction evidence means something.
+    ///
+    /// The engine *adopts* an existing scratch directory and continues its segment numbering
+    /// (`segment numbering continues at <n>`), which is right for a user's machine and wrong
+    /// for a measurement: a second run against a previous run's directory would report
+    /// "the lowest segment number is not 0" without a single eviction having happened. So
+    /// the sandbox is removed here, and a failure to remove it is a failed check rather than
+    /// a silently weakened one.
+    fn reset_sandbox(&mut self) {
+        let dir = self.opts.work_dir.clone();
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => self.pass(
+                "sandbox",
+                "the run started from a clean sandbox",
+                "criterion 2 (what makes the eviction evidence real)",
+                "the work directory is empty before the run",
+                format!("removed {} first", dir.display()),
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.pass(
+                "sandbox",
+                "the run started from a clean sandbox",
+                "criterion 2 (what makes the eviction evidence real)",
+                "the work directory is empty before the run",
+                format!("{} did not exist yet", dir.display()),
+            ),
+            Err(err) => self.fail(
+                "sandbox",
+                "the run started from a clean sandbox",
+                "criterion 2 (what makes the eviction evidence real)",
+                "the work directory is empty before the run",
+                format!("could not remove {}: {err}", dir.display()),
+                "a run that adopts a previous scratch directory continues its segment \
+                 numbering, and then `the lowest segment number is not 0` would be true \
+                 without any eviction having happened",
+            ),
         }
     }
 
