@@ -1,0 +1,138 @@
+# Continuous integration for localplay.
+#
+# ---------------------------------------------------------------------------
+# RUNNER
+# ---------------------------------------------------------------------------
+# `macos-latest` is this project's development host: the Windows only code is
+# cross-checked from macOS and the desktop frontend is built there, so CI runs
+# on the same kind of machine a developer does. There is deliberately no Windows
+# runner: the Windows-only code (WASAPI loopback, Windows Graphics Capture) cannot
+# be exercised headlessly in any case, and the store/CLI/desktop crates cannot be
+# cross-checked on *any* host without an MSVC C toolchain (below).
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS JOB COVERS
+# ---------------------------------------------------------------------------
+#   - the whole Rust workspace test suite, with the software-encoder feature the
+#     suite needs;
+#   - `cargo check` of the cross-checkable crates for `x86_64-pc-windows-msvc`:
+#     type / API / ownership checking of the Windows-only code from macOS. `check`
+#     does not link, so no MSVC toolchain is required, only the target's std;
+#   - the desktop frontend: clean install, typecheck (`svelte-check`), unit tests
+#     (`vitest`) and a production build; and then the desktop shell's own Rust tests;
+#   - `cargo clippy` over the workspace (warnings surfaced, not fatal — see below).
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS JOB DOES NOT COVER
+# ---------------------------------------------------------------------------
+#   - No Windows runtime verification. Not one line of the WASAPI or WGC backends
+#     is *executed* here; they are only compiled. A green run says nothing about
+#     how the app behaves on a real machine, and the audio/video paths have never
+#     been observed producing a clip.
+#   - No GUI window. No window is opened, the screen is never captured and no input
+#     is synthesised — the desktop command layer is driven with the Tauri runtime
+#     mocked, exactly as the crate is designed to be testable without a window.
+#   - `localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell
+#     are only *host*-verified: they depend on rusqlite's bundled SQLite, whose C
+#     source cannot be built for MSVC from macOS, so they are excluded from the
+#     Windows cross-check and the store/CLI cannot be cross-checked anywhere here.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push supersedes an in-flight run of the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests, Windows cross-check and frontend
+    runs-on: macos-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Add the cross-check target's std here; no MSVC linker is needed because
+          # `cargo check` stops before linking.
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache the Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Two workspaces: the repo's own (target/) and the desktop shell's, which
+          # is a separate workspace rooted at apps/desktop/src-tauri.
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install ffmpeg
+        # The workspace and desktop tests splice, probe and software-encode with a real
+        # ffmpeg (`FfmpegBinaries::discover(None)` — the very thing their failure messages
+        # tell a developer to do with `brew install ffmpeg`). The runner image ships none,
+        # and `xtask sidecars fetch` cannot help: `xtask/sidecars.toml` pins a *Windows*
+        # sidecar only. Homebrew's ffmpeg carries libx264, which the `test-encoders` path
+        # needs. `HOMEBREW_NO_AUTO_UPDATE` skips brew's slow self-update.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install ffmpeg
+
+      - name: Rust workspace tests
+        # The suite the project treats as its gate. `localplay-encoder/test-encoders`
+        # turns on the software-encoder path the encoder, replay and CLI integration
+        # tests build against; a bare `cargo test` would skip those targets.
+        run: cargo test --workspace --features localplay-encoder/test-encoders
+
+      - name: Windows cross-check (cross-checkable crates only)
+        # Type / API / ownership checking of the Windows-only code from macOS. The
+        # store, recorder, CLI and desktop shell are excluded on purpose: rusqlite's
+        # bundled SQLite C cannot be built for MSVC here, and the CLI/desktop add
+        # nothing to the API-shape gate.
+        run: >-
+          cargo check
+          -p localplay-capture -p localplay-encoder -p localplay-events
+          -p localplay-replay -p localplay-media -p xtask
+          --target x86_64-pc-windows-msvc
+
+      - name: Frontend — install, typecheck, unit tests, production build
+        # `npm ci` installs from the committed lockfile into a clean tree. `npm run
+        # build` produces apps/desktop/dist, which the desktop shell's
+        # `tauri::generate_context!` reads at compile time (a release build panics if
+        # it is missing), so it must exist before the desktop Rust tests below.
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+
+      - name: Desktop shell Rust tests
+        # The desktop crate is its own workspace, so run its tests from its manifest
+        # directory — after the frontend build above has produced apps/desktop/dist.
+        working-directory: apps/desktop/src-tauri
+        run: cargo test
+
+      - name: Clippy (warnings surfaced, not fatal)
+        # Deliberately NOT `-D warnings`: the workspace sets `unwrap_used = warn` for
+        # test bodies, so a hard deny would fail on the intentional `unwrap()`s in
+        # tests. This step exists to make lints visible in the log, not to gate on them.
+        run: cargo clippy --workspace --all-targets
