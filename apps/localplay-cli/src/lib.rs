@@ -19,7 +19,7 @@ use localplay_capture::platform::{default_audio_backend, default_video_backend};
 use localplay_capture::stub::StubConfig;
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame};
 use localplay_encoder::probe::select_vendor;
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, Vendor, VideoCodec};
 use localplay_events::hotkey::Hotkey;
 use localplay_media::FfmpegBinaries;
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
@@ -189,9 +189,22 @@ pub fn run_buffer() -> Result<()> {
         clips_dir: clips_dir.clone(),
     };
 
-    // The capture backend is built first so the encoder can be told the true frame
-    // size the pipe will carry. On Windows WGC reports the primary monitor; off
-    // Windows the stub stands in at a fixed size.
+    // Resolve and validate the encoder — the codec and the vendor, the latter proven
+    // usable by a one-frame smoke test — *before* any capture backend is created. On
+    // Windows the backend call below opens a WGC capture session on the primary monitor,
+    // so doing this first is what lets an unusable encoder fail fast without ever touching
+    // the display (see [`resolve_encoder`]).
+    //
+    // `--dev-software-encoder` only exists when built with the test-encoders feature; it
+    // selects libx264, needs no GPU vendor at all, and so is never gated behind a hardware
+    // check.
+    let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
+    let (codec, vendor) = resolve_encoder(&bin, &cfg, dev_software)?;
+
+    // Only now create the capture backend: the encoder's rawvideo pipe is declared from the
+    // backend's own frame geometry (`native_size` — the monitor under WGC, the configured
+    // size for the stub), so the size-dependent half of the encoder config has to wait
+    // until the backend exists.
     let mut capture = default_video_backend(StubConfig {
         width: STUB_CAPTURE_SIZE.0,
         height: STUB_CAPTURE_SIZE.1,
@@ -199,9 +212,7 @@ pub fn run_buffer() -> Result<()> {
     })?;
     let native = capture.native_size();
 
-    // `--dev-software-encoder` only exists when built with the test-encoders feature.
-    let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
-    let mut encode_cfg = build_encode_config(&bin, &cfg, &scratch_dir, dev_software, native)?;
+    let mut encode_cfg = build_encode_config(&cfg, &scratch_dir, codec, vendor, native)?;
 
     // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
     // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
@@ -543,64 +554,86 @@ fn app_data_dir() -> PathBuf {
     base.join("localplay")
 }
 
-/// Decide everything the encoder needs, without starting it. Hardware is the only
-/// shipping path.
+/// Resolve the encoder's codec and vendor — proving this machine can actually encode —
+/// **before** any capture backend is created.
 ///
-/// `native_size` is the capture backend's own frame geometry: the monitor for WGC,
-/// the configured size for the stub. The encoder's rawvideo pipe is declared from it.
-/// Empty `encode.output_size` means "encode at native resolution" (config.example.toml,
-/// spec §10); any other value is the output size, scaled from the native frames.
+/// WHY THIS RUNS FIRST. On Windows, creating the video backend opens a Windows Graphics
+/// Capture session on the primary monitor: it starts capturing the user's screen. The
+/// vendor cannot be known to work until [`select_vendor`] has driven a one-frame smoke
+/// test of the candidate encoder, and that smoke test is exactly where an
+/// advertised-but-unusable vendor is caught (the measured `h264_amf` on a box with no AMD
+/// driver, which otherwise died mid-capture with "video writer thread has stopped"). If
+/// the smoke test ran *after* the backend was created, a machine whose encoder cannot
+/// start would have had its screen captured before the process discovered it could encode
+/// nothing. Resolving the vendor first turns that into a fast, actionable startup failure
+/// that never touches the display. Nothing is lost by moving it earlier: the smoke test
+/// encodes its own synthetic frame, so it needs no real capture size.
 ///
-/// `dev_software` exists solely so the pipeline can be smoke-tested on a host with
-/// no GPU encoder, and is only reachable when the CLI is built with
-/// `--features test-encoders`. It is never reachable from the config file.
+/// The size-dependent half of the encoder decision does still need the backend (the
+/// rawvideo pipe is declared from the backend's `native_size`), so it stays in
+/// [`build_encode_config`] and runs once the backend exists.
+///
+/// The returned vendor is `None` for `--dev-software-encoder`, the libx264 smoke-test
+/// path, which needs no GPU vendor at all and must not be gated behind a hardware check.
+/// `dev_software` is only reachable when the CLI is built with `--features test-encoders`,
+/// and is never reachable from the config file (see `Config::validate`).
+fn resolve_encoder(
+    bin: &FfmpegBinaries,
+    cfg: &Config,
+    dev_software: bool,
+) -> Result<(VideoCodec, Option<Vendor>)> {
+    let codec = parse_codec(&cfg.encode.codec)?;
+    if dev_software {
+        #[cfg(feature = "test-encoders")]
+        {
+            return Ok((codec, None));
+        }
+        #[cfg(not(feature = "test-encoders"))]
+        {
+            bail!("--dev-software-encoder requires building with `--features test-encoders`");
+        }
+    }
+    Ok((codec, Some(select_vendor(bin, &cfg.encode.vendor, codec)?)))
+}
+
+/// The video codec the config asks for. Machine-independent, so it is resolved alongside
+/// the vendor, before any capture backend exists.
+fn parse_codec(spec: &str) -> Result<VideoCodec> {
+    match spec {
+        "h264" => Ok(VideoCodec::H264),
+        "hevc" => Ok(VideoCodec::Hevc),
+        other => bail!("unsupported encode.codec: {other}"),
+    }
+}
+
+/// Build the encoder's configuration from the already-resolved codec and vendor plus the
+/// capture backend's own frame geometry — without starting the encoder. Hardware is the
+/// only shipping path.
+///
+/// The vendor is resolved earlier, before the capture backend exists (see
+/// [`resolve_encoder`]); `None` here is the `--dev-software-encoder` (libx264) path.
+/// `native_size` is the capture backend's own frame geometry: the monitor for WGC, the
+/// configured size for the stub. The encoder's rawvideo pipe is declared from it, which is
+/// why this size-dependent step has to run *after* the backend exists. Empty
+/// `encode.output_size` means "encode at native resolution" (config.example.toml, spec
+/// §10); any other value is the output size, scaled from the native frames.
 ///
 /// Separate from [`spawn_encoder`] because the process has to know the encoder's name
 /// (for the ring's clip metadata) and, more importantly, has to decide the segment
 /// numbering from the scratch directory *before* the child starts: the number is an
 /// ffmpeg argument, so it cannot be changed afterwards.
 fn build_encode_config(
-    bin: &FfmpegBinaries,
     cfg: &Config,
     scratch_dir: &Path,
-    dev_software: bool,
+    codec: VideoCodec,
+    vendor: Option<Vendor>,
     native_size: (u32, u32),
 ) -> Result<EncodeConfig> {
     let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
-    let codec = match cfg.encode.codec.as_str() {
-        "h264" => VideoCodec::H264,
-        "hevc" => VideoCodec::Hevc,
-        other => bail!("unsupported encode.codec: {other}"),
-    };
     let segment_ms = cfg.buffer.segment_time * 1000;
 
-    let encode_cfg = if dev_software {
-        #[cfg(feature = "test-encoders")]
-        {
-            tracing::warn!(
-                "--dev-software-encoder: using libx264. This is for smoke-testing the \
-                 pipeline only and is NOT a supported configuration."
-            );
-            let mut c = EncodeConfig::for_tests_software(
-                codec,
-                native_size.0,
-                native_size.1,
-                cfg.encode.fps,
-                scratch_dir.to_path_buf(),
-                segment_ms,
-            );
-            // The dev encoder scales the same way the hardware one does: frames arrive
-            // at the native size, the output is `output_size`.
-            c.output_size = output_size;
-            c
-        }
-        #[cfg(not(feature = "test-encoders"))]
-        {
-            bail!("--dev-software-encoder requires building with `--features test-encoders`");
-        }
-    } else {
-        let vendor = select_vendor(bin, &cfg.encode.vendor, codec)?;
-        EncodeConfig::hardware(
+    let encode_cfg = match vendor {
+        Some(vendor) => EncodeConfig::hardware(
             codec,
             vendor,
             native_size, // source: the frames the capture pipe delivers
@@ -609,7 +642,34 @@ fn build_encode_config(
             cfg.encode.bitrate_kbps,
             segment_ms,
             scratch_dir.to_path_buf(),
-        )
+        ),
+        // `vendor` is `None` only for `--dev-software-encoder`, which is only reachable
+        // when built with `test-encoders` (see [`resolve_encoder`]).
+        None => {
+            #[cfg(feature = "test-encoders")]
+            {
+                tracing::warn!(
+                    "--dev-software-encoder: using libx264. This is for smoke-testing the \
+                     pipeline only and is NOT a supported configuration."
+                );
+                let mut c = EncodeConfig::for_tests_software(
+                    codec,
+                    native_size.0,
+                    native_size.1,
+                    cfg.encode.fps,
+                    scratch_dir.to_path_buf(),
+                    segment_ms,
+                );
+                // The dev encoder scales the same way the hardware one does: frames
+                // arrive at the native size, the output is `output_size`.
+                c.output_size = output_size;
+                c
+            }
+            #[cfg(not(feature = "test-encoders"))]
+            {
+                bail!("--dev-software-encoder requires building with `--features test-encoders`");
+            }
+        }
     };
 
     // The rawvideo pipe is declared from `source_size`; if it did not equal the
