@@ -180,8 +180,18 @@ requiring the user to install anything.
 **Clock.** `Frame::pts` and `AudioBuffer::pts` are both derived from the same QPC
 clock, which is what makes A/V alignment tractable at all. Both are real-time
 sources consuming at 1×, so drift over a 30 s clip is bounded rather than
-accumulating. Drift is logged per clip (§13) but is not a gating criterion for
-Phase 1.
+accumulating.
+
+Two distinct things are worth separating here, because conflating them is how sync
+bugs hide:
+
+- **Clip-level drift** — the offset between the muxed video and audio streams in the
+  produced file, computed from their durations and start times. This *is* logged per
+  clip and is what criterion 8 checks.
+- **Live-source clock divergence** — whether the capture and audio clocks drift apart
+  while recording. This is **not** measured, and would require instrumenting the
+  capture path itself. Recorded as a known gap in the Phase 1 runbook rather than
+  implied to be covered.
 
 ### 5.2 `encoder`
 
@@ -509,7 +519,7 @@ The `Trigger` enum is present but only `Trigger::Hotkey` is wired.
 | 5 | Clip is a stream copy, not a re-encode | `ffprobe` codec/profile matches the live encoder; export completes near-instantly |
 | 6 | Steady-state CPU under 5% of one core and RSS under 400 MB | Process counters sampled during the soak |
 | 7 | The process exits non-zero with an actionable message when no hardware encoder exists | Run on a machine/GPU without one, or force `vendor` to an absent encoder |
-| 8 | The clip contains a synchronised audio stream | `ffprobe -show_streams` reports one video and one audio stream; the audio is audible and lip-sync is correct on playback; A/V drift is logged |
+| 8 | The clip contains a synchronised audio stream | `ffprobe -show_streams` reports one video and one audio stream; the audio is audible and lip-sync is correct on playback; A/V drift is logged. The logged drift is measured **in the produced clip** (per-stream duration and start-time delta) — it is *not* the live QPC-vs-WASAPI clock divergence, which is still unmeasured. |
 
 Criteria 3–6 are the ones that prove the design. Criteria 1–2 prove the plumbing.
 Criterion 7 exists because a silent CPU fallback would violate principle 3. Criterion 8
