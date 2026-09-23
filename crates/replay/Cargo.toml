@@ -1,0 +1,25 @@
+[package]
+name = "localplay-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+localplay-media = { path = "../media" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+localplay-capture = { path = "../capture" }
+localplay-encoder = { path = "../encoder" }
+tempfile.workspace = true
+
+# Forwards to the encoder's feature so the pipeline is testable off-Windows.
+[features]
+test-encoders = ["localplay-encoder/test-encoders"]
+
+[lints]
+workspace = true

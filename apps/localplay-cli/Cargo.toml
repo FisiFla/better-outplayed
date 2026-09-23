@@ -1,0 +1,26 @@
+[package]
+name = "localplay-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+localplay-capture = { path = "../../crates/capture" }
+localplay-encoder = { path = "../../crates/encoder" }
+localplay-replay  = { path = "../../crates/replay" }
+localplay-media   = { path = "../../crates/media" }
+localplay-events  = { path = "../../crates/events" }
+localplay-store   = { path = "../../crates/store" }
+
+# Enables the hidden `--dev-software-encoder` flag for pipeline smoke tests on a
+# host with no GPU encoder. Never enabled in a release build.
+[features]
+test-encoders = ["localplay-encoder/test-encoders"]
+
+[lints]
+workspace = true

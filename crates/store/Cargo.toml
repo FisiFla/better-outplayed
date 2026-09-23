@@ -1,0 +1,12 @@
+[package]
+name = "localplay-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "localplay-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [] }
+
+[features]
+test-encoders = []
+
+[lints]
+workspace = true
