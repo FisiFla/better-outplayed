@@ -22,5 +22,16 @@ localplay-store   = { path = "../../crates/store" }
 [features]
 test-encoders = ["localplay-encoder/test-encoders"]
 
+# The post-roll regression test (`tests/post_roll.rs`) needs a scratch directory and
+# a clips directory of its own.
+[dev-dependencies]
+tempfile.workspace = true
+# Enables `EncodeConfig::for_tests_software` for this package's TEST builds only: dev
+# dependencies are not built for `cargo build`, so the binary still cannot fall back to
+# CPU encoding (that guard is this package's own `test-encoders` feature, which stays
+# opt-in). The test file is not `cfg`-gated, because the feature the suite enables on the
+# command line (`--features localplay-encoder/test-encoders`) is not this package's.
+localplay-encoder = { path = "../../crates/encoder", features = ["test-encoders"] }
+
 [lints]
 workspace = true

@@ -196,6 +196,7 @@ dependencies = [
  "localplay-replay",
  "localplay-store",
  "serde",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
