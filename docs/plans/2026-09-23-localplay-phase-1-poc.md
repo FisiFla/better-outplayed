@@ -1695,8 +1695,13 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     // Guards the `segment_ms` unit. Passing 1 instead of 1_000 silently produces
     // 1ms segments, which still satisfies the ">= 2 segments" check above — so
     // without this assertion the unit error goes unnoticed.
+    //
+    // The range is deliberately wide at the top: ffmpeg cuts on the next keyframe
+    // at or after `-segment_time`, so the first segment lands on frame 34 (~1155ms)
+    // rather than frame 30. The *floor* is what catches the unit bug — a 1ms value
+    // yields ~64ms segments, far below 900.
     assert!(
-        (900..=1100).contains(&info.duration_ms),
+        (900..=1300).contains(&info.duration_ms),
         "segment duration {}ms should be ~1000ms (segment_ms is milliseconds)",
         info.duration_ms
     );
@@ -3703,7 +3708,11 @@ exact expected observation. It must include:
 - Criterion 1: `localplay-cli buffer`, then confirm the log reports a monotonically
   increasing frame count and the captured resolution.
 - Criterion 2: after a 5-minute soak, confirm the logged `bytes=` never exceeds
-  `scratch_cap_bytes`.
+  `scratch_cap_bytes`. **Measure the ledger, not the directory.** The scratch
+  directory can transiently hold one extra segment: `scanner::newly_complete` holds
+  back the newest segment because ffmpeg may still be appending to it, so that file
+  is not yet indexed and therefore not yet evictable. The ledger cap is the binding
+  constraint; a `du` of the scratch dir can legitimately read one segment higher.
 - Criterion 3: press `Ctrl+F8`, and record the wall-clock delta between the press and
   the `wrote ...` log line. Expected under 2 s plus `post_seconds`.
 - Criterion 4: `ffprobe -v error -show_format -of json <clip>` and compare

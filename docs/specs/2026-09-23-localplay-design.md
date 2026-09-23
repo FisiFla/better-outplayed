@@ -503,7 +503,7 @@ The `Trigger` enum is present but only `Trigger::Hotkey` is wired.
 | # | Criterion | Verification method |
 |---|---|---|
 | 1 | Captures the primary monitor via WGC at the configured fps | Startup log + frame counter over the run |
-| 2 | Scratch directory stays at or under `scratch_cap_bytes` | Asserted on `BufferStats` after a 5-minute soak |
+| 2 | Scratch directory stays at or under `scratch_cap_bytes` | Asserted on `BufferStats` (the ledger) after a 5-minute soak. Note: the *directory* may transiently hold one extra segment, because the segment still being appended to is deliberately not indexed yet and so is not evictable. The ledger is the binding constraint. |
 | 3 | `Ctrl+F8` writes `clip-*.mp4` within 2 s of post-roll completion | Timestamp delta, printed by the run |
 | 4 | Clip duration matches `pre_seconds + post_seconds` ± 0.5 s | `ffprobe -show_format` |
 | 5 | Clip is a stream copy, not a re-encode | `ffprobe` codec/profile matches the live encoder; export completes near-instantly |
