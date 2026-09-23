@@ -2368,6 +2368,9 @@ mod tests {
     #[test]
     fn migrating_is_idempotent() {
         let s = Store::open_in_memory().unwrap();
+        // Migrate first: reading the version before migrating yields 0, so
+        // comparing against it afterwards can never hold.
+        s.migrate().unwrap();
         let v1 = s.schema_version().unwrap();
         s.migrate().unwrap();
         assert_eq!(s.schema_version().unwrap(), v1, "re-migrating must not bump the version");
@@ -2394,7 +2397,7 @@ mod tests {
 
         let clips = s.list_clips().unwrap();
         assert_eq!(clips.len(), 2);
-        assert_eq!(clips[0].path, "/clips/b.mp4", "newest first");
+        assert_eq!(clips[0].path, PathBuf::from("/clips/b.mp4"), "newest first");
         assert_eq!(clips[1].id, a);
     }
 
