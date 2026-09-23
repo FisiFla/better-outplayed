@@ -151,9 +151,32 @@ localplay/
 ```
 
 The design spec is at
-[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md)
-and the Phase 1 task breakdown at
-[`docs/plans/2026-09-23-localplay-phase-1-poc.md`](docs/plans/2026-09-23-localplay-phase-1-poc.md).
+[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md),
+the Phase 1 task breakdown at
+[`docs/plans/2026-09-23-localplay-phase-1-poc.md`](docs/plans/2026-09-23-localplay-phase-1-poc.md)
+and the Phase 4 game-event integrations at
+[`docs/plans/2026-09-23-localplay-phase-4-integrations.md`](docs/plans/2026-09-23-localplay-phase-4-integrations.md).
+
+### Game event integrations (Phase 4)
+
+Two sources, both **loopback-only by construction** and both switched on from `[events]` in
+the config file:
+
+- **League of Legends** — polls Riot's Live Client Data API
+  (`https://127.0.0.1:2999/liveclientdata/allgamedata`) once a second while a game is
+  running. The endpoint's certificate is self-signed, so TLS verification is relaxed inside
+  one dedicated, address-pinned client; a guard test asserts that no other file in the tree
+  relaxes verification or constructs an HTTP client.
+- **CS2 / Dota 2** — a `127.0.0.1`-bound HTTP listener for Valve's Game State Integration.
+  It requires a generated token (which the game echoes back inside the payload's `auth`
+  object), rejects anything that does not carry it, and generates the
+  `gamestate_integration_localplay.cfg` you copy into the game's `cfg` directory.
+
+An event takes a clip through **the hotkey's own trigger** — same pre-roll, same post-roll,
+same lossless splice in media time — and writes why it was taken into the `events` table,
+linked to the clip. A kill, a bomb or the end of a match clips; a round boundary is recorded
+as a timeline marker without taking footage. No game has been contacted to verify any of
+this yet: the payloads are canned fixtures and the servers are mocks in the test process.
 
 ---
 
@@ -197,7 +220,9 @@ diff and committed. At runtime the app looks for `binaries/` next to the executa
 - [ ] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC)
 - [ ] **Phase 2** — Tauri shell, timeline scrubber, clip trim/export
 - [ ] **Phase 3** — SQLite index, storage manager, auto-cleanup policies
-- [ ] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations
+- [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
+      tested against local mocks; **never run against a real game** — see the
+      [Phase 4 note](docs/plans/2026-09-23-localplay-phase-4-integrations.md))*
 - [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer
 
 Phase 1 acceptance is verified on Windows hardware using the
