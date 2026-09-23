@@ -110,6 +110,18 @@ const AUDIO_CONNECT_POLL: Duration = Duration::from_millis(20);
 /// pathological case, not a delay on the ordinary one (see `drain_stderr`).
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
+/// How long a writer failure waits for ffmpeg to become reapable, so its exit status and
+/// stderr can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
+///
+/// The broken pipe is noticed the moment ffmpeg closes its stdin, which can be a few
+/// milliseconds before the process itself can be waited on. This is spent only on a path
+/// that has already failed, and it is a deadline, not a guarantee: past it the error is
+/// reported with the symptom alone.
+const CHILD_DEATH_GRACE: Duration = Duration::from_millis(250);
+
+/// Poll interval while waiting out that grace period.
+const CHILD_DEATH_POLL: Duration = Duration::from_millis(10);
+
 /// How many video frames may sit in the queue between the capture loop and the writer
 /// thread before submits start being dropped.
 ///
@@ -153,6 +165,11 @@ pub struct FfmpegEncoder {
     /// the submitting thread and read through `&self` (see `Encoder::dropped_frames`).
     dropped_video: AtomicU64,
     dropped_audio: AtomicU64,
+    /// Text already read out of ffmpeg's stderr, which a pipe can only give up once
+    /// (see [`FfmpegEncoder::drain_stderr`]). Two different reports can want it — the
+    /// writer failure that explains a dead encoder, and [`Encoder::finish`] — and the
+    /// second one must not be left saying nothing.
+    drained_stderr: Option<String>,
 }
 
 impl FfmpegEncoder {
@@ -275,6 +292,7 @@ impl FfmpegEncoder {
             source_size: cfg.source_size,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
+            drained_stderr: None,
         })
     }
 }
@@ -397,19 +415,27 @@ impl Encoder for FfmpegEncoder {
     ///
     /// A disconnected channel is a different matter — the writer thread is gone, ffmpeg
     /// is not reading, and nothing submitted afterwards can be encoded, so that is an
-    /// error rather than a drop.
+    /// error rather than a drop. That error carries ffmpeg's own exit status and stderr
+    /// when they are known by then, because "video writer thread has stopped" is the
+    /// symptom, not the cause ([`FfmpegEncoder::explain_dead_writer`]).
     fn submit_video(&mut self, frame: Frame) -> Result<()> {
         // The frame's geometry is checked by the caller (`pump_once_counted`), which is
         // the only place that holds both the frame and the pipe's declared size.
-        let tx = self.video_tx.as_ref().context("encoder already finished")?;
-        enqueue_or_drop(tx, frame.data, &self.dropped_video, "video")
+        let queued = match self.video_tx.as_ref() {
+            Some(tx) => enqueue_or_drop(tx, frame.data, &self.dropped_video, "video"),
+            None => bail!("encoder already finished"),
+        };
+        queued.map_err(|e| self.explain_dead_writer(e))
     }
 
     /// Queue an audio block, or drop it if the queue is full. Same reasoning as
     /// [`Encoder::submit_video`]; the counter is `Encoder::dropped_audio_blocks`.
     fn submit_audio(&mut self, audio: AudioBuffer) -> Result<()> {
-        let tx = self.audio_tx.as_ref().context("encoder already finished")?;
-        enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio")
+        let queued = match self.audio_tx.as_ref() {
+            Some(tx) => enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio"),
+            None => bail!("encoder already finished"),
+        };
+        queued.map_err(|e| self.explain_dead_writer(e))
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -474,6 +500,53 @@ impl Encoder for FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
+    /// Complete a writer failure with ffmpeg's own exit status and stderr, if it has died.
+    ///
+    /// The writer thread can only report the symptom: its `write` to the child's stdin
+    /// failed, so it stopped, so the channel is disconnected. It does not own the child,
+    /// and the fact that arrives at the caller is "…writer thread has stopped" — which is
+    /// exactly the unhelpful message a Windows capture produced when `h264_amf` could not
+    /// start (`Error: video writer thread has stopped`, with the real cause — a missing
+    /// `amfrt64.dll` — only ever in ffmpeg's stderr). This encoder owns the child, so it
+    /// can add the cause.
+    ///
+    /// Returns the error untouched when the child has not exited yet. That is a real
+    /// possibility (the pipe can break before the process is reapable) and inventing a
+    /// cause would be worse than reporting the symptom honestly.
+    fn explain_dead_writer(&mut self, err: anyhow::Error) -> anyhow::Error {
+        match self.ffmpeg_death() {
+            Some(cause) => anyhow::Error::msg(format!("{err}; {cause}")),
+            None => err,
+        }
+    }
+
+    /// ffmpeg's exit status and stderr, when it has exited.
+    ///
+    /// A short bounded grace period is spent waiting for the exit first. The broken pipe
+    /// is observed the instant ffmpeg closes its stdin, which can precede the moment the
+    /// process becomes reapable, and the whole point is to catch the cause. The wait only
+    /// happens on a path that has already failed — the run is ending either way — and it
+    /// is bounded, so a child that survives the grace period still produces an error.
+    ///
+    /// `try_wait` reaps the child; a later [`Encoder::finish`] still gets the same status
+    /// from `Child::wait`, which returns the stored one.
+    fn ffmpeg_death(&mut self) -> Option<String> {
+        let deadline = Instant::now() + CHILD_DEATH_GRACE;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(CHILD_DEATH_POLL),
+                _ => return None,
+            }
+        };
+        let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+        Some(format!(
+            "ffmpeg exited with {status} using encoder '{}': {}",
+            self.encoder_name,
+            stderr.trim()
+        ))
+    }
+
     /// Everything ffmpeg wrote to stderr, but never at the cost of waiting longer than
     /// `budget` for it.
     ///
@@ -484,7 +557,15 @@ impl FfmpegEncoder {
     /// forked a sleeper stalled the report for its whole 60s). Draining on its own
     /// thread and taking whatever arrived keeps the report honest and bounded; on the
     /// ordinary path the text is already buffered and this returns at once.
+    ///
+    /// The text is remembered because a pipe can only be drained once, and more than one
+    /// report wants it: the writer failure that explains a dead encoder, and
+    /// [`Encoder::finish`]'s own failure. Without the cache the second one would print
+    /// nothing where ffmpeg's reason should be.
     fn drain_stderr(&mut self, budget: Duration) -> String {
+        if let Some(text) = &self.drained_stderr {
+            return text.clone();
+        }
         let Some(mut stderr) = self.child.stderr.take() else {
             return String::new();
         };
@@ -495,7 +576,9 @@ impl FfmpegEncoder {
             let _ = stderr.read_to_string(&mut text);
             let _ = tx.send(text);
         });
-        rx.recv_timeout(budget).unwrap_or_default()
+        let text = rx.recv_timeout(budget).unwrap_or_default();
+        self.drained_stderr = Some(text.clone());
+        text
     }
 }
 
@@ -593,5 +676,103 @@ mod tests {
             "the error must name the dead writer: {err}"
         );
         assert_eq!(dropped.load(Ordering::Relaxed), 0, "a failure is not a drop");
+    }
+
+    /// A pipe can only be read once, and two reports want ffmpeg's words: the writer
+    /// failure that explains a dead encoder, and the failure [`Encoder::finish`] raises
+    /// afterwards. The second one must not be left with nothing — that would move the
+    /// unexplained failure from one place to another.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_is_remembered_so_a_second_report_is_not_left_empty() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo 'DLL amfrt64.dll failed to open' >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The child is written by hand here because `spawn` needs a real ffmpeg and an
+        // audio listener; this is the smallest thing that has a child with stderr.
+        let mut encoder = FfmpegEncoder {
+            child,
+            video_tx: None,
+            audio_tx: None,
+            video_writer: None,
+            audio_writer: None,
+            encoder_name: "h264_amf",
+            source_size: (320, 240),
+            dropped_video: AtomicU64::new(0),
+            dropped_audio: AtomicU64::new(0),
+            drained_stderr: None,
+        };
+        encoder.child.wait().unwrap();
+
+        let first = encoder.drain_stderr(Duration::from_secs(1));
+        assert!(first.contains("DLL amfrt64.dll failed to open"), "got: {first:?}");
+        let second = encoder.drain_stderr(Duration::from_secs(1));
+        assert_eq!(second, first, "the second report gets the same words, not nothing");
+    }
+
+    /// The message a Windows capture produced was `Error: video writer thread has stopped`
+    /// while the real cause — an `h264_amf` that could not initialise — sat in ffmpeg's
+    /// stderr. A dead writer must now carry the child's own exit status and words.
+    ///
+    /// The stand-in child is a script that fails the way a hardware encoder does on a
+    /// machine with no vendor runtime: it says why on stderr and exits non-zero. No GPU is
+    /// needed, and the path under test — a pump thread noticing the broken pipe, then the
+    /// submitter asking the child what happened — is the one the real encoder uses.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_writer_reports_ffmpegs_exit_status_and_stderr() {
+        use crate::VideoCodec;
+        use localplay_capture::{Frame, PixelFormat};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("ffmpeg");
+        std::fs::write(&stub, "#!/bin/sh\necho 'DLL amfrt64.dll failed to open' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let cfg = EncodeConfig::for_tests_software(
+            VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        // Spawning succeeds: the child starts and then fails, which is exactly the shape
+        // of an encoder that cannot initialise.
+        let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).unwrap();
+
+        // The channel only disconnects once the pump thread *tries* to write into the
+        // dead child and fails, so submit until that happens; each attempt is an
+        // independent frame the encoder may accept first.
+        let frame = || Frame {
+            data: vec![0u8; 64 * 64 * 4],
+            pts: Duration::ZERO,
+            width: 64,
+            height: 64,
+            format: PixelFormat::Bgra8,
+        };
+        let mut failure = None;
+        for _ in 0..50 {
+            match encoder.submit_video(frame()) {
+                Ok(()) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+
+        let err = failure.expect("a payload cannot be encoded once the writer thread is gone");
+        assert!(err.contains("video writer thread has stopped"), "the symptom survives: {err}");
+        assert!(
+            err.contains("DLL amfrt64.dll failed to open"),
+            "ffmpeg's own words are the point, and they were only in its stderr: {err}"
+        );
+        assert!(err.contains("exit status"), "and so is its exit status: {err}");
     }
 }

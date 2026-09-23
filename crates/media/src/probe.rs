@@ -1,6 +1,6 @@
 //! `ffprobe` JSON into a typed `MediaInfo`.
 
-use crate::binaries::{run_with_timeout, FfmpegBinaries};
+use crate::binaries::{run_with_stdin, run_with_timeout, FfmpegBinaries};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -182,6 +182,143 @@ impl MediaInfo {
     }
 }
 
+/// Encode exactly one frame with `encoder` and throw the output away.
+///
+/// `Ok` means this machine can actually drive that encoder; `Err` carries **ffmpeg's own
+/// words** about why it cannot, because that is the only actionable diagnosis there is (a
+/// missing `amfrt64.dll` names itself).
+///
+/// This exists because `ffmpeg -encoders` cannot answer the question. That list is what
+/// ffmpeg was *compiled* with, not what its runtime can initialise: measured on an RTX 3090
+/// box with no AMD hardware or driver at all, ffmpeg advertised `h264_amf` and then died
+/// with `DLL amfrt64.dll failed to open` the moment it was asked to open the encoder. The
+/// design spec called for this smoke test alongside the encoder list (§5.2, and §13 lists
+/// the encoder list alone as a risk) and it is the difference between failing at startup
+/// and failing mid-capture.
+///
+/// One 320x240 BGRA frame (307 200 bytes) goes in over `pipe:0` as rawvideo, exactly as the
+/// live capture feeds the real encoder, and the output goes to the null muxer. There is
+/// deliberately no `-f lavfi` test source: a strip-down ffmpeg build may not carry those
+/// filters, and the point is to exercise the encoder, not a filter graph. The child's exit
+/// status is the answer — a frame ffmpeg accepted is what proves the encoder opened.
+///
+/// Nothing here touches the screen or synthesises input: it is a synthetic frame, not a
+/// capture.
+pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), String> {
+    let size = format!("{}x{}", SMOKE_SIZE.0, SMOKE_SIZE.1);
+    let mut cmd = Command::new(&bin.ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        // Keeps ffmpeg from reading the probe's own stdin for interactive commands; the
+        // frame still arrives on the `pipe:0` input below.
+        "-nostdin",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgra",
+        "-s",
+        size.as_str(),
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ]);
+    let frame = vec![0u8; (SMOKE_SIZE.0 * SMOKE_SIZE.1 * 4) as usize];
+    let out = run_with_stdin(cmd, frame, SMOKE_TIMEOUT).map_err(|e| format!("{e:#}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(reason_from(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// ffmpeg's explanation of a failed smoke test, condensed onto one line.
+///
+/// Shapes this handles, both measured against ffmpeg 9.0.2:
+///
+/// ```text
+/// Input #0, rawvideo, from 'pipe:0':                     <- filtered: description
+///   Stream #0:0: Video: rawvideo ..., bgra, 320x240       <- filtered: description
+/// [h264_amf @ 0x55…] DLL amfrt64.dll failed to open      <- THE reason
+/// [h264_amf @ 0x55…] Error initializing an external …    <- second reason
+/// Error while opening encoder for output stream #0:0 …   <- ffmpeg's own summary
+/// ```
+///
+/// The description lines are dropped (they say nothing about the failure), the reasons are
+/// kept first because that is where the missing DLL or driver is *named*, and the closing
+/// summary is kept because it is ffmpeg's statement of what went wrong overall. Middle
+/// lines are usually a restatement of the first two, so only the first two and the last are
+/// used, and the result is capped so it cannot become a wall of text in a log or a table.
+fn reason_from(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_ffmpeg_chatter(l))
+        .collect();
+    let reason = match lines.as_slice() {
+        [] => "ffmpeg said nothing on stderr".to_string(),
+        [only] => (*only).to_string(),
+        [first, second] => format!("{first} | {second}"),
+        [first, second, .., last] => format!("{first} | {second} | {last}"),
+    };
+    if reason.chars().count() > REASON_CAP {
+        let kept: String = reason.chars().take(REASON_CAP).collect();
+        return format!("{kept}…");
+    }
+    reason
+}
+
+/// ffmpeg's non-diagnostic output: the description of the input and output it is about to
+/// build, its stream mapping, and the progress line. None of it says why an encoder failed,
+/// and all of it would otherwise be read as "the reason" because it comes first.
+///
+/// `Stream #` and `Duration:` are matched after trimming, so the two-space indentation
+/// ffmpeg uses inside a stream block does not defeat the match.
+fn is_ffmpeg_chatter(line: &str) -> bool {
+    const CHATTER: [&str; 9] = [
+        "Input #",
+        "Output #",
+        "Stream mapping",
+        "Metadata:",
+        "Duration:",
+        "Stream #",
+        "Press [q]",
+        "frame=",
+        "size=",
+    ];
+    CHATTER.iter().any(|prefix| line.starts_with(prefix))
+}
+
+/// The frame a smoke test encodes: 320x240 BGRA, i.e. 307 200 bytes.
+///
+/// The size is **not** free to shrink. Hardware encoders have vendor minimum sizes, and a
+/// probe that trips one reports a working encoder as unusable — which is the opposite of
+/// what this test is for:
+///
+/// - **NVENC** rejects anything under 145x145 *at the driver*, with "Frame Dimension less
+///   than the minimum supported value" (ffmpeg trac #9251: 144x144 fails, 145x145 works). A
+///   64x64 probe would therefore have called a perfectly good RTX 3090 unusable.
+/// - **QSV** has a minimum around 128x96.
+/// - **AMF** documents 64x64 for H.264 but 192x128 for HEVC, and one probe size has to
+///   serve both codecs.
+///
+/// 320x240 clears every one of those, is 16-pixel aligned in both directions, and is one
+/// frame of 300 KiB: large enough to be a real encode, small enough that feeding it costs
+/// nothing.
+const SMOKE_SIZE: (u32, u32) = (320, 240);
+
+/// How long a smoke test may take before the encoder is declared unusable. An encoder that
+/// needs the GPU runtime and cannot get it fails in milliseconds; this is a ceiling on a
+/// wedged child, not a budget an honest one needs.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on the length of a returned reason, in characters.
+const REASON_CAP: usize = 400;
+
 /// ffprobe reports duration as a decimal string of seconds.
 fn seconds_to_ms(seconds: Option<&str>) -> u64 {
     seconds_to_ms_opt(seconds).unwrap_or(0)
@@ -351,5 +488,84 @@ mod tests {
         }"#;
         let info = MediaInfo::from_ffprobe_json(json).expect("valid probe json");
         assert!(info.av_drift().is_none(), "no audio stream means no drift");
+    }
+
+    /// The probe size is a hardware constraint, not a preference — see [`SMOKE_SIZE`]. This
+    /// is the guard against "shrink it, it is only a smoke test": NVENC fails under 145x145
+    /// **at the driver**, QSV under roughly 128x96, and AMF's HEVC encoder under 192x128.
+    /// A probe below any of those would report working hardware as unusable, which is worse
+    /// than not probing at all.
+    #[test]
+    fn the_smoke_frame_clears_every_vendors_minimum_size() {
+        assert!(
+            SMOKE_SIZE.0 >= 192 && SMOKE_SIZE.1 >= 145,
+            "the smoke frame {}x{} is under a vendor's driver minimum; see the SMOKE_SIZE note",
+            SMOKE_SIZE.0,
+            SMOKE_SIZE.1
+        );
+        // 16-pixel alignment, which every one of these encoders also expects.
+        assert_eq!(
+            (SMOKE_SIZE.0 % 16, SMOKE_SIZE.1 % 16),
+            (0, 0),
+            "the smoke frame is not 16-pixel aligned"
+        );
+    }
+
+    /// The real machinery, end to end: a real child, a real frame over `pipe:0`, a real
+    /// exit status, and ffmpeg's real words. `libx264` is the encoder this suite's software
+    /// path already requires (`crates/encoder/tests/segmenting.rs`), so needing it here
+    /// adds no new expectation of the test host.
+    ///
+    /// This is what a hardware vendor's smoke test rides on: the difference between a
+    /// usable and an unusable encoder is only the exit status of exactly this child.
+    #[test]
+    fn a_working_encoder_encodes_one_frame() {
+        let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        smoke_test_encoder(&bin, "libx264").expect("libx264 can encode a 320x240 frame");
+    }
+
+    /// The other half: an encoder ffmpeg cannot open must fail *with ffmpeg's reason*, not
+    /// with "it did not work". On the Windows box the equivalent reason is
+    /// `DLL amfrt64.dll failed to open`, which is only ever in the child's stderr.
+    #[test]
+    fn an_encoder_that_cannot_open_reports_ffmpegs_own_reason() {
+        let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        let reason = smoke_test_encoder(&bin, "definitely_not_an_encoder")
+            .expect_err("this encoder does not exist");
+        assert!(
+            reason.contains("definitely_not_an_encoder"),
+            "ffmpeg's stderr names what it could not open: {reason}"
+        );
+        assert!(
+            !reason.contains("Input #") && !reason.contains("Stream #"),
+            "the input description is not the reason and must not be reported as one: {reason}"
+        );
+        assert!(!reason.contains('\n'), "a reason is one line: {reason}");
+    }
+
+    /// A hanging encoder has to be bounded, not waited out. The stand-in never reads its
+    /// stdin, never writes to it, and never exits; the probe must give up on the deadline
+    /// instead of wedging startup. The encoded "frame" is deliberately far larger than any
+    /// pipe buffer, so the writer thread would block forever if the timeout were not real.
+    #[cfg(unix)]
+    #[test]
+    fn an_encoder_that_hangs_is_bounded_by_the_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        // `sleep`ing longer than the probe's own deadline, with the frame arriving on a
+        // pipe nobody reads.
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("ffmpeg");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+
+        let started = std::time::Instant::now();
+        let err = smoke_test_encoder(&bin, "h264_amf").expect_err("a stalled child is not a pass");
+        assert!(err.contains("timed out"), "the deadline is named: {err}");
+        assert!(
+            started.elapsed() < SMOKE_TIMEOUT + Duration::from_secs(5),
+            "the probe waited {:?}, which is not bounded by {SMOKE_TIMEOUT:?}",
+            started.elapsed()
+        );
     }
 }

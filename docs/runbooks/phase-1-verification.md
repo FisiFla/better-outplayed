@@ -59,18 +59,34 @@ If your checkout does not have the `xtask` cargo alias, the equivalent is:
 cargo run -p xtask -- probe
 ```
 
-This runs `ffmpeg -encoders` and prints one line per candidate id — `h264_nvenc`,
-`hevc_nvenc`, `h264_qsv`, `hevc_qsv`, `h264_amf`, `hevc_amf` — each marked `listed`
-or `absent`, followed by a note that a 1-frame smoke test is still required.
+This runs `ffmpeg -encoders` **and a 1-frame smoke test** for each candidate id —
+`h264_nvenc`, `hevc_nvenc`, `h264_qsv`, `hevc_qsv`, `h264_amf`, `hevc_amf` — and prints one
+line per encoder in one of three states:
 
-- Note every vendor whose encoder is `listed`. That is the value you put in
+```
+h264_nvenc   advertised, WORKS
+h264_amf     advertised, FAILS: [h264_amf @ …] DLL amfrt64.dll failed to open | …
+hevc_qsv     not advertised
+```
+
+- **`advertised, WORKS`** — ffmpeg lists the encoder *and* this machine encoded a 320x240
+  frame with it. This is the only state that is a usable vendor value.
+- **`advertised, FAILS: …`** — ffmpeg lists the encoder but it cannot open a session on
+  this machine (no vendor runtime, wrong driver). The text after `FAILS:` is ffmpeg's own
+  reason. **Do not put this vendor in `encode.vendor`.**
+- **`not advertised`** — the encoder is not in this ffmpeg build at all.
+- Note every vendor whose encoder is `advertised, WORKS`. That is the value you put in
   `encode.vendor` in step 0.3. On an AMD-only machine expect the `*_amf` lines
-  `listed` and the NVENC/QSV lines `absent`.
-- `probe` needs `ffmpeg` **on `PATH`** (it does not search the sidecar directory the way
-  the CLI does).
-- `listed` means ffmpeg advertises the encoder. It does **not** prove the encoder can
-  actually open a session on your driver — the 1-frame smoke test that would prove
-  that is deferred to Phase 2. Treat `listed` as necessary but not sufficient.
+  `advertised, WORKS` and the NVENC/QSV lines `not advertised`.
+- `probe` locates ffmpeg the way the CLI does — the sidecar directory first, then `PATH`.
+- `advertised` alone is necessary but **not** sufficient: ffmpeg lists every encoder it
+  was *built* with, including ones whose vendor runtime is not installed. A Windows box
+  with no AMD hardware still lists `h264_amf`. That is why the smoke test runs: it is the
+  encoder actually encoding a frame, and nothing else, that proves the vendor works here.
+- The smoke test is synthetic: it encodes one generated 320x240 frame to a discarded
+  output and does **not** capture the screen or inject input. (320x240, not something
+  smaller, because the vendors have driver-level minimum frame sizes — NVENC refuses
+  anything under 145x145 — and a probe below one would report a working encoder as broken.)
 
 ### 0.3 Configure
 
@@ -79,7 +95,7 @@ example defaults (`pre_seconds = 30`, `post_seconds = 5`, `fps = 60`,
 `segment_time = 1`, `scratch_cap_bytes = 2147483648`, `vendor = "auto"`). To change
 anything, copy `config.example.toml` there and edit it. At minimum:
 
-- `encode.vendor` — the vendor from step 0.2, or `"auto"`.
+- `encode.vendor` — a vendor step 0.2 reported **`advertised, WORKS`**, or `"auto"`.
 - `encode.fps`, `buffer.pre_seconds`, `buffer.post_seconds`, `buffer.segment_time`,
   `buffer.scratch_cap_bytes` — as you want them for the runs below.
 
@@ -248,8 +264,11 @@ watch the log.
 Immediately after the keypress:
 
 ```
-hotkey pressed at <trigger_ms>ms; waiting for post-roll
+hotkey pressed: media=<m>ms wall=<w>ms (drift <d>ms); waiting for post-roll
 ```
+
+(`media=` is the trigger in media time, `wall=` in wall-clock time, and `drift` is the
+difference between them; the post-roll wait is bounded from the wall-clock trigger.)
 
 Then, once the post-roll has elapsed (about `post_seconds` later):
 
@@ -416,8 +435,13 @@ encoder init, first probes) are not the steady-state figure; sample later.
 
 **Command**
 
-Force `vendor` to an encoder this machine does **not** have, then run. On an AMD-only box
-(pick a value step 0.2 reported `absent`):
+Force `vendor` to an encoder this machine does **not** have, then run. Two cases belong to
+this criterion, and both must be checked:
+
+1. a vendor step 0.2 reported `not advertised` (e.g. `vendor = "nvenc"` on an AMD-only box);
+2. a vendor step 0.2 reported **`advertised, FAILS: …`** — ffmpeg lists the encoder, but
+   this machine cannot run it. This is the case that used to slip through, because the
+   encoder list was the only check.
 
 ```powershell
 # in %LOCALAPPDATA%\localplay\config.toml set:
@@ -427,34 +451,63 @@ cargo run --release -p localplay-cli -- buffer
 
 **Expected observation (PASS)**
 
-- The process starts, cannot find the requested encoder, prints an error, and exits
+- The process starts, cannot use the requested encoder, prints an error, and exits
   **non-zero**. Confirm the exit code: `$LASTEXITCODE` (PowerShell) or `%ERRORLEVEL%`
   (cmd) is not `0`.
-- The error **names the missing encoder**, e.g.:
+- The error **names the encoder that was tried and why it failed**, e.g. for a vendor in
+  the `not advertised` state:
 
   ```
-  Error: no usable hardware encoder. ffmpeg advertises none of: h264_nvenc. Install the
-  GPU vendor runtime (NVIDIA driver / Intel graphics driver / AMD Adrenalin), or set
-  encode.vendor to a vendor this machine has. localplay will not fall back to CPU
-  encoding because it would cost game performance.
+  Error: no usable hardware encoder. Tried in order — h264_nvenc: not advertised by this
+  ffmpeg build. An encoder appearing in `ffmpeg -encoders` does not mean this machine can
+  run it: that list names every encoder ffmpeg was built with, including ones whose
+  vendor runtime is not installed. Install the GPU vendor runtime (NVIDIA driver / Intel
+  graphics driver / AMD Adrenalin), or set encode.vendor to a vendor this machine has.
+  localplay will not fall back to CPU encoding because it would cost game performance.
   ```
 
+  and for the advertised-but-unusable case, where the encoder's own failure is included:
+
+  ```
+  Error: no usable hardware encoder. Tried in order — h264_amf: advertised, but it could
+  not encode a single frame: [h264_amf @ 0x…] DLL amfrt64.dll failed to open | Error
+  while opening encoder for output stream #0:0 — … . Install the GPU vendor runtime …
+  localplay will not fall back to CPU encoding because it would cost game performance.
+  ```
+
+- With `vendor = "auto"` the message lists **every** vendor tried, in order
+  (`h264_nvenc`, `h264_qsv`, `h264_amf` for H.264), each with its own reason.
 - Nothing starts: no `WGC capture started …` line, no `seg-*.mp4`, no `buffering …` line,
   no clip.
+- The failure happens at **startup**, before any capture. A `video writer thread has
+  stopped` message means the encoder was accepted and then died mid-flight: for this
+  criterion that is a **failure**, not a pass, even though the exit code is non-zero.
+  (Such a message now carries ffmpeg's exit status and stderr after the semicolon, e.g.
+  `video writer thread has stopped; ffmpeg exited with exit status: 1 using encoder
+  'h264_amf': DLL amfrt64.dll failed to open` — useful, but this criterion is met by
+  refusing to start at all.)
 
 **FAILURE (each of these is a defect, not a pass)**
 
 - The process **exits 0**, keeps running, or produces a clip. That is a **silent CPU
   fallback**, which violates the project's non-negotiable principle against CPU encoding
   — a defect.
-- It exits non-zero but the message does not name the missing encoder (e.g. a generic
-  "ffmpeg failed").
+- It exits non-zero but the message does not name the encoder (e.g. a generic "ffmpeg
+  failed", or `video writer thread has stopped` with no encoder named).
+- It exits non-zero but the message does not say *why* — no ffmpeg reason, and no
+  "not advertised" for an encoder the build does not carry.
+- It names an encoder but not the failure reason, for a vendor that was
+  `advertised, FAILS` in step 0.2. The distinguishing check is: does the message repeat
+  ffmpeg's own words (e.g. the missing DLL)?
 - It silently proceeds with a *different* hardware vendor than the one requested, without
   saying so.
 
 **Do not misread:** the message names the **ffmpeg encoder id** the codec resolves to
 (`h264_nvenc` for `codec = "h264"`, or `hevc_nvenc` for HEVC), not the vendor word
 "NVIDIA". Look for `h264_nvenc` / `hevc_nvenc` (and the `*_qsv` / `*_amf` equivalents).
+Also note that only the *first* candidate to work is used (`auto`), so a machine with a
+working Intel iGPU and a broken NVIDIA runtime legitimately picks `h264_qsv` and says so
+in the log line `encoding with h264_qsv`.
 
 ---
 
@@ -541,10 +594,16 @@ not softened; do not read a pass elsewhere as coverage of them.
   `Direct3D11CaptureFramePool::Recreate` is not called; a mid-capture resolution or
   refresh-rate change is not handled. The backend copies whatever size the incoming
   texture happens to be, but the pool itself is never resized.
-- **Encoder selection only checks ffmpeg's advertisement.** `cargo xtask probe` (and the
-  CLI's vendor selection) tests that `ffmpeg -encoders` lists the encoder; the 1-frame
-  smoke test that would prove the encoder actually opens on your driver is deferred to
-  Phase 2. `listed` is necessary but not sufficient.
+- **Encoder probing is a 1-frame smoke test, not a full capture.** Vendor selection now
+  lists encoders with `ffmpeg -encoders` *and* makes each advertised candidate encode one
+  generated 320x240 frame (`cargo xtask probe` reports all three states: `advertised, WORKS`,
+  `advertised, FAILS: …`, `not advertised`). That proves the encoder **opens** on this
+  machine. It does **not** prove the *live capture path* drives it at 4K, and the
+  `advertised, FAILS` case has **not** yet been observed on real hardware in this change —
+  the box holder confirms it with `cargo xtask probe` there. What is verified on the
+  development host is the selection logic (against injected results) and the smoke test's
+  own plumbing (a working encoder passes, an encoder that cannot open reports ffmpeg's
+  reason, a hanging child is bounded by the timeout).
 - **Non-Windows runs prove none of this.** Off Windows the pipeline uses `StubCapture`,
   which captures a synthetic image and nothing real. A green macOS/Linux test run is not
   evidence for any of the eight criteria.
@@ -572,7 +631,9 @@ specifically:
   extraction wall time and the clip duration.
 - **Criterion 6:** `cores used`; RSS in MB; and the machine's logical-processor count (to
   interpret Task Manager).
-- **Criterion 7:** the forced `vendor`; the process exit code; and the exact error text.
+- **Criterion 7:** the forced `vendor`; the state step 0.2 reported for it
+  (`advertised, WORKS` / `advertised, FAILS: …` / `not advertised`); the process exit code;
+  and the exact error text.
 - **Criterion 8:** the stream counts (video/audio); the codec names; whether lip-sync was
   correct on playback; and the `<delta>` from each clip's `clip … drift` log line (note
   whether it stayed sub-100 ms or grew).

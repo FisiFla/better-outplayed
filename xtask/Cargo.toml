@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Only for the encoder probe (`xtask probe`): the smoke test it runs is the same one the
+# capture app selects a hardware encoder with (`localplay_media::smoke_test_encoder`).
+# Duplicating it here would let the two answers drift apart, which is exactly the failure
+# this command exists to make visible.
+localplay-media.workspace = true
 
 [lints]
 workspace = true

@@ -1,8 +1,9 @@
 //! Locating and invoking the ffmpeg sidecar binaries.
 
 use anyhow::{bail, Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 /// The directory ffmpeg/ffprobe are expected to live in for a packaged build.
@@ -88,12 +89,47 @@ pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawning ffmpeg child")?;
+    wait_with_deadline(&mut child, timeout)?;
+    child.wait_with_output().context("collecting ffmpeg output")
+}
 
-    // Poll rather than block, so a hung ffmpeg cannot wedge the buffer.
+/// Run a child with `input` written to its stdin — then closed — and a hard timeout.
+///
+/// [`run_with_timeout`] cannot stand in for this: it hands the child an immediately-closed
+/// stdin, so a probe that has to *encode* something would have ffmpeg read zero frames and
+/// fail — for an encoder that works perfectly well. This variant feeds bytes first. `input`
+/// is taken by value because the writer thread has to own it.
+pub fn run_with_stdin(mut cmd: Command, input: Vec<u8>, timeout: Duration) -> Result<Output> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawning ffmpeg child")?;
+    let mut stdin = child.stdin.take().context("child stdin unavailable")?;
+
+    // The write happens on its own thread, and deliberately not here: a pipe's buffer is
+    // only 64KiB on this development host and as little as 4KiB for a Windows anonymous
+    // pipe, so a blocking write from this thread could stall *before* the deadline loop
+    // below ever runs — which is the very hang the timeout exists to bound. The thread
+    // ends when the bytes are in or the child is gone (a dead reader fails `write_all`
+    // with a broken pipe), so nothing needs to join it.
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        // Dropping `stdin` at the end of this closure is the child's EOF.
+    });
+
+    wait_with_deadline(&mut child, timeout)?;
+    child.wait_with_output().context("collecting ffmpeg output")
+}
+
+/// Poll `child` until it exits, killing it and failing if `timeout` elapses first.
+///
+/// Polling rather than blocking is what makes the timeout real: a wedged child would
+/// otherwise park the caller forever.
+fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait().context("polling ffmpeg child")? {
-            Some(_) => break,
+            Some(_) => return Ok(()),
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -102,7 +138,6 @@ pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     }
-    child.wait_with_output().context("collecting ffmpeg output")
 }
 
 #[cfg(test)]
