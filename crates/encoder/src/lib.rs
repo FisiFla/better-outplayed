@@ -138,8 +138,18 @@ impl EncodeConfig {
 }
 
 pub trait Encoder: Send {
-    fn submit_video(&mut self, frame: &Frame) -> anyhow::Result<()>;
-    fn submit_audio(&mut self, audio: &AudioBuffer) -> anyhow::Result<()>;
+    /// Hand a captured frame to the encoder for encoding.
+    ///
+    /// Takes the `Frame` by value so the implementation can *move* the pixel buffer
+    /// into its writer queue. A `&Frame` forces a clone of `frame.data`, and at
+    /// 3840x2160 BGRA that is a 33.2MB memcpy per frame — ~1GB/s of pure copying at
+    /// 30fps, on the very path that has to keep up with a live capture (see
+    /// `localplay_encoder::ffmpeg`).
+    fn submit_video(&mut self, frame: Frame) -> anyhow::Result<()>;
+    /// Hand captured PCM to the encoder. Owned for the same reason as
+    /// [`Encoder::submit_video`]: the audio block is moved into the writer queue
+    /// instead of being cloned into it.
+    fn submit_audio(&mut self, audio: AudioBuffer) -> anyhow::Result<()>;
     fn finish(&mut self) -> anyhow::Result<()>;
     /// Codec actually in use, for ffprobe assertions and the UI.
     fn active_encoder(&self) -> &'static str;

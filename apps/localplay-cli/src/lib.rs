@@ -419,12 +419,15 @@ pub fn pump_once_counted(
     if let Some(frame) = capture.next_frame(FRAME_POLL)? {
         guard_frame_size(&frame, encoder.source_size())?;
         if pacer.admit(Instant::now()) {
-            encoder.submit_video(&frame)?;
+            // Ownership moves into the encoder so the pixel buffer is queued, not
+            // copied: at 3840x2160 BGRA a clone is 33.2MB per frame, ~1GB/s of pure
+            // memcpy at 30fps on this path (see `localplay_encoder::ffmpeg`).
+            encoder.submit_video(frame)?;
             frames += 1;
         }
     }
     while let Some(block) = audio.next_buffer(Duration::ZERO)? {
-        encoder.submit_audio(&block)?;
+        encoder.submit_audio(block)?;
     }
     Ok(frames)
 }

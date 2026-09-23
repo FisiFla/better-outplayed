@@ -68,11 +68,11 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
     let mut frames: u64 = 0;
     while Instant::now() < until {
         if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
-            encoder.submit_video(&frame).expect("submit video");
+            encoder.submit_video(frame).expect("submit video");
             frames += 1;
         }
         while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
-            encoder.submit_audio(&block).expect("submit audio");
+            encoder.submit_audio(block).expect("submit audio");
         }
     }
     let captured = started.elapsed();

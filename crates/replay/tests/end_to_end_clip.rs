@@ -62,11 +62,11 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
     let mut frames = 0u64;
     while Instant::now() < until {
         if let Some(frame) = video.next_frame(Duration::from_millis(5)).unwrap() {
-            encoder.submit_video(&frame).unwrap();
+            encoder.submit_video(frame).unwrap();
             frames += 1;
         }
         while let Some(block) = audio.next_buffer(Duration::ZERO).unwrap() {
-            encoder.submit_audio(&block).unwrap();
+            encoder.submit_audio(block).unwrap();
         }
     }
     assert!(frames >= 50, "10fps for 6s must deliver ~60 frames, got {frames}");

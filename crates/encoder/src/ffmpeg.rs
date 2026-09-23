@@ -78,6 +78,11 @@
 //! input far ahead of the other (its muxer buffers to interleave audio and video), so
 //! writing both streams in bursts from the calling thread deadlocks as soon as either
 //! sink's buffer fills. Decoupling the two writes lets the submits arrive in any order.
+//!
+//! The payload's buffer is **moved** into the channel, not cloned: `Frame`/`AudioBuffer`
+//! are taken by value in the trait for exactly that reason. The clone this replaced
+//! copied the whole pixel buffer on every frame — 3840x2160 BGRA is 33.2MB, ~1GB/s of
+//! pure memcpy at 30fps — on the path that was already failing to keep up.
 
 use crate::{EncodeConfig, Encoder};
 use anyhow::{bail, Context, Result};
@@ -374,6 +379,11 @@ fn accept_within(
 impl Encoder for FfmpegEncoder {
     /// Queue the frame for the rawvideo pipe, or drop it if the queue is full.
     ///
+    /// The frame is taken by value and its pixel buffer is moved into the queue — that
+    /// is what the ownership in the trait signature is for. The clone this replaces
+    /// copied 3840x2160 BGRA (33.2MB) per frame, ~1GB/s of pure memcpy at 30fps on the
+    /// path that is failing to keep up.
+    ///
     /// `try_send` rather than `send`, and a drop rather than an error, because this is a
     /// live capture: this call sits in the same loop that has to keep pulling frames off
     /// the capture backend, so blocking here would take the latency budget from a stream
@@ -388,18 +398,18 @@ impl Encoder for FfmpegEncoder {
     /// A disconnected channel is a different matter — the writer thread is gone, ffmpeg
     /// is not reading, and nothing submitted afterwards can be encoded, so that is an
     /// error rather than a drop.
-    fn submit_video(&mut self, frame: &Frame) -> Result<()> {
+    fn submit_video(&mut self, frame: Frame) -> Result<()> {
         // The frame's geometry is checked by the caller (`pump_once_counted`), which is
         // the only place that holds both the frame and the pipe's declared size.
         let tx = self.video_tx.as_ref().context("encoder already finished")?;
-        enqueue_or_drop(tx, frame.data.clone(), &self.dropped_video, "video")
+        enqueue_or_drop(tx, frame.data, &self.dropped_video, "video")
     }
 
     /// Queue an audio block, or drop it if the queue is full. Same reasoning as
     /// [`Encoder::submit_video`]; the counter is `Encoder::dropped_audio_blocks`.
-    fn submit_audio(&mut self, audio: &AudioBuffer) -> Result<()> {
+    fn submit_audio(&mut self, audio: AudioBuffer) -> Result<()> {
         let tx = self.audio_tx.as_ref().context("encoder already finished")?;
-        enqueue_or_drop(tx, audio.data.clone(), &self.dropped_audio, "audio")
+        enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio")
     }
 
     fn finish(&mut self) -> Result<()> {

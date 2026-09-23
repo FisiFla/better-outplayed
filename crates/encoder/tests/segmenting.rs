@@ -42,11 +42,11 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     let mut frames = 0u64;
     while Instant::now() < until {
         if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
-            enc.submit_video(&frame).expect("submit video");
+            enc.submit_video(frame).expect("submit video");
             frames += 1;
         }
         while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
-            enc.submit_audio(&block).expect("submit audio");
+            enc.submit_audio(block).expect("submit audio");
         }
     }
     assert!(frames >= 60, "30fps for 3s must deliver ~90 frames, got {frames}");
@@ -102,10 +102,10 @@ fn the_encoder_starts_segment_numbering_at_start_number() {
     video.start().expect("start the capture stub");
     audio.start().expect("start the audio stub");
     for frame in video.drain_for(Duration::from_millis(200)) {
-        enc.submit_video(&frame).expect("submit video");
+        enc.submit_video(frame).expect("submit video");
     }
     for block in audio.drain_for(Duration::from_millis(200)) {
-        enc.submit_audio(&block).expect("submit audio");
+        enc.submit_audio(block).expect("submit audio");
     }
     enc.finish().expect("flush encoder");
 
