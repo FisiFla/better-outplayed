@@ -55,7 +55,7 @@ const POST_ROLL_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 /// Margin added to the post-roll when sizing the wait budget.
 ///
 /// The wait lasts at least the *remaining* post-roll: `trigger_ms` is "now" on the
-/// capture timeline and `need_ms` is `post_ms` further along it, of footage ffmpeg has
+/// media timeline and `need_ms` is `post_ms` further along it, of footage ffmpeg has
 /// not encoded yet. A fixed budget therefore races its own deadline — with the example
 /// defaults (`post_seconds = 5`) a bare 5s allowance is spent entirely on the post-roll
 /// itself, and whether the wait succeeds comes down to where inside a segment the
@@ -64,6 +64,11 @@ const POST_ROLL_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 /// (up to `buffer.segment_time`), its finalisation, one scan interval, and the splice
 /// that follows. Generous on purpose: a trigger that gives up early loses the clip the
 /// user just asked for, and the wait is invisible to them.
+///
+/// It also carries one unit conversion: the budget is wall clock while `post_ms` is
+/// media time, and on real hardware the media timeline runs slower than the wall clock
+/// (measured 0.81x), so `post_ms` of media costs ~1.23x `post_ms` of waiting. This
+/// margin covers that for any `post_seconds` up to ~20s.
 const POST_ROLL_MARGIN: Duration = Duration::from_secs(5);
 
 /// How far the pacer may fall behind the wall clock before it resynchronises.
@@ -297,16 +302,47 @@ pub fn run_buffer() -> Result<()> {
         }
 
         if localplay_events::hotkey::wait_for_press(&hotkeys, Duration::from_millis(10)) {
-            let trigger_ms = clock.ms_at(Instant::now());
-            tracing::info!("hotkey pressed at {trigger_ms}ms; waiting for post-roll");
+            // The trigger is "now" on the LEDGER's timeline — media time — not on the
+            // wall clock, and that is deliberate: the two clocks only agree while the
+            // pipeline keeps up with `encode.fps`, and on real 4K hardware it does not.
+            // Measured on the box (RTX 3090, 3840x2160): segments were written at 0.81/s
+            // while each one contained exactly 1.000000s of media, so the media timeline
+            // advanced at ~0.81x of the wall clock. A wall-clock `trigger_ms` made
+            // `need_ms` unreachable — the ledger can never catch up to a target derived
+            // from a clock running ~19% ahead of it — which is exactly the measured
+            // failure this replaces: `timed out ... waiting for post-roll (span=27000ms
+            // need=29236ms)`. `span_ms` is the end of the footage the ring can prove is
+            // on disk, i.e. the media-time position of "now"; `need_ms` and the splice
+            // window `[trigger_ms - pre_ms, trigger_ms + post_ms]` are then all on that
+            // same clock, so the post-roll target is reachable by construction.
+            //
+            // Consequence, stated on purpose: with media at 0.81x, the default
+            // `pre_seconds = 10` of media is ~12.3s of real time, and the clip is "the
+            // last 10s of captured media" rather than the last 10s of real time. That is
+            // the only self-consistent meaning until the timeline divergence itself is
+            // fixed (deferred). If the buffer holds less than `pre_ms` of media at the
+            // press, `RingBuffer::trigger` already warns and splices the truncated
+            // front — that path is unchanged.
+            let trigger_ms = ring.stats().span_ms;
+            // Wall-clock value, kept for telemetry only: nothing below reads it, because
+            // mixing the two clocks is what made the post-roll unreachable. Logged next
+            // to the media value so the divergence is observable in a soak — `drift` is
+            // wall minus media and grows by ~190ms per second of capture at 0.81x.
+            let wall_ms = clock.ms_at(Instant::now());
+            tracing::info!(
+                "hotkey pressed: media={trigger_ms}ms wall={wall_ms}ms (drift {}ms); \
+                 waiting for post-roll",
+                wall_ms as i64 - trigger_ms as i64
+            );
 
             // Wait for the post-roll to be written before splicing (spec §6.2 step 2).
             //
             // The budget is `post_ms` + a margin, never a constant: the trigger instant
-            // is "now", so the wait is at least the whole post-roll long, and a budget
-            // that did not account for that would time out on itself (see
-            // `POST_ROLL_MARGIN`). The margin also absorbs the segment ffmpeg is still
-            // appending to, whose length is `buffer.segment_time`.
+            // is "now" on the media timeline, so the wait covers the whole post-roll —
+            // `post_ms` of MEDIA, which at the measured 0.81x is ~1.23x that in wall
+            // clock — and a budget that did not account for that would time out on
+            // itself (see `POST_ROLL_MARGIN`). The margin also absorbs the segment
+            // ffmpeg is still appending to, whose length is `buffer.segment_time`.
             let need_ms = trigger_ms + buffer_cfg.post_ms;
             let budget = Duration::from_millis(buffer_cfg.post_ms) + POST_ROLL_MARGIN;
             pump_until_span(
@@ -443,7 +479,10 @@ fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 ///
 /// `budget` bounds the wait, measured from this call. Callers size it from the
 /// post-roll they are waiting for plus a margin ([`POST_ROLL_MARGIN`]) rather than from
-/// a constant, because the wait itself lasts at least the remaining post-roll.
+/// a constant, because the wait itself lasts at least the remaining post-roll. Note the
+/// two clocks in one call: `need_ms` and the span are media time, `budget` is wall
+/// clock, and on real hardware the former advances slower than the latter (measured
+/// 0.81x) — which is why the caller adds a margin rather than passing a bare `post_ms`.
 ///
 /// Returns `Ok(())` once the span covers `need_ms`; a span already at or beyond
 /// `need_ms` on entry returns immediately. Errors if the budget elapses first, or if

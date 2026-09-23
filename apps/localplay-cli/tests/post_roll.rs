@@ -238,6 +238,81 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     fx.encoder.finish().expect("flush encoder");
 }
 
+/// The hotkey path, exactly as the CLI writes it: the trigger is the ledger's own
+/// media-time position and the post-roll target is `post_ms` further along the same
+/// clock, so the whole window is self-consistent by construction.
+///
+/// The bug this pins: the CLI used to take `trigger_ms` from the `CaptureClock` (wall
+/// clock) and compare `trigger_ms + post_ms` against the ledger's media-time span. On
+/// the 4K box the media timeline ran at ~0.81x of the wall clock (25 segments written
+/// at 0.81/s, each exactly 1.000000s of media), so a wall-derived target sat ~19%
+/// beyond anything the ledger could ever reach and every press ended in
+/// `timed out ... waiting for post-roll`. The stub pipeline here keeps up (media ~=
+/// wall), so the divergence itself cannot be reproduced off the box; what this test
+/// pins is the property that makes the target reachable — trigger, target and ledger
+/// are one clock — and the window the resulting clip actually covers.
+#[test]
+fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
+    let mut fx = Fixture::new();
+
+    // A full pre-roll first, so the window assertions below describe the ordinary press
+    // (the buffer already holds `pre_ms` of media). A press before that is the existing
+    // truncated-front warning path in `RingBuffer::trigger`, not this test.
+    fx.pump(PRE_MS, Duration::from_secs(30))
+        .expect("top the buffer up to a full pre-roll");
+
+    // Exactly the CLI's hotkey branch: the trigger position comes from the ledger, in
+    // media time; `need_ms` is `post_ms` further along that same timeline; the budget is
+    // the wall-clock wait for it (post-roll + margin, as the CLI sizes it).
+    let trigger_ms = fx.ring.stats().span_ms;
+    assert!(trigger_ms >= PRE_MS, "sanity: the pre-roll must be fully buffered");
+    let need_ms = trigger_ms + POST_MS;
+    let budget = Duration::from_millis(POST_MS) + Duration::from_secs(5);
+
+    let started = Instant::now();
+    let result = fx.pump(need_ms, budget);
+    let waited = started.elapsed();
+    eprintln!("media-time trigger {trigger_ms}ms, need {need_ms}ms: {result:?} after {waited:?}");
+    result.expect("span + post_ms on the ledger's own clock must be reachable");
+
+    // The ledger now covers `trigger_ms + post_ms` of media — precisely the window's
+    // far edge — so the trigger below cannot refuse for `PostRollUnavailable`.
+    let after = fx.ring.stats();
+    assert!(
+        after.span_ms >= need_ms,
+        "span must cover the media-time post-roll: need {need_ms}ms, span {}ms",
+        after.span_ms
+    );
+
+    // The window is `[trigger_ms - pre_ms, trigger_ms + post_ms]` in media terms, and
+    // both ends are on disk now, so the splice must cover the request in full.
+    let clip = fx
+        .ring
+        .trigger(trigger_ms, "media-time-clip")
+        .expect("the media-time post-roll must be on disk once the wait returns");
+    let info = MediaInfo::probe(&fx.bin, &clip.path).expect("probe the clip");
+    eprintln!(
+        "clip covers [{}, {}]ms of media (requested pre={PRE_MS}ms post={POST_MS}ms): \
+         {}ms, {} bytes",
+        trigger_ms - PRE_MS,
+        need_ms,
+        info.duration_ms,
+        info.size_bytes
+    );
+    assert!(info.video.is_some(), "clip must have video");
+    assert!(info.audio.is_some(), "clip must have audio");
+    // To within one segment — the granularity the window is aligned to by construction
+    // (segment starts are keyframes, `window::resolve` selects whole segments).
+    assert!(
+        info.duration_ms + SEGMENT_MS >= PRE_MS + POST_MS,
+        "clip must cover the requested pre+post in media terms to within one segment: \
+         {}ms for a {PRE_MS}+{POST_MS}ms window",
+        info.duration_ms
+    );
+
+    fx.encoder.finish().expect("flush encoder");
+}
+
 #[test]
 fn an_unreachable_need_ms_gives_up_on_its_budget_instead_of_hanging() {
     let mut fx = Fixture::new();
