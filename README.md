@@ -119,27 +119,34 @@ boundary; arbitrary scrubbing trims accept keyframe granularity.
 
 ---
 
-## Planned repository layout
+## Repository layout
 
 ```
 localplay/
 ├── Cargo.toml                  # workspace manifest
 ├── crates/
 │   ├── capture/                # WGC + DXGI backends behind one trait
-│   ├── encoder/                # NVENC / QSV / AMF selection + probe
+│   ├── encoder/                # ffmpeg sidecar + NVENC/QSV/AMF selection
 │   ├── replay/                 # ring buffer, trigger windows, clip splice
 │   ├── media/                  # ffmpeg/ffprobe sidecar driver, lossless trim
 │   ├── events/                 # LoL Live Client, CS2/Dota2 GSI, hotkeys
-│   └── store/                  # SQLite schema + clip/match index
+│   └── store/                  # SQLite schema + clip/session index
 ├── apps/
+│   ├── localplay-cli/          # headless PoC binary (Phase 1)
 │   └── desktop/
-│       ├── src-tauri/          # Tauri v2 app, IPC commands, tray
+│       ├── src-tauri/          # Tauri v2 app, IPC commands, tray (Phase 2)
 │       └── src/                # Svelte frontend (timeline, scrubber, settings)
 ├── docs/
-│   └── specs/                  # design docs, one per phase
+│   └── specs/                  # design + plan docs, one per phase
 ├── xtask/                      # build helpers, sidecar fetch/verify
+├── config.example.toml
+├── LICENSE-MIT
+├── LICENSE-APACHE
 └── .gitignore
 ```
+
+The design spec is at
+[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md).
 
 ---
 
@@ -170,5 +177,17 @@ localplay/
 
 ## License
 
-Not yet chosen. This project is intended to be open source; the license will be
-selected deliberately before the first public release rather than defaulted.
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the Rust ecosystem convention and is compatible with
+shipping an LGPL-licensed `ffmpeg` sidecar.
+
+### A note on the `ffmpeg` build
+
+localplay only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
+so it never requires `libx264`. That means an **LGPL** `ffmpeg` build is sufficient,
+and shipping it does not pull the GPL `libx264`/`libx265` obligations into this
+project.

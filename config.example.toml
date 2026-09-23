@@ -1,0 +1,50 @@
+# ============================================================
+# localplay — example configuration
+# ============================================================
+# Copy to the application data directory and edit:
+#   %LOCALAPPDATA%\localplay\config.toml
+#
+# localplay never reads configuration from environment variables.
+
+[buffer]
+# How much footage before the trigger instant is written into the clip.
+pre_seconds = 30
+# How much footage after the trigger instant is written into the clip.
+post_seconds = 5
+# Seconds per scratch segment. This also sets the keyframe interval, and
+# therefore the granularity of lossless trimming (cuts snap to <= this value).
+# Lower = more precise cuts, higher = larger files.
+segment_time = 1
+# Hard ceiling on the scratch directory, in bytes. Oldest segments are evicted
+# first once this is exceeded. Default: 2 GiB.
+scratch_cap_bytes = 2147483648
+# Empty = %LOCALAPPDATA%\localplay\scratch
+scratch_dir = ""
+
+[encode]
+# auto | nvenc | qsv | amf
+# "auto" probes the GPU and picks the first available hardware encoder.
+# If none is available localplay exits with an error rather than falling back
+# to CPU encoding.
+vendor = "auto"
+# h264 | hevc
+codec = "h264"
+bitrate_kbps = 20000
+fps = 60
+# Empty = capture at native resolution. Otherwise "WIDTHxHEIGHT", e.g. "1920x1080".
+output_size = ""
+
+[storage]
+# Empty = %LOCALAPPDATA%\localplay\clips
+clips_dir = ""
+# Default: 50 GiB. Favourited clips are exempt from this cap.
+max_total_bytes = 53687091200
+# Favourited clips are exempt from this limit.
+max_age_days = 7
+
+[hotkeys]
+clip = "Ctrl+F8"
+
+[events]
+lol_poll_enabled = true
+gsi_port = 45671
