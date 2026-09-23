@@ -46,10 +46,12 @@ pub const POST_ROLL_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 /// that follows. Generous on purpose: a trigger that gives up early loses the clip the
 /// user just asked for, and the wait is invisible to them.
 ///
-/// It also carries one unit conversion: the budget is wall clock while `post_ms` is
-/// media time, and on real hardware the media timeline runs slower than the wall clock
-/// (measured 0.81x), so `post_ms` of media costs ~1.23x `post_ms` of waiting. This
-/// margin covers that for any `post_seconds` up to ~20s.
+/// It also carries one unit conversion: the budget is wall clock while `post_ms` is media
+/// time, and media time is only as far ahead as the ing has *finished writing*. On the
+/// measured 4K box before the timeline fix media ran at 0.81x of the wall clock, which made
+/// `post_ms` of media cost ~1.23x `post_ms` of waiting; the two now advance together, and
+/// this margin covers that case and the encoder's own lag besides, for any `post_seconds` up
+/// to ~20s.
 pub const POST_ROLL_MARGIN: Duration = Duration::from_secs(5);
 
 /// How far the pacer may fall behind the wall clock before it resynchronises.
@@ -363,9 +365,9 @@ pub fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 /// `budget` bounds the wait, measured from this call. Callers size it from the
 /// post-roll they are waiting for plus a margin ([`POST_ROLL_MARGIN`]) rather than from
 /// a constant, because the wait itself lasts at least the remaining post-roll. Note the
-/// two clocks in one call: `need_ms` and the span are media time, `budget` is wall
-/// clock, and on real hardware the former advances slower than the latter (measured
-/// 0.81x) — which is why the caller adds a margin rather than passing a bare `post_ms`.
+/// two clocks in one call: `need_ms` and the span are media time, `budget` is wall clock.
+/// They now advance together (the timeline fix), but media time still only counts segments
+/// ffmpeg has finished, so the caller adds a margin rather than passing a bare `post_ms`.
 ///
 /// Returns the counts of what it pumped while waiting, so the caller's `frames=` and
 /// `skipped=` account for every frame that reached the encoder — including the ones the
@@ -420,13 +422,14 @@ pub fn pump_until_span(
 
 /// The rate frames are actually reaching the encoder at, averaged over `window`.
 ///
-/// This is the number that decides whether media time tracks real time (the difference
-/// between a clip's configured `pre_seconds` and the real seconds it covers), so it is
-/// worth measuring honestly rather than inferring from the slope of `frames=` in a log:
-/// it counts the frames that got past the encoder's queue, not the ones the pacer admitted
-/// (the two differ exactly when the machine cannot encode at the configured rate — the
-/// case this is here to expose) and not the ones the source offered (which the pacer
-/// discards on purpose, see [`CaptureBackend::discard_pending`]).
+/// This is the rate the *encoder child is given frames at* — not the rate the pacer admitted,
+/// and not the rate the source offered. The three differ exactly when the machine cannot
+/// encode the declared rate (the case this is here to expose), and the gap between the first
+/// two is what the drop warning is about: frames that were captured, copied and never
+/// encoded, so the picture holds instead. It does **not** decide whether media time tracks
+/// real time — that is the frames' arrival timestamps (see `localplay_encoder::ffmpeg`), and
+/// it holds at any rate including this one, which is why the warning it feeds no longer
+/// claims otherwise.
 ///
 /// `record` is called on every pump with the frames that survived since the previous call,
 /// so the measurement covers the whole run rather than whichever instant a log line

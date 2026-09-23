@@ -91,8 +91,8 @@ impl Config {
         // an error, and the engine would clamp it to 1 rather than guess. Say so instead.
         if self.encode.fps == 0 {
             bail!(
-                "encode.fps must be at least 1: it is the frame rate the pipeline declares \
-                 (and measures itself against — see encode.adapt_fps)"
+                "encode.fps must be at least 1: it is the ceiling on the frame rate the \
+                 pipeline paces to (it measures itself against this — see encode.adapt_fps)"
             );
         }
         Ok(())

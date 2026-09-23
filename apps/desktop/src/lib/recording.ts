@@ -47,10 +47,12 @@ export function recordingLabel(status: RecordingStatus | null): string {
  *
  * The denominator is `effective_fps`, not `configured_fps`: the engine measures what this
  * machine can sustain at the captured resolution and paces to `min(configured, measured)`
- * (`encode.adapt_fps`, spec §10.1), so the effective rate is the one the media timeline is
- * being recorded at. When it is below what the config asked for, the readout says so —
- * otherwise a machine that cannot hold the configured rate would look like a permanent
- * shortfall rather than the decision the engine actually made.
+ * (`encode.adapt_fps`, spec §10.1). That is a *pacing* decision — capture work not spent on
+ * frames the encoder would drop — not the rate the media timeline is recorded at: the
+ * timeline is the frames' arrival timestamps and tracks the wall clock at any rate. When the
+ * effective rate is below what the config asked for, the readout says so — otherwise a
+ * machine that cannot hold the configured rate would look like a permanent shortfall rather
+ * than the decision the engine actually made.
  *
  * `localplay-recorder` measures the achieved rate over a one-second window and reports 0.0
  * until the first window closes, deliberately (a rate over 200ms is noise). So a running

@@ -6,10 +6,19 @@
 //! `-framerate`, and the [`crate::pump::FramePacer`] that decides how often a frame may be
 //! taken off the capture backend. While those two numbers were *both* the configured
 //! `encode.fps`, a machine that could not encode that rate dropped the surplus in the
-//! encoder's bounded queue and recorded a timeline that did not match its own duration:
-//! measured on real 4K hardware, ~24fps sustained against a configured 30 with ~45% of
-//! delivered frames dropped (issue #1), and a media timeline that advanced at a fraction of
-//! real time, so a `pre_seconds = 10` clip covered more than ten real seconds (issue #2).
+//! encoder's bounded queue: measured on real 4K hardware, ~24fps sustained against a
+//! configured 30 with ~45% of delivered frames dropped (issue #1).
+//!
+//! What made that a *timeline* defect was **not** the rate either consumer was told. It was
+//! ffmpeg's default constant-rate frame conversion, which turned the declared rate into a
+//! clock: the arrival timestamps were resampled onto a `1/R` grid, missing frames were
+//! invented to fill it, and the media the ring could see advanced at (frames the encoder
+//! could emit) ÷ R — measured on the dev host at 0.64–0.69x of real time against a declared
+//! 120fps with a software 4K encoder. That is fixed in
+//! `localplay_encoder::ffmpeg::video_output_args` (`-fps_mode passthrough`), by construction
+//! and independently of throughput. What is left here is the *pacing* decision: paying a
+//! readback for frames the encoder will throw away is waste, and this is where that is
+//! avoided.
 //!
 //! So the rate is decided **once**, from the configured value and what the encoder was
 //! actually measured to sustain, and that one value is threaded to both consumers:
@@ -26,7 +35,8 @@
 //!   machine that can keep up.
 //! * `encode.adapt_fps = false` skips the measurement entirely (saving its ~1.5s of startup)
 //!   and declares the configured rate regardless. That is the escape hatch, and it is also
-//!   how a user *forces* a rate the probe would otherwise reduce.
+//!   how a user *forces* a rate the probe would otherwise reduce. Its cost is dropped frames
+//!   and the capture work spent on them — no longer a media timeline that drifts.
 
 use localplay_encoder::ThroughputMeasurement;
 

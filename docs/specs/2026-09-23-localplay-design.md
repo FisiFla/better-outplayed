@@ -214,9 +214,11 @@ If no hardware encoder is available the process exits with an actionable error n
 the missing vendor runtime. **There is no silent CPU fallback.**
 
 The chosen encoder is then **measured** before it is used: a bounded throughput probe
-(`localplay_encoder::throughput`) feeds frames at the real capture resolution for 1.5 s
-and reports the rate the machine sustains. The pipeline runs — and declares, to both the
-encoder child and the pacer — the lower of that and `encode.fps` (§10.1, `adapt_fps`).
+(`localplay_encoder::throughput`) feeds frames at the real capture resolution for 1.5 s and
+reports the rate the machine sustains. The pipeline runs — and declares, to both the encoder
+child and the pacer — the lower of that and `encode.fps` (§10.1, `adapt_fps`). This decides
+how much capture work is spent on frames the encoder keeps; it is not what makes the media
+timeline track real time (see §10.1 and ledger §1).
 
 ### 5.3 `replay` — the core
 
@@ -510,37 +512,43 @@ lol_poll_enabled = true
 gsi_port         = 45671
 ```
 
-### 10.1 `encode.adapt_fps` — the declared rate is the measured rate
+### 10.1 `encode.adapt_fps` — the rate is measured so capture work is not wasted
 
-`fps` is a **ceiling**, not a promise. With `adapt_fps = true` (the default) startup
-probes the selected encoder at the **capture's own resolution** — the bottleneck is
-resolution-dependent, so a small probe frame would not predict the real rate — for a
-bounded budget (1.5 s; one frame at 4K is 33 MB, and the first frame is excluded because
-it carries the encoder's session setup). It counts the frames the encoder actually
-accepted and derives frames per second from the window that elapsed.
+**The media timeline does not depend on this setting.** It is the frame-rate conversion in
+`localplay_encoder::ffmpeg::video_output_args` (`-fps_mode passthrough`) that makes media
+time the arrival time of frames, and therefore the wall clock; that holds at any declared
+rate and at any machine speed (ledger §1, §4). What the measurement decides is how much of
+the capture work is spent on frames the encoder will keep.
 
-The **effective rate is `min(fps, measured)`**, and that single value is what both
-consumers are given: the encoder child's `-framerate` and the capture loop's pacer
-(`FramePacer`). They must be the same number — a pipeline that paces to one rate and
-declares another is a pipeline that lies about its timeline — so the engine derives it
-once and reads the pacer's rate back out of the encoder's own configuration.
+`fps` is a **ceiling**, not a promise. With `adapt_fps = true` (the default) startup probes
+the selected encoder at the **capture's own resolution** — the bottleneck is
+resolution-dependent, so a small probe frame would not predict the real rate — for a bounded
+budget (1.5 s; one frame at 4K is 33 MB, and the first frame is excluded because it carries
+the encoder's session setup). It counts the frames the encoder actually accepted and derives
+frames per second from the window that elapsed.
+
+The **effective rate is `min(fps, measured)`**, and that single value is what both consumers
+are given: the encoder child's `-framerate` and the capture loop's pacer (`FramePacer`).
+They are the same number — the engine derives it once and reads the pacer's rate back out of
+the encoder's own configuration — so `fps=<achieved>/<effective>` in the status line has one
+denominator.
 
 * Measured **at or above** `fps`: nothing changes; the configured rate is used.
-* Measured **below** `fps`: the pipeline records at the measured rate and says so at
-  startup (`WARN`), naming the configured rate, the measured rate, the resolution it was
-  measured at, and what follows (`output_size`/`fps` are the levers). The encoder's drop
-  warning remains as the backstop for a machine whose load changes after startup.
-* `adapt_fps = false`: no measurement, `fps` declared as configured — the pre-adaptation
-  behaviour, where the encoder's bounded queue drops the surplus and the timeline can run
-  slower than real time.
+* Measured **below** `fps`: the pipeline paces at the measured rate and says so at startup
+  (`WARN`), naming the configured rate, the measured rate, the resolution it was measured at,
+  and what follows (`output_size`/`fps` are the levers). The encoder's drop warning remains
+  as the backstop for a machine whose load changes after startup.
+* `adapt_fps = false`: no measurement, `fps` declared as configured. The frames the machine
+  cannot encode are dropped by the encoder's bounded queue and held in the picture; the clock
+  is unaffected, and `dropped=` in the status line counts them.
 
 The measurement is a property of the *encode path* (rawvideo pipe + encoder), not of the
-capture path: it is a faithful number for a hardware encoder (fixed-function, insensitive
-to picture content) and a conservative lower bound for a software one. This is the
-mechanism behind issues #1 and #2: on a 4K box the pipeline declared 30 fps, sustained
-~24, dropped ~45% of frames, and the media timeline did not track real time (the direction
-and magnitude of that divergence are **unresolved** on the box — see the ledger, which
-records both informal measurements and why mtimes cannot settle it).
+capture path, and the difference is not small: on the dev host, at a deliberately
+over-declared 4K output rate, the probe measured **62 fps** and the live pipeline achieved
+**8**. On Windows (NVENC cheap, WGC's 33 MB readback not) the probe is *more* optimistic,
+which is why it cannot be the mechanism behind issues #1/#2 — an earlier change that declared
+`min(configured, measured)` to both consumers did not fix the timeline, and the ledger records
+that plainly.
 
 ---
 

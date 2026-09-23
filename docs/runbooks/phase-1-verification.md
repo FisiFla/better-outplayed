@@ -198,11 +198,13 @@ At startup, on stdout:
     <fps>fps`. Nothing else changes.
   - *reduced* (`WARN`): `encode.fps = <fps> is not achievable at <W>x<H> on this machine:
     <measured>fps sustainable … Capturing at <effective>fps instead …`. The pipeline paces
-    to `<effective>` and the encoder child is told the same number, so **media time still
-    tracks real time** — but criterion 1 *as written* (the configured fps) is not met at
-    this resolution, and the ledger must record it as such. The levers are
+    to `<effective>` and the encoder child is told the same number, so no readback is spent
+    on frames the encoder will drop — but criterion 1 *as written* (the configured fps) is
+    not met at this resolution, and the ledger must record it as such. The levers are
     `encode.output_size` and `encode.fps`; `encode.adapt_fps = false` declares the
-    configured rate anyway and reintroduces the dropped frames.
+    configured rate anyway and accepts the dropped frames. **Neither shape says anything
+    about the media timeline**: media time is the frames' arrival timestamps and tracks the
+    wall clock either way (ledger §1).
 - `buffering <pre>s pre / <post>s post at <fps>fps; press Ctrl+F8 to clip` — `<fps>` is
   the rate the pipeline is running at: your configured `encode.fps` unless the probe above
   reduced it.
@@ -225,9 +227,11 @@ being captured is visible up front.
 `fps=<achieved>/<effective>` is the achieved rate — the frames that actually reached the
 encoder per second, measured over the last second of the run — against the rate the
 pipeline is running at (a fresh run reads `0.0/<effective>` until its first second has been
-measured). It is the number that says whether media time tracks real time: `<effective>` is
-what it must reach. `configured=` is what `encode.fps` asked for, and differs from
-`<effective>` exactly when the startup probe reduced the rate.
+measured). It is the rate the capture path is *delivering* to the encoder, and with
+`dropped=` it says how many captured moments are being held in the picture instead of shown.
+It does **not** decide whether media time tracks real time — that is the frames' arrival
+timestamps, and it holds at any achieved rate (ledger §1). `configured=` is what `encode.fps`
+asked for, and differs from `<effective>` exactly when the startup probe reduced the rate.
 
 `dropped=` (video frames) and `dropped_audio=` (10 ms audio blocks) are the encoder's own
 count of payloads it had to discard because its queue was full during that run: a live

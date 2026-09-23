@@ -45,26 +45,30 @@ pub struct EncodeSection {
     /// Measure the sustainable encode rate at startup and record at the lower of that and
     /// `fps` (default `true`).
     ///
-    /// This is what keeps the recorded media timeline honest. A pipeline that *declares* a
-    /// rate it cannot deliver records a timeline that does not track real time: on real 4K
-    /// hardware a configured 30fps was measured at ~24fps sustained with ~45% of frames
-    /// dropped (issue #1), and a clip configured at `pre_seconds = 10` covered more than ten
-    /// real seconds (issue #2). With this on, the rate the pipeline declares is the rate it
-    /// was measured to be able to hold.
+    /// This is a **pacing** decision, not the timeline's guarantee. It exists so the capture
+    /// does not pay for frames the encoder will throw away: on Windows every captured frame
+    /// costs a GPU-to-CPU readback (33 MB at 4K) whether or not it is ever encoded, so a rate
+    /// the machine cannot hold is wasted work and a choppier picture — on the measured 4K box
+    /// a configured 30fps sustained ~24fps with ~45% of frames dropped (issue #1).
     ///
-    /// The probe costs about 1.5s of startup. Set it to `false` to skip that and declare
-    /// `fps` exactly as configured — the pre-adaptation behaviour, where the encoder's queue
-    /// drops whatever it cannot take and the timeline can run slower than real time. A
-    /// measurement at or above `fps` changes nothing either way.
+    /// What makes the *media timeline* track real time is independent of throughput and of
+    /// this setting: frames carry their arrival timestamps and the encoder no longer resamples
+    /// them onto a declared grid (`localplay_encoder::ffmpeg`), so a `pre_seconds` window is
+    /// that many real seconds on a machine of any speed. With `adapt_fps = false` the frames
+    /// the machine cannot encode are still dropped — the picture holds them — but the clock
+    /// stays honest, and the drop counter in the status line says how many.
+    ///
+    /// The probe costs about 1.5s of startup. Set it to `false` to skip that and declare `fps`
+    /// exactly as configured. A measurement at or above `fps` changes nothing either way.
     #[serde(default = "adapt_fps_default")]
     pub adapt_fps: bool,
     /// `"1920x1080"`, or empty for the capture backend's native size (spec §10).
     pub output_size: String,
 }
 
-/// `encode.adapt_fps` when the file does not mention it: on, because adapting to what the
-/// machine can sustain is the honest behaviour, and it is what this project's own
-/// measurements (issues #1 and #2) say the pipeline needs. A `config.toml` written before
+/// `encode.adapt_fps` when the file does not mention it: on, because not paying a readback
+/// for frames the encoder will drop is the better default, and a rate the machine cannot hold
+/// is worth warning about before recording rather than after. A `config.toml` written before
 /// this key existed keeps working and gets the measured behaviour.
 fn adapt_fps_default() -> bool {
     true

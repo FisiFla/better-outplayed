@@ -1,18 +1,31 @@
 //! How many frames per second this machine can actually encode, measured before it records.
 //!
-//! # Why this exists
+//! # What this is, and what it is NOT
 //!
-//! The pipeline used to *declare* the configured `encode.fps` in two places at once — the
-//! encoder child's `-framerate` and the capture loop's pacer — and simply drop whatever the
-//! encoder could not take. On real 4K hardware that is what happened: ~24fps sustained
-//! against a configured 30, ~45% of delivered frames dropped, and a media timeline that ran
-//! at a fraction of real time (issues #1 and #2). A pipeline that declares a rate it cannot
-//! deliver is lying about its own timeline in the only place that matters: the encoder's
-//! timestamps are what a clip's duration is made of.
+//! This is a **diagnostic and a pacing aid**. It is not what makes the media timeline track
+//! real time, and no measurement could be: that is the frame-rate conversion being off
+//! ([`video_output_args`]'s `-fps_mode passthrough`), which makes the muxer take each frame's
+//! arrival timestamp instead of resampling it onto a rigid `1/R` grid. That property does not
+//! depend on throughput at all. A machine that cannot keep up now drops frames — visible as a
+//! held frame in the picture — while the clock stays honest.
 //!
-//! So the rate is measured first, at the resolution that will actually be captured, with the
-//! encoder that will actually be used — and the number that comes out is the number the whole
-//! pipeline then declares (see `localplay_recorder::FpsDecision`).
+//! What this number *can* answer is how fast this machine encodes at the resolution and with
+//! the encoder that will actually be used. Pacing capture to it (see
+//! `localplay_recorder::FpsDecision`) stops the pipeline paying for captures — on Windows, a
+//! 33 MB GPU-to-CPU readback each — that the encoder will throw away, and it is how a user
+//! learns that `encode.fps = 30` is not reachable at 4K here. Adapting to it never guaranteed
+//! anything about the timeline, and the ledger says so.
+//!
+//! # Why it cannot be a timeline guarantee
+//!
+//! It measures the *encode path*: raw frames into an encoder, out to the null muxer. The live
+//! pipeline is capture readback + copy + pipe + encode + segment muxing, and the gap between
+//! the two is not small. Measured on the dev host with a deliberately over-declared rate at a
+//! 4K output (software encoder): the probe reported **62fps sustainable**, and the pipeline
+//! then achieved **8 frames a second** end to end. On the Windows box this project is built
+//! for, NVENC is cheap and the WGC readback is not, so the probe's number there is *more*
+//! optimistic, not less — which is why an earlier change that declared
+//! `min(configured, measured)` to the pacer and the encoder did not fix the timeline.
 //!
 //! # What it measures, exactly
 //!
@@ -31,9 +44,10 @@
 //!   detailed moving pattern precisely so that the software case is not flattered (see
 //!   [`probe_frame`]), and the shipping path uses a hardware encoder (spec §3.2).
 //! * **It measures the encode path, not the capture path.** The frames are synthetic: no
-//!   GPU-to-CPU readback, no window composition, no game. A machine whose *capture* cost also
-//!   matters can therefore still fall slightly short of the measured rate; that is what the
-//!   encoder's drop counter and its rate-limited warning remain for.
+//!   GPU-to-CPU readback, no window composition, no game. That is not a rounding error — it
+//!   is the 62-vs-8 above — so the encoder's drop counter and its rate-limited warning remain
+//!   the report of what the *pipeline* actually achieved, and that report is now about held
+//!   frames rather than about a clock that drifts.
 //!
 //! # Bounds
 //!

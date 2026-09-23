@@ -244,13 +244,13 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
 ///
 /// The bug this pins: the CLI used to take `trigger_ms` from the `CaptureClock` (wall
 /// clock) and compare `trigger_ms + post_ms` against the ledger's media-time span. On
-/// the 4K box the media timeline ran at ~0.81x of the wall clock (25 segments written
-/// at 0.81/s, each exactly 1.000000s of media), so a wall-derived target sat ~19%
-/// beyond anything the ledger could ever reach and every press ended in
-/// `timed out ... waiting for post-roll`. The stub pipeline here keeps up (media ~=
-/// wall), so the divergence itself cannot be reproduced off the box; what this test
-/// pins is the property that makes the target reachable — trigger, target and ledger
-/// are one clock — and the window the resulting clip actually covers.
+/// the 4K box the media timeline then ran at ~0.81x of the wall clock (25 segments written
+/// at 0.81/s, each exactly 1.000000s of media — the grid resampling the timeline fix
+/// removed), so a wall-derived target sat ~19% beyond anything the ledger could reach and
+/// every press ended in `timed out ... waiting for post-roll`. Even with the clock fixed
+/// the two are not interchangeable — the ledger only counts segments ffmpeg has finished —
+/// so what this test pins is the property that makes the target reachable at all: trigger,
+/// target and ledger are one clock. Plus the window the resulting clip actually covers.
 #[test]
 fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
     let mut fx = Fixture::new();

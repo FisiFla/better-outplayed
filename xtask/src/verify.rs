@@ -1048,6 +1048,14 @@ impl Session {
 
             // Media time against the wall clock, measured the way the ledger says: from
             // `span=` between two timestamped status lines. Not from file mtimes.
+            //
+            // This is the check for the timeline fix itself, and it is deliberately a
+            // *hardware* check: the property must hold when the machine cannot keep up, and
+            // only a real soak can show that. The frame-rate conversion is off
+            // (`-fps_mode passthrough`), so frames carry their arrival timestamps and this
+            // ratio is ~1.0 by construction whatever the delivered rate is — which is why
+            // it no longer depends on whether the startup probe adapted the rate (the
+            // `frame_rate`/`configured_rate_reached` checks above cover that separately).
             if let (Some((Some(t0), first)), Some((Some(t1), last))) = (parsed.first(), parsed.last()) {
                 let wall_ms = t1.saturating_sub(*t0) as f64;
                 let span_ms = last.span_ms.saturating_sub(first.span_ms) as f64;
@@ -1062,7 +1070,7 @@ impl Session {
                     self.hardware_check(
                         "media_vs_real_time",
                         "media time tracks the wall clock",
-                        "criterion 1 / the ledger's unresolved 0.81x-vs-1.11x question",
+                        "criterion 1 / the ledger's 0.81x-vs-1.11x question, settled by the timeline fix",
                         "0.9 <= span-per-second <= 1.1",
                         &measured,
                         if (0.9..=1.1).contains(&ratio) {
@@ -1079,7 +1087,7 @@ impl Session {
                     self.not_performed(
                         "media_vs_real_time",
                         "media time tracks the wall clock",
-                        "criterion 1 / the ledger's unresolved 0.81x-vs-1.11x question",
+                        "criterion 1 / the ledger's 0.81x-vs-1.11x question, settled by the timeline fix",
                         "0.9 <= span-per-second <= 1.1",
                         "fewer than 5s of timestamped status lines",
                         "the run is too short to average the ratio; raise --seconds",
@@ -1089,7 +1097,7 @@ impl Session {
                 self.not_performed(
                     "media_vs_real_time",
                     "media time tracks the wall clock",
-                    "criterion 1 / the ledger's unresolved 0.81x-vs-1.11x question",
+                    "criterion 1 / the ledger's 0.81x-vs-1.11x question, settled by the timeline fix",
                     "0.9 <= span-per-second <= 1.1",
                     "status lines carry no parseable timestamps",
                     "the tracing timestamp format could not be parsed",
@@ -1291,7 +1299,7 @@ impl Session {
             self.not_performed(
                 "media_vs_real_time",
                 "media time tracks the wall clock",
-                "criterion 1 / the ledger's unresolved 0.81x-vs-1.11x question",
+                "criterion 1 / the ledger's 0.81x-vs-1.11x question, settled by the timeline fix",
                 "0.9 <= span-per-second <= 1.1",
                 "no status line to read span= from",
                 "the engine's status line never appeared",

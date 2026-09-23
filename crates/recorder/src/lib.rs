@@ -55,8 +55,9 @@
 //! Each of these was paid for once, and each has a test:
 //!
 //! * The trigger is expressed in the **ledger's media time** (`span_ms`), never the wall
-//!   clock, and the post-roll budget is `post_ms + margin`. A wall-clock trigger made the
-//!   post-roll unreachable on hardware whose media timeline runs slower than real time.
+//!   clock, and the post-roll budget is `post_ms + margin`. Media time is the footage the ring
+//!   can prove is on disk, which is the only clock a splice can be cut on — a wall-clock
+//!   trigger asked for footage the encoder might not have written yet.
 //! * The pacer decides **before** the frame is materialised, and non-due frames are
 //!   drained with [`CaptureBackend::discard_pending`] so the GPU readback is skipped.
 //! * The encoder is smoke-tested **before** any capture backend is created, so an
@@ -246,12 +247,15 @@ pub struct RecorderStatus {
     /// The rate the pipeline is actually running at — the pacer's rate and the encoder
     /// child's `-framerate`, one number. Below `configured_fps` when the startup probe
     /// measured that this machine cannot hold the configured rate and adaptation is on
-    /// (startup logs that in as many words). This is the rate the media timeline is being
-    /// recorded at, so it is the rate an achieved-rate readout should be compared against.
+    /// (startup logs that in as many words). It is the rate an achieved-rate readout should
+    /// be compared against; the media timeline does not depend on it (frames carry their
+    /// arrival timestamps).
     pub effective_fps: u32,
-    /// Wall clock minus media time, in ms. Positive means the media timeline is running
-    /// behind real time (the measured 0.81x case), which is why the trigger is taken from
-    /// `span_ms` instead.
+    /// Wall clock minus media time, in ms. Positive means the footage the ring can prove it
+    /// has is behind the wall clock — the ring can only count *finished* segments, so this
+    /// includes the encoder's lag as well as any clock divergence. Expected to stay near its
+    /// start-up offset (ffmpeg's start-up plus one segment) on a healthy machine; the
+    /// trigger's media-time arithmetic is anchored to `span_ms`, so it is worth watching.
     pub drift_ms: i64,
     /// Clips this session has written.
     pub clips: u64,
@@ -652,9 +656,10 @@ impl Recorder {
     ///
     /// The trigger instant is the **ledger's** media time, taken inside the recording
     /// loop at the moment the trigger is handled — not a wall-clock instant sampled here.
-    /// That is the hard-won part: on hardware whose media timeline runs slower than real
-    /// time (measured 0.81x) a wall-clock trigger sits beyond anything the ledger can
-    /// reach, and every press times out.
+    /// That is the hard-won part: the ledger only counts finished segments, so a wall-clock
+    /// trigger can name footage the encoder has not written yet — on the measured 4K box
+    /// (media then running at 0.81x, issue #2) it sat beyond anything the ledger could reach
+    /// and every press timed out.
     ///
     /// Blocks until the clip is written: the post-roll alone is `post_seconds` of media,
     /// and the wait covers it plus a margin. A caller that must stay responsive should run
@@ -777,10 +782,10 @@ struct Engine {
     /// never to pace or to configure the encoder, which is [`Engine::effective_fps`]'s job.
     configured_fps: u32,
     /// The rate the pipeline is actually running at: the pacer's interval and the encoder
-    /// child's `-framerate`. The status line's denominator is this value, because it is the
-    /// rate the media timeline is being recorded at — and the drop warning compares the
-    /// achieved rate against it, because "the encoder cannot sustain the rate it was told"
-    /// is the condition that warning exists for.
+    /// child's `-framerate`. The status line's denominator is this value, and the drop warning
+    /// compares the achieved rate against it, because "the encoder cannot sustain the rate it
+    /// was told" is the condition that warning exists for — frames captured and never encoded,
+    /// which the picture holds through.
     effective_fps: u32,
     /// The last rate a window closed on, published on every pump and logged on every tick.
     achieved: f64,
@@ -913,10 +918,18 @@ impl Engine {
         // A rising `dropped=` means the encoder's queue is overflowing while the pacer
         // admits at most the rate the pipeline is running at: the machine cannot encode that
         // rate *now* — after a startup measurement said it could, and after the pacer was
-        // set to it. That must be loud rather than inferred, because its consequence is a
-        // *timeline* one, not just a quality one. This is the backstop for a load that
-        // changed since startup; when it fires, the recording's media time is again running
-        // slower than the wall clock.
+        // set to it. That must be loud rather than inferred, because it is a *capture* fact,
+        // not a quality setting: every dropped frame is a moment of the recording that will
+        // be held on the previous picture instead of shown.
+        //
+        // What it is NOT any more is a timeline warning. The media clock is the frames'
+        // arrival timestamps (`-fps_mode passthrough`, see `localplay_encoder::ffmpeg`), so
+        // the `span=` in the status line keeps tracking the wall clock and a `pre_seconds`
+        // window is still that many real seconds even while this warning is firing: measured
+        // on the dev host, a 4K output fed at ~45fps against a declared 120 (1172 of 1801
+        // frames dropped by the queue) still wrote one 1s segment per second of wall clock
+        // and a 3-segment clip covering ~2.8s of real footage. The warning is therefore
+        // about the picture, and the wording below says so.
         let dropped_since_last = dropped.saturating_sub(self.last_warned_dropped);
         let warn_due = self
             .last_drop_warning
@@ -931,8 +944,9 @@ impl Engine {
                 "the encoder cannot sustain the {}fps it was told: only {:.1} frames per \
                  second are reaching it, and its queue is dropping the rest ({} since the \
                  last report, {dropped} in total) even though the pacer admits at most the \
-                 same {}fps. Media time will not track real time, so a pre_seconds clip will \
-                 correspond to more real seconds than configured. Lower encode.fps, or set \
+                 same {}fps. The recording's clock is still the wall clock, so a clip still \
+                 covers the seconds it says it does — but every dropped frame is a moment \
+                 the picture will hold the previous frame through. Lower encode.fps, or set \
                  encode.output_size smaller.",
                 self.effective_fps,
                 self.achieved,
@@ -969,18 +983,21 @@ impl Engine {
         // are then all on that same clock, so the post-roll target is reachable by
         // construction.
         //
-        // Consequence, stated on purpose: with media at 0.81x, the default
-        // `pre_seconds = 10` of media is ~12.3s of real time, and the clip is "the last
-        // 10s of captured media" rather than the last 10s of real time. That is the only
-        // self-consistent meaning until the timeline divergence itself is fixed
-        // (deferred). If the buffer holds less than `pre_ms` of media at the trigger,
-        // `RingBuffer::trigger` already warns and splices the truncated front — that path
-        // is unchanged.
+        // Consequence of measuring in media time: `pre_seconds` means seconds of *recorded
+        // footage*, and a clip is spliced from whole segments, so it can run up to one
+        // segment past the request but cannot fall short of it (the post-roll is waited for).
+        // Since the timeline fix (frames carry their arrival timestamps, see
+        // `localplay_encoder::ffmpeg`) media time and the wall clock advance together, so
+        // "10s of footage" and "10 real seconds" now agree on a machine of any speed — the
+        // earlier divergence, media at 0.81x, is what the ledger records as fixed. If the
+        // buffer holds less than `pre_ms` of media at the trigger, `RingBuffer::trigger`
+        // already warns and splices the truncated front — that path is unchanged.
         let trigger_ms = self.ring.stats().span_ms;
-        // Wall-clock value, kept for telemetry only: nothing below reads it, because
-        // mixing the two clocks is what made the post-roll unreachable. Logged next to
-        // the media value so the divergence is observable in a soak — `drift` is wall
-        // minus media and grows by ~190ms per second of capture at 0.81x.
+        // Wall-clock value, kept for telemetry only: nothing below reads it, because mixing
+        // the two clocks is what made the post-roll unreachable. Logged next to the media
+        // value so the two can be compared in a soak: `drift` is wall minus media and should
+        // sit still (at the encoder's start-up offset plus the segment ffmpeg is still
+        // appending to) rather than grow.
         let wall_ms = self.clock.ms_at(Instant::now());
         // The line describes the instant of the trigger, which is the same whether a
         // hotkey, a button or a game event asked for the clip; what the reason adds is who
@@ -993,12 +1010,11 @@ impl Engine {
 
         // Wait for the post-roll to be written before splicing (spec §6.2 step 2).
         //
-        // The budget is `post_ms` + a margin, never a constant: the trigger instant is
-        // "now" on the media timeline, so the wait covers the whole post-roll —
-        // `post_ms` of MEDIA, which at the measured 0.81x is ~1.23x that in wall clock —
-        // and a budget that did not account for that would time out on itself (see
-        // `POST_ROLL_MARGIN`). The margin also absorbs the segment ffmpeg is still
-        // appending to, whose length is `buffer.segment_time`.
+        // The budget is `post_ms` + a margin, never a constant: the trigger instant is "now"
+        // on the media timeline and the wait covers the whole post-roll, which is `post_ms` of
+        // media — real seconds, one for one, but still invisible to the ring until ffmpeg has
+        // finished the segment carrying them. The margin absorbs that segment plus the
+        // encoder's own lag (see `POST_ROLL_MARGIN`).
         let need_ms = trigger_ms + self.post_ms;
         let budget = Duration::from_millis(self.post_ms) + POST_ROLL_MARGIN;
         let counts = pump_until_span(
@@ -1157,18 +1173,22 @@ fn resolve_encoder(
 ///
 /// This line is a deliverable, not a debug aid. It is the difference between "capture is
 /// running at 24fps" as an unexplained number and as a measured fact about *this* machine at
-/// *this* resolution — and it is the only place that names the consequence: the recorded
-/// media timeline tracks real time because the rate declared is the rate measured, so a
-/// configured `pre_seconds` of footage is that many real seconds.
+/// *this* resolution — and it is the number that decides how much of the capture work is
+/// spent on frames the encoder will keep.
+///
+/// It is **not** the timeline guarantee, and the text below must not claim to be: the media
+/// timeline is the frames' arrival timestamps and does not depend on this measurement at all
+/// (see `localplay_encoder::throughput` for the 62-measured-vs-8-achieved measurement that
+/// settled that). What adapting buys is the capture work of frames that would be dropped, and
+/// a warning a user can act on before recording instead of after.
 ///
 /// Nothing here is printed from the *configured* value when the effective one differs: a
 /// reader must never have to work out which of the two is in force.
 ///
 /// * **Reduced** (`WARN`) — the configured rate is not achievable here. It says what was
-///   measured, what the pipeline therefore runs at, why that is the honest choice, and how a
-///   user who wants a higher rate can get one (a smaller output size, or a lower fps), plus
-///   the escape hatch (`adapt_fps = false`) and what it costs (dropped frames and a media
-///   timeline that runs slower than real time).
+///   measured, what the pipeline therefore runs at, how a user who wants a higher rate can get
+///   one (a smaller output size, or a lower fps), plus the escape hatch (`adapt_fps = false`)
+///   and what it costs (dropped frames: moments of the recording held on the previous frame).
 /// * **Not reduced** (`INFO`) — one short line, because there is nothing to warn about and a
 ///   user should still be able to see that the measurement happened and what it said.
 /// * **Not measured at all** (`INFO`) — adaptation is off; say so, since the absence of a
@@ -1178,8 +1198,9 @@ fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) 
         tracing::info!(
             "encode rate: not measured (encode.adapt_fps = false), so capture runs at the \
              configured {}fps at {}x{} whatever this machine can sustain: the encoder's queue \
-             will drop any frame it cannot take, and the recorded timeline can then run slower \
-             than real time",
+             will drop any frame it cannot take, so the picture can hold frames the machine \
+             could not encode. The media timeline is unaffected — it is the frames' arrival \
+             timestamps",
             decision.configured(),
             native.0,
             native.1
@@ -1208,12 +1229,14 @@ fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) 
     if decision.reduced() {
         tracing::warn!(
             "encode.fps = {} is not achievable at {}x{} on this machine: {measured}. Capturing \
-             at {}fps instead — the same rate the encoder child is told — so that the media \
-             timeline tracks real time and a configured pre_seconds of footage is that many \
-             real seconds. The configured rate was not reached at this resolution: lower \
-             encode.output_size (e.g. \"1920x1080\") or encode.fps to a rate this machine \
-             holds, or set encode.adapt_fps = false to declare {}fps anyway and accept dropped \
-             frames and a timeline that runs slower than real time.",
+             at {}fps instead — the same rate the encoder child is told — so that the capture \
+             is not paying a readback and a copy for frames the encoder will throw away. The \
+             media timeline does not depend on this rate: frames carry their arrival \
+             timestamps, so a clip covers the seconds it was captured over either way. The \
+             configured rate was not reached at this resolution: lower encode.output_size \
+             (e.g. \"1920x1080\") or encode.fps to a rate this machine holds, or set \
+             encode.adapt_fps = false to declare {}fps anyway and accept the frames that will \
+             be dropped and held in the picture.",
             decision.configured(),
             native.0,
             native.1,

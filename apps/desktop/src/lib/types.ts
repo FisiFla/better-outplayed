@@ -93,7 +93,11 @@ export interface RecordingStatus {
    * resolution, in which case the engine logged why (`encode.adapt_fps`, spec §10.1).
    */
   effective_fps: number;
-  /** Wall clock minus media time, ms. Positive means media time is behind real time. */
+  /**
+   * Wall clock minus media time, ms. Positive means the footage the ring can prove it has is
+   * behind the wall clock — the ring counts finished segments, so this includes ffmpeg's lag
+   * as well as any clock divergence. Steady on a healthy machine, not a rate to watch.
+   */
   drift_ms: number;
   /** Clips written this session. */
   clips: number;
