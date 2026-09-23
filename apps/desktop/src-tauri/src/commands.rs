@@ -815,6 +815,13 @@ pub struct RecordingStatusDto {
     pub fps: f64,
     /// What `encode.fps` asked for, to show the two side by side.
     pub configured_fps: u32,
+    /// The rate the pipeline is actually running at — the pacer's rate and the encoder
+    /// child's `-framerate`, one number, chosen at startup from what the throughput probe
+    /// measured. Equal to `configured_fps` unless this machine could not hold the
+    /// configured rate at the captured resolution, in which case the engine has already
+    /// logged why. It is the rate the media timeline is recorded at, so it is what an
+    /// achieved-rate readout belongs next to.
+    pub effective_fps: u32,
     /// Wall clock minus media time, in ms. Positive means the media timeline is behind
     /// real time, which is why a trigger is taken from `span_ms` rather than the clock.
     pub drift_ms: i64,
@@ -837,6 +844,7 @@ impl From<RecorderStatus> for RecordingStatusDto {
             skipped: status.skipped,
             fps: status.fps,
             configured_fps: status.configured_fps,
+            effective_fps: status.effective_fps,
             drift_ms: status.drift_ms,
             clips: status.clips,
             error: status.error,
@@ -1813,6 +1821,7 @@ mod tests {
         assert_eq!(status, RecordingStatusDto::from(RecorderStatus::stopped()));
         assert!(!status.running, "a shell that has never recorded reports not running");
         assert_eq!(status.configured_fps, 0, "and claims no configured rate");
+        assert_eq!(status.effective_fps, 0, "nor a rate in use");
         assert_eq!(status.error, None);
     }
 
@@ -2002,6 +2011,7 @@ mod tests {
                 "drift_ms",
                 "dropped",
                 "dropped_audio",
+                "effective_fps",
                 "error",
                 "fps",
                 "frames",

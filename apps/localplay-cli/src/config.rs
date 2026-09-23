@@ -86,6 +86,15 @@ impl Config {
         if self.buffer.post_seconds == 0 {
             bail!("buffer.post_seconds must be at least 1 second");
         }
+        // The rate the pipeline declares to the encoder (its `-framerate`) and paces capture
+        // to. Zero is not a rate: it makes `1 / fps` meaningless and ffmpeg's `-framerate 0`
+        // an error, and the engine would clamp it to 1 rather than guess. Say so instead.
+        if self.encode.fps == 0 {
+            bail!(
+                "encode.fps must be at least 1: it is the frame rate the pipeline declares \
+                 (and measures itself against — see encode.adapt_fps)"
+            );
+        }
         Ok(())
     }
 }
@@ -130,6 +139,46 @@ mod tests {
             .replace("gsi_port = 45671", "gsi_port = 0");
         let cfg = Config::from_toml(&text).expect("0 is a valid setting");
         assert_eq!(cfg.events.gsi_port, 0);
+    }
+
+    /// The frame rate is what the pipeline declares and paces to, so zero has to fail with a
+    /// sentence rather than be silently clamped to 1 by the engine.
+    #[test]
+    fn rejects_a_zero_frame_rate() {
+        let text = include_str!("../../../config.example.toml").replace("fps = 60", "fps = 0");
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(err.to_string().contains("encode.fps"), "got: {err}");
+    }
+
+    /// The example enables adaptation, so a fresh install measures what the machine can hold
+    /// (the behaviour issues #1 and #2 need); a file without the key gets it too, and the
+    /// opt-out is honoured. Parsed through the CLI's own reader, which is what runs.
+    #[test]
+    fn the_example_enables_adaptation_and_the_key_can_turn_it_off() {
+        let example = Config::from_toml(include_str!("../../../config.example.toml"))
+            .expect("the example is valid");
+        assert!(example.encode.adapt_fps, "config.example.toml must enable adaptation");
+
+        let text = include_str!("../../../config.example.toml")
+            .replace("adapt_fps = true", "adapt_fps = false");
+        let off = Config::from_toml(&text).expect("false is a valid setting");
+        assert!(!off.encode.adapt_fps);
+
+        // And a file that never mentions the key still adapts: the default lives in the
+        // shared section type, which this reader deserialises.
+        let text = include_str!("../../../config.example.toml")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("adapt_fps"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("fps = 60")
+                && !text.lines().any(|l| l.trim_start().starts_with("adapt_fps =")),
+            "the setting must be gone from the text being parsed (a comment mentioning the \
+             key is fine — the point is that no value is set)"
+        );
+        let default = Config::from_toml(&text).expect("the key is optional");
+        assert!(default.encode.adapt_fps, "the default is measured behaviour, not silence");
     }
 
     #[test]

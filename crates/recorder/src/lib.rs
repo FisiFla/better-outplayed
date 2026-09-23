@@ -68,6 +68,7 @@
 //!   fps=`) stays observable, and `running`/counters stay readable from another thread.
 
 pub mod config;
+pub mod fps;
 pub mod index;
 pub mod pump;
 
@@ -75,6 +76,7 @@ pub mod pump;
 mod tests;
 
 pub use config::{BufferSection, EncodeSection, StorageSection};
+pub use fps::FpsDecision;
 pub use index::{
     cleanup_pass, index_clip, index_event, now_ms, open_clip_index, unix_seconds, CleanupReport,
 };
@@ -89,7 +91,9 @@ use localplay_capture::platform::{default_audio_backend, default_video_backend};
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::probe::select_vendor;
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, Vendor, VideoCodec};
+use localplay_encoder::{
+    EncodeConfig, Encoder, FfmpegEncoder, ThroughputMeasurement, Vendor, VideoCodec,
+};
 use localplay_events::{CaptureClock, GameEvent};
 use localplay_media::FfmpegBinaries;
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
@@ -239,6 +243,12 @@ pub struct RecorderStatus {
     pub fps: f64,
     /// What `encode.fps` asked for, so the two can be shown side by side.
     pub configured_fps: u32,
+    /// The rate the pipeline is actually running at — the pacer's rate and the encoder
+    /// child's `-framerate`, one number. Below `configured_fps` when the startup probe
+    /// measured that this machine cannot hold the configured rate and adaptation is on
+    /// (startup logs that in as many words). This is the rate the media timeline is being
+    /// recorded at, so it is the rate an achieved-rate readout should be compared against.
+    pub effective_fps: u32,
     /// Wall clock minus media time, in ms. Positive means the media timeline is running
     /// behind real time (the measured 0.81x case), which is why the trigger is taken from
     /// `span_ms` instead.
@@ -264,6 +274,7 @@ impl RecorderStatus {
             skipped: 0,
             fps: 0.0,
             configured_fps: 0,
+            effective_fps: 0,
             drift_ms: 0,
             clips: 0,
             error: None,
@@ -336,6 +347,10 @@ pub struct Recorder {
     commands: Sender<Command>,
     status: Arc<SharedStatus>,
     configured_fps: u32,
+    /// The rate this pipeline runs at: the pacer's interval and the encoder child's
+    /// `-framerate`, from one decision ([`FpsDecision::effective`]). Equal to
+    /// `configured_fps` unless the probe measured less and adaptation is on.
+    effective_fps: u32,
     /// The loop thread's handle, taken by [`Recorder::stop`]. Behind a mutex so `stop`
     /// can take `&self` and stay callable from a shared `Arc<Recorder>` (which is how the
     /// desktop shell holds one) — and so a second, concurrent `stop` waits for the first
@@ -423,14 +438,59 @@ impl Recorder {
     /// 3. resolve the encoder's vendor with a one-frame smoke test, **before** any capture
     ///    backend exists, so an unusable encoder never opens a session on the display;
     /// 4. create the capture backend and read its native size;
-    /// 5. build the encoder configuration from that size, start the ring, adopt what is
-    ///    already on disk, decide the encoder's first segment number, and spawn ffmpeg;
+    /// 5. build the encoder configuration from that size, **measure what the machine can
+    ///    sustain at that size** and decide the rate the pipeline runs at
+    ///    ([`FpsDecision`]), start the ring, adopt what is already on disk, decide the
+    ///    encoder's first segment number, and spawn ffmpeg;
     /// 6. start capture and audio;
     /// 7. spawn the pump loop.
     ///
     /// Nothing is captured before step 6, so the segment numbering decided in step 5
-    /// cannot miss footage.
+    /// cannot miss footage — and the throughput probe in step 5 runs before the capture
+    /// session exists, so a probe failure costs a startup error rather than a session on
+    /// the user's display.
     pub fn start(cfg: RecorderConfig) -> Result<Recorder> {
+        // The shipping measurement: the selected encoder, at the capture's own size, for a
+        // bounded budget. The binaries are cloned into the closure so the probe does not
+        // borrow `cfg` while it is being moved into `start_with_measure`.
+        let bin = cfg.bin.clone();
+        Self::start_with_measure(cfg, &move |encode_cfg| {
+            localplay_encoder::throughput::measure_sustainable_fps(
+                &bin,
+                encode_cfg,
+                localplay_encoder::throughput::PROBE_BUDGET,
+            )
+        })
+    }
+
+    /// [`Recorder::start`], with the throughput measurement injected.
+    ///
+    /// Split out so the *decision* — and, with it, the pairing of the pacer's rate with the
+    /// encoder child's — can be tested without a machine whose encoder is slow: a test hands
+    /// in a measurement of its own and asserts what the pipeline did with it. Production
+    /// passes [`localplay_encoder::throughput::measure_sustainable_fps`].
+    ///
+    /// # The one rate
+    ///
+    /// [`FpsDecision::effective`] is written into `encode_cfg.fps` **once**, and both
+    /// consumers read that field:
+    ///
+    /// * [`spawn_encoder`] hands the whole configuration to
+    ///   [`localplay_encoder::FfmpegEncoder::spawn`], whose `-framerate` comes from
+    ///   `EncodeConfig::fps` (`localplay_encoder::video_input_args` — the same function the
+    ///   probe itself used, so the number measured and the number recorded are one argument);
+    /// * the [`FramePacer`] is built from `encode_cfg.fps` — the encoder's own field, not
+    ///   `cfg.encode.fps` and not a second computation of the minimum.
+    ///
+    /// That is deliberate and it is the whole of the fix: the pacer admits what the encoder
+    /// was told, so the pipeline cannot declare a rate it does not deliver. If they are ever
+    /// computed separately they can disagree — that is how issues #1 and #2 happened — so
+    /// there is one binding, and `tests::the_pacer_and_the_encoder_are_told_the_same_rate`
+    /// fails if a second one appears.
+    fn start_with_measure(
+        cfg: RecorderConfig,
+        measure: &dyn Fn(&EncodeConfig) -> Result<ThroughputMeasurement>,
+    ) -> Result<Recorder> {
         let scratch_dir = cfg.scratch_dir();
         let clips_dir = cfg.clips_dir();
 
@@ -448,6 +508,26 @@ impl Recorder {
         let native = capture.native_size();
 
         let mut encode_cfg = build_encode_config(&cfg, &scratch_dir, codec, vendor, native)?;
+
+        // The rate decision, and the point where the pipeline stops declaring a rate it
+        // cannot deliver. The probe (when it runs) is given the configuration that declares
+        // the *configured* rate — that is part of the invocation being measured — and the
+        // rate it reports is what the whole pipeline then uses.
+        let decision = if cfg.encode.adapt_fps {
+            let measurement = measure(&encode_cfg).with_context(|| {
+                format!(
+                    "measuring the sustainable encode rate with {} at {}x{}",
+                    encode_cfg.encoder_name(),
+                    native.0,
+                    native.1
+                )
+            })?;
+            FpsDecision::decide(cfg.encode.fps, true, Some(measurement))
+        } else {
+            FpsDecision::decide(cfg.encode.fps, false, None)
+        };
+        encode_cfg.fps = decision.effective();
+        log_rate_decision(&decision, encode_cfg.encoder_name(), native);
 
         // The ring is built and adopted *before* the encoder is spawned because the
         // segment number the encoder must continue from is decided from what is already
@@ -479,13 +559,23 @@ impl Recorder {
 
         let (encoder, encoder_name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
         tracing::info!("encoding with {encoder_name}");
+        // The pacer's rate is read back out of the encoder object — i.e. out of the
+        // configuration ffmpeg was actually spawned with — instead of being taken from
+        // `encode_cfg.fps` a second time. That is the structural half of the fix: the pacer
+        // cannot pace to a number the encoder child was not told, whichever way a future edit
+        // rearranges the code around it, and the published rate (`effective_fps` below) is
+        // then the child's own number rather than a belief about it. Read here, before the
+        // encoder is moved into the engine.
+        let encoder_fps = encoder.input_fps();
         // One-line capture-geometry summary so a reader can see the resolution being
-        // captured and that the frame counter starts from zero (criterion 1).
+        // captured and that the frame counter starts from zero (criterion 1). The rate is
+        // the one the pipeline is running at; when it is below the configured rate, the
+        // adaptation line above says so and why.
         tracing::info!(
             "capture geometry {}x{} at {}fps (frame counter starts at 0)",
             native.0,
             native.1,
-            cfg.encode.fps
+            encoder_fps
         );
 
         capture.start()?;
@@ -499,7 +589,10 @@ impl Recorder {
             scratch_cap_bytes: buffer_cfg.scratch_cap_bytes,
             storage: cfg.storage.clone(),
             cleanup,
-            pacer: FramePacer::new(cfg.encode.fps),
+            // The pacer paces to the rate the encoder child was told — read back from the
+            // encoder itself, so the two cannot disagree. See this function's doc comment:
+            // that agreement is the whole fix.
+            pacer: FramePacer::new(encoder_fps),
             capture,
             audio,
             encoder,
@@ -508,7 +601,8 @@ impl Recorder {
             clock: CaptureClock::new(),
             status: Arc::clone(&status),
             rate: RateMeter::new(RATE_WINDOW),
-            configured_fps: cfg.encode.fps,
+            configured_fps: decision.configured(),
+            effective_fps: encoder_fps,
             frames: 0,
             skipped: 0,
             achieved: 0.0,
@@ -526,7 +620,8 @@ impl Recorder {
         Ok(Recorder {
             commands,
             status,
-            configured_fps: cfg.encode.fps,
+            configured_fps: decision.configured(),
+            effective_fps: encoder_fps,
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -546,6 +641,7 @@ impl Recorder {
             skipped: status.skipped.load(Ordering::Relaxed),
             fps: f64::from_bits(status.fps.load(Ordering::Relaxed)),
             configured_fps: self.configured_fps,
+            effective_fps: self.effective_fps,
             drift_ms: status.drift_ms.load(Ordering::Relaxed),
             clips: status.clips.load(Ordering::Relaxed),
             error,
@@ -676,8 +772,16 @@ struct Engine {
     /// signature of this optimisation working: the surplus is being skipped cheaply
     /// instead of being copied and then dropped.
     skipped: u64,
-    /// What `encode.fps` asked for, for the status line and the drop warning.
+    /// What `encode.fps` asked for. Reported (`RecorderStatus::configured_fps`), and used
+    /// in the drop warning to say *why* the rate in use may be lower than requested —
+    /// never to pace or to configure the encoder, which is [`Engine::effective_fps`]'s job.
     configured_fps: u32,
+    /// The rate the pipeline is actually running at: the pacer's interval and the encoder
+    /// child's `-framerate`. The status line's denominator is this value, because it is the
+    /// rate the media timeline is being recorded at — and the drop warning compares the
+    /// achieved rate against it, because "the encoder cannot sustain the rate it was told"
+    /// is the condition that warning exists for.
+    effective_fps: u32,
     /// The last rate a window closed on, published on every pump and logged on every tick.
     achieved: f64,
     /// The dropped count as of the last time each of the two consumers looked at it: the
@@ -780,11 +884,13 @@ impl Engine {
         // either submitted to the encoder or skipped without the readback, so `frames=` +
         // `skipped=` is the source's own rate. `fps=` is the achieved rate over the last
         // `RATE_WINDOW` — the frames that actually reached the encoder per second —
-        // printed against the configured rate so a shortfall is readable at a glance
-        // instead of inferred from a counter's slope.
+        // printed against the rate the pipeline is running at, so a shortfall is readable at
+        // a glance instead of inferred from a counter's slope. `configured=` carries what
+        // `encode.fps` asked for, which differs from that rate exactly when the startup
+        // probe measured less and adaptation is on (the startup line says so in words).
         tracing::debug!(
             "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} \
-             skipped={} fps={:.1}/{}",
+             skipped={} fps={:.1}/{} configured={}",
             self.frames,
             stats.segments,
             stats.bytes_on_disk,
@@ -793,6 +899,7 @@ impl Engine {
             self.encoder.dropped_audio_blocks(),
             self.skipped,
             self.achieved,
+            self.effective_fps,
             self.configured_fps
         );
         if stats.bytes_on_disk > self.scratch_cap_bytes {
@@ -804,9 +911,12 @@ impl Engine {
         }
 
         // A rising `dropped=` means the encoder's queue is overflowing while the pacer
-        // admits at most the configured rate: the machine cannot encode that rate. That
-        // must be loud rather than inferred, because its consequence is a *timeline* one,
-        // not just a quality one.
+        // admits at most the rate the pipeline is running at: the machine cannot encode that
+        // rate *now* — after a startup measurement said it could, and after the pacer was
+        // set to it. That must be loud rather than inferred, because its consequence is a
+        // *timeline* one, not just a quality one. This is the backstop for a load that
+        // changed since startup; when it fires, the recording's media time is again running
+        // slower than the wall clock.
         let dropped_since_last = dropped.saturating_sub(self.last_warned_dropped);
         let warn_due = self
             .last_drop_warning
@@ -818,16 +928,16 @@ impl Engine {
         // log line.
         if dropped_since_last > 0 && warn_due && self.achieved > 0.0 {
             tracing::warn!(
-                "the encoder cannot sustain the configured {}fps: only {:.1} frames per \
+                "the encoder cannot sustain the {}fps it was told: only {:.1} frames per \
                  second are reaching it, and its queue is dropping the rest ({} since the \
                  last report, {dropped} in total) even though the pacer admits at most the \
-                 configured {}fps. Media time will not track real time, so a pre_seconds \
-                 clip will correspond to more real seconds than configured. Lower \
-                 encode.fps, or set encode.output_size smaller.",
-                self.configured_fps,
+                 same {}fps. Media time will not track real time, so a pre_seconds clip will \
+                 correspond to more real seconds than configured. Lower encode.fps, or set \
+                 encode.output_size smaller.",
+                self.effective_fps,
                 self.achieved,
                 dropped_since_last,
-                self.configured_fps
+                self.effective_fps
             );
             self.last_drop_warning = Some(Instant::now());
             self.last_warned_dropped = dropped;
@@ -1043,10 +1153,86 @@ fn resolve_encoder(
     Ok((codec, Some(select_vendor(bin, &encode.vendor, codec)?)))
 }
 
+/// The rate decision, said out loud.
+///
+/// This line is a deliverable, not a debug aid. It is the difference between "capture is
+/// running at 24fps" as an unexplained number and as a measured fact about *this* machine at
+/// *this* resolution — and it is the only place that names the consequence: the recorded
+/// media timeline tracks real time because the rate declared is the rate measured, so a
+/// configured `pre_seconds` of footage is that many real seconds.
+///
+/// Nothing here is printed from the *configured* value when the effective one differs: a
+/// reader must never have to work out which of the two is in force.
+///
+/// * **Reduced** (`WARN`) — the configured rate is not achievable here. It says what was
+///   measured, what the pipeline therefore runs at, why that is the honest choice, and how a
+///   user who wants a higher rate can get one (a smaller output size, or a lower fps), plus
+///   the escape hatch (`adapt_fps = false`) and what it costs (dropped frames and a media
+///   timeline that runs slower than real time).
+/// * **Not reduced** (`INFO`) — one short line, because there is nothing to warn about and a
+///   user should still be able to see that the measurement happened and what it said.
+/// * **Not measured at all** (`INFO`) — adaptation is off; say so, since the absence of a
+///   measurement is itself a decision someone made.
+fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) {
+    let Some(m) = decision.measurement() else {
+        tracing::info!(
+            "encode rate: not measured (encode.adapt_fps = false), so capture runs at the \
+             configured {}fps at {}x{} whatever this machine can sustain: the encoder's queue \
+             will drop any frame it cannot take, and the recorded timeline can then run slower \
+             than real time",
+            decision.configured(),
+            native.0,
+            native.1
+        );
+        return;
+    };
+
+    // The size is spelled out from the measurement rather than from the configuration: the
+    // number is a property of the geometry it was taken at, and when the output is scaled
+    // both sizes are part of what was measured (the frames fed *and* the frames encoded).
+    let where_measured = if m.source_size == m.output_size {
+        format!("at {}x{}", m.source_size.0, m.source_size.1)
+    } else {
+        format!(
+            "at {}x{} frames scaled to a {}x{} output",
+            m.source_size.0, m.source_size.1, m.output_size.0, m.output_size.1
+        )
+    };
+    let measured = format!(
+        "{:.1}fps sustainable {where_measured} with {encoder} ({} frames over {:.1}s)",
+        m.fps,
+        m.frames,
+        m.window.as_secs_f64()
+    );
+
+    if decision.reduced() {
+        tracing::warn!(
+            "encode.fps = {} is not achievable at {}x{} on this machine: {measured}. Capturing \
+             at {}fps instead — the same rate the encoder child is told — so that the media \
+             timeline tracks real time and a configured pre_seconds of footage is that many \
+             real seconds. The configured rate was not reached at this resolution: lower \
+             encode.output_size (e.g. \"1920x1080\") or encode.fps to a rate this machine \
+             holds, or set encode.adapt_fps = false to declare {}fps anyway and accept dropped \
+             frames and a timeline that runs slower than real time.",
+            decision.configured(),
+            native.0,
+            native.1,
+            decision.effective(),
+            decision.configured()
+        );
+    } else {
+        tracing::info!(
+            "encode rate: {measured}; encode.fps = {} is within that, so capture runs at the \
+             configured {}fps",
+            decision.configured(),
+            decision.effective()
+        );
+    }
+}
+
 /// The video codec the config asks for. Machine-independent, so it is resolved alongside
 /// the vendor, before any capture backend exists.
-pub fn parse_codec(spec: &str) -> Result<VideoCodec> {
-    match spec {
+pub fn parse_codec(spec: &str) -> Result<VideoCodec> {    match spec {
         "h264" => Ok(VideoCodec::H264),
         "hevc" => Ok(VideoCodec::Hevc),
         other => bail!("unsupported encode.codec: {other}"),

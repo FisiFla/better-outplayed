@@ -192,8 +192,20 @@ At startup, on stdout:
 - `rawvideo -s=<W>x<H> (capture native), encode output <W>x<H>` — the raw-video pipe
   size must equal that same `<W>x<H>`.
 - `encoding with <encoder_name>` — e.g. `encoding with h264_nvenc`.
-- `buffering <pre>s pre / <post>s post at <fps>fps; press Ctrl+F8 to clip` — `<fps>`
-  must equal your configured `encode.fps`.
+- `encode rate: <measured>fps sustainable at <W>x<H> with <encoder_name> (…)` — the startup
+  throughput probe (`encode.adapt_fps`, spec §10.1). Two shapes:
+  - *not reduced*: `…; encode.fps = <fps> is within that, so capture runs at the configured
+    <fps>fps`. Nothing else changes.
+  - *reduced* (`WARN`): `encode.fps = <fps> is not achievable at <W>x<H> on this machine:
+    <measured>fps sustainable … Capturing at <effective>fps instead …`. The pipeline paces
+    to `<effective>` and the encoder child is told the same number, so **media time still
+    tracks real time** — but criterion 1 *as written* (the configured fps) is not met at
+    this resolution, and the ledger must record it as such. The levers are
+    `encode.output_size` and `encode.fps`; `encode.adapt_fps = false` declares the
+    configured rate anyway and reintroduces the dropped frames.
+- `buffering <pre>s pre / <post>s post at <fps>fps; press Ctrl+F8 to clip` — `<fps>` is
+  the rate the pipeline is running at: your configured `encode.fps` unless the probe above
+  reduced it.
 
 Within a few seconds, `seg-000000.mp4`, `seg-000001.mp4`, … appear in
 `%LOCALAPPDATA%\localplay\scratch\`.
@@ -202,13 +214,20 @@ With `RUST_LOG=debug`, every ~200 ms you get a line:
 
 ```
 frames=<n> segments=<n> bytes=<b> span=<ms>ms dropped=<n> dropped_audio=<n> \
-skipped=<n> fps=<achieved>/<configured>
+skipped=<n> fps=<achieved>/<effective> configured=<configured>
 ```
 
 `frames=` is a literal counter of the video frames actually submitted to the encoder
 since startup — not a proxy. At startup the CLI also prints a one-line geometry summary,
 `capture geometry <W>x<H> at <fps>fps (frame counter starts at 0)`, so the resolution
 being captured is visible up front.
+
+`fps=<achieved>/<effective>` is the achieved rate — the frames that actually reached the
+encoder per second, measured over the last second of the run — against the rate the
+pipeline is running at (a fresh run reads `0.0/<effective>` until its first second has been
+measured). It is the number that says whether media time tracks real time: `<effective>` is
+what it must reach. `configured=` is what `encode.fps` asked for, and differs from
+`<effective>` exactly when the startup probe reduced the rate.
 
 `dropped=` (video frames) and `dropped_audio=` (10 ms audio blocks) are the encoder's own
 count of payloads it had to discard because its queue was full during that run: a live
@@ -220,28 +239,22 @@ blocks), so these counters can never be traded for unbounded RAM.
 
 `skipped=` is the other half of `frames=`: the frames the capture backend offered that the
 pacer threw away **without reading their pixels back** (`CaptureBackend::discard_pending`).
-A display that delivers more frames per second than `encode.fps` is the normal case —
-measured on the reference box at 53-75fps delivered against a configured 30 — so
-`skipped=` is expected to be a substantial fraction of `frames=` there, close to
-`(source rate / encode.fps - 1) × frames=`. On a high-refresh display, **`skipped= 0`
-means every surplus frame was read back before being dropped, which is the CPU cost that
-was measured at 50.8% of a core**; that is a failure of this criterion even though the
-recording itself is fine. `frames=` + `skipped=` is the source's own delivery rate.
+A display that delivers more frames per second than the rate the pipeline is running at is
+the normal case — measured on the reference box at 53-75fps delivered against a configured
+30 — so `skipped=` is expected to be a substantial fraction of `frames=` there, close to
+`(source rate / fps - 1) × frames=`. On a high-refresh display, **`skipped= 0` means every
+surplus frame was read back before being dropped, which is the CPU cost that was measured
+at 50.8% of a core**; that is a failure of this criterion even though the recording itself
+is fine. `frames=` + `skipped=` is the source's own delivery rate.
 
-`fps=<achieved>/<configured>` is the achieved rate: the frames that actually reached the
-encoder per second, measured over the last second of the run (so a fresh run reads
-`0.0/<configured>` until its first second has been measured). It is the number that says
-whether media time tracks real time, and on this box the configured value is what it must
-reach.
-
-If the encoder's queue is dropping frames while the pacer admits the configured rate, the
-CLI raises a `WARN` (at most one per 10 s) — `the encoder cannot sustain the configured
-<fps>fps: only <achieved> frames per second are reaching it …`. It names the configured and
-the achieved rate and states the consequence: **media time will not track real time, so a
-`pre_seconds` clip will correspond to more real seconds than configured.** A run that
-prints this warning must not be reported as passing criterion 1 or 2: the machine cannot
-encode that many frames per second at that resolution, and the remedy is a lower
-`encode.fps` or a smaller `encode.output_size`.
+If the encoder's queue is dropping frames *after* the pipeline was paced to the rate it
+measured — a load that changed since startup — the CLI raises a `WARN` (at most one per
+10 s): `the encoder cannot sustain the <effective>fps it was told: only <achieved> frames per
+second are reaching it …`. It names both rates and states the consequence: **media time will
+not track real time, so a `pre_seconds` clip will correspond to more real seconds than
+configured.** A run that prints this warning must not be reported as passing criterion 1 or
+2: the machine cannot encode that many frames per second at that resolution, and the remedy
+is a lower `encode.fps` or a smaller `encode.output_size`.
 
 Segment numbering **continues across runs**. A run started on a scratch directory that
 already holds `seg-000000.mp4`…`seg-000018.mp4` writes `seg-000019.mp4` onward (the CLI

@@ -43,7 +43,14 @@ export function recordingLabel(status: RecordingStatus | null): string {
 }
 
 /**
- * The achieved rate against the configured one — `29.8 / 30 fps`.
+ * The achieved rate against the rate the pipeline is running at — `29.8 / 30 fps`.
+ *
+ * The denominator is `effective_fps`, not `configured_fps`: the engine measures what this
+ * machine can sustain at the captured resolution and paces to `min(configured, measured)`
+ * (`encode.adapt_fps`, spec §10.1), so the effective rate is the one the media timeline is
+ * being recorded at. When it is below what the config asked for, the readout says so —
+ * otherwise a machine that cannot hold the configured rate would look like a permanent
+ * shortfall rather than the decision the engine actually made.
  *
  * `localplay-recorder` measures the achieved rate over a one-second window and reports 0.0
  * until the first window closes, deliberately (a rate over 200ms is noise). So a running
@@ -53,7 +60,10 @@ export function recordingLabel(status: RecordingStatus | null): string {
 export function formatRate(status: RecordingStatus | null): string {
   if (status === null || !status.running) return '—';
   if (!(status.fps > 0)) return 'measuring…';
-  return `${status.fps.toFixed(1)} / ${status.configured_fps} fps`;
+  const rate = `${status.fps.toFixed(1)} / ${status.effective_fps} fps`;
+  return status.effective_fps < status.configured_fps
+    ? `${rate} (${status.configured_fps} configured)`
+    : rate;
 }
 
 /**
@@ -75,9 +85,10 @@ export function formatDrift(status: RecordingStatus | null): string {
  * What the frame accounting says, or `null` when there is nothing to report.
  *
  * `dropped` is the encoder's own count of frames it discarded because its queue was full:
- * the machine cannot encode at `encode.fps`, which is a timeline problem and not only a
- * quality one. `skipped` is the pacer dropping surplus frames *without* reading them back,
- * which is the optimisation working — it is normal and is only mentioned when it happens.
+ * the machine cannot encode the rate the pipeline declared (`effective_fps`), which is a
+ * timeline problem and not only a quality one. `skipped` is the pacer dropping surplus
+ * frames *without* reading them back, which is the optimisation working — it is normal and
+ * is only mentioned when it happens.
  */
 export function describeFrames(status: RecordingStatus | null): string | null {
   if (status === null) return null;
@@ -85,7 +96,7 @@ export function describeFrames(status: RecordingStatus | null): string | null {
   if (status.dropped > 0) {
     parts.push(
       `${status.dropped} frame${status.dropped === 1 ? '' : 's'} dropped by the encoder — ` +
-        `this machine is not keeping up with ${status.configured_fps}fps`,
+        `this machine is not keeping up with the ${status.effective_fps}fps it declared`,
     );
   }
   if (status.skipped > 0) {

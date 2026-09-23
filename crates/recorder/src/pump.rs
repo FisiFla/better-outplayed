@@ -96,6 +96,9 @@ pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Deliberately has no backlog: it is a rate limiter, not a scheduler. Nothing downstream
 /// needs the frames it drops (each one is superseded by the next).
 pub struct FramePacer {
+    /// The rate this pacer admits — the number the encoder child was told, kept so the two
+    /// can be compared from outside (see [`FramePacer::fps`]).
+    fps: u32,
     /// When the next frame may be submitted.
     next_due: Instant,
     /// `1 / fps`. Exact enough as a `Duration` (ns resolution), and unlike an accumulator
@@ -111,14 +114,31 @@ impl FramePacer {
     /// `fps` is clamped to at least 1: the same value drives the encoder's arguments and
     /// `-rate`-style arithmetic, and a zero would be a division by zero rather than a
     /// meaningful "no limit".
+    ///
+    /// **This number must be the same one the encoder child is told.** The pacer admits what
+    /// the encoder is expecting to receive: pace to 30 while the child encodes a declared 24
+    /// (or the other way round) and the pipeline declares a rate it does not deliver, which
+    /// is exactly the defect behind issues #1 and #2. The engine builds both from one
+    /// binding — see `Recorder::start_with_measure` — and `EncodeConfig::fps` is that binding.
     pub fn new(fps: u32) -> Self {
         let fps = fps.max(1);
         let interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
         Self {
+            fps,
             next_due: Instant::now(),
             interval,
             resync_after: interval * PACER_RESYNC_AFTER_INTERVALS,
         }
+    }
+
+    /// The rate this pacer admits, in frames per second.
+    ///
+    /// Exists so the rate the *pacer* is actually running at is observable rather than
+    /// assumed: the engine publishes it (the status line's denominator and
+    /// `RecorderStatus::effective_fps`), and the agreement test between the pacer and the
+    /// encoder child reads it back from both sides.
+    pub fn fps(&self) -> u32 {
+        self.fps
     }
 
     /// Whether a frame is due at `now` — i.e. whether the caller should take one off the

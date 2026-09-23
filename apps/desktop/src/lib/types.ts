@@ -86,6 +86,13 @@ export interface RecordingStatus {
   fps: number;
   /** What `encode.fps` asked for. */
   configured_fps: number;
+  /**
+   * The rate the pipeline is running at: the pacer's interval and the encoder child's
+   * `-framerate`, decided at startup from what the throughput probe measured. Equal to
+   * `configured_fps` unless this machine could not hold the configured rate at the captured
+   * resolution, in which case the engine logged why (`encode.adapt_fps`, spec §10.1).
+   */
+  effective_fps: number;
   /** Wall clock minus media time, ms. Positive means media time is behind real time. */
   drift_ms: number;
   /** Clips written this session. */

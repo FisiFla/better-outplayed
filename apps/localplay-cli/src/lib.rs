@@ -214,10 +214,11 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         Config::from_toml(include_str!("../../../config.example.toml"))?
     };
     let Config { buffer, encode, storage, hotkeys, events, .. } = cfg;
-    // Read before the move: this line is the CLI's own, and it is logged after the engine
-    // is already capturing.
-    let (pre_seconds, post_seconds, fps) =
-        (buffer.pre_seconds, buffer.post_seconds, encode.fps);
+    // Read before the move: these are the CLI's own line (it is logged after the engine is
+    // already capturing). The rate the line prints comes from the engine rather than from
+    // `encode.fps`, because the engine may have measured that this machine cannot hold the
+    // configured rate and is pacing to a lower one — see `RecorderStatus::effective_fps`.
+    let (pre_seconds, post_seconds) = (buffer.pre_seconds, buffer.post_seconds);
 
     let bin = FfmpegBinaries::discover(None)?;
     let hotkey = localplay_events::hotkey::Hotkey::parse(&hotkeys.clip)?;
@@ -248,12 +249,14 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // what only it knows about — and it is emitted at the same point in the sequence it
     // always was. The chord printed is the *parsed* one (its `Display`), so a config that
     // says `ctrl+f8` reads back as `Ctrl+F8` and matches what the desktop shell shows for
-    // the same file.
+    // the same file. The rate is the one the pipeline is running at: when it is below the
+    // configured `encode.fps`, the engine has already logged a warning saying what it
+    // measured and why (see `log_rate_decision` in `localplay-recorder`).
     tracing::info!(
         "buffering {}s pre / {}s post at {}fps; press {} to clip",
         pre_seconds,
         post_seconds,
-        fps,
+        recorder.status().effective_fps,
         hotkey
     );
 

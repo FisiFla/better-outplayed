@@ -71,6 +71,10 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             codec: "h264".to_string(),
             bitrate_kbps: 2_000,
             fps: FPS,
+            // The shipping default. At 64x48 libx264 measures far above 10fps, so the probe
+            // cannot reduce the rate here — which is what the plain end-to-end test wants
+            // (it is about the pipeline, not about adaptation).
+            adapt_fps: true,
             output_size: String::new(),
         },
         storage: StorageSection {
@@ -327,6 +331,136 @@ fn a_clip_records_why_it_was_taken() {
 /// the same way the test's configuration discovers them.
 fn recorder_bin(_app_data_dir: &Path) -> FfmpegBinaries {
     FfmpegBinaries::discover(None).expect("ffmpeg on PATH")
+}
+
+/// The regression test for issues #1 and #2: **the pacer and the encoder child are given the
+/// same rate, and it is the rate the probe measured.**
+///
+/// This is the whole defect in one test. The pipeline used to declare the *configured*
+/// `encode.fps` in two places at once — the child's `-framerate` and the pacer — on a machine
+/// that could not encode it: the surplus went to the encoder's bounded queue and was dropped
+/// (~45% of delivered frames on the measured 4K box, issue #1), and the media timeline ran at
+/// a fraction of real time, so a configured `pre_seconds` of footage covered more real
+/// seconds than asked for (issue #2).
+///
+/// The shape here is that failure, made deterministic: `encode.fps = 120` configured, a
+/// measurement of 10, and a capture source that offers 120fps — so the pacer's rate is
+/// visible in what reaches the encoder. Every assertion below fails if either consumer
+/// recomputes its rate from `encode.fps` instead of taking the decided one:
+///
+/// * `effective_fps` is published from the **encoder child's own** `-framerate` (read back
+///   through `Encoder::input_fps`), and the pacer is built from that same read-back, so the
+///   two cannot be given different numbers without this assertion noticing;
+/// * `frames` must advance at the *pacer's* rate, which is only observable because the source
+///   offers more than it: a pacer at 120 would admit 120/s;
+/// * nothing may be dropped, which is what "declare what you can deliver" buys.
+#[test]
+fn the_pacer_and_the_encoder_are_told_the_same_rate() {
+    let (_tmp, app_data_dir) = application_data_dir("rate-agreement");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.encode.fps = 120;
+    cfg.encode.adapt_fps = true;
+    // The source offers the configured rate; the pipeline may only keep what it declared.
+    cfg.sources = Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: 120 });
+
+    // The measurement a 4K box produced: well below the configured rate.
+    let measured_fps = 10.0;
+    let recorder = Recorder::start_with_measure(cfg, &|encode_cfg: &EncodeConfig| {
+        assert_eq!(
+            encode_cfg.fps, 120,
+            "the probe is handed the configuration that declares the *configured* rate: the \
+             number being measured is part of the ffmpeg invocation"
+        );
+        Ok(ThroughputMeasurement {
+            fps: measured_fps,
+            frames: 15,
+            window: Duration::from_millis(1500),
+            source_size: (WIDTH, HEIGHT),
+            output_size: (WIDTH, HEIGHT),
+        })
+    })
+    .expect("the recorder starts");
+
+    let status = recorder.status();
+    assert_eq!(status.configured_fps, 120, "what the config asked for is still reported");
+    assert_eq!(
+        status.effective_fps, 10,
+        "the pipeline must run at the measured 10fps: 10.0 floored is 10, and the encoder \
+         child's own -framerate is where this value comes from"
+    );
+
+    // What the pacer admits, watched from outside: the source offers 120fps, so the number of
+    // frames reaching the encoder per second *is* the pacer's rate.
+    let first = wait_for(&recorder, Duration::from_secs(10), "a first rate sample", |s| s.frames > 0);
+    let t0 = Instant::now();
+    let second = wait_for(&recorder, Duration::from_secs(10), "two seconds of capture", |_| {
+        Instant::now().duration_since(t0) >= Duration::from_millis(2000)
+    });
+    let wall = Instant::now().duration_since(t0).as_secs_f64();
+    let submitted = (second.frames - first.frames) as f64;
+    let observed = submitted / wall;
+    eprintln!(
+        "configured 120fps, measured {measured_fps}fps: {} frames over {wall:.2}s = \
+         {observed:.1}/s (declared {}); skipped={} dropped={}",
+        second.frames - first.frames,
+        second.effective_fps,
+        second.skipped,
+        second.dropped
+    );
+    assert!(
+        (5.0..=20.0).contains(&observed),
+        "the pacer must admit the 10fps it declared, not the configured 120: {observed:.1}/s \
+         over {wall:.2}s ({status:?})"
+    );
+    assert!(
+        second.skipped > 0,
+        "a source offering 120fps against a 10fps pacer is the case the readback skip exists \
+         for: {second:?}"
+    );
+    assert_eq!(
+        second.dropped, 0,
+        "pacing to what the encoder was told is what stops the bounded queue from dropping: \
+         {second:?}"
+    );
+
+    // The property the whole change is for: media time tracks the wall clock. Each segment is
+    // one second of media, so a second of wall clock must produce about a second of span.
+    let span_first = second.span_ms;
+    let t1 = Instant::now();
+    let third = wait_for(&recorder, Duration::from_secs(10), "three seconds of media", |_| {
+        Instant::now().duration_since(t1) >= Duration::from_millis(2000)
+    });
+    let media = (third.span_ms.saturating_sub(span_first)) as f64;
+    let wall = Instant::now().duration_since(t1).as_secs_f64() * 1000.0;
+    eprintln!("media time advanced {media:.0}ms over {wall:.0}ms of wall clock");
+    assert!(
+        (0.75..=1.25).contains(&(media / wall)),
+        "media time must track the wall clock (issue #2): {media}ms of media over {wall}ms of \
+         wall clock"
+    );
+
+    recorder.stop().expect("stop must succeed");
+}
+
+/// `encode.adapt_fps = false` is the escape hatch: no probe runs at all (it would cost ~1.5s
+/// of startup for a number the caller has said it does not want), and the configured rate is
+/// declared exactly as it was before this change.
+#[test]
+fn with_adaptation_off_the_configured_rate_is_declared_and_nothing_is_measured() {
+    let (_tmp, app_data_dir) = application_data_dir("rate-no-adaptation");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.encode.fps = 60;
+    cfg.encode.adapt_fps = false;
+
+    let recorder = Recorder::start_with_measure(cfg, &|_: &EncodeConfig| {
+        panic!("no measurement may be taken when encode.adapt_fps = false")
+    })
+    .expect("the recorder starts without measuring");
+
+    let status = recorder.status();
+    assert_eq!(status.configured_fps, 60);
+    assert_eq!(status.effective_fps, 60, "the configured rate is declared as it always was");
+    recorder.stop().expect("stop must succeed");
 }
 
 #[test]

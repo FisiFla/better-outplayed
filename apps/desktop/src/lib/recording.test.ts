@@ -34,6 +34,7 @@ function status(overrides: Partial<RecordingStatus> = {}): RecordingStatus {
     skipped: 320,
     fps: 29.83,
     configured_fps: 30,
+    effective_fps: 30,
     drift_ms: 1_258,
     clips: 1,
     error: null,
@@ -79,10 +80,24 @@ describe('the achieved rate', () => {
     expect(formatRate(status({ fps: 0 }))).toBe('measuring…');
   });
 
-  it('shows the achieved rate against the configured one', () => {
+  it('shows the achieved rate against the rate the pipeline is running at', () => {
     expect(formatRate(status())).toBe('29.8 / 30 fps');
-    expect(formatRate(status({ fps: 60, configured_fps: 60 }))).toBe('60.0 / 60 fps');
-    expect(formatRate(status({ fps: 23.94, configured_fps: 30 }))).toBe('23.9 / 30 fps');
+    expect(formatRate(status({ fps: 60, configured_fps: 60, effective_fps: 60 }))).toBe(
+      '60.0 / 60 fps',
+    );
+    // A shortfall *within* the rate the pipeline declared — the machine is not even holding
+    // what it measured it could, which is what the engine's drop warning is about.
+    expect(formatRate(status({ fps: 23.94 }))).toBe('23.9 / 30 fps');
+  });
+
+  it('names the configured rate when the engine had to adapt below it', () => {
+    // `encode.adapt_fps`: the probe measured 24fps at 4K against a configured 30, so the
+    // pipeline declares and paces to 24 (spec §10.1). Showing "24.0 / 30 fps" alone would
+    // read as a machine that cannot keep up with itself; the suffix is what makes it the
+    // decision it is. The engine logs the same pair at startup.
+    expect(formatRate(status({ fps: 23.9, configured_fps: 30, effective_fps: 24 }))).toBe(
+      '23.9 / 24 fps (30 configured)',
+    );
   });
 });
 
@@ -111,7 +126,7 @@ describe('the frame accounting', () => {
   it('names the encoder drop as the failure it is', () => {
     const text = describeFrames(status({ dropped: 6 }));
     expect(text).toContain('6 frames dropped by the encoder');
-    expect(text).toContain('not keeping up with 30fps');
+    expect(text).toContain('not keeping up with the 30fps it declared');
   });
 
   it('reports a skipped frame as an optimisation, not a loss', () => {

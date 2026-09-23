@@ -30,8 +30,29 @@ vendor = "auto"
 # h264 | hevc
 codec = "h264"
 bitrate_kbps = 20000
+# The frame rate asked for — a ceiling, not a promise. See adapt_fps below.
 fps = 60
+# Measure what this machine can actually sustain at the capture resolution and
+# record at the lower of that and `fps` (default: true).
+#
+# Why: a pipeline that *declares* a rate it cannot deliver records a timeline
+# that does not track real time. Measured on 4K hardware with fps = 30: ~24 fps
+# sustained, ~45% of frames dropped, and media time running at a fraction of
+# real time — so a `pre_seconds = 10` clip covered more than 10 real seconds.
+# With this on, localplay spends ~1.5 s at startup encoding frames at the real
+# capture resolution with the selected encoder, and both the pacer and the
+# encoder child are then told the rate it measured. Startup logs what it
+# measured and, if that is below `fps`, warns you which rate is in use and why.
+#
+# false = skip the measurement and declare `fps` exactly as configured. That is
+# the pre-adaptation behaviour: on a machine that cannot hold `fps`, the
+# encoder's queue drops the surplus frames and the recorded timeline can run
+# slower than real time. Only useful if the ~1.5 s of startup matters to you, or
+# if you want to force a rate above what the probe measures.
+adapt_fps = true
 # Empty = capture at native resolution. Otherwise "WIDTHxHEIGHT", e.g. "1920x1080".
+# This is also the single biggest lever on the sustainable rate: at 4K a frame is
+# 33 MB, at 1080p it is 8 MB.
 output_size = ""
 
 [audio]

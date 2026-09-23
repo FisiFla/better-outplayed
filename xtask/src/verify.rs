@@ -884,7 +884,8 @@ impl Session {
             .collect();
         if let Some((_, last)) = parsed.last() {
             let measured = format!(
-                "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} skipped={} fps={:.1}/{}",
+                "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} \
+                 skipped={} fps={:.1}/{} configured={}",
                 last.frames,
                 last.segments,
                 last.bytes,
@@ -893,6 +894,7 @@ impl Session {
                 last.dropped_audio,
                 last.skipped,
                 last.fps,
+                last.declared,
                 last.configured
             );
             self.note(
@@ -918,29 +920,76 @@ impl Session {
                 );
             }
 
-            // Achieved frame rate against the configured one.
-            let expected_fps = last.configured as f64;
-            let floor = expected_fps * 0.9;
+            // Achieved frame rate against the rate the pipeline declared. The denominator is
+            // the *effective* rate (the status line's `fps=` field, which is what the pacer
+            // and the encoder child were both given); `configured=` carries what `encode.fps`
+            // asked for, and is checked on its own below. Keeping the two apart is what
+            // stops this check from becoming trivially true once adaptation exists.
+            let declared_fps = last.declared as f64;
+            let floor = declared_fps * 0.9;
             let measured_fps = format!(
-                "achieved {:.1} fps against {} configured (over the last second; tolerance {:.1})",
-                last.fps, last.configured, floor
+                "achieved {:.1} fps against {} declared (over the last second; tolerance \
+                 {:.1}); encode.fps asked for {}{}",
+                last.fps,
+                last.declared,
+                floor,
+                last.configured,
+                if last.configured == last.declared {
+                    ""
+                } else {
+                    " — the startup probe measured less than the configured rate and the \
+                     pipeline adapted to it"
+                }
             );
             self.hardware_check(
                 "frame_rate",
-                "the achieved frame rate reaches the configured rate",
+                "the achieved frame rate reaches the rate the pipeline declared",
                 "criterion 1",
-                format!("fps >= {floor:.1} ({expected_fps} configured × 0.9)"),
+                format!("fps >= {floor:.1} ({declared_fps} declared × 0.9)"),
                 &measured_fps,
                 if last.fps >= floor {
                     Outcome::Pass
                 } else {
                     Outcome::Fail(format!(
-                        "the pipeline did not sustain {} fps on this machine — this is issue #1's \
-                         shortfall when it repeats; media time then runs slower than the wall clock",
-                        last.configured
+                        "the pipeline did not sustain the {} fps it declared on this machine: \
+                         the encoder's queue is dropping frames and media time then runs slower \
+                         than the wall clock (this is the backstop for a load that changed after \
+                         the startup measurement)",
+                        last.declared
                     ))
                 },
             );
+
+            // Was the configured rate achievable at all? This is criterion 1 as written, and
+            // adaptation must not be able to hide a shortfall: a machine that cannot hold
+            // `encode.fps` at this resolution is reported as failing it, with both numbers,
+            // even though the pipeline is now running honestly at the lower rate.
+            {
+                let reached = last.declared == last.configured;
+                let measured = format!(
+                    "encode.fps = {} configured; the pipeline declared {}",
+                    last.configured, last.declared
+                );
+                self.hardware_check(
+                    "configured_rate_reached",
+                    "the configured frame rate was achievable at this resolution",
+                    "criterion 1",
+                    "the declared rate equals encode.fps",
+                    &measured,
+                    if reached {
+                        Outcome::Pass
+                    } else {
+                        Outcome::Fail(format!(
+                            "this machine cannot hold {} fps at the captured resolution: the \
+                             startup probe measured the encode path and the pipeline adapted to \
+                             {} fps, which keeps media time on the wall clock but does not meet \
+                             criterion 1 as configured (issue #1). Lower encode.output_size or \
+                             encode.fps, and record both numbers in the ledger",
+                            last.configured, last.declared
+                        ))
+                    },
+                );
+            }
 
             // Dropped frames: the encoder's own count of payloads it had to discard.
             self.hardware_check(
@@ -962,7 +1011,7 @@ impl Session {
 
             // The readback skip: only observable when the source offers more frames than
             // the pacer keeps. On a 60 Hz+ display against 30 fps it must be non-zero; on a
-            // source paced at the configured rate there is nothing to skip, and demanding
+            // source paced at the declared rate there is nothing to skip, and demanding
             // a non-zero count would be wrong.
             if let (Some((t0, first)), Some((t1, _))) = (parsed.first(), parsed.last()) {
                 let offered_delta =
@@ -972,23 +1021,23 @@ impl Session {
                     _ => run.wall.as_secs_f64(),
                 };
                 let offered_rate = offered_delta as f64 / wall_s.max(0.001);
-                let source_faster = offered_rate > last.configured as f64 * 1.2;
+                let source_faster = offered_rate > last.declared as f64 * 1.2;
                 let measured = format!(
                     "offered to the pacer: {offered_delta} frames over {wall_s:.1}s = \
-                     {offered_rate:.1}/s against {} configured; skipped={}",
-                    last.configured, last.skipped
+                     {offered_rate:.1}/s against {} declared ({} configured); skipped={}",
+                    last.declared, last.configured, last.skipped
                 );
                 self.hardware_check(
                     "skipped_readback_skip",
                     "frames the pacer throws away are skipped without the GPU readback",
                     "criterion 1 (commit dd921b3)",
-                    "if the source offers > 1.2× the configured rate, skipped > 0",
+                    "if the source offers > 1.2× the rate the pacer admits, skipped > 0",
                     &measured,
                     if !source_faster || last.skipped > 0 {
                         Outcome::Pass // nothing to skip, or the surplus was skipped cheaply
                     } else {
                         Outcome::Fail(
-                            "the source delivered more frames than the configured rate and \
+                            "the source delivered more frames than the pacer admits and \
                              skipped stayed 0: every surplus frame was read back before being \
                              dropped, which is the measured 50.8%-of-a-core cost"
                                 .to_string(),
@@ -2120,6 +2169,12 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The engine's periodic status line.
+///
+/// `declared` is the status line's `fps=` denominator: the rate the pipeline is running at,
+/// i.e. the pacer's rate and the encoder child's `-framerate`. `configured` is the
+/// `configured=` field — what `encode.fps` asked for — and falls back to `declared` for a
+/// line written before that field existed (and for the fabricated lines in this file's own
+/// tests, where the two are the same thing).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Status {
     frames: u64,
@@ -2130,12 +2185,14 @@ struct Status {
     dropped_audio: u64,
     skipped: u64,
     fps: f64,
+    declared: u32,
     configured: u32,
 }
 
 fn parse_status(line: &str) -> Option<Status> {
     let fps_field = field(line, "fps")?;
-    let (achieved, configured) = fps_field.split_once('/')?;
+    let (achieved, declared) = fps_field.split_once('/')?;
+    let declared: u32 = declared.parse().ok()?;
     Some(Status {
         frames: field(line, "frames")?.parse().ok()?,
         segments: field(line, "segments")?.parse().ok()?,
@@ -2145,7 +2202,10 @@ fn parse_status(line: &str) -> Option<Status> {
         dropped_audio: field(line, "dropped_audio")?.parse().ok()?,
         skipped: field(line, "skipped")?.parse().ok()?,
         fps: achieved.parse().ok()?,
-        configured: configured.parse().ok()?,
+        declared,
+        configured: field(line, "configured")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(declared),
     })
 }
 
@@ -2687,7 +2747,7 @@ mod tests {
     fn the_status_line_is_parsed_field_by_field() {
         let line = "2026-09-23T19:20:27.157909Z DEBUG localplay_recorder: frames=1814 \
                     segments=57 bytes=37795772 span=57000ms dropped=1183 dropped_audio=12 \
-                    skipped=2048 fps=24.1/30";
+                    skipped=2048 fps=24.1/24 configured=30";
         let status = parse_status(line).expect("the engine's own line must parse");
         assert_eq!(
             status,
@@ -2700,9 +2760,16 @@ mod tests {
                 dropped_audio: 12,
                 skipped: 2048,
                 fps: 24.1,
+                declared: 24,
                 configured: 30,
             }
         );
+        // A line written before `configured=` existed still parses: the declared rate is the
+        // fallback, which is the honest reading of a line whose two rates were always equal.
+        let older = parse_status("frames=1 segments=2 bytes=3 span=4ms dropped=0 \
+                                  dropped_audio=0 skipped=0 fps=29.9/30")
+            .expect("an older status line still parses");
+        assert_eq!((older.declared, older.configured), (30, 30));
         // A line that is missing a field is not a status line, not a half-filled one.
         assert!(parse_status("frames=1 segments=2").is_none());
     }
