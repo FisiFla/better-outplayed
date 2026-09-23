@@ -4,8 +4,9 @@ mod config;
 
 use anyhow::{bail, Context, Result};
 use config::Config;
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use localplay_capture::platform::{default_audio_backend, default_video_backend};
+use localplay_capture::stub::StubConfig;
+use localplay_capture::AudioFormat;
 use localplay_encoder::probe::select_vendor;
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_events::hotkey::Hotkey;
@@ -73,8 +74,9 @@ fn run_buffer() -> Result<()> {
     let (mut encoder, encoder_name) = build_encoder(&bin, &cfg, &scratch_dir, dev_software)?;
     tracing::info!("encoding with {encoder_name}");
 
-    // Phase 1 wires the stub sources so the pipeline runs on any platform. Tasks 14/15
-    // swap these for WgcCapture + WasapiLoopback behind the same traits.
+    // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
+    // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
+    // there is no stub fallback to hide it behind.
     let mut ring = RingBuffer::start(
         &bin,
         buffer_cfg.clone(),
@@ -87,12 +89,9 @@ fn run_buffer() -> Result<()> {
     }
 
     let (width, height) = parse_output_size(&cfg.encode.output_size, 1920, 1080);
-    let mut capture: Box<dyn CaptureBackend> = Box::new(StubCapture::new(StubConfig {
-        width,
-        height,
-        fps: cfg.encode.fps,
-    }));
-    let mut audio: Box<dyn AudioBackend> = Box::new(StubAudio::new(AudioFormat::default()));
+    let mut capture =
+        default_video_backend(StubConfig { width, height, fps: cfg.encode.fps })?;
+    let mut audio = default_audio_backend(AudioFormat::default())?;
     capture.start()?;
     audio.start()?;
 
