@@ -1919,6 +1919,38 @@ impl Encoder for FfmpegEncoder {
 }
 ```
 
+> **CORRECTION — the code block above does not compile or run as written.** Two
+> defects, both confirmed by a standalone repro during implementation (Task 9 is
+> committed and working; `crates/encoder/src/ffmpeg.rs` is the authoritative version):
+>
+> 1. **`ChildStdout` is `Read`, not `Write`.** `Stdio::piped()` hands the parent the
+>    *read* end of the child's stdout, so `audio_in.write_all(...)` cannot compile —
+>    and the parent could not write into that pipe at all. Fix: construct our own
+>    pipe with `std::io::pipe()` (stable since Rust 1.87), pass the `PipeReader` to
+>    the child via `Stdio::from(audio_reader)`, and keep the `PipeWriter` in the
+>    parent. `pipe:0` / `pipe:1` and `-nostdin` are unchanged.
+> 2. **Synchronous writes deadlock.** ffmpeg's muxer refuses to pull one input far
+>    ahead of the other. Writing all video then all audio (which is exactly what this
+>    task's own test does) fills the video pipe and blocks forever — reproduced
+>    standalone: stalled after ~53 frames, killed by a 15s watchdog, zero segments.
+>    Fix: give each pipe its own writer thread fed by an unbounded `mpsc` channel, so
+>    `submit_video`/`submit_audio` enqueue and return immediately. `finish()` drops
+>    both senders (closing the pipes → EOF), joins the threads, then waits on the
+>    child.
+>
+> The corrected shape is: `video_tx/audio_tx: Option<Sender<Vec<u8>>>`,
+> `video_writer/audio_writer: Option<JoinHandle<io::Result<()>>>`, plus
+> `fn pump<W: Write>(rx: Receiver<Vec<u8>>, mut sink: W)` which drains the channel
+> into the pipe and closes it on return. Because the trait takes `&Frame`/
+> `&AudioBuffer`, each submit clones the byte buffer — one extra memcpy per frame,
+> acceptable for the PoC but a known cost at 1080p60 (and an argument for the
+> Phase 2 native-MFT backend).
+>
+> Two further notes: `FfmpegEncoder` has no `Drop`, so dropping it without `finish()`
+> leaves the ffmpeg child running — the CLI must always call `finish()`. And
+> `tests/segmenting.rs` requires `--features test-encoders`, because integration
+> tests do not inherit the library's `cfg(test)`.
+
 Add `crates/encoder/src/probe.rs` — this is criterion 7's implementation, and it is
 what makes "no silent CPU fallback" real rather than aspirational:
 
@@ -2650,6 +2682,13 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
         if rel.ends_with("lol.rs") {
             continue;
         }
+        // The guard must not scan itself: this file necessarily contains the very
+        // literals it searches for. Exempted by path, explicitly, rather than by
+        // splitting the literals — a guard that passes for the wrong reason is
+        // worse than no guard.
+        if rel.ends_with("no_egress.rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
         if text.contains("reqwest::Client") || text.contains("ureq::agent") {
             offenders.push(rel);
@@ -2667,7 +2706,7 @@ fn the_gsi_listener_binds_loopback_only() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for entry in walk_rs(&root) {
         let rel = entry.to_string_lossy().replace('\\', "/");
-        if rel.contains("/target/") {
+        if rel.contains("/target/") || rel.ends_with("no_egress.rs") {
             continue;
         }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
