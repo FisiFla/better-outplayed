@@ -74,7 +74,7 @@ Counting the distinct significant claims about the system made in §1–§4, eac
 | Level | Count |
 |---|---|
 | Verified on Windows hardware | 19 |
-| Verified on the dev host | 20 |
+| Verified on the dev host | 23 |
 | Type-checked only | 6 |
 | Unverified | 0 |
 
@@ -86,10 +86,14 @@ read-only re-read of files retained on the box (see §1). They move from *Unveri
 background half (§3, §8) then added three claims of its own: two at *verified on the dev
 host* — the background logic, and the trigger path driven through a real recording — and one
 at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller, which needs
-a Windows message queue to run. The measured-rate change (§4) adds one more at *verified on
+a Windows message queue to run. The measured-rate change (§4) added one at *verified on
 the dev host* — the rate decision, its new config key and the probe's own bounds are tested,
 and the startup lines were produced by real runs — while the *accuracy* of its measurement at
-4K on the target hardware is explicitly not claimed: 20 → 21 Verified on the dev host.
+4K on the target hardware was explicitly not claimed. The timeline fix (§1, §4) adds two more
+at the same level — that the media clock is the frames' arrival timestamps (a local A/B, a
+regression test that fails without it), and that the VFR output still splices, probes and
+plays (a splice test that decodes every frame) — and *demotes* the measured-rate claim to a
+pacing aid rather than a timeline guarantee: 20 → 23 Verified on the dev host.
 
 ---
 
@@ -141,16 +145,18 @@ understated the state and has since been corrected.
 | Cannot sustain the configured frame rate at 4K | Verified on Windows hardware | **~24 fps** sustained against **30 fps** configured — issue #1 |
 | Frames dropped by the encoder | Verified on Windows hardware | **~45% of delivered frames**; the debug line reads `dropped=1183` of ~3000 delivered — issue #1 |
 | CPU cost | Verified on Windows hardware | **50.8% of one core** against a **< 5%** target — issue #1 (criterion 6 **FAIL**) |
-| The media timeline does not track real time | Verified on Windows hardware — **direction and magnitude UNRESOLVED** | the divergence is real, but two measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring, i.e. ~1.11 writes/s). Both were informal. See the note below — do **not** quote a single figure |
+| The media timeline does not track real time | Verified on Windows hardware — the measurement is unresolved there; **the mechanism is now measured on the dev host and fixed** | the divergence on the box is real, and two informal measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring). Both measured the *write* position, which is what `span_ms` is; the mechanism is the frame-rate conversion (see below), and the fix takes the dev host's ratio from 0.660× to 0.987×. **The box's own number is still unmeasured** |
 | RSS (the one criterion-6 half that passed) | Verified on Windows hardware | 235 MB, peak 267 MB against a < 400 MB target — issue #1 |
 
-The consequence depends on the direction, which is now **unresolved**. If media ran at
-0.81x, **a `pre_seconds` clip would cover more real seconds than configured** —
-`pre_seconds = 10` → ~12.3 real seconds (issue #2); at 1.11x it would cover *fewer*. Either
-way the trigger works in media time, so clips are internally consistent; the open question
-is only how media time relates to wall clock, and therefore how a `pre_seconds` setting
-relates to real seconds. The earlier confident **0.81x** figure is **withdrawn** (see issue
-#2's correction comment).
+The box's two figures are **both readings of the write position** (`span_ms` is
+`completed segments × segment_time`), which is why they can disagree between runs and why
+neither settles the mechanism on its own: what they measure is how fast ffmpeg's muxer got
+through a grid that required `R` frames a second — slower when the encoder was short, and
+apparently faster in a run whose scratch cap had evicted segments and shifted the ledger's
+origin. The earlier confident **0.81x** figure stays **withdrawn** (issue #2's correction
+comment), and the *rerun that will settle the box's number* is prescribed below. On the dev
+host the same reading is now 0.987× rather than 0.660× after the timeline fix, because the
+grid that made it a throughput measurement is gone.
 
 **How to measure it properly — do not infer it from file mtimes.** mtimes measure *writes*,
 not the media they carry, so a cadence read off mtimes is not the media-vs-real-time ratio.
@@ -159,40 +165,107 @@ time across a sustained run, and its `fps=` field against the configured rate. T
 matters is media-time (`span`) per wall-clock second, read from the log on a run long enough
 (minutes) to average out segment jitter.
 
-**What the dev host adds — a refinement of the hypothesis, not a measurement of the box.**
-Measured here (ffmpeg 9.0.2, the real argument list), with the segment muxer in place a
-declared `-framerate R` makes ffmpeg resample the output onto a rigid `1/R` grid and
-*duplicate* frames to fill the gaps left by whatever the pipeline could not deliver: a pipe
-fed 122 frames at ~24 fps with 30 declared encoded 180 frames, `dup=58 drop=0`. So the media
-clock is the *declared* grid, and it advances at (output frames the encoder can emit per
-second) ÷ `R`: 1.0× when the encoder can emit `R` frames a second even if many are
-duplicates, and proportionally less when it cannot. Two consequences worth recording, both
-measured here and neither of them the mechanism the issue text assumed:
+**What the dev host found, and what it fixed. The mechanism is the frame-rate conversion,
+not the declared rate.** Measured here (ffmpeg 9.0.2, the real argument list) and corrected
+twice on the way, so read this as the final account:
 
-- **Dropped frames do not become holes in the timeline; they slow the whole clock.** A gap
-  in what arrives is re-filled with duplicates when the encoder has the headroom, so the
-  media clock stays glued to the wall clock and the *pictures* repeat. It is only when the
-  encoder cannot emit `R` frames a second that the clock itself slips — uniformly, not
-  hole-by-hole.
-- **The declared rate therefore shows up directly in the ratio.** An A/B on this host,
-  identical content and configuration except for the new `encode.adapt_fps` (4K output
-  scaled from the 1280x720 stub, 12 s of media): declaring the *measured* 62 fps gave
-  **0.94×**; declaring the *configured* 120 fps gave **0.69×**. That is consistent with the
-  box's 0.81× being "the encoder could emit ~24 frames a second while 30 were declared" —
-  but it is a hypothesis about the box, not a measurement of it: this host's libx264
-  duplicates readily, the box's run did not appear to, and the `span=`-vs-wall-clock reading
-  prescribed above is still the only thing that will settle it.
+- With the segment muxer in place, a declared `-framerate R` makes ffmpeg resample the video
+  onto a rigid `1/R` grid, and the *default* conversion mode fills that grid by
+  **inventing frames**: a pipe fed 122 frames at ~24 fps with 30 declared encoded 180 frames,
+  `dup=58 drop=0`. In the real pipeline the multiplication is what hurts — a 4K arm fed 39
+  frames over 12.6 s encoded **1631** of them, `dup=1592`, every scratch segment reporting
+  `avg_frame_rate=120/1`.
+- ffmpeg's own `speed=` field then says where the time goes in that arm: **0.333×**, i.e. the
+  muxer's write position advanced one second per three seconds of wall clock, because the
+  encoder can only emit ~40 of the 120 frames a second the grid demands. The ring's
+  `span_ms` is exactly that write position (`completed segments × segment_time`), so
+  *that* — not a stretched container timeline — is the number that falls behind. Measured
+  at the pipeline level below: **0.660×**.
+- The container's own timestamps are **not** stretched: each frame keeps the arrival time it
+  was given and the invented frames only pad the gaps between them. Verified by tagging every
+  fed frame and reading its media timestamp back out of the encoded segments (49 distinct
+  frames, 1085 output frames, media span 8001 ms against an arrival span of 9027 ms — slope
+  0.94 against *write* times, the small deficit being ffmpeg's own read lag, not a warp). So
+  the box's original complaint was about the ring's clock and the *staleness* it implies
+  (footage at the trigger was seconds old), not about time-compressed pictures.
 
-`gh issue list --state all` shows both issues still **OPEN** — neither the 4K throughput
-shortfall nor the timeline divergence has been **re-measured on hardware**, and that
-re-measurement is what closing them needs. The
-readback-skip commit ([`dd921b3`](#4-added-since-the-windows-session)) was the first
-attempt at issue #1 and says in its own message that it was not measured on Windows. What
-has changed since, and what the next run on the box is for, is the measured-rate change in
-§4: the pipeline no longer declares a rate it cannot deliver — one measured value is given
-to both the pacer and the encoder child — so the media clock can no longer slip *because
-the declared rate exceeded what the encoder could emit*. Whether that is the whole of the
-box's shortfall is what its next run has to show.
+**The fix, and the A/B that justifies it.** `-fps_mode passthrough` on the video output
+(`crates/encoder/src/ffmpeg.rs::video_output_args`) removes the conversion: each frame
+reaches the muxer with its arrival timestamp, so the media clock *is* the wall clock
+whatever rate the machine manages, and the encoder is no longer asked to emit `R` frames a
+second of which most are invented. Same machine, same stub capture, same
+`--dev-software-encoder`, 12 s of media requested, 4K output scaled from the stub
+(`fps = 120`, `adapt_fps = false`) and the 720p control (`fps = 30`, adaptation on). The
+ratio is the ring's own clock: `span=` between two status lines over their wall-clock
+timestamps, over the window that excludes the ring's fill.
+
+| arm | declared | achieved | dropped by the encoder's queue | media/wall | segments/wall-second |
+|---|---|---|---|---|---|
+| 4K output, **before** (`e051b60`+`411c32e`) | 120 fps | 3.3 fps | 2295 of 2454 | **0.660×** | 0.66 |
+| 4K output, **after** (`-fps_mode passthrough`) | 120 fps | 31.7 fps | 1172 of 1801 | **0.987×** | 0.99 |
+| 720p control, before | 30 fps | 29.6 fps | 0 | **0.999×** | 1.00 |
+| 720p control, after | 30 fps | 29.7 fps | 0 | **0.986×** | 0.99 |
+
+The same A/B at the ffmpeg level, with the child's exact argument list, feeding 8 fps against
+120 declared at a 4K output: before, 39 frames became 1631 coded frames and the write
+position ran at `speed=0.333×`; after, 97 frames became **exactly 97** coded frames (no
+invention at all) and `speed=0.832×`, limited only by how long the feed itself lasted.
+
+**What that change costs, measured, and it is not nothing.** A VFR segment holds the frames
+that arrived while it was open, which is `segment_time` **minus up to one frame interval**:
+measured 0.82–1.00 s of media per 1 s segment at ~40 fps delivered, and ~0.94 s at the
+recorder test's 10 fps. Three consequences, all recorded rather than smoothed over:
+
+1. **A clip can be short of its nominal window by one frame interval per segment it is
+   spliced from** — measured 2821 ms for a 3000 ms request at 10 fps in
+   `crates/recorder/src/tests.rs`, and 2756 ms of video for a 3000 ms request in the 4K CLI
+   run. Before the fix such a clip was exactly nominal and its footage was **seconds old**
+   (the `hotkey pressed: media=12000ms wall=18619ms` line is that staleness); now the
+   footage is current and the file is a few frames short. The recorder test asserts the
+   honest bound (one frame interval per segment) instead of the old one.
+2. **`span_ms` over-estimates the footage on disk by the same one frame interval per
+   segment**, since the ring counts `segment_time` per completed segment without probing it.
+   At 30–60 fps that is 1–3%; at the recorder test's deliberately slow 10 fps it is 6%.
+3. **Timestamps are resolved at `1/R`** (the demuxer's timebase comes from `-framerate`), so
+   frames read within one tick of each other share a timestamp and occupy no time. Measured
+   at 4K with bursts arriving from the pipe: 38 repeated timestamps among the 117 frames of
+   the produced clip, and none in the 720p control. The frames are all there and decode; the
+   duplicated ones are simply not displayed.
+
+**Splicing and playback survive that — checked, not assumed.** `-reset_timestamps 1` still
+gives every segment `start_time = 0`; the segmenter still cuts ~1 s segments (13 segments and
+13 s of media in the after-4K arm); `localplay_media::edit::concat_lossless` — the exact
+function `ClipSplicer` calls — still produces a clip that probes with **both** streams and
+whose every coded frame decodes (117 frames in the 4K clip, 46/46 in the regression test).
+One caveat: a frame that lands just across a segment boundary makes the concat demuxer's
+per-file offset step *backwards* at that boundary — measured 0 in three of the four real clips
+and, in a deliberately starved synthetic feed, a worst case of ~16–46 ms (well under one frame
+interval at 30 fps). `crates/encoder/tests/timeline.rs` bounds it rather than pretending it is
+absent.
+
+**The throughput probe is not, and cannot be, the timeline guarantee.** The last two commits
+before this one (`e051b60`, `411c32e`) measured the encode rate at startup and declared
+`min(configured, measured)` to both the pacer and the encoder child. That does not make the
+timeline correct on the machine that matters, and the numbers now say so plainly: the probe
+measured **62 fps** and the live pipeline achieved **8** on the same host in the same
+configuration (the probe measures the encode path only — raw frames to an encoder to `-f
+null` — while the pipeline is WGC readback + copy + pipe + encode + segment muxing). On the
+Windows box, where NVENC is cheap and the 33 MB-per-frame readback is the known bottleneck,
+the probe's number is *more* optimistic. It remains as what it always should have been: a
+diagnostic that reports the sustainable rate and a pacing aid that keeps capture from paying
+for frames the encoder will drop.
+
+`gh issue list --state all` shows both issues still **OPEN**, and both still need the box:
+
+- issue #1 (throughput): unchanged by all of this. What the box must produce is the 4K soak's
+  `fps=`/`dropped=`, and criterion 6's CPU number.
+- issue #2 (the timeline): the *direction and magnitude* question above is now answered by
+  mechanism and by the local A/B (the ring's clock was the write position and it ran at
+  0.66×; it is now ~0.99×), and the fix is in the shipping argument list. **The box's own
+  number is still unmeasured** — one soak with `RUST_LOG=debug` and the `span=`-vs-wall-clock
+  reading prescribed above is what settles it, and it is also the only place the WGC readback
+  can show whether passthrough leaves the machine able to encode the frames it actually
+  captures.
 
 ---
 
@@ -291,7 +364,9 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | Desktop background half: tray, global clip hotkey, hide-on-close, `[app] start_with_system` | `225a1fe`, `e3fcb95`, `d20d748` | Verified on the dev host (headless: pure logic + a real recording driven through the trigger path). **Never observed on any machine**: no tray icon drawn, no window closed, no key pressed, no Run-key write executed |
 | A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
-| The pipeline **declares the rate it can actually deliver**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate` (issues #1/#2) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, and its numbers do not transfer to NVENC (hardware, content-blind). The harness's criterion-1 checks were split so adaptation cannot hide a shortfall (see §1) |
+| The pipeline **paces capture to a rate it can actually keep**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate`. **This is a pacing aid and a diagnostic, not the timeline guarantee** (see the two rows below, and §1) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, its numbers do not transfer to NVENC (hardware, content-blind), and the probe measures the encode path only — on this host it reported 62 fps where the pipeline achieved 8 |
+| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Not verified on Windows**: nothing has run there, and `-fps_mode` on the pinned sidecar is evidenced only by the option's own strings inside `binaries/ffmpeg.exe` |
+| A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`localplay_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
 
 The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
 dev host (stub capture, `--dev-software-encoder`, so the encoder is libx264 at the stub's
@@ -302,7 +377,7 @@ dev host (stub capture, `--dev-software-encoder`, so the encoder is libx264 at t
 INFO localplay_recorder: encode rate: 326.8fps sustainable at 1280x720 with libx264 (491 frames over 1.5s); encode.fps = 30 is within that, so capture runs at the configured 30fps
 
 # encode.fps = 120 against a 4K output: reduced to the measured rate
-WARN localplay_recorder: encode.fps = 120 is not achievable at 1280x720 on this machine: 61.9fps sustainable at 1280x720 frames scaled to a 3840x2160 output with libx264 (95 frames over 1.5s). Capturing at 61fps instead — the same rate the encoder child is told — so that the media timeline tracks real time and a configured pre_seconds of footage is that many real seconds. The configured rate was not reached at this resolution: lower encode.output_size (e.g. "1920x1080") or encode.fps to a rate this machine holds, or set encode.adapt_fps = false to declare 120fps anyway and accept dropped frames and a timeline that runs slower than real time.
+WARN localplay_recorder: encode.fps = 120 is not achievable at 1280x720 on this machine: 61.9fps sustainable at 1280x720 frames scaled to a 3840x2160 output with libx264 (95 frames over 1.5s). Capturing at 61fps instead — the same rate the encoder child is told — so that the capture is not paying a readback and a copy for frames the encoder will throw away. The media timeline does not depend on this rate: frames carry their arrival timestamps, so a clip covers the seconds it was captured over either way. The configured rate was not reached at this resolution: lower encode.output_size (e.g. "1920x1080") or encode.fps to a rate this machine holds, or set encode.adapt_fps = false to declare 120fps anyway and accept the frames that will be dropped and held in the picture.
 ```
 
 ---
@@ -375,13 +450,18 @@ $ gh run view 35904179918 --log-failed
 
 ## 7. Known limitations — do not mistake these for bugs, or for working features
 
-- **The media timeline does not track real time on 4K hardware — direction and magnitude
-  unresolved.** Two informal measurements disagree (≈0.81x media-slower from issue #2
-  versus ≈1.11x media-faster from retained-ring mtimes); the confident 0.81x figure is
-  withdrawn. The consequence — whether a `pre_seconds` clip covers *more* or *fewer* real
-  seconds than configured — therefore depends on the unresolved direction. See §1 and issue
-  #2's correction comment for how to measure it (the log's `span=` field against wall
-  clock, not file mtimes).
+- **The box's own media/wall ratio has never been measured with the fix in place.** The
+  mechanism is settled and fixed on the dev host (§1: 0.660× → 0.987×, with the encoder
+  inventing no frames), and the box's two informal readings (≈0.81x, ≈1.11x) were both
+  readings of the *write position*, which is what `span_ms` is. What needs the box is one
+  soak with `RUST_LOG=debug`: the log's `span=` field against wall clock (never file
+  mtimes), which is also the only place the 33 MB-per-frame WGC readback can show whether
+  the remaining shortfall is capture rather than encode.
+- **A VFR clip can be one frame interval per segment short of its nominal window**, its
+  `span_ms` over-estimates footage on disk by the same amount, and a frame landing across a
+  segment boundary can step the concatenated timeline back by ≤ ~50 ms. All three are
+  measured in §1; before the fix the clip was exactly nominal and its footage was seconds
+  stale.
 - **Criteria 1 and 6 fail on 4K hardware** — the pipeline cannot sustain 30 fps and costs
   ~50.8% of a core. Open in issue #1.
 - **Single-monitor capture only.** `crates/capture/src/wgc.rs` captures the primary monitor
