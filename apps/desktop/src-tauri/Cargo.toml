@@ -20,10 +20,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `protocol-asset` is what serves clip files to the <video> element (spec §9) without a
 # hand-rolled file server.
 tauri = { version = "2", features = ["protocol-asset"] }
-# The Phase 1 crates are reused as-is. Nothing here re-implements them, and nothing here
-# touches capture: the desktop shell only reads the index, edits clips and probes them.
+# The Phase 1 crates are reused as-is. Nothing here re-implements them: the shell reads
+# the index, edits clips and probes them, and it *records* through the same engine the CLI
+# drives (`localplay-recorder`), which owns capture, audio, the encoder and the ring.
 localplay-media = { path = "../../../crates/media" }
 localplay-store = { path = "../../../crates/store" }
+localplay-recorder = { path = "../../../crates/recorder" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

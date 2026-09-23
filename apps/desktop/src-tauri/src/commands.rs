@@ -21,13 +21,16 @@
 //! event markers are Phase 4 and the timeline draws none (see `src/lib/components/
 //! Timeline.svelte`).
 
+use crate::config::RecordingConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::{Recorder, RecorderConfig, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Store};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The app-data-relative directories the shell reads and writes.
 ///
@@ -138,6 +141,9 @@ pub enum ErrorCode {
     Store,
     /// ffmpeg or ffprobe ran and failed.
     Media,
+    /// The recording engine refused the operation: no hardware encoder, a recorder that
+    /// is already running, a config file that cannot describe a recording.
+    Recording,
     /// A filesystem operation failed.
     Io,
 }
@@ -761,6 +767,247 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------------------
+//
+// The engine itself is `localplay-recorder` — the same one the CLI drives. What is here is
+// the shell's side of it: one slot that holds the recording this window started, and the
+// plain functions the `#[tauri::command]` wrappers delegate to.
+//
+// Two properties are worth naming, because the obvious implementations get them wrong:
+//
+// * `recording_status` never blocks the recording loop. The engine publishes its counters
+//   through atomics (`Recorder::status`), so a poll every 500ms costs a handful of loads
+//   and cannot disturb a capture that is trying to keep up with 60fps.
+// * A clip trigger *does* block — `clip_now` waits for the post-roll to be written, which
+//   is `post_seconds` of media plus a margin. The slot lock is therefore released before
+//   the wait: the caller clones a handle out of the slot and blocks on that, so the
+//   window's status poll keeps answering while a clip is being saved.
+
+/// The live recording status, as the frontend sees it.
+///
+/// Mirrored by hand in `src/lib/types.ts`, and pinned by a test below that asserts the
+/// exact JSON keys — the same contract the clip and storage DTOs carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingStatusDto {
+    /// Whether a recording is running. `false` also means "never started".
+    pub running: bool,
+    /// Video frames submitted to the encoder this session.
+    pub frames: u64,
+    /// Completed segments in the scratch ring.
+    pub segments: u64,
+    /// Bytes the ring holds on disk.
+    pub bytes: u64,
+    /// Media time on disk, in ms: how much footage a clip can be cut from.
+    pub span_ms: u64,
+    /// Encoder frames dropped because its queue was full (the machine cannot keep up).
+    pub dropped: u64,
+    /// The same for audio blocks.
+    pub dropped_audio: u64,
+    /// Frames the capture backend offered and the pacer skipped without reading back.
+    pub skipped: u64,
+    /// The achieved frame rate over the last second; 0.0 before one has been measured.
+    pub fps: f64,
+    /// What `encode.fps` asked for, to show the two side by side.
+    pub configured_fps: u32,
+    /// Wall clock minus media time, in ms. Positive means the media timeline is behind
+    /// real time, which is why a trigger is taken from `span_ms` rather than the clock.
+    pub drift_ms: i64,
+    /// Clips this session has written.
+    pub clips: u64,
+    /// Why the engine stopped, when it stopped for a failure rather than a `stop`.
+    pub error: Option<String>,
+}
+
+impl From<RecorderStatus> for RecordingStatusDto {
+    fn from(status: RecorderStatus) -> Self {
+        Self {
+            running: status.running,
+            frames: status.frames,
+            segments: status.segments,
+            bytes: status.bytes,
+            span_ms: status.span_ms,
+            dropped: status.dropped,
+            dropped_audio: status.dropped_audio,
+            skipped: status.skipped,
+            fps: status.fps,
+            configured_fps: status.configured_fps,
+            drift_ms: status.drift_ms,
+            clips: status.clips,
+            error: status.error,
+        }
+    }
+}
+
+/// What a clip trigger produced.
+///
+/// Not a [`ClipDto`]: a clip that was written but could not be indexed has no row, and
+/// reporting it as a clip with a made-up id would hide exactly the failure the index write
+/// has to be honest about (spec §8.2). `id` is the row when there is one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedClipDto {
+    /// The `clips` row, or `null` when the file was written but not indexed — in which
+    /// case the UI must say so, because the clip will not appear in the list.
+    pub id: Option<i64>,
+    pub path: String,
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+    pub codec: String,
+    /// The clip's first frame on the engine's media timeline.
+    pub started_at_ms: u64,
+}
+
+/// The one recording this shell can have running, plus what a start is built from.
+///
+/// The engine is an `Arc<Recorder>` rather than a `Recorder` so a command can take a
+/// handle and drop the slot lock before doing slow work (see the note above about
+/// `clip_now`). `Mutex` because the commands run on more than one thread.
+pub struct RecorderHost {
+    /// The directory `scratch/`, `clips/` and `localplay.db` resolve against, and where
+    /// `config.toml` is read from when a recording starts.
+    app_data_dir: PathBuf,
+    /// ffmpeg, or `None` when it could not be found at startup — in which case recording
+    /// is impossible and every start says so rather than failing somewhere deeper.
+    bins: Option<FfmpegBinaries>,
+    current: Mutex<Option<Arc<Recorder>>>,
+}
+
+impl RecorderHost {
+    pub fn new(app_data_dir: PathBuf, bins: Option<FfmpegBinaries>) -> Self {
+        Self { app_data_dir, bins, current: Mutex::new(None) }
+    }
+
+    /// The `config.toml` a recording would be started from.
+    pub fn config_path(&self) -> PathBuf {
+        self.app_data_dir.join("config.toml")
+    }
+
+    /// The slot, or the error a poisoned slot deserves.
+    ///
+    /// Poisoning means a command panicked while holding the slot. Nothing in this module
+    /// panics, so if it happens it is a bug, and the honest answer is to refuse rather
+    /// than to pretend no recording is running.
+    fn slot(&self) -> Result<MutexGuard<'_, Option<Arc<Recorder>>>, CommandError> {
+        self.current.lock().map_err(|_| {
+            CommandError::new(
+                ErrorCode::Recording,
+                "the recording state is unusable: an earlier command panicked while \
+                 holding it",
+            )
+        })
+    }
+
+    /// A handle on the running recording, with the slot lock already released.
+    fn handle(&self) -> Result<Option<Arc<Recorder>>, CommandError> {
+        Ok(self.slot()?.as_ref().map(Arc::clone))
+    }
+
+    /// What the recorder is doing right now — never blocks the recording loop, and answers
+    /// "not running" before anything has been started.
+    pub fn status(&self) -> Result<RecordingStatusDto, CommandError> {
+        Ok(match self.handle()? {
+            Some(recorder) => RecordingStatusDto::from(recorder.status()),
+            None => RecordingStatusDto::from(RecorderStatus::stopped()),
+        })
+    }
+
+    /// Start recording, and return the first status.
+    ///
+    /// Everything the engine decides at startup (the encoder smoke test, the capture
+    /// backend, the ring, ffmpeg) happens here, on the caller's thread, so a machine that
+    /// cannot record says so now instead of failing inside a background thread.
+    pub fn start(&self, settings: &RecordingConfig) -> Result<RecordingStatusDto, CommandError> {
+        let bins = self.bins.as_ref().ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::FfmpegUnavailable,
+                "ffmpeg was not found, so a recording cannot be started. Install ffmpeg on \
+                 PATH or place the sidecar binaries next to the application.",
+            )
+        })?;
+
+        // The lock is held across the start so two concurrent starts cannot both win; a
+        // start is a startup handshake (a one-frame smoke test at most), not a wait.
+        let mut slot = self.slot()?;
+        if slot.as_ref().is_some_and(|recorder| recorder.is_running()) {
+            return Err(CommandError::new(
+                ErrorCode::Recording,
+                "a recording is already running: stop it before starting another",
+            ));
+        }
+
+        let cfg = RecorderConfig {
+            bin: bins.clone(),
+            app_data_dir: self.app_data_dir.clone(),
+            buffer: settings.buffer.clone(),
+            encode: settings.encode.clone(),
+            storage: settings.storage.clone(),
+            // WGC + WASAPI on Windows, the synthetic stubs everywhere else. This shell has
+            // no switch for it and must not: the engine refuses to substitute a stub on
+            // Windows, so there is no path here that captures nothing while looking like a
+            // recording.
+            sources: Sources::Platform,
+            // The desktop shell never encodes on the CPU: there is no UI for it, and
+            // principle 3 rules it out (spec §3.2).
+            dev_software_encoder: false,
+        };
+
+        let recorder = Recorder::start(cfg).map_err(|err| {
+            CommandError::new(ErrorCode::Recording, format!("could not start recording: {err:#}"))
+        })?;
+        let status = RecordingStatusDto::from(recorder.status());
+        *slot = Some(Arc::new(recorder));
+        Ok(status)
+    }
+
+    /// Stop the recording, flush the encoder and return the final status.
+    ///
+    /// Idempotent: with nothing running it reports the idle status rather than failing, so
+    /// a stop from a window whose recording already died is not an error the user has to
+    /// make sense of.
+    pub fn stop(&self) -> Result<RecordingStatusDto, CommandError> {
+        // Held across the stop: the join returns within one frame poll, and holding it is
+        // what makes "stop then start" a sequence rather than a race between a capture
+        // session that is closing and one that is opening.
+        let taken = self.slot()?.take();
+        let Some(recorder) = taken else {
+            return Ok(RecordingStatusDto::from(RecorderStatus::stopped()));
+        };
+        let outcome = recorder.stop().map_err(|err| {
+            CommandError::new(ErrorCode::Recording, format!("stopping the recorder failed: {err:#}"))
+        });
+        let status = RecordingStatusDto::from(recorder.status());
+        // The status is reported either way — a recorder that failed while stopping still
+        // has counters worth showing — but a failed stop is still a failure.
+        outcome.map(|()| status)
+    }
+
+    /// Take a clip now.
+    ///
+    /// Blocks for the post-roll (seconds), which is why the caller must be off the UI
+    /// thread: the whole point of this command is that the footage is on disk before it
+    /// returns.
+    pub fn clip_now(&self) -> Result<RecordedClipDto, CommandError> {
+        let recorder = self.handle()?.ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::Recording,
+                "nothing is recording, so there is no buffer to take a clip from",
+            )
+        })?;
+        let clip = recorder.clip_now().map_err(|err| {
+            CommandError::new(ErrorCode::Recording, format!("taking a clip failed: {err:#}"))
+        })?;
+        Ok(RecordedClipDto {
+            id: clip.id,
+            path: clip.metadata.path.to_string_lossy().into_owned(),
+            duration_ms: clip.metadata.duration_ms,
+            size_bytes: clip.metadata.size_bytes,
+            codec: clip.metadata.encoder,
+            started_at_ms: clip.started_at_ms,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1501,6 +1748,138 @@ mod tests {
     fn the_thumbnail_cache_name_is_derived_from_the_clip_and_the_frame() {
         assert_eq!(thumbnail_file_name(1, 0), "clip-1-0.jpg");
         assert_eq!(thumbnail_file_name(12, 1_500), "clip-12-1500.jpg");
+    }
+
+    // -- recording -----------------------------------------------------------------------
+
+    /// A recorder host over the fixture's temporary directory.
+    ///
+    /// `with_ffmpeg` is false for the "no sidecars installed" case; when it is true the
+    /// host holds the real binaries, but no test here ever lets it *start* a recording
+    /// that gets as far as capturing — see `a_start_the_engine_refuses_fails_before_any_capture_starts`.
+    fn host(f: &Fixture, with_ffmpeg: bool) -> RecorderHost {
+        let app_data_dir = f.paths.db_path.parent().expect("the db lives in the app dir");
+        RecorderHost::new(app_data_dir.to_path_buf(), with_ffmpeg.then(|| f.bins.clone()))
+    }
+
+    #[test]
+    fn recording_status_is_the_idle_status_before_anything_is_started() {
+        let f = Fixture::new();
+        let status = host(&f, true).status().unwrap();
+
+        assert_eq!(status, RecordingStatusDto::from(RecorderStatus::stopped()));
+        assert!(!status.running, "a shell that has never recorded reports not running");
+        assert_eq!(status.configured_fps, 0, "and claims no configured rate");
+        assert_eq!(status.error, None);
+    }
+
+    #[test]
+    fn a_start_without_ffmpeg_fails_with_the_code_the_ui_explains() {
+        let f = Fixture::new();
+        let host = host(&f, false);
+
+        let err = host.start(&RecordingConfig::example().unwrap()).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::FfmpegUnavailable);
+        assert!(err.message.contains("ffmpeg was not found"), "got: {}", err.message);
+        assert!(!host.status().unwrap().running, "and nothing was started");
+    }
+
+    #[test]
+    fn a_start_the_engine_refuses_fails_before_any_capture_starts() {
+        // Why this is the only test that reaches `RecorderHost::start` with real binaries:
+        // the engine resolves the encoder — codec, then vendor — *before* it creates the
+        // capture backend, and on Windows that backend is a live Windows Graphics Capture
+        // session. This test therefore fails the start at the codec, on every platform,
+        // without a capture session ever existing. A test that let a start succeed here
+        // would record the screen of whoever ran the suite.
+        let f = Fixture::new();
+        let host = host(&f, true);
+        let mut settings = RecordingConfig::example().unwrap();
+        settings.encode.codec = "vp9".to_string();
+
+        let err = host.start(&settings).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Recording);
+        assert!(
+            err.message.contains("unsupported encode.codec"),
+            "the message must name the setting, through the command error: {}",
+            err.message
+        );
+        assert!(!host.status().unwrap().running, "a failed start leaves nothing running");
+    }
+
+    #[test]
+    fn stopping_nothing_is_idempotent_and_says_so() {
+        let f = Fixture::new();
+        let host = host(&f, true);
+
+        let first = host.stop().unwrap();
+        let second = host.stop().unwrap();
+
+        assert_eq!(first, second, "a stop with nothing running is a value, not a failure");
+        assert!(!first.running);
+        assert_eq!(first.error, None);
+    }
+
+    #[test]
+    fn a_clip_with_nothing_recording_is_refused_rather_than_waited_for() {
+        let f = Fixture::new();
+        let host = host(&f, true);
+
+        let err = host.clip_now().unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Recording);
+        assert!(
+            err.message.contains("nothing is recording"),
+            "the message must say why there is no clip: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_recording_dto_json_matches_the_typescript_interface() {
+        // `src/lib/types.ts` mirrors these two structs by hand, like the clip and storage
+        // DTOs above: without this, a rename on either side is discovered by a user
+        // watching a status readout that never moves.
+        let status = serde_json::to_value(RecordingStatusDto::from(RecorderStatus::stopped())).unwrap();
+        let mut keys: Vec<&str> = status.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "clips",
+                "configured_fps",
+                "drift_ms",
+                "dropped",
+                "dropped_audio",
+                "error",
+                "fps",
+                "frames",
+                "running",
+                "segments",
+                "skipped",
+                "span_ms"
+            ]
+        );
+
+        let clip = serde_json::to_value(RecordedClipDto {
+            id: Some(3),
+            path: "/clips/clip-1.mp4".to_string(),
+            duration_ms: 12_000,
+            size_bytes: 1_024,
+            codec: "libx264".to_string(),
+            started_at_ms: 4_000,
+        })
+        .unwrap();
+        let mut keys: Vec<&str> = clip.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["codec", "duration_ms", "id", "path", "size_bytes", "started_at_ms"]
+        );
+        assert_eq!(clip["id"], 3, "an indexed clip carries its row id");
     }
 
     #[test]

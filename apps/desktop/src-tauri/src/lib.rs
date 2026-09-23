@@ -11,10 +11,10 @@ pub mod commands;
 pub mod config;
 
 use commands::{
-    AppPaths, ClipDto, CommandError, DeleteOutcome, Deps, ErrorCode, StorageConfigView,
-    StorageStats, ThumbnailRef,
+    AppPaths, ClipDto, CommandError, DeleteOutcome, Deps, ErrorCode, RecorderHost,
+    RecordedClipDto, RecordingStatusDto, StorageConfigView, StorageStats, ThumbnailRef,
 };
-use config::StorageConfig;
+use config::{RecordingConfig, StorageConfig};
 use localplay_media::FfmpegBinaries;
 use localplay_store::Store;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,11 @@ pub struct AppState {
     paths: AppPaths,
     storage: StorageConfig,
     warnings: Vec<String>,
+    /// The recording this window started, if any — the engine the CLI also drives
+    /// (`localplay-recorder`). It is a host rather than a bare handle because a start has
+    /// to resolve the application data directory and the ffmpeg sidecar binaries, and
+    /// both are already here.
+    recorder: RecorderHost,
 }
 
 impl AppState {
@@ -100,7 +105,13 @@ impl AppState {
             store.total_bytes().unwrap_or(0)
         );
 
-        Ok(Self { store: Mutex::new(store), bins, paths, storage, warnings })
+        let recorder = RecorderHost::new(app_data_dir.to_path_buf(), bins.clone());
+        Ok(Self { store: Mutex::new(store), bins, paths, storage, warnings, recorder })
+    }
+
+    /// The recording engine this window drives. No UI is built unless it can record.
+    pub fn recorder(&self) -> &RecorderHost {
+        &self.recorder
     }
 
     /// The paths the asset protocol has to be allowed to serve (spec §9).
@@ -188,6 +199,41 @@ fn delete_clip(state: State<'_, AppState>, id: i64) -> Result<DeleteOutcome, Com
     state.with_deps(|deps| commands::delete_clip(deps, id))
 }
 
+// -- recording ---------------------------------------------------------------------------
+//
+// These four are `async`, unlike every other command here, for one reason: tauri runs a
+// synchronous command on the webview's own thread, and two of these block for real time —
+// `clip_now` waits for the post-roll to be written (seconds), and a start runs the
+// encoder smoke test. An `async fn` command runs on the runtime's worker threads instead,
+// which is what keeps the window responsive while a clip is being saved.
+
+/// Start recording through the shared engine.
+#[tauri::command(rename_all = "snake_case")]
+async fn start_recording(state: State<'_, AppState>) -> Result<RecordingStatusDto, CommandError> {
+    // Read at start time, not at window-open time: a capture-only mistake must not stop the
+    // review pane from opening (see `config.rs`).
+    let settings = RecordingConfig::load(&state.recorder.config_path())?;
+    state.recorder.start(&settings)
+}
+
+/// Stop recording and flush the encoder. Idempotent.
+#[tauri::command(rename_all = "snake_case")]
+async fn stop_recording(state: State<'_, AppState>) -> Result<RecordingStatusDto, CommandError> {
+    state.recorder.stop()
+}
+
+/// The live recording status. Answers "not running" before anything has been started.
+#[tauri::command(rename_all = "snake_case")]
+async fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusDto, CommandError> {
+    state.recorder.status()
+}
+
+/// Take a clip now: wait for the post-roll, splice it losslessly, index it.
+#[tauri::command(rename_all = "snake_case")]
+async fn clip_now(state: State<'_, AppState>) -> Result<RecordedClipDto, CommandError> {
+    state.recorder.clip_now()
+}
+
 /// Start the desktop application.
 ///
 /// Nothing in this crate calls this in a test: it opens a window, and neither this
@@ -243,7 +289,11 @@ pub fn run() {
             set_favourite,
             trim_clip,
             thumbnail,
-            delete_clip
+            delete_clip,
+            start_recording,
+            stop_recording,
+            recording_status,
+            clip_now
         ])
         .run(tauri::generate_context!())
         .expect("error while running the localplay desktop shell");

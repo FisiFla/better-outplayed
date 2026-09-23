@@ -24,6 +24,7 @@
 //! works, and it is named here rather than done.
 
 use crate::commands::{CommandError, ErrorCode};
+use localplay_recorder::config::{BufferSection, EncodeSection, StorageSection};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +78,69 @@ impl StorageConfig {
         if !path.is_file() {
             tracing::info!(
                 "no config at {}; using the values from config.example.toml",
+                path.display()
+            );
+            return Self::example();
+        }
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            CommandError::new(
+                ErrorCode::Io,
+                format!("could not read the config file {}: {err}", path.display()),
+            )
+        })?;
+        Self::from_toml(&text)
+    }
+}
+
+/// The `[buffer]`, `[encode]` and `[storage]` sections — everything the recorder needs to
+/// start.
+///
+/// Why this is separate from [`StorageConfig`]: the review pane reads `[storage]` when the
+/// window opens, while a *recording* needs `[buffer]` and `[encode]` as well, and the two
+/// are deliberately parsed at different moments. The shell must open even when the capture
+/// sections are missing or wrong (a file carrying only `[storage]`, a typo'd
+/// `vendor = "software"`) — that is the point of a review pane that works without a
+/// recorder — so this is parsed when *recording starts*, and a failure there fails that
+/// command rather than the window.
+///
+/// The section types are the recorder's own (`localplay_recorder::config`), which the CLI
+/// deserialises too, so one `config.toml` means one thing to both front-ends.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingConfig {
+    pub buffer: BufferSection,
+    pub encode: EncodeSection,
+    pub storage: StorageSection,
+}
+
+impl RecordingConfig {
+    /// The capture sections of the repository's example config — the fallback for a fresh
+    /// install, so a first recording behaves exactly as the example documents.
+    pub fn example() -> Result<Self, CommandError> {
+        Self::from_toml(EXAMPLE_CONFIG)
+    }
+
+    pub fn from_toml(text: &str) -> Result<Self, CommandError> {
+        toml::from_str::<Self>(text).map_err(|err| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "the config file's [buffer], [encode] and [storage] sections could not \
+                     be read, so a recording cannot be started: {err}"
+                ),
+            )
+        })
+    }
+
+    /// Read the recording settings from `path`, or fall back to the example when the file
+    /// does not exist.
+    ///
+    /// A file that exists but is malformed is an error rather than a silent fallback: a
+    /// user who edited `encode.fps` and typo'd it must not be recorded at a rate they did
+    /// not ask for.
+    pub fn load(path: &Path) -> Result<Self, CommandError> {
+        if !path.is_file() {
+            tracing::info!(
+                "no config at {}; recording with the values from config.example.toml",
                 path.display()
             );
             return Self::example();
@@ -164,6 +228,58 @@ mod tests {
         let err = StorageConfig::load(&path).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("[storage]"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn the_recording_settings_fall_back_to_the_example_config() {
+        // A fresh install has no `config.toml`: a first recording must behave exactly as
+        // `config.example.toml` documents, which is also what the CLI does.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RecordingConfig::load(&dir.path().join("config.toml")).unwrap();
+
+        assert_eq!(cfg.buffer.pre_seconds, 30);
+        assert_eq!(cfg.buffer.post_seconds, 5);
+        assert_eq!(cfg.encode.fps, 60, "the example's capture rate");
+        assert_eq!(cfg.encode.codec, "h264");
+        assert_eq!(cfg.storage.max_total_bytes, 53_687_091_200);
+    }
+
+    #[test]
+    fn the_recording_settings_come_from_the_same_file_the_review_pane_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[buffer]\npre_seconds = 12\npost_seconds = 3\nsegment_time = 1\n\
+             scratch_cap_bytes = 1024\nscratch_dir = \"\"\n\n\
+             [encode]\nvendor = \"nvenc\"\ncodec = \"hevc\"\nbitrate_kbps = 20000\n\
+             fps = 60\noutput_size = \"1920x1080\"\n\n\
+             [storage]\nclips_dir = \"\"\nmax_total_bytes = 2048\nmax_age_days = 1\n",
+        )
+        .unwrap();
+
+        let recording = RecordingConfig::load(&path).unwrap();
+        assert_eq!(recording.buffer.pre_seconds, 12);
+        assert_eq!(recording.encode.vendor, "nvenc");
+        assert_eq!(recording.storage.max_total_bytes, 2048);
+
+        // The same file, read by the review pane's own type: one file, two readers, and
+        // they agree about where clips go.
+        let review = StorageConfig::load(&path).unwrap();
+        assert_eq!(review.max_total_bytes, recording.storage.max_total_bytes);
+    }
+
+    #[test]
+    fn a_file_without_the_capture_sections_fails_recording_but_not_the_shell() {
+        // `a_capture_only_config_file_does_not_stop_the_shell_from_opening` (lib.rs) is the
+        // other half of this: the review pane opens on this file, and only a *recording*
+        // refuses it, naming what is missing.
+        let err = RecordingConfig::from_toml(
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\nmax_age_days = 1\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("[buffer]"), "the message must name the sections: {}", err.message);
     }
 
     #[test]
