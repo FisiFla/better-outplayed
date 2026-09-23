@@ -151,7 +151,8 @@ Within a few seconds, `seg-000000.mp4`, `seg-000001.mp4`, … appear in
 With `RUST_LOG=debug`, every ~200 ms you get a line:
 
 ```
-frames=<n> segments=<n> bytes=<b> span=<ms>ms dropped=<n> dropped_audio=<n>
+frames=<n> segments=<n> bytes=<b> span=<ms>ms dropped=<n> dropped_audio=<n> \
+skipped=<n> fps=<achieved>/<configured>
 ```
 
 `frames=` is a literal counter of the video frames actually submitted to the encoder
@@ -166,6 +167,31 @@ Zero is the expected value on a machine that keeps up; **a non-zero and rising
 `dropped=` means the encoder is the bottleneck** — the recording has holes in it, and the
 run should not be reported as clean. The queue is bounded (4 video frames, 32 audio
 blocks), so these counters can never be traded for unbounded RAM.
+
+`skipped=` is the other half of `frames=`: the frames the capture backend offered that the
+pacer threw away **without reading their pixels back** (`CaptureBackend::discard_pending`).
+A display that delivers more frames per second than `encode.fps` is the normal case —
+measured on the reference box at 53-75fps delivered against a configured 30 — so
+`skipped=` is expected to be a substantial fraction of `frames=` there, close to
+`(source rate / encode.fps - 1) × frames=`. On a high-refresh display, **`skipped= 0`
+means every surplus frame was read back before being dropped, which is the CPU cost that
+was measured at 50.8% of a core**; that is a failure of this criterion even though the
+recording itself is fine. `frames=` + `skipped=` is the source's own delivery rate.
+
+`fps=<achieved>/<configured>` is the achieved rate: the frames that actually reached the
+encoder per second, measured over the last second of the run (so a fresh run reads
+`0.0/<configured>` until its first second has been measured). It is the number that says
+whether media time tracks real time, and on this box the configured value is what it must
+reach.
+
+If the encoder's queue is dropping frames while the pacer admits the configured rate, the
+CLI raises a `WARN` (at most one per 10 s) — `the encoder cannot sustain the configured
+<fps>fps: only <achieved> frames per second are reaching it …`. It names the configured and
+the achieved rate and states the consequence: **media time will not track real time, so a
+`pre_seconds` clip will correspond to more real seconds than configured.** A run that
+prints this warning must not be reported as passing criterion 1 or 2: the machine cannot
+encode that many frames per second at that resolution, and the remedy is a lower
+`encode.fps` or a smaller `encode.output_size`.
 
 Segment numbering **continues across runs**. A run started on a scratch directory that
 already holds `seg-000000.mp4`…`seg-000018.mp4` writes `seg-000019.mp4` onward (the CLI
@@ -198,6 +224,13 @@ resolution and the pipe size.
 - `frames=` grows materially slower than `T × <fps>` (e.g. well under half of `<fps>`),
   or `span=` grows materially slower than 1000 ms per wall-clock second — capture is not
   keeping up at the configured fps (or the pipeline is stalling).
+- `skipped=` stays at `0` on a display whose refresh rate is far above `encode.fps`: every
+  surplus frame is being read back before it is dropped, which is the measured CPU burn
+  (50.8% of a core at 4K) with nothing to show for it.
+- `fps=` settles below the configured rate, or the `the encoder cannot sustain the
+  configured <fps>fps` warning appears: the machine cannot encode that rate at this
+  resolution. Media time then runs slower than the wall clock, so a configured `pre_seconds`
+  corresponds to more real seconds than asked for — lower `encode.fps` or `encode.output_size`.
 
 **Do not misread:** if `segments=` has stopped climbing but `span` still grows, that is
 normal ring behaviour once the scratch cap is reached (oldest segments are evicted) — not

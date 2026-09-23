@@ -4,6 +4,13 @@
 //! memory as BGRA8. That copy is the known cost of the ffmpeg-sidecar encode path
 //! (spec §6.1) and is exactly what a Phase 2 Media Foundation backend would remove.
 //!
+//! It is paid **only for frames the caller keeps**. A display delivering more frames per
+//! second than the encoder is configured for hands over a surplus every interval (measured:
+//! 53-75fps against a configured 30), and those frames are closed by
+//! [`CaptureBackend::discard_pending`] without a staging texture, a `CopyResource`, a `Map`
+//! or an allocation of any kind (see [`Session::discard_pending`]). Nothing is captured
+//! differently: the same frames arrive, they are simply not copied out.
+//!
 //! # What has been verified about this code
 //!
 //! It type-checks for `x86_64-pc-windows-msvc` from macOS (`cargo check` does not
@@ -35,8 +42,9 @@
 //!   rather than feeding a differently sized frame to ffmpeg.
 //! - Only the primary monitor is captured, and monitor selection is not wired to
 //!   configuration.
-//! - Frames are copied through a staging texture on every frame. That is the cost this
-//!   design accepts to keep the encoder an ffmpeg sidecar (spec §6.1).
+//! - Frames are copied through a staging texture on every frame the caller keeps. That is
+//!   the cost this design accepts to keep the encoder an ffmpeg sidecar (spec §6.1); the
+//!   frames the pacer discards are closed without it (`discard_pending`).
 
 #![cfg(windows)]
 
@@ -81,6 +89,14 @@ const BUFFER_COUNT: i32 = 2;
 /// outside the `FrameArrived` callback, and polling at 1ms keeps the added latency well
 /// under a single 60fps frame interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Upper bound on the frames one `discard_pending` call will close.
+///
+/// The pool holds `BUFFER_COUNT` frames at a time, so a well-behaved pool cannot offer
+/// more than that; the bound exists only so that a pool which keeps answering cannot turn
+/// the caller's "drain what is there" into an unbounded loop. Stopping at it is not an
+/// error — every frame taken is closed — and the next call picks up whatever is left.
+const DISCARD_LIMIT: usize = BUFFER_COUNT as usize * 4;
 
 /// Primary-monitor screen capture.
 pub struct WgcCapture {
@@ -265,6 +281,32 @@ impl CaptureBackend for WgcCapture {
         // is not a cosmetic problem — see `copy_out` and the CLI's frame guard.
         self.size
     }
+
+    /// Close everything the frame pool is holding, without reading a single pixel back —
+    /// see [`Session::discard_pending`].
+    ///
+    /// The pacer in the CLI asks for this *instead of* `next_frame` whenever it has no
+    /// slot for a frame, which on the measured 4K machine was ~45% of the frames the
+    /// display handed over (the compositor delivered 53-75fps against a configured 30).
+    /// Those frames used to be read back — 33.2MB of GPU copy plus a row-by-row CPU copy
+    /// each — and then dropped, so nearly half of the capture cost was bought and thrown
+    /// away. This path buys nothing: no staging texture, no `CopyResource`, no `Map`, no
+    /// allocation. A frame still has to be closed, because the pool only holds
+    /// `BUFFER_COUNT` of them and an unclosed frame starves the next capture.
+    fn discard_pending(&mut self) -> Result<usize> {
+        // Same contract as `next_frame`: without `start` there is no running capture
+        // session to drain, and reporting success would hide that from the caller.
+        if !self.started {
+            bail!("WGC capture is not started");
+        }
+        let session = self
+            .session
+            .as_ref()
+            .context("WGC capture has no session (already stopped)")?;
+        // `&Session`: this is a read of the pool, not a change to the session. The frames
+        // it closes are released through the frame handles themselves.
+        session.discard_pending()
+    }
 }
 
 impl Drop for WgcCapture {
@@ -339,6 +381,50 @@ impl Session {
         let frame = staged?;
         closed.context("closing the WGC frame")?;
         Ok(Some(frame))
+    }
+
+    /// Close every frame the pool is holding, without reading a single pixel back, and
+    /// say how many were closed.
+    ///
+    /// This is [`Self::poll_frame`] minus all of its cost: no staging texture is created,
+    /// no `CopyResource` is issued, `Map` is never called and nothing is allocated. The
+    /// only work per frame is `TryGetNextFrame` and `Close`.
+    ///
+    /// Closing is not optional. The pool owns `BUFFER_COUNT` buffers, and a frame that is
+    /// taken out of it but never closed keeps its buffer — take `BUFFER_COUNT` frames
+    /// without closing them and the capture starves, exactly as it would with
+    /// `next_frame`. So "discard" means "as far as WGC is concerned, `next_frame` was
+    /// called and the frame was consumed": the difference is entirely on our side, in what
+    /// we do *not* do with the texture.
+    ///
+    /// `Err` is the "no frame is ready" answer, exactly as in `poll_frame`
+    /// ([`is_frame_unavailable`]) — any other error is a real failure and is reported
+    /// rather than swallowed, because a drain that silently stopped working would look
+    /// exactly like a source that had nothing to give.
+    fn discard_pending(&self) -> Result<usize> {
+        let mut discarded = 0;
+        // Bounded: see [`DISCARD_LIMIT`]. Hitting the bound is not a failure — the frames
+        // taken so far are closed, and the caller's next call drains the rest.
+        for _ in 0..DISCARD_LIMIT {
+            let frame = match self.pool.TryGetNextFrame() {
+                Ok(frame) => frame,
+                Err(e) if is_frame_unavailable(&e) => break,
+                Err(e) => {
+                    bail!("Direct3D11CaptureFramePool::TryGetNextFrame failed while draining: {e}")
+                }
+            };
+            // SAFETY: `frame` is a live `Direct3D11CaptureFrame` obtained from this
+            // session's own frame pool, so it is owned by this thread's pool and by
+            // nothing else; `Close` is the documented way to release it and is run exactly
+            // once per frame here. Nothing below reads the frame's texture or surface, so
+            // no device, context or mapped memory is involved at all — there is nothing to
+            // synchronise with. Closing releases the pool buffer the frame was holding,
+            // which is what lets the pool deliver the next one (`poll_frame` does the same
+            // for the frame it copies out).
+            frame.Close().context("closing a discarded WGC frame")?;
+            discarded += 1;
+        }
+        Ok(discarded)
     }
 
     /// Stage-copy the frame's D3D11 texture into CPU-visible memory as BGRA8.

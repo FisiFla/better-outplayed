@@ -112,8 +112,12 @@ fn a_frame_that_matches_the_declared_pipe_size_is_still_submitted() {
     // The pacer admits the first frame immediately, so this is the frame's own guard that
     // is being exercised here — not the rate limiter.
     let mut pacer = FramePacer::new(FPS);
-    let submitted = pump_once_counted(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    let counts = pump_once_counted(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
         .expect("a frame the pipe was declared for must be submitted");
-    assert_eq!(submitted, 1, "the matching frame must reach the encoder");
+    assert_eq!(counts.submitted, 1, "the matching frame must reach the encoder");
+    assert_eq!(
+        counts.skipped, 0,
+        "a pacer with an unused slot must take the frame it is due, not skip it"
+    );
     fx.encoder.finish().expect("flush encoder");
 }

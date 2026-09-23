@@ -74,6 +74,29 @@ pub trait CaptureBackend: Send {
     fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>>;
     fn stop(&mut self) -> anyhow::Result<()>;
 
+    /// Close any frames the backend has buffered, without copying their pixels to CPU
+    /// memory. Returns how many were discarded. Used to skip the (expensive) readback
+    /// for frames the pacer will not keep.
+    ///
+    /// This is the cheap half of [`CaptureBackend::next_frame`], and the caller decides
+    /// which half to use *before* paying for a frame: the rate-limiting pacer in the CLI
+    /// discards the frames it has no slot for (see `pump_once_counted`), and at
+    /// 3840x2160 BGRA the readback it skips is a 33.2MB GPU copy plus a row-by-row CPU
+    /// copy per frame. Implementations must therefore do no allocation, no pixel copy and
+    /// no blocking wait here, must release what they close (an unclosed frame occupies a
+    /// backend buffer and starves the next one), and must bound their loop.
+    ///
+    /// Counting contract: a frame is either returned by [`CaptureBackend::next_frame`] or
+    /// counted here, so the caller's materialised and discarded counters together account
+    /// for every frame the backend offered.
+    ///
+    /// The default is correct for a backend that owns no frame pool — there is nothing
+    /// buffered to close, so there is nothing to discard. The stub overrides it to model a
+    /// paced source, and WGC overrides it to close the frames its pool is holding.
+    fn discard_pending(&mut self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// The frame geometry this backend delivers.
     ///
     /// Infallible by design: the size is fixed once the backend is constructed (the
