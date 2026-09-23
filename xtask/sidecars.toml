@@ -1,0 +1,12 @@
+# xtask/sidecars.toml
+#
+# LGPL ffmpeg builds only: localplay never uses libx264/libx265, so GPL builds are
+# unnecessary and would impose GPL obligations on the distributed app (README).
+
+[[platform]]
+target = "x86_64-pc-windows-msvc"
+archive_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# Recorded on first fetch via `cargo xtask sidecars record`. Reviewed in the PR.
+sha256 = "RECORD_ME"
+archive_kind = "zip"
+binaries = ["bin/ffmpeg.exe", "bin/ffprobe.exe"]
