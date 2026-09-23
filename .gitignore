@@ -110,6 +110,12 @@ ringbuffer/**/*.ts
 *.pem
 *.key
 *.pfx
+# The Phase 4 test fixtures carry a throwaway self-signed certificate for 127.0.0.1 and its
+# key, on purpose: the League mock server has to present a certificate nothing has signed, so
+# that a client with verification *on* can be shown refusing it. It is a test fixture, not a
+# secret — see `crates/events/tests/fixtures/README.md` — and the exception is scoped to
+# fixture directories so the rules above keep protecting everything else.
+!**/fixtures/**/*.pem
 secrets/
 credentials.json
 # Windows DPAPI / local config with tokens

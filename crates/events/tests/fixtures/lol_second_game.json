@@ -1,0 +1,21 @@
+{
+  "activePlayer": {
+    "level": 1,
+    "riotIdGameName": "FisiFla",
+    "summonerName": "FisiFla#EUW"
+  },
+  "allPlayers": [],
+  "events": {
+    "Events": [
+      { "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 },
+      { "EventID": 1, "EventName": "MinionsSpawning", "EventTime": 65.0 }
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": -24.5,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}

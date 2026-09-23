@@ -1,0 +1,97 @@
+{
+  "activePlayer": {
+    "abilities": {},
+    "championStats": { "attackDamage": 120.0 },
+    "currentGold": 1450.5,
+    "level": 11,
+    "riotId": "FisiFla#EUW",
+    "riotIdGameName": "FisiFla",
+    "summonerName": "FisiFla#EUW"
+  },
+  "allPlayers": [
+    {
+      "championName": "Ahri",
+      "isBot": false,
+      "isDead": false,
+      "level": 11,
+      "position": "MIDDLE",
+      "rawChampionName": "game_character_displayname_Ahri",
+      "respawnTimer": 0.0,
+      "riotId": "FisiFla#EUW",
+      "riotIdGameName": "FisiFla",
+      "scores": {
+        "assists": 3,
+        "creepScore": 142,
+        "deaths": 1,
+        "kills": 5,
+        "wardScore": 11.5
+      },
+      "skinID": 0,
+      "summonerName": "FisiFla#EUW",
+      "team": "ORDER"
+    },
+    {
+      "championName": "Zed",
+      "isBot": false,
+      "isDead": true,
+      "level": 10,
+      "position": "MIDDLE",
+      "scores": {
+        "assists": 1,
+        "creepScore": 130,
+        "deaths": 4,
+        "kills": 1,
+        "wardScore": 4.0
+      },
+      "skinID": 0,
+      "summonerName": "ZedMain",
+      "team": "CHAOS"
+    }
+  ],
+  "events": {
+    "Events": [
+      { "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 },
+      { "EventID": 1, "EventName": "MinionsSpawning", "EventTime": 65.0 },
+      {
+        "EventID": 2,
+        "EventName": "ChampionKill",
+        "EventTime": 201.4,
+        "KillerName": "FisiFla#EUW",
+        "VictimName": "ZedMain",
+        "Assisters": ["SupportMain"]
+      },
+      {
+        "EventID": 3,
+        "EventName": "ChampionKill",
+        "EventTime": 320.9,
+        "KillerName": "ZedMain",
+        "VictimName": "FisiFla#EUW",
+        "Assisters": []
+      },
+      {
+        "EventID": 4,
+        "EventName": "ChampionKill",
+        "EventTime": 402.2,
+        "KillerName": "EnemyTop",
+        "VictimName": "EnemyJungle",
+        "Assisters": []
+      },
+      {
+        "EventID": 5,
+        "EventName": "DragonKill",
+        "EventTime": 480.0,
+        "KillerName": "FisiFla#EUW",
+        "Stolen": "False",
+        "MonsterType": "DRAGON",
+        "MonsterSubType": "FIRE_DRAGON"
+      }
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": 641.7,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}

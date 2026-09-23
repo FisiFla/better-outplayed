@@ -1,0 +1,18 @@
+{
+  "activePlayer": {
+    "level": 3
+  },
+  "allPlayers": [],
+  "events": {
+    "Events": [
+      { "EventID": 11, "EventName": "ChampionKill", "EventTime": 95.0, "KillerName": "Somebody", "VictimName": "Someone", "Assisters": [] }
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": 100.0,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}

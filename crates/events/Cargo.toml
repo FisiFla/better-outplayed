@@ -7,6 +7,28 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The League Live Client Data API serves a self-signed certificate, so the one dedicated
+# client that talks to it has to be able to skip verification (spec §7.1). `native-tls`
+# is the platform's own TLS — Schannel on Windows, Security.framework here — chosen over a
+# bundled stack for two reasons that both matter to this project: it adds no C build step
+# (so `cargo check --target x86_64-pc-windows-msvc` still works from macOS, which
+# `rustls` + `ring` does not), and `danger_accept_invalid_certs` is the platform-supported
+# way to accept an unknown authority on both targets. See `lol::client`.
+native-tls = "0.2"
+# The GSI token gate compares a presented token against the generated one. A hand-written
+# comparison would be a bet that the optimiser keeps it branch-free; `subtle` is the crate
+# the TLS ecosystem uses for exactly this, has no dependencies of its own, and no build
+# script. See `gsi::token_matches`.
+subtle = "2"
+# The GSI token itself (spec §7.2's "generated shared token"). OS randomness, no C, and
+# already in the tree transitively (via `tempfile`).
+getrandom = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

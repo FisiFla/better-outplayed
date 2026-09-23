@@ -1,0 +1,29 @@
+{
+  "activePlayer": {
+    "level": 14,
+    "riotIdGameName": "FisiFla",
+    "summonerName": "FisiFla#EUW"
+  },
+  "allPlayers": [
+    { "championName": "Ahri", "scores": { "assists": 4, "deaths": 1, "kills": 7 }, "summonerName": "FisiFla#EUW", "team": "ORDER" }
+  ],
+  "events": {
+    "Events": [
+      { "EventID": 0, "EventName": "GameStart", "EventTime": 0.0 },
+      { "EventID": 1, "EventName": "MinionsSpawning", "EventTime": 65.0 },
+      { "EventID": 2, "EventName": "ChampionKill", "EventTime": 201.4, "KillerName": "FisiFla#EUW", "VictimName": "ZedMain", "Assisters": ["SupportMain"] },
+      { "EventID": 3, "EventName": "ChampionKill", "EventTime": 320.9, "KillerName": "ZedMain", "VictimName": "FisiFla#EUW", "Assisters": [] },
+      { "EventID": 4, "EventName": "ChampionKill", "EventTime": 402.2, "KillerName": "EnemyTop", "VictimName": "EnemyJungle", "Assisters": [] },
+      { "EventID": 5, "EventName": "DragonKill", "EventTime": 480.0, "KillerName": "FisiFla#EUW", "Stolen": "False", "MonsterType": "DRAGON", "MonsterSubType": "FIRE_DRAGON" },
+      { "EventID": 6, "EventName": "ChampionKill", "EventTime": 640.1, "KillerName": "FisiFla#EUW", "VictimName": "EnemyTop", "Assisters": ["SupportMain"] },
+      { "EventID": 7, "EventName": "BaronKill", "EventTime": 712.6, "KillerName": "FisiFla#EUW", "Stolen": "True", "MonsterType": "BARON_NASHOR" }
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": 730.2,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}
