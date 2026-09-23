@@ -52,5 +52,39 @@ max_age_days = 7
 clip = "Ctrl+F8"
 
 [events]
+# --- League of Legends (Riot's Live Client Data API) -------------------------------
+# Poll https://127.0.0.1:2999/liveclientdata/allgamedata while a game is running and turn
+# kills, deaths, assists, objectives and the game's start/end into clips (see the
+# highlights/markers note below).
+#
+# The poller only ever talks to 127.0.0.1:2999 — the game's own local API. A refused
+# connection is its normal state (no game running, or no League installed) and is not an
+# error. The endpoint serves a self-signed certificate, so TLS verification is relaxed for
+# that one address-pinned client and for nothing else.
 lol_poll_enabled = true
+
+# --- CS2 / Dota 2 (Valve Game State Integration) ------------------------------------
+# The port the GSI listener binds on 127.0.0.1. Set it to 0 (or omit it) to leave the
+# listener off; it never binds anything but loopback.
+#
+# The listener requires a token, which arrives inside the game's POST body (in the payload's
+# "auth" object — that is how Valve's "auth" block works; GSI sends no Authorization
+# header). localplay generates one on first use into <app data dir>/gsi-token.txt and writes
+# the file you have to install to:
+#   <app data dir>/gsi/cs2/gamestate_integration_localplay.cfg
+#   <app data dir>/gsi/dota2/gamestate_integration_localplay.cfg
+# Copy the one for the game you play into its cfg directory:
+#   .../Counter-Strike Global Offensive/game/csgo/cfg/
+#   .../dota 2 beta/game/dota/cfg/gamestate_integration/
+# and restart the game. A payload whose token does not match is answered HTTP 403 and
+# ignored; the token itself is never logged. Delete gsi-token.txt to rotate it (the
+# generated cfg file must then be replaced too).
 gsi_port = 45671
+
+# --- What an event does -------------------------------------------------------------
+# A *highlight* (kill, death, assist, objective, bomb planted/defused, end of game) takes a
+# clip through the same trigger the hotkey uses: pre_seconds before it, post_seconds after
+# it, losslessly spliced. A *marker* (a game or round starting or ending) is recorded in the
+# events table so the session timeline shows it, and takes no footage — a Counter-Strike
+# match would otherwise write a clip per round. Why a clip was taken is written to the same
+# table, linked to the clip.

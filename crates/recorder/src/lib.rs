@@ -24,6 +24,19 @@
 //! GUI calls [`Recorder::clip_now`] from a button) and **no** UI, and it reads no
 //! configuration file: the front-ends hand it a [`RecorderConfig`].
 //!
+//! # Why a clip was taken
+//!
+//! A trigger carries a [`ClipReason`]. A manual clip records nothing but the clip; a clip an
+//! integration asked for writes the reason into the `events` table (spec §5.5) linked to the
+//! clip it produced, so the session timeline says *why* the footage exists. Both paths are
+//! the same trigger — [`Recorder::clip_now_with`] is [`Recorder::clip_now`] with a reason —
+//! which is what keeps an event-triggered clip subject to the same pre-roll, post-roll and
+//! media-time semantics as a hotkey press.
+//!
+//! An event that is a *marker* rather than a highlight ([`EventKind::is_highlight`]) is
+//! recorded without a clip, through [`Recorder::note_event`]. No second trigger path is
+//! involved in either case.
+//!
 //! # The thread
 //!
 //! [`Recorder::start`] does the whole startup handshake on the calling thread — open the
@@ -62,7 +75,9 @@ pub mod pump;
 mod tests;
 
 pub use config::{BufferSection, EncodeSection, StorageSection};
-pub use index::{cleanup_pass, index_clip, now_ms, open_clip_index, unix_seconds, CleanupReport};
+pub use index::{
+    cleanup_pass, index_clip, index_event, now_ms, open_clip_index, unix_seconds, CleanupReport,
+};
 pub use pump::{
     guard_frame_size, pump_once, pump_once_counted, pump_until_span, FramePacer, PumpCounts,
     RateMeter, FRAME_POLL, PACER_RESYNC_AFTER_INTERVALS, POST_ROLL_MARGIN, POST_ROLL_SCAN_INTERVAL,
@@ -75,7 +90,7 @@ use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::probe::select_vendor;
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, Vendor, VideoCodec};
-use localplay_events::CaptureClock;
+use localplay_events::{CaptureClock, GameEvent};
 use localplay_media::FfmpegBinaries;
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
 use localplay_replay::splice::ClipMetadata;
@@ -256,6 +271,48 @@ impl RecorderStatus {
     }
 }
 
+/// Why a clip was taken.
+///
+/// This is the difference between "a clip exists" and "the session timeline knows why",
+/// which is what spec §5.5's `events` table is for. It is also the seam the two game
+/// integrations come in through (spec §7.1, §7.2): a driver hands the engine a derived
+/// [`GameEvent`], and the engine takes the clip through exactly the path a hotkey press
+/// takes — one trigger, one window, one splice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipReason {
+    /// A hotkey press or a button. No `events` row is written: there is no game event to
+    /// record, and a synthetic one would put a marker on the session timeline at which
+    /// nothing happened.
+    Manual,
+    /// A game event derived by an integration. The reason is written to `events` and linked
+    /// to the clip it produced (or to nothing, if the clip could not be indexed).
+    GameEvent(GameEvent),
+}
+
+impl ClipReason {
+    /// How the trigger is described in the log — and, for an event, in the `events` row.
+    pub fn describe(&self) -> String {
+        match self {
+            ClipReason::Manual => "hotkey pressed".to_string(),
+            ClipReason::GameEvent(event) => format!("{} event {}", event.source, event.kind),
+        }
+    }
+
+    /// The event behind this trigger, when there is one.
+    pub fn event(&self) -> Option<&GameEvent> {
+        match self {
+            ClipReason::Manual => None,
+            ClipReason::GameEvent(event) => Some(event),
+        }
+    }
+}
+
+impl From<GameEvent> for ClipReason {
+    fn from(event: GameEvent) -> Self {
+        ClipReason::GameEvent(event)
+    }
+}
+
 /// What a trigger produced.
 #[derive(Debug, Clone)]
 pub struct RecordedClip {
@@ -288,8 +345,11 @@ pub struct Recorder {
 
 /// A request from a caller on another thread to the pump loop.
 enum Command {
-    /// Take a clip now. The reply is the clip, or why there is none.
-    Clip(Sender<Result<RecordedClip>>),
+    /// Take a clip now, for this reason. The reply is the clip, or why there is none.
+    Clip { reason: ClipReason, reply: Sender<Result<RecordedClip>> },
+    /// Record an event that did not ask for a clip (a game or round boundary). The reply is
+    /// the `events` row's id, so a caller can tell that it landed.
+    Note { event: GameEvent, reply: Sender<Result<i64>> },
     /// Flush the encoder and end the loop.
     Stop,
 }
@@ -503,10 +563,24 @@ impl Recorder {
     /// Blocks until the clip is written: the post-roll alone is `post_seconds` of media,
     /// and the wait covers it plus a margin. A caller that must stay responsive should run
     /// this off its own event loop (the desktop shell does).
+    ///
+    /// Equivalent to [`Recorder::clip_now_with`] with [`ClipReason::Manual`] — the hotkey's
+    /// path, unchanged.
     pub fn clip_now(&self) -> Result<RecordedClip> {
+        self.clip_now_with(ClipReason::Manual)
+    }
+
+    /// The same trigger, with the reason recorded.
+    ///
+    /// This is the single entry point for both manual and automatic clipping: a game event
+    /// takes a clip through *this* call, so it inherits the media-time trigger instant, the
+    /// post-roll wait and the lossless splice rather than reimplementing any of them. What
+    /// the reason adds is one `events` row (spec §5.5) naming what happened, written after
+    /// the clip is indexed and linked to it.
+    pub fn clip_now_with(&self, reason: ClipReason) -> Result<RecordedClip> {
         let (reply, answer) = mpsc::channel();
         self.commands
-            .send(Command::Clip(reply))
+            .send(Command::Clip { reason, reply })
             .map_err(|_| anyhow::anyhow!("the recorder is not running"))?;
         // Cannot hang: the loop answers every queued command, and if it stops first its
         // receiver is dropped — which drops this command and its reply channel, making
@@ -514,6 +588,26 @@ impl Recorder {
         answer
             .recv()
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?
+    }
+
+    /// Record a derived event that did not ask for a clip, and return its `events` row id.
+    ///
+    /// Markers — a game starting or ending, a round boundary (see [`EventKind::is_highlight`])
+    /// — are part of what happened in a session, so the session timeline should show them;
+    /// they are not worth `pre_seconds` of footage each, so no clip is taken. The row's `at`
+    /// is the trigger instant's position on the ledger timeline, the same clock a clip's
+    /// `started_at` is on, so a marker and a clip can be compared directly. `clip_id` is
+    /// NULL: no clip produced this.
+    ///
+    /// Blocking, and cheap — a single INSERT on the loop thread.
+    pub fn note_event(&self, event: GameEvent) -> Result<i64> {
+        let (reply, answer) = mpsc::channel();
+        self.commands
+            .send(Command::Note { event, reply })
+            .map_err(|_| anyhow::anyhow!("the recorder is not running"))?;
+        answer
+            .recv()
+            .map_err(|_| anyhow::anyhow!("the recorder stopped before it could note the event"))?
     }
 
     /// Stop recording: flush the encoder, close the capture and audio sources, join the
@@ -609,11 +703,15 @@ impl Engine {
         loop {
             match commands.try_recv() {
                 Ok(Command::Stop) => break,
-                Ok(Command::Clip(reply)) => {
-                    let taken = self.take_clip();
+                Ok(Command::Clip { reason, reply }) => {
+                    let taken = self.take_clip(reason);
                     // The caller may have given up (a window closed, a test finished);
                     // that is its business, not the loop's.
                     let _ = reply.send(taken);
+                }
+                Ok(Command::Note { event, reply }) => {
+                    let noted = self.note_event(&event);
+                    let _ = reply.send(noted);
                 }
                 Err(TryRecvError::Empty) => {}
                 // Every `Recorder` was dropped: nothing can ask for a clip any more, so
@@ -746,7 +844,7 @@ impl Engine {
     }
 
     /// The trigger path (spec §6.2), run on the loop thread because it pumps.
-    fn take_clip(&mut self) -> Result<RecordedClip> {
+    fn take_clip(&mut self, reason: ClipReason) -> Result<RecordedClip> {
         // The trigger is "now" on the LEDGER's timeline — media time — not on the wall
         // clock, and that is deliberate: the two clocks only agree while the pipeline
         // keeps up with `encode.fps`, and on real 4K hardware it does not. Measured on
@@ -774,12 +872,12 @@ impl Engine {
         // the media value so the divergence is observable in a soak — `drift` is wall
         // minus media and grows by ~190ms per second of capture at 0.81x.
         let wall_ms = self.clock.ms_at(Instant::now());
-        // The wording is the runbook's, and it is kept verbatim: the line describes the
-        // instant of the trigger, which is the same whether a hotkey, a button or a game
-        // event asked for the clip.
+        // The line describes the instant of the trigger, which is the same whether a
+        // hotkey, a button or a game event asked for the clip; what the reason adds is who
+        // asked. A manual clip logs exactly what it always logged.
         tracing::info!(
-            "hotkey pressed: media={trigger_ms}ms wall={wall_ms}ms (drift {}ms); \
-             waiting for post-roll",
+            "{}: media={trigger_ms}ms wall={wall_ms}ms (drift {}ms); waiting for post-roll",
+            reason.describe(),
             wall_ms as i64 - trigger_ms as i64
         );
 
@@ -820,8 +918,31 @@ impl Engine {
         // segment numbering — and so the footage itself — is measured on.
         let started_at_ms = self.ring.ledger_origin_ms() + trigger_ms.saturating_sub(self.pre_ms);
         let id = index_clip(&self.store, &clip, started_at_ms);
+
+        // Spec §5.5: an event-triggered clip says *why* it exists. The row's `at` is the
+        // trigger instant (which is `pre_ms` into the clip, not its start), so the marker
+        // lands on the moment that caused it. A failed insert is reported and not fatal, for
+        // the same reason a failed clip insert is not: the footage is what the user asked
+        // for, and the clip file is on disk either way.
+        if let Some(event) = reason.event() {
+            let at_ms = self.ring.ledger_origin_ms() + trigger_ms;
+            if let Err(err) = index_event(&self.store, event, at_ms, id) {
+                tracing::error!(
+                    "could not record the {} event that asked for this clip ({err:#}); the \
+                     clip itself is kept, and the session timeline is missing one marker",
+                    event.kind
+                );
+            }
+        }
+
         self.status.clips.fetch_add(1, Ordering::Relaxed);
         Ok(RecordedClip { metadata: clip, id, started_at_ms })
+    }
+
+    /// Record an event that did not ask for a clip (see [`Recorder::note_event`]).
+    fn note_event(&mut self, event: &GameEvent) -> Result<i64> {
+        let at_ms = self.ring.ledger_origin_ms() + self.ring.stats().span_ms;
+        index_event(&self.store, event, at_ms, None)
     }
 
     /// Fold one pump's counts into the counters and publish them.

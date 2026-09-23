@@ -29,6 +29,10 @@ test-encoders = ["localplay-encoder/test-encoders"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# The event tests build a payload the way the integrations do — as one line of JSON — and
+# read it back out of the database. Test-only: this crate stores payloads, and rendering one
+# is the events crate's business.
+serde_json.workspace = true
 # Enables `EncodeConfig::for_tests_software` for this package's TEST builds only: dev
 # dependencies are not built for `cargo build`, so the shipping path keeps no CPU
 # fallback (that guard is this package's own `test-encoders` feature, which stays opt-in).

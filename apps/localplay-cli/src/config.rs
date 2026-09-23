@@ -33,9 +33,17 @@ pub struct HotkeySection {
     pub clip: String,
 }
 
+/// `[events]` — which game-event sources to run (spec §7.1, §7.2).
+///
+/// Two settings, and no more: the endpoint the League poller uses is fixed by the spec, the
+/// GSI path is fixed, and the token is generated into the application data directory rather
+/// than written in a file a user edits (see `gsi::load_or_create_token`).
 #[derive(Debug, Deserialize)]
 pub struct EventsSection {
+    /// Poll the League Live Client Data API (spec §7.1). Harmless when no game is running:
+    /// a refused loopback connection is the normal state and is not an error.
     pub lol_poll_enabled: bool,
+    /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
     pub gsi_port: u16,
 }
 
@@ -62,9 +70,13 @@ impl Config {
             ),
             other => bail!("unknown encode.vendor: {other}"),
         }
-        if !(1024..=65535).contains(&self.events.gsi_port) {
+        // 0 disables the listener (config.example.toml documents it): a user who does not
+        // want it should not have to pick a port they will never use. Anything else is a
+        // real port, and the default sits above the ephemeral range so that a temporarily
+        // bound listener elsewhere cannot shadow it at startup.
+        if self.events.gsi_port != 0 && !(1024..=65535).contains(&self.events.gsi_port) {
             bail!(
-                "events.gsi_port must be between 1024 and 65535, got {}",
+                "events.gsi_port must be 0 (disabled) or between 1024 and 65535, got {}",
                 self.events.gsi_port
             );
         }
@@ -109,6 +121,15 @@ mod tests {
             .replace("gsi_port = 45671", "gsi_port = 80");
         let err = Config::from_toml(&text).unwrap_err();
         assert!(err.to_string().contains("gsi_port"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_gsi_port_means_the_listener_is_off() {
+        // The documented way to disable an integration that would otherwise want a port.
+        let text = include_str!("../../../config.example.toml")
+            .replace("gsi_port = 45671", "gsi_port = 0");
+        let cfg = Config::from_toml(&text).expect("0 is a valid setting");
+        assert_eq!(cfg.events.gsi_port, 0);
     }
 
     #[test]

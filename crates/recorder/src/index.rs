@@ -9,9 +9,10 @@
 
 use crate::config::StorageSection;
 use anyhow::{Context, Result};
+use localplay_events::GameEvent;
 use localplay_replay::splice::ClipMetadata;
 use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
-use localplay_store::{NewClip, Store};
+use localplay_store::{NewClip, NewEvent, Store};
 use std::path::Path;
 
 /// Wall-clock now, in ms since the Unix epoch — the clock `clips.created_at` is on, and
@@ -103,6 +104,47 @@ pub fn index_clip(store: &Store, clip: &ClipMetadata, started_at_ms: u64) -> Opt
             None
         }
     }
+}
+
+/// Insert the `events` row for a derived game event (spec §5.5), linked to the clip it
+/// produced when it produced one.
+///
+/// * `at_ms` is the event's position on the **ledger's media timeline** — the same clock
+///   `clips.started_at` is on, so a session timeline can place a marker against a clip
+///   without converting anything. For a clip's own event this is the *trigger* instant,
+///   which is `buffer.pre_seconds` into the clip, because that is the moment the event
+///   happened; the window merely starts earlier.
+/// * `clip_id` is `None` for a marker (a game or round boundary, recorded but not clipped —
+///   see `EventKind::is_highlight`) and for an event whose clip could not be indexed. The
+///   column is nullable for exactly those cases.
+/// * `session_id` is left NULL, as `index_clip` leaves it: this engine opens no `sessions`
+///   row.
+///
+/// Returns the new row's id, or the error: the callers differ on what a failure means. A
+/// clip that has already been written must not be lost to a bookkeeping failure, while a
+/// marker is the *only* thing the caller asked for, so failing it is worth reporting.
+pub fn index_event(store: &Store, event: &GameEvent, at_ms: u64, clip_id: Option<i64>) -> Result<i64> {
+    let new = NewEvent {
+        session_id: None,
+        kind: event.kind.as_tag().to_string(),
+        at_ms,
+        payload: event.payload.clone(),
+        clip_id,
+    };
+    let id = store.insert_event(&new)?;
+    match clip_id {
+        Some(clip) => tracing::info!(
+            "recorded {} event #{} at media t={at_ms}ms against clip #{clip}",
+            event.kind,
+            id
+        ),
+        None => tracing::info!(
+            "recorded {} event #{} at media t={at_ms}ms (no clip: a marker, not a highlight)",
+            event.kind,
+            id
+        ),
+    }
+    Ok(id)
 }
 
 /// Bookkeeping across storage-policy passes, so a condition that lasts the whole session
@@ -270,6 +312,56 @@ mod tests {
             "a failed index write must never cost the clip the user asked for"
         );
         assert_eq!(store.list_clips().unwrap().len(), 1, "and must not corrupt the index");
+    }
+
+    #[test]
+    fn indexing_an_event_records_the_reason_and_its_clip() {
+        let (dir, store) = index_dir();
+        let path = dir.path().join("clip-1.mp4");
+        std::fs::write(&path, vec![7u8; 500]).unwrap();
+        let clip_id = index_clip(&store, &metadata(path, 500), 30_000).expect("the clip is indexed");
+
+        let kill = localplay_events::GameEvent::new(
+            localplay_events::Source::Lol,
+            localplay_events::EventKind::Kill,
+            // One line of JSON, which is what the payload column holds.
+            serde_json::json!({ "source": "lol", "killer": "Ahri" }),
+        );
+        let id = index_event(&store, &kill, 34_000, Some(clip_id)).expect("the reason is written");
+
+        let events = store.list_events().expect("read the events back");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, id);
+        assert_eq!(events[0].kind, "kill", "the tag the vocabulary defines");
+        assert_eq!(events[0].at_ms, 34_000, "media time, as given");
+        assert_eq!(events[0].clip_id, Some(clip_id), "linked to the clip it produced");
+        assert_eq!(events[0].session_id, None);
+        assert!(events[0].payload.as_deref().unwrap_or("").contains("Ahri"));
+
+        // A marker: recorded, no clip.
+        let marker = localplay_events::GameEvent::bare(
+            localplay_events::Source::Gsi,
+            localplay_events::EventKind::RoundStart,
+        );
+        index_event(&store, &marker, 40_000, None).expect("a marker is written too");
+        let events = store.list_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "round_start");
+        assert_eq!(events[1].clip_id, None);
+        assert_eq!(events[1].payload, None, "a bare event has no detail to record");
+    }
+
+    #[test]
+    fn an_event_for_a_clip_that_does_not_exist_is_reported_rather_than_written() {
+        // The foreign key is the store's; all this checks is that the failure comes back as
+        // an error for the caller to decide about instead of being silently dropped.
+        let (_dir, store) = index_dir();
+        let event = localplay_events::GameEvent::bare(
+            localplay_events::Source::Lol,
+            localplay_events::EventKind::Kill,
+        );
+        assert!(index_event(&store, &event, 1_000, Some(7)).is_err());
+        assert!(store.list_events().unwrap().is_empty());
     }
 
     #[test]

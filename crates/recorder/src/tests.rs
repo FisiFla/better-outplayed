@@ -13,6 +13,7 @@
 //! Needs ffmpeg on `PATH` with a working libx264, like the rest of the suite.
 
 use super::*;
+use localplay_events::EventKind;
 
 /// The stub geometry the end-to-end test records at. Small and slow on purpose: this is
 /// four seconds of real-time capture, and 64x48 at 10fps encodes it in well under a second.
@@ -224,6 +225,108 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
         "the error must say the recorder is gone: {err}"
     );
     eprintln!("clip_now() after stop: {err}");
+}
+
+#[test]
+fn a_clip_records_why_it_was_taken() {
+    // The wiring of a game event into the *same* trigger path the hotkey uses, end to end
+    // and through the real database: one recording session, three different triggers.
+    //
+    //   1. a manual clip — the hotkey's path, which records no `events` row;
+    //   2. a game event — the same path with a reason, which records one linked to the clip;
+    //   3. a marker (a round boundary) — recorded, with no clip at all.
+    let (_tmp, app_data_dir) = application_data_dir("event-clip");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    let ready_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    wait_for(&recorder, Duration::from_secs(30), "enough media for a clip", |s| {
+        s.span_ms >= ready_ms
+    });
+
+    // 1. Manual: exactly what the CLI does on a hotkey press.
+    let manual = recorder.clip_now().expect("the manual trigger produces a clip");
+
+    // 2. An event: the derived reason a driver would hand over, through the same call the
+    //    event source's driver makes.
+    let kill = GameEvent::new(
+        localplay_events::Source::Lol,
+        EventKind::Kill,
+        serde_json::json!({ "source": "lol", "event": "ChampionKill", "killer": "Ahri" }),
+    );
+    let evented = recorder
+        .clip_now_with(ClipReason::GameEvent(kill.clone()))
+        .expect("the event trigger produces a clip too");
+
+    // 3. A marker: no clip, just the row.
+    let marker_id = recorder
+        .note_event(GameEvent::bare(localplay_events::Source::Gsi, EventKind::RoundStart))
+        .expect("the marker is recorded");
+
+    recorder.stop().expect("stop must succeed");
+
+    // Read the result back through a fresh connection, i.e. as a later run would see it.
+    let store = open_clip_index(&db_path).expect("reopen the clip index");
+    let clips = store.list_clips().expect("list the clips");
+    assert_eq!(clips.len(), 2, "both triggers wrote a clip: {clips:?}");
+
+    let events = store.list_events().expect("list the events");
+    assert_eq!(
+        events.len(),
+        2,
+        "the manual clip wrote no event row, the event trigger wrote one, and the marker \
+         wrote one: {events:?}"
+    );
+
+    let kill_row = events.iter().find(|e| e.kind == "kill").expect("the kill's row");
+    assert_eq!(kill_row.clip_id, evented.id, "linked to the clip it produced");
+    assert_eq!(
+        kill_row.at_ms,
+        evented.started_at_ms + PRE_SECONDS * 1000,
+        "the event's `at` is the trigger instant, which is `pre_seconds` into the clip \
+         (the clip starts earlier than the moment that caused it)"
+    );
+    assert!(
+        kill_row.payload.as_deref().unwrap_or("").contains("ChampionKill"),
+        "the integration's detail is persisted verbatim: {:?}",
+        kill_row.payload
+    );
+    assert_eq!(kill_row.session_id, None, "this engine opens no session row");
+    eprintln!("event row: {kill_row:?}");
+
+    let marker_row = events.iter().find(|e| e.id == marker_id).expect("the marker's row");
+    assert_eq!(marker_row.kind, "round_start");
+    assert_eq!(marker_row.clip_id, None, "a marker has no clip");
+    assert_eq!(marker_row.payload, None);
+    assert!(
+        marker_row.at_ms > kill_row.at_ms,
+        "the marker is later on the media timeline: {} vs {}",
+        marker_row.at_ms,
+        kill_row.at_ms
+    );
+
+    assert!(
+        events.iter().all(|e| e.clip_id != manual.id),
+        "a manual clip is not an event, and writes no events row"
+    );
+
+    // The clip the event produced is a real clip — the reason did not change the media
+    // path, only what was recorded about it.
+    let info = localplay_media::probe::MediaInfo::probe(&recorder_bin(&app_data_dir), &evented.metadata.path)
+        .expect("the event-triggered clip is a readable media file");
+    assert!(info.video.is_some() && info.audio.is_some(), "video and audio, as for a hotkey clip");
+    assert!(
+        evented.metadata.duration_ms >= ready_ms,
+        "and the same pre+post window: {}ms",
+        evented.metadata.duration_ms
+    );
+}
+
+/// The ffmpeg binaries the recorder used, for probing a clip after it stopped. Discovered
+/// the same way the test's configuration discovers them.
+fn recorder_bin(_app_data_dir: &Path) -> FfmpegBinaries {
+    FfmpegBinaries::discover(None).expect("ffmpeg on PATH")
 }
 
 #[test]
