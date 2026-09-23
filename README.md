@@ -139,7 +139,9 @@ localplay/
 │       ├── src-tauri/          # Tauri v2 app, IPC commands, tray (Phase 2)
 │       └── src/                # Svelte frontend (timeline, scrubber, settings)
 ├── docs/
-│   └── specs/                  # design + plan docs, one per phase
+│   ├── specs/                  # design docs, one per phase
+│   ├── plans/                  # task breakdowns, one per phase
+│   └── runbooks/               # manual verification procedures
 ├── xtask/                      # build helpers, sidecar fetch/verify
 ├── config.example.toml
 ├── LICENSE-MIT
@@ -148,7 +150,9 @@ localplay/
 ```
 
 The design spec is at
-[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md).
+[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md)
+and the Phase 1 task breakdown at
+[`docs/plans/2026-09-23-localplay-phase-1-poc.md`](docs/plans/2026-09-23-localplay-phase-1-poc.md).
 
 ---
 
