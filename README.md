@@ -225,10 +225,14 @@ cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
 
 `record` writes a **trust-on-first-use** pin: it cannot attest who served the archive, only
 the bytes to expect from then on, so the URL and the hash are meant to be reviewed in the
-diff and committed. At runtime the app looks for `binaries/` next to the executable first
-(that is where packaging will put it), then — for a `cargo run` checkout only — for a
-`binaries/` directory at the root of the project the executable lives under, and finally on
-`PATH`. Installing `ffmpeg` system-wide is therefore not required, which is the point.
+diff and committed. At runtime the app looks, in order, for `binaries/` **next to the
+executable** (the Windows installation directory, i.e. where the installer's resource mapping
+puts it), then for the **resources of an installed bundle** (`Contents/Resources/binaries`
+inside a macOS `.app`), then — for a `cargo run` checkout only — for a `binaries/` directory at
+the root of the project the executable lives under, and finally on `PATH`. Installing `ffmpeg`
+system-wide is therefore not required, which is the point. The packaging story — what
+`tauri build` produces, where the sidecars land, and what a release still needs — is in
+[`docs/packaging.md`](docs/packaging.md).
 
 ### Verifying a Windows box
 
@@ -274,7 +278,10 @@ stays manual.
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
       tested against local mocks; **never run against a real game** — see the
       [Phase 4 note](docs/plans/2026-09-23-localplay-phase-4-integrations.md))*
-- [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer
+- [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer *(bundling and
+      the sidecar resource mapping are configured and a macOS `.app` was built and inspected;
+      **code signing, notarisation, an auto-updater and a Windows install are all still
+      missing** — see [`docs/packaging.md`](docs/packaging.md))*
 
 > **Caveat on every `[x]` above.** Only the Phase 1 capture path has ever run on Windows,
 > once, and it only partly passed. The Windows-specific code added since that run — and all

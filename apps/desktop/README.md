@@ -15,7 +15,8 @@ apps/desktop/
 ├── package.json, vite.config.ts, tsconfig.json, svelte.config.js, index.html
 ├── scripts/
 │   ├── shots.mjs             # headless render + screenshot + assertion run (`npm run shots`)
-│   └── png-stats.mjs         # the minimal PNG decoder that proves a shot is not blank
+│   ├── png-stats.mjs         # the minimal PNG decoder that proves a shot is not blank
+│   └── require-sidecars.mjs  # `beforeBundleCommand`: refuse to bundle without the sidecars
 ├── src/                      # Svelte 5 + TypeScript
 │   ├── App.svelte            # the shell: list / detail / storage panel, all state
 │   ├── app.css               # the dark palette and the two-pane layout
@@ -28,7 +29,10 @@ apps/desktop/
 │       └── components/       # ClipList, ClipDetail, Timeline, StoragePanel
 └── src-tauri/
     ├── Cargo.toml            # its own workspace — see below
-    ├── build.rs, tauri.conf.json, capabilities/default.json, icons/icon.png
+    ├── build.rs, capabilities/default.json
+    ├── tauri.conf.json       # product metadata, the sidecar resource map, app/bundle config
+    ├── tauri.windows.conf.json, tauri.macos.conf.json   # bundle targets per platform
+    ├── icons/                # generated icon set + `app-icon.png`, the placeholder source
     └── src/
         ├── main.rs           # the entry point
         ├── lib.rs            # state + the thin `#[tauri::command]` wrappers
@@ -137,18 +141,23 @@ frontend it names (`apps/desktop/dist`) does not exist, so membership would make
   asset protocol injects its own sources into a configured CSP, and picking one without
   being able to observe a webview would risk silently blocking playback — so it is left for
   a pass that can.
-- **No installer.** `bundle.active` is `false`: packaging is Phase 5.
+- **No installer that anyone can run yet.** Bundling *is* configured — `bundle.active` is
+  `true`, `bundle.resources` embeds the ffmpeg sidecars where `localplay-media` looks for
+  them, and a macOS `.app` was built and inspected — but the artifacts are unsigned, the icon
+  is a placeholder, there is no updater, and nothing has been installed or uninstalled on
+  Windows. Read [`../../docs/packaging.md`](../../docs/packaging.md) before treating any of
+  this as shippable.
 
 ## Verification status
 
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 86 vitest tests
+cd apps/desktop && npm test          # 101 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
 cd apps/desktop && npm run shots     # 10 headless screenshots, 123 assertions, 0 failures
-cd apps/desktop/src-tauri && cargo test    # 43 tests, against a real store and real ffmpeg
+cd apps/desktop/src-tauri && cargo test    # 55 tests, against a real store and real ffmpeg
 cd apps/desktop/src-tauri && cargo clippy  # no warnings outside test bodies
 ```
 

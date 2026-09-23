@@ -21,8 +21,10 @@ You need:
 - a GPU that offers a hardware H.264/HEVC encoder (NVIDIA **NVENC**, Intel **Quick
   Sync**, or AMD **AMF**), and
 - `ffmpeg` and `ffprobe` reachable. The simplest setup is both on `PATH`. Otherwise
-  put them in a `binaries\` directory next to the built executable
-  (`target\release\binaries\`), which is where the CLI looks second.
+  put them in a `binaries\` directory next to the built executable —
+  `target\release\binaries\` for a `cargo build` checkout — which is the first place the
+  app looks, ahead of an installed copy's own resources, a checkout root's `binaries\`,
+  and `PATH`, in that order ([`docs/packaging.md`](../packaging.md) §2.3).
 
 You do **not** need to have read the design spec. Where a result depends on your
 machine (resolution, fps, CPU %, RSS), this runbook says what to measure and the
