@@ -2,5 +2,6 @@
 
 pub mod ledger;
 pub mod scanner;
+pub mod window;
 
 pub use ledger::{Segment, SegmentLedger};
