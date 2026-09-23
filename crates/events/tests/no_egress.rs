@@ -16,12 +16,15 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
         if rel.ends_with("lol.rs") {
             continue;
         }
+        // The guard must not scan itself: this file necessarily contains the very
+        // literals it searches for. Exempted by path, explicitly, rather than by
+        // splitting the literals — a guard that passes for the wrong reason is
+        // worse than no guard.
+        if rel.ends_with("no_egress.rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
-        // Split so this guard's own source does not contain the contiguous
-        // marker it searches for (which would otherwise flag itself).
-        if text.contains(concat!("reqwest::", "Client"))
-            || text.contains(concat!("ureq::", "agent"))
-        {
+        if text.contains("reqwest::Client") || text.contains("ureq::agent") {
             offenders.push(rel);
         }
     }
@@ -37,7 +40,7 @@ fn the_gsi_listener_binds_loopback_only() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for entry in walk_rs(&root) {
         let rel = entry.to_string_lossy().replace('\\', "/");
-        if rel.contains("/target/") {
+        if rel.contains("/target/") || rel.ends_with("no_egress.rs") {
             continue;
         }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
