@@ -56,6 +56,7 @@ hardware before it can be considered working.
                       │  │  ┌──────────┐   ┌────────▼─────────┐   │  │
                       │  │  │ capture  │──▶│  encoder (HW)    │   │  │
                       │  │  │ WGC/DXGI │   │ NVENC/QSV/AMF    │   │  │
+                      │  │  │ + WASAPI │   │ (ffmpeg child)   │   │  │
                       │  │  └──────────┘   └────────┬─────────┘   │  │
                       │  │                          │             │  │
                       │  │  ┌──────────┐   ┌────────▼─────────┐   │  │
@@ -67,7 +68,7 @@ hardware before it can be considered working.
                                         │
                           ┌─────────────▼──────────────┐
                           │  NVMe scratch + clip store │
-                          │  (ring buffer ≤ RAM budget)│
+                          │  (bounded segment ring)    │
                           └────────────────────────────┘
 ```
 
@@ -104,7 +105,8 @@ boundary; arbitrary scrubbing trims accept keyframe granularity.
 | GUI shell | **Tauri v2** | Uses the OS webview (WebView2) — no bundled Chromium, ~10 MB shell |
 | Frontend | **Vite + Svelte** | Small runtime, fine-grained reactivity fits a live timeline well |
 | Capture | **Windows Graphics Capture** (fallback: DXGI Desktop Duplication) | Supported on Win10 1903+, per-window capture, no hook injection |
-| Encode | **NVENC / QuickSync / AMD AMF** via Media Foundation | Encoding happens on the GPU; near-zero CPU cost |
+| Audio | **WASAPI loopback** of the default render endpoint | Game audio isn't a capture device; loopback needs no virtual audio driver |
+| Encode | **NVENC / QuickSync / AMD AMF** via the bundled `ffmpeg` sidecar | Hardware encoding on the GPU at near-zero CPU cost, and one code path for all three vendors |
 | Video I/O | **Bundled `ffmpeg`/`ffprobe` sidecars** | Lossless `-c copy`, thumbnails, remux — no libav build in-tree |
 | Index | **SQLite (rusqlite, bundled)** | Single-file, zero-config, embedded; indexes matches/timestamps/tags |
 
@@ -167,7 +169,7 @@ The design spec is at
 ## Roadmap
 
 - [ ] **Phase 0** — repo, tooling, design spec *(in progress)*
-- [ ] **Phase 1** — capture + hardware encode + ring buffer + hotkey trigger (PoC)
+- [ ] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC)
 - [ ] **Phase 2** — Tauri shell, timeline scrubber, clip trim/export
 - [ ] **Phase 3** — SQLite index, storage manager, auto-cleanup policies
 - [ ] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations

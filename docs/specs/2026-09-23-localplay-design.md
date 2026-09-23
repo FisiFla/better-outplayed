@@ -62,6 +62,7 @@ a correct clip on hotkey. The measurable criteria are in
 | Frontend | Svelte 5 + Vite + TypeScript | Small runtime; fine-grained reactivity suits a continuously updating timeline. |
 | Screen capture | Windows Graphics Capture (WGC) | Win10 1903+; per-window capture; no process injection or API hooking. |
 | Capture fallback | DXGI Desktop Duplication | Covers configurations where WGC is unavailable; monitor-granular only. |
+| Audio capture | WASAPI loopback (`IAudioClient`) | Game audio is not exposed as a capture device. Loopback of the default render endpoint is the only zero-config route, and it needs no virtual audio driver. |
 | Video encode | `ffmpeg` sidecar with `h264_nvenc` / `hevc_qsv` / `h264_amf` | One integration path for all three vendors; ffmpeg is required for trimming regardless. |
 | Video I/O | `ffmpeg` / `ffprobe` sidecars (LGPL build) | Lossless `-c copy`, concat, thumbnails. LGPL suffices because only hardware encoders are used. |
 | Metadata index | SQLite via `rusqlite` (`bundled` feature) | Single-file, zero-config, no system SQLite dependency. |
@@ -147,6 +148,40 @@ workspace type-checks and unit-tests on macOS).
 Windows implementations are gated behind `#[cfg(windows)]`. `probe::select_backend()`
 prefers WGC and falls back to DXGI, returning a typed error rather than a `null`
 result if neither is available.
+
+#### Audio
+
+Audio is captured in the same crate, behind a parallel trait:
+
+```rust
+pub trait AudioBackend: Send {
+    fn start(&mut self) -> Result<()>;
+    fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>>;
+    fn stop(&mut self) -> Result<()>;
+}
+
+pub struct AudioBuffer {
+    pub data: Vec<u8>,        // interleaved PCM, s16le
+    pub frames: usize,
+    pub pts: Duration,        // QPC-based, same clock as Frame::pts
+    pub format: AudioFormat,  // 48 kHz stereo s16le by default
+}
+```
+
+Implementations: `WasapiLoopback` (captures the default render endpoint),
+`StubAudio` (non-Windows; emits silence so downstream code is testable).
+
+**Why loopback capture matters here.** There is no way to hand ffmpeg a "game audio"
+device on Windows: ffmpeg's `dshow` input needs a DirectShow device, and no such
+device exists for the default output unless the user installs a virtual audio cable.
+Capturing the render endpoint in loopback from Rust and piping raw PCM avoids
+requiring the user to install anything.
+
+**Clock.** `Frame::pts` and `AudioBuffer::pts` are both derived from the same QPC
+clock, which is what makes A/V alignment tractable at all. Both are real-time
+sources consuming at 1×, so drift over a 30 s clip is bounded rather than
+accumulating. Drift is logged per clip (§13) but is not a gating criterion for
+Phase 1.
 
 ### 5.2 `encoder`
 
@@ -266,15 +301,23 @@ See [§7](#7-game-event-integrations).
 ### 6.1 Steady state (buffer running)
 
 ```
- [ WGC ]──frame──▶[ encoder ]──packet──▶[ RingBuffer ]──append──▶ scratch/NNNNN.mp4
-     ▲                    │                     │
-     │                    │                     └──▶ SegmentLedger (atomic write)
-     │                    └── vendor HW encoder via ffmpeg sidecar
-     └── D3D11 texture, copied to CPU buffer
+ [ WGC ]──BGRA frame (QPC pts)──┐
+                                ├──▶[ ffmpeg sidecar ]──muxed A/V──▶ scratch/NNNNN.mp4
+ [ WASAPI loopback ]──PCM s16───┘     (2 pipe inputs)                      │
+                                            │                              │
+                                            ├ vendor HW video encoder      │
+                                            └ aac audio encoder            ▼
+                                                              SegmentLedger (atomic write)
 ```
 
+The `encoder` crate owns **one** ffmpeg child process with two pipe inputs
+(`pipe:0` = raw video, `pipe:3` = raw audio) rather than two processes, so that the
+container is muxed once and A/V timestamps stay coherent inside each segment. The
+segment muxer therefore cuts video and audio together, and a clip is a set of
+already-interleaved segments.
+
 Memory stays flat: the ledger is small and bounded by the cap, and no media is held
-in RAM beyond the in-flight frame.
+in RAM beyond the in-flight frame and audio buffers.
 
 ### 6.2 Trigger → clip
 
@@ -425,6 +468,12 @@ bitrate_kbps  = 20000
 fps           = 60
 output_size   = ""      # empty = native capture resolution
 
+[audio]
+enabled       = true
+source        = "loopback"   # default render endpoint, captured in loopback
+codec         = "aac"
+bitrate_kbps  = 192
+
 [storage]
 clips_dir         = ""  # empty = %LOCALAPPDATA%\localplay\clips
 max_total_bytes   = 53687091200   # 50 GiB
@@ -445,8 +494,8 @@ gsi_port         = 45671
 **Deliverable:** `localplay-cli buffer` — a headless Windows binary that runs the
 full pipeline.
 
-**In scope:** WGC capture → hardware encode → bounded segment ring → hotkey trigger →
-lossless clip extraction → SQLite row.
+**In scope:** WGC capture + WASAPI loopback audio → hardware encode → bounded segment
+ring → hotkey trigger → lossless clip extraction → SQLite row.
 
 **Out of scope:** GUI, session review, storage cleanup policies, game integrations.
 The `Trigger` enum is present but only `Trigger::Hotkey` is wired.
@@ -460,9 +509,12 @@ The `Trigger` enum is present but only `Trigger::Hotkey` is wired.
 | 5 | Clip is a stream copy, not a re-encode | `ffprobe` codec/profile matches the live encoder; export completes near-instantly |
 | 6 | Steady-state CPU under 5% of one core and RSS under 400 MB | Process counters sampled during the soak |
 | 7 | The process exits non-zero with an actionable message when no hardware encoder exists | Run on a machine/GPU without one, or force `vendor` to an absent encoder |
+| 8 | The clip contains a synchronised audio stream | `ffprobe -show_streams` reports one video and one audio stream; the audio is audible and lip-sync is correct on playback; A/V drift is logged |
 
 Criteria 3–6 are the ones that prove the design. Criteria 1–2 prove the plumbing.
-Criterion 7 exists because a silent CPU fallback would violate principle 3.
+Criterion 7 exists because a silent CPU fallback would violate principle 3. Criterion 8
+exists because a clip with no audio is not shippable, and A/V sync is the failure mode
+that a video-only PoC would have hidden.
 
 ### 11.1 Test strategy
 
@@ -504,6 +556,8 @@ scratch volume.
 | Vendor encoder detection is fiddly (QSV/AMF especially) | Startup failure or wrong encoder | Probe with `ffmpeg -encoders` plus a 1-frame smoke test; fail with a message naming the missing runtime |
 | Forced 1 s keyframes raise bitrate 5–10% | Larger clips at equal quality | Accepted; `segment_time` is configurable |
 | ffmpeg sidecar supply chain | A tampered binary would run with user privileges | Pin a version and verify a checksum in `xtask`; record the source URL in the manifest |
+| A/V drift between the QPC video clock and the WASAPI audio clock | Desynced clip, the classic capture bug | Both sources share the QPC clock and run at 1×, so drift is bounded not cumulative; drift is logged per clip. WasapiLoopback resamples to a fixed 48 kHz so the audio timeline is exactly derivable |
+| Loopback captures *all* system audio, not just the game | Discord/music bleed into clips | Accepted for Phase 1 — it is the same behavior OBS defaults to. Per-application isolation requires WASAPI process loopback (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Win10 2004+) and is deferred to Phase 2 |
 | WGC unavailable on some configurations | No capture | DXGI fallback; typed error if neither works |
 | Sidecar + child-process management | Zombie ffmpeg processes on crash | Explicit `Child` ownership, kill-on-drop, and a startup sweep for orphaned processes from a previous run |
 
@@ -524,8 +578,8 @@ scratch volume.
 
 - Cloud upload, sharing, or accounts of any kind.
 - macOS or Linux capture backends.
-- Audio capture and mixing. **Note:** Phase 1 is video-only. Desktop/game audio
-  capture is required for the product to be useful and is scheduled into Phase 2 —
-  it is excluded from Phase 1 solely to keep the PoC's verification surface small.
+- Audio *mixing*: per-application isolation, separate microphone and game tracks, and
+  any mixing or ducking. Phase 1 captures the default render endpoint in loopback as a
+  single mixed track, which is deliberate and matches what OBS does by default.
 - Overlay rendering or in-game HUD.
 - Auto-update mechanism.

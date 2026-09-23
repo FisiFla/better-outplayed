@@ -34,6 +34,12 @@ fps = 60
 # Empty = capture at native resolution. Otherwise "WIDTHxHEIGHT", e.g. "1920x1080".
 output_size = ""
 
+[audio]
+enabled = true
+source = "loopback"
+codec = "aac"
+bitrate_kbps = 192
+
 [storage]
 # Empty = %LOCALAPPDATA%\localplay\clips
 clips_dir = ""
