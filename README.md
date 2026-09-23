@@ -179,6 +179,9 @@ and the Phase 1 task breakdown at
 - [ ] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations
 - [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer
 
+Phase 1 acceptance is verified on Windows hardware using the
+[Phase 1 verification runbook](docs/runbooks/phase-1-verification.md).
+
 ---
 
 ## License
