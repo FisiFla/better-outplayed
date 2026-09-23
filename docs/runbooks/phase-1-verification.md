@@ -8,6 +8,12 @@ but **large parts of it still have not**, and the eight criteria below have **no
 re-run end-to-end on the current build. A green `cargo test` on macOS exercises the
 synthetic stubs and proves none of the eight criteria — see [Known gaps](#known-gaps).
 
+**`cargo xtask verify` automates most of this document** and writes one Markdown report
+with every check, its threshold, its measured value and the raw output behind it. Start
+there ([Run the harness first](#run-the-harness-first-cargo-xtask-verify)); the per
+criterion sections below are what it cannot do, plus how to reproduce any of its rows by
+hand.
+
 You need:
 
 - the repository checked out on a **Windows** machine,
@@ -34,6 +40,44 @@ Conventions used below:
   `width=1920 height=1080`); the values are the numbers you record.
 - `%LOCALAPPDATA%\localplay\` is the app data directory: `config.toml`, `scratch\`, and
   `clips\` live there unless the config overrides `scratch_dir` / `clips_dir`.
+
+---
+
+## Run the harness first (`cargo xtask verify`)
+
+There is now a command that does most of this runbook for you and writes down what it saw:
+
+```powershell
+cargo xtask verify
+```
+
+It builds the release CLI, probes the encoders, starts the buffer with a **bounded,
+documented configuration** (printed in the report), takes one clip through the CLI's own
+verification trigger (`buffer --self-test-clip-after` — see criterion 3), probes that clip
+with ffprobe (duration, streams, codec, A/V drift, audio level), reads the process's own
+CPU time and working set against criterion 6's thresholds, checks the scratch cap and that
+eviction happened, confirms the media-vs-wall-clock ratio from the status line's `span=`
+(not from file mtimes), exercises criterion 7 by forcing a vendor this machine cannot run,
+and writes everything — every check, its expected value, its measured value, and the raw
+command output — to `target\verify\report.md`. It exits non-zero if any check failed.
+
+Useful flags: `--seconds N` (how much media to buffer before the clip), `--report PATH`,
+`--clean-work` (delete the sandbox afterwards).
+
+**The harness is not a replacement for this document.** It cannot check the GUI window, a
+real `Ctrl+F8` keypress, anything needing a real game, or the live WGC-vs-WASAPI clock
+divergence; it marks everything it could not perform as *not performed*, with the reason,
+and it says so in its own report. The criteria below remain the source of truth for a human
+who wants to look with their own eyes — and the runbook text still applies, because the
+self-test trigger emits the **same log lines** a keypress does.
+
+**If you are driving the box over SSH**, a capture session needs a desktop, which an SSH
+session does not have. Use the wrapper, which runs the harness in your interactive session
+through a one-shot scheduled task and cleans the task up afterwards:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-in-interactive-session.ps1
+```
 
 ---
 
@@ -289,16 +333,36 @@ that is a misconfiguration, not a criterion-2 failure.
 
 ---
 
-## Criterion 3 — `Ctrl+F8` writes `clip-*.mp4` within 2 s of post-roll completion
+## Criterion 3 — a trigger writes `clip-*.mp4` within 2 s of post-roll completion
 
-**Command**
+**Command (recommended: the self-test trigger)**
+
+```powershell
+cargo run --release -p localplay-cli -- buffer --self-test-clip-after 45
+```
+
+`--self-test-clip-after <SECONDS>` is a **verification aid, not a feature**. Once the ring
+holds `SECONDS` of media — and never before it holds a full pre-roll plus post-roll — it
+calls the *same* media-time trigger the hotkey calls (`Recorder::clip_now`), exactly once,
+logs the same lines, and stops. It sends, simulates and injects **no** keyboard or mouse
+input, and it does not enumerate windows. `localplay-cli --help` says so too.
+
+**Why not just press the key from a script.** It used to be done that way, with
+`keybd_event`. This machine runs kernel-level anti-cheat, and synthetic input injection is
+precisely the behaviour that anti-cheat is built to flag; a verification run that gets the
+machine banned is not verification. The hotkey is still the shipping trigger — it is
+installed in this mode too, and nothing about it changed — but the *scripted* path to the
+clip no longer goes anywhere near the input stack.
+
+**Command (the manual alternative: press the key yourself)**
 
 With the buffer running, start a stopwatch, press **Ctrl+F8** at a known instant, and
-watch the log.
+watch the log. The trigger lines are identical to the self-test's, so everything under
+"Expected observation" below applies to both.
 
 **Expected observation (PASS)**
 
-Immediately after the keypress:
+Immediately after the trigger:
 
 ```
 hotkey pressed: media=<m>ms wall=<w>ms (drift <d>ms); waiting for post-roll
@@ -315,25 +379,31 @@ wrote <path> (<duration_ms>ms, <size_bytes> bytes, encoder=<name>)
 
 - `<path>` ends with `clip-<unix_seconds>.mp4` and the file exists in
   `%LOCALAPPDATA%\localplay\clips\`.
-- The **wall-clock delta from your keypress to the `wrote` line** is **less than
+- The **wall-clock delta from the trigger to the `wrote` line** is **less than
   `post_seconds + 2 s`**. The trigger→write path includes waiting out the rest of the
   post-roll, up to 50 ms of polling granularity, and the splice; the 2 s budget is on top
   of `post_seconds`.
 
 To measure precisely, subtract the timestamp the log formatter prints at the start of the
-`wrote` line from your recorded keypress time (or just use a stopwatch).
+`wrote` line from the timestamp of the `hotkey pressed:` line (with the self-test trigger
+those two timestamps are the whole measurement; with a real press, use your stopwatch).
+`cargo xtask verify` does exactly this subtraction and reports it as
+`clip_trigger_to_write`.
 
 **FAILURE looks like**
 
-- The `wrote` line never appears after the press — e.g.
+- The `wrote` line never appears after the trigger — e.g.
   `Error: timed out waiting for post-roll (span=<ms> need=<ms>)` (the post-roll never
   completed).
 - `wrote` appears but the delta is **≥ `post_seconds + 2 s`**.
 - No new `clip-*.mp4` appears on disk, or the file is not named `clip-*.mp4`.
 
 **Do not misread:** the budget is `post_seconds + 2 s`, not `2 s`. With `post_seconds = 5`
-a delta of 6.8 s is a **PASS**. Count the delta from the keypress to the `wrote` line
-only.
+a delta of 6.8 s is a **PASS**. Count the delta from the trigger line to the `wrote` line
+only. And a self-test run is not a weaker check than a keypress: the trigger it calls is
+the same call, on the same media-time path, with the same reason (`Manual`) — what a real
+keypress adds is proof that the global hotkey itself fires, and that is worth doing once
+by hand (press it and watch for the same `hotkey pressed:` line).
 
 ---
 
@@ -691,6 +761,15 @@ not softened; do not read a pass elsewhere as coverage of them.
   development host is the selection logic (against injected results) and the smoke test's
   own plumbing (a working encoder passes, an encoder that cannot open reports ffmpeg's
   reason, a hanging child is bounded by the timeout).
+- **The harness is not a substitute for a human.** `cargo xtask verify` runs the criteria
+  it can automate and marks the rest *not performed* with a reason. It has **never been run
+  on Windows** — it was written and exercised on the development host against the synthetic
+  backends (its self-test trigger, its parsers, its report writer and its criterion-7 path
+  all ran there). The first thing to check on the box is that the interactive session it
+  runs in really gives the capture backend a desktop: if the report's `capture_started` row
+  says the WGC line is missing, or the geometry says `1280x720`, the session has no
+  desktop (or the stub ran) and nothing else in that report means anything. See its own
+  "What this harness does not cover" section for the full list.
 - **Non-Windows runs prove none of this.** Off Windows the pipeline uses `StubCapture`,
   which captures a synthetic image and nothing real. A green macOS/Linux test run is not
   evidence for any of the eight criteria.
@@ -699,9 +778,29 @@ not softened; do not read a pass elsewhere as coverage of them.
 
 ## How to record the result
 
-Write the measurements to `docs/runbooks/phase-1-results-<date>.md` (or a comment on the
-tracking issue) — one line per criterion, with the measured value and PASS/FAIL. Record,
-specifically:
+`cargo xtask verify` writes the whole record for you: `target\verify\report.md` carries
+one row per check with its criterion, the expected value, the measured value, the verdict,
+and every raw command output underneath (the probe, the run's log, the ffprobe, the
+volume numbers). Attach that file. It is generated by the code in `xtask/src/verify.rs`,
+so every number in it is reproducible with the command line it prints.
+
+What it does **not** cover, and what therefore still has to be written by hand (or left
+open with a reason):
+
+- the **GUI window** and its recording wiring — no window is opened by any automated run;
+- a **real `Ctrl+F8` press** — the harness takes its clip through the same trigger the key
+  reaches, but it never drives the global hotkey itself;
+- **lip-sync by ear** — the report carries the A/V drift number, not a human's judgement;
+- anything needing a **real game** (the Phase 4 integrations);
+- the **live-source clock divergence** (not instrumented in this build);
+- whatever the machine's state made impossible that day — an endpoint that is natively
+  48 kHz never exercises the engine-side conversion, and a box whose every encoder works
+  has no unusable vendor to point criterion 7 at. The report marks those *not performed*
+  with the reason, so they are visible rather than silently absent.
+
+If you are recording by hand instead, write the measurements to
+`docs/runbooks/phase-1-results-<date>.md` (or a comment on the tracking issue) — one line
+per criterion, with the measured value and PASS/FAIL. Record, specifically:
 
 - **Environment:** ffmpeg version (`ffmpeg -version`) and the GPU + driver version, because
   encoder behaviour is driver-dependent.
@@ -710,8 +809,9 @@ specifically:
   run (yes/no).
 - **Criterion 2:** the configured `scratch_cap_bytes`; the largest `bytes=` seen; and the
   largest the scratch directory measured (note if it was exactly one segment over).
-- **Criterion 3:** `post_seconds`; the measured keypress→`wrote` delta; pass/fail against
-  `post_seconds + 2 s`.
+- **Criterion 3:** `post_seconds`; the measured trigger→`wrote` delta (with the self-test
+  trigger this is the two log timestamps; with a real press, your stopwatch); pass/fail
+  against `post_seconds + 2 s`.
 - **Criterion 4:** the expected `pre_seconds + post_seconds`; the `format.duration` seen;
   the absolute difference.
 - **Criterion 5:** the logged encoder name; the clip's video `codec_name`; the approximate

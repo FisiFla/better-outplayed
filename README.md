@@ -155,7 +155,8 @@ localplay/
 │   ├── specs/                  # design docs
 │   ├── plans/                  # task breakdowns, one per phase
 │   └── runbooks/               # manual (Windows) verification procedures
-├── xtask/                      # build helpers: `xtask sidecars fetch|record`, `xtask probe`
+├── xtask/                      # build helpers: `xtask sidecars …`, `xtask probe`, `xtask verify`
+├── scripts/                    # PowerShell glue (run the harness in a desktop session)
 ├── config.example.toml
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
@@ -228,6 +229,32 @@ diff and committed. At runtime the app looks for `binaries/` next to the executa
 (that is where packaging will put it), then — for a `cargo run` checkout only — for a
 `binaries/` directory at the root of the project the executable lives under, and finally on
 `PATH`. Installing `ffmpeg` system-wide is therefore not required, which is the point.
+
+### Verifying a Windows box
+
+The one command that runs the acceptance checks and writes down what it saw:
+
+```powershell
+cargo xtask verify
+```
+
+It starts the buffer with a bounded, documented configuration (printed in the report) and
+takes a clip through the CLI's own in-process `--self-test-clip-after` trigger — **no
+keyboard or mouse input is synthesised, sent or injected anywhere in it** — then probes
+that clip with ffprobe: duration against the configured window, stream count, codec,
+resolution, A/V drift and audio level, next to the process's own CPU and memory against
+criterion 6's thresholds, the media-vs-wall-clock ratio, the scratch cap and eviction, and
+criterion 7's fail-loud encoder path. Everything lands in `target\verify\report.md`, raw
+output inline; checks it cannot perform are marked *not performed* with the reason, and it
+exits non-zero only when a check actually failed. Over SSH — where there is no desktop to
+capture — use `scripts\verify-in-interactive-session.ps1`, which runs it in the logged-on
+user's session through a one-shot scheduled task and cleans the task up afterwards.
+
+The harness **has never run on Windows** — it was built and exercised on macOS against the
+synthetic backends — so its own report is part of what a fresh run checks. It cannot verify
+the GUI window, a real keypress, anything needing a real game, or the live capture-clock
+divergence; §8 of [`docs/verification-status.md`](docs/verification-status.md) lists what
+stays manual.
 
 ---
 

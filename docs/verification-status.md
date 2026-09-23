@@ -31,6 +31,19 @@ named, so every line below can be re-checked.
 
 If that paragraph surprises you, it is doing its job. The rest of this file is the detail.
 
+**How to move an item out of *type-checked only*:** run `cargo xtask verify`
+(`07b90fc`) on the Windows box. It runs the criteria it can automate in one bounded
+session and writes `target\verify\report.md` — every check with its threshold, its
+measured value and the raw output behind it — marking anything it could not perform as
+*not performed*, with the reason. From an SSH session, use
+`scripts/verify-in-interactive-session.ps1`, because a capture session needs a desktop.
+**The harness itself has never run on Windows** (it was exercised on the development host
+against the synthetic backends), so its own report is part of what you are checking: the
+first row to look at is `capture_started` — if the WGC line is missing, or the geometry is
+`1280x720`, the session has no desktop (or the stub ran) and the rest of that report says
+nothing. It cannot check the GUI, a real keypress, anything needing a real game, or the
+live clock divergence; §8 lists what stays manual.
+
 [issue #1]: https://github.com/FisiFla/localplay/issues/1
 [issue #2]: https://github.com/FisiFla/localplay/issues/2
 
@@ -167,6 +180,7 @@ Source checked with `git log --oneline` and by reading each module's own doc com
 | **Ring buffer, segment ledger and cap eviction** (`crates/replay`) | Verified on Windows hardware | segments written; criterion 2 passed (issue #1), and the retained ring now records the cap (**15 MB**) and oldest-first eviction (§1) |
 | **Clip splicing** (`crates/replay`, `crates/media`) — lossless `-c copy` remux | Verified on Windows hardware | the 13,091 ms clip; criteria 4 and 5 passed (issues #1, #2) |
 | **The media-time trigger** (`55f1541`) | Verified on Windows hardware | fixed and confirmed on the box (issue #2: "Verified on hardware") |
+| **The self-test trigger** — the same media-time trigger, reached without synthesising input (`d8ec96b`) | Verified on the dev host (the trigger), not on Windows | `apps/localplay-cli/tests/self_test_clip.rs::the_self_test_trigger_writes_a_clip_through_the_hotkey_path` drives the whole command in-process over real ffmpeg: it waited for the ring to hold the configured window, called `Recorder::clip_now()` once, and wrote a real clip (8,053 ms for an 8,000 ms window, `encoder=libx264`). What still needs Windows is not the trigger but the keypress that reaches the *same* call |
 
 ### Tests that cover the non-Windows half of this path
 
@@ -235,6 +249,8 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | Silence detector | `2a63949` | Type-checked only |
 | CI workflow (tests + Windows cross-check + frontend) | `42b68a9` | Verified on the dev host |
 | GSI accept-loop blocking-mode fix | `c5abc58` | Verified on the dev host (CI) |
+| Self-test clip trigger (`--self-test-clip-after`) — the clip path without synthetic input | `d8ec96b` | Verified on the dev host (an integration test drives it end to end over real ffmpeg); never run on Windows |
+| `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
 
 ---
 
@@ -249,7 +265,7 @@ $ gh run list --limit 10
 
 What a green run proves:
 
-- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 319
+- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 339
   tests, `cargo test --workspace --features localplay-encoder/test-encoders`;
 - **`cargo check` for `x86_64-pc-windows-msvc`** of the cross-checkable crates
   (`capture`, `encoder`, `events`, `replay`, `media`, `xtask`) — *type-checking*, not
@@ -341,6 +357,14 @@ $ gh run view 35904179918 --log-failed
   CS2/Dota 2 client was ever contacted; the payloads are canned fixtures and the servers are
   mocks in the test process (see `docs/plans/2026-09-23-localplay-phase-4-integrations.md`
   §5 for the full, itemised list of what that leaves unproven).
+- **The harness is unproven on Windows.** `cargo xtask verify` (`07b90fc`) has run only on
+  the development host, against the stub capture backend and the software encoder. Its
+  logic is tested there (parsers, the report writer, the criterion-7 path, the trigger),
+  and it marks every check it cannot perform instead of omitting it — but its Windows
+  sampler (`GetProcessTimes` + `K32GetProcessMemoryInfo`, the runbook's own recipe), its
+  interactive-session wrapper (`scripts/verify-in-interactive-session.ps1`) and everything
+  it claims about a *real* capture path are **compiled, not run**. A not-performed row in
+  its report is not a pass, and a pass on the stub path is not evidence about Windows.
 
 ---
 
@@ -351,6 +375,26 @@ The smallest ordered set of runs that moves the most items from *type-checked* t
 observation; the Phase 1 runbook
 (`docs/runbooks/phase-1-verification.md`) already contains the PASS/FAIL detail.
 
+> **Most of this is now one command.** `cargo xtask verify` (`07b90fc`) runs steps 1–7 and
+> writes `target\verify\report.md`: the probe, a bounded buffer run with the CPU/RSS
+> window, the media-vs-real-time ratio from `span=`, the cap and eviction, the clip taken
+> through the CLI's own `--self-test-clip-after` trigger (**no synthetic input anywhere**),
+> the ffprobe of that clip, and criterion 7's fail-loud path. Run it from an SSH session
+> with `scripts/verify-in-interactive-session.ps1`, which puts it in the logged-on user's
+> desktop session through a one-shot scheduled task and cleans up afterwards.
+>
+> Two caveats, both load-bearing. First, **the harness has never run on Windows either** —
+> it was developed and exercised on macOS against the stub backends, so a fresh run is
+> checking the harness as much as the app: start with the report's `capture_started` row
+> (a missing WGC line, or `1280x720` geometry, means the session had no desktop and the
+> rest of the report is meaningless), then read the rows marked *not performed*. Second,
+> **it does not cover step 8 (the GUI) or step 9 (a real game) at all**, nor a real
+> keypress, nor lip-sync by ear; those stay manual.
+>
+> The steps below remain the source of truth — and every one of them is worth running by
+> hand at least once, because a report's green cell is not the same thing as a person
+> having watched the clip and heard the audio.
+
 1. **`cargo xtask probe`** — confirms which hardware encoders this box can actually open.
    Cheap, no capture. Confirms the encoder half of the path.
 2. **`cargo run --release -p localplay-cli -- buffer`** on the 4K display for ~40 s, then
@@ -358,9 +402,13 @@ observation; the Phase 1 runbook
    and **`dropped=` falling to zero** with **`fps=` reaching the configured rate** — this is
    the *only* thing that can neither be tested nor type-checked for the readback skip. Also
    re-measures **criteria 1 and 6** (issue #1).
-3. **Capture one `Ctrl+F8` clip and `ffprobe` it** — re-confirms criteria 3/4/5/8 on the
-   current build. (The black-frame defect is already resolved — see §2 — so this is a
-   regression check, not the dispute it once was.)
+3. **Take one clip and `ffprobe` it** — re-confirms criteria 3/4/5/8 on the current
+   build. Use the self-test trigger rather than a scripted keypress:
+   `cargo run --release -p localplay-cli -- buffer --self-test-clip-after 45` (it calls the
+   hotkey's own `clip_now()`; no synthetic input), then press `Ctrl+F8` once by hand, when
+   you are at the keyboard, to confirm the global hotkey itself fires. (The black-frame
+   defect is already resolved — see §2 — so this is a regression check, not the dispute it
+   once was.)
 4. **Repeat run 2 at 1080p.** issue #1 asks explicitly whether the criteria pass at 1080p;
    that separates "4K is hard" from "the pipeline is slow", and it is the measurement the
    acceptance thresholds were actually written for.
