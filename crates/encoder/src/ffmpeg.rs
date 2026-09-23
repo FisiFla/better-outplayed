@@ -234,6 +234,25 @@ fn accept_within(
                         format!("audio input connection from non-loopback peer {peer}"),
                     ));
                 }
+                // The listener is non-blocking SOLELY so this poll loop can enforce a
+                // connect deadline; that has no business leaking into the stream we
+                // hand to the pump. BSD-derived platforms (macOS included) propagate
+                // O_NONBLOCK from the listener to the socket `accept()` returns, while
+                // Linux does not — so without this line the accepted socket is
+                // non-blocking only on the very host this suite runs on. A
+                // non-blocking socket makes `write_all` fail with `WouldBlock`
+                // (`EAGAIN`, os error 35) the instant ffmpeg's receive buffer fills,
+                // which is a race on how fast the pump fills it: the intermittent
+                // failure this line fixes. A blocking accepted socket is the correct
+                // design here: the pump runs on its own dedicated thread fed by an
+                // unbounded channel, so the backpressure of a blocking write can never
+                // propagate to `submit_audio` on the caller's thread.
+                stream.set_nonblocking(false).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("making the accepted audio input socket blocking: {e}"),
+                    )
+                })?;
                 return Ok(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
