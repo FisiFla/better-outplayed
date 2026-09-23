@@ -1,11 +1,12 @@
 # Phase 1 verification runbook
 
-**Status: unexecuted.** This document tells a human how to decide, honestly, whether
-Phase 1 works. As of writing, **none of it has been run on Windows.** The Windows
-capture and audio backends only type-check (`cargo check --target
-x86_64-pc-windows-msvc` from macOS); no frame and no audio sample has ever been
-captured. A green `cargo test` on macOS exercises the synthetic stubs and proves none
-of the eight criteria below — see [Known gaps](#known-gaps).
+**Status: partly executed.** This document tells a human how to decide, honestly, whether
+Phase 1 works. Some Windows runs have happened — the capture→NVENC encode→clip-splice
+path ran on a 4K box and the WGC/WASAPI backends did execute (see the ledger
+`docs/verification-status.md`), so it is no longer true that nothing has run on Windows —
+but **large parts of it still have not**, and the eight criteria below have **not** been
+re-run end-to-end on the current build. A green `cargo test` on macOS exercises the
+synthetic stubs and proves none of the eight criteria — see [Known gaps](#known-gaps).
 
 You need:
 
@@ -652,11 +653,14 @@ settings first, or there is nothing to check.
 These are unverified or broken areas of the current build. They are stated plainly and
 not softened; do not read a pass elsewhere as coverage of them.
 
-- **The Windows backends have never been executed.** `crates/capture/src/wgc.rs` and
-  `crates/capture/src/wasapi.rs` have only ever been **type-checked**, via
-  `cargo check --target x86_64-pc-windows-msvc` from macOS. Neither has ever run on
-  Windows; **no frame has ever been captured**, and no audio sample has ever come through
-  WASAPI. This runbook is the first place they get a real run.
+- **The Windows backends have run, but only partly, and not on the current code.** An
+  early build of `crates/capture/src/wgc.rs` and `crates/capture/src/wasapi.rs` did run on
+  Windows (a 4K capture session — frames were captured and audio came through WASAPI; see
+  `docs/verification-status.md` §1). What remains unproven: every change committed **since**
+  that session has never run on Windows (the readback skip `dd921b3`, the WASAPI
+  autoconversion `0848fc7` and the silence detector `2a63949` are type-checked only), the
+  GUI window has never been opened, and every criterion below still needs a run on the
+  **current** build. This runbook is where that gets done.
 - **Engine-side sample-rate conversion has never been observed.** The WASAPI backend now
   initialises the loopback stream with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
   AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` and asks for 48 kHz stereo s16, so the audio

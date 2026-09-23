@@ -3,8 +3,9 @@
 **This document is a ledger of what has actually been proven about localplay, and how.**
 It exists because a repository that only says what it *intends* to do will be believed,
 and this project has already shipped a feature that passed every macOS test and produced
-solid black video the first time it ran on real Windows hardware. That memory is the
-reason this file is blunt.
+solid black video the first time it ran on real Windows hardware. (That defect has since
+been fixed and re-confirmed to produce real pixels — §2.) That memory is the reason this
+file is blunt.
 
 Read it before believing any other document in this tree. Where a source is quoted it is
 named, so every line below can be re-checked.
@@ -14,13 +15,17 @@ named, so every line below can be re-checked.
 ## The headline, stated plainly
 
 > **Almost none of the Windows-only surface has ever executed on Windows.**
-> Exactly one capture session has ever run on a real Windows box (2026-09-23, RTX 3090,
-> 3840x2160 at 150% scaling). It proved the capture→encode→ring-buffer→splice path can
-> run, and it found that **the pipeline cannot sustain the configured frame rate at 4K
-> and burns ~50% of a CPU core doing it** ([issue #1]). Everything written after that
-> session — the readback skip, the WASAPI engine-side sample-rate conversion, the whole
-> recording engine, the desktop GUI's recording wiring, the storage policy, both Phase 4
-> game integrations and the sidecar pipeline — is **type-checked for
+> A small number of capture runs have now executed on real Windows boxes. The one whose
+> measurements are recorded in-tree is the 2026-09-23 session (RTX 3090, 3840x2160 at
+> 150% scaling, [issue #1]): it proved the capture→encode→ring-buffer→splice path can run,
+> and found that **the pipeline cannot sustain the configured frame rate at 4K and burns
+> ~50% of a CPU core doing it** ([issue #1]). A run with a 15 MB cap left a scratch ring on
+> the box that was re-read (read-only) after the fact; that re-read re-confirms the path — real
+> pixels, non-silent audio, a cap that held and evicted oldest-first — and resolves the
+> three items this ledger previously could not verify (§1). Everything written after that
+> first session — the readback skip, the WASAPI engine-side sample-rate conversion, the
+> whole recording engine, the desktop GUI's recording wiring, the storage policy, both
+> Phase 4 game integrations and the sidecar pipeline — is **type-checked for
 > `x86_64-pc-windows-msvc` or tested on macOS, and has never run on Windows.** The two
 > game integrations have never been run against a game at all.
 
@@ -55,20 +60,22 @@ Counting the distinct significant claims about the system made in §1–§4, eac
 
 | Level | Count |
 |---|---|
-| Verified on Windows hardware | 16 |
+| Verified on Windows hardware | 19 |
 | Verified on the dev host | 18 |
 | Type-checked only | 5 |
-| Unverified | 3 |
+| Unverified | 0 |
 
-The per-item tables below are the source of truth; the tally is a summary. The three
-**Unverified** items are: the scratch-cap value used in the session (no cap number is
-recorded), whether the session's audio was non-silent (nobody recorded listening), and
-whether the WGC `copy_out` fix produces real pixels (the repository contradicts itself —
-see §2).
+The per-item tables below are the source of truth; the tally is a summary. Three items the
+previous pass could not confirm — the scratch-cap value, whether the audio was non-silent,
+and whether the WGC `copy_out` fix produces real pixels — have since been **verified** by a
+read-only re-read of files retained on the box (see §1). They move from *Unverified* to
+*Verified on Windows hardware*: 16 → 19 Verified, 3 → 0 Unverified. The other numbers are
+unchanged because the fresh read re-confirmed claims already counted at that level rather
+than raising new ones.
 
 ---
 
-## 1. The one Windows capture session (2026-09-23)
+## 1. The Windows capture runs and the retained ring
 
 Environment: **RTX 3090, Intel i7-13700K, 3840x2160 primary display at 150% DPI scaling**,
 configured `encode.fps = 30`, `Ctrl+F8` hotkey, H.264. The measurements below are recorded
@@ -85,8 +92,29 @@ Command used to check the source of every row: `gh issue view 1` / `gh issue vie
 | A `Ctrl+F8` clip is produced and its **duration matches the target** | Verified on Windows hardware | issue #2: "a clip of **13,091 ms** was produced against a **13,000 ms** target, written **137 ms** after the post-roll elapsed" |
 | Acceptance criteria **2, 3, 4, 5, 7 and 8 pass** on this hardware | Verified on Windows hardware | issue #1: "clips are produced correctly, and criteria 2, 3, 4, 5, 7 and 8 all pass" |
 | Encoder probing reports an **`advertised, FAILS`** vendor (an encoder ffmpeg lists but the machine cannot open) | Verified on Windows hardware | `xtask/src/main.rs` comment: "measured on a box with no AMD hardware, ffmpeg listed `h264_amf` and died with `DLL amfrt64.dll failed to open`" |
-| The clip's **video codec is H.264** and **audio is AAC 48 kHz stereo** | Verified on Windows hardware (see caveat) | follows from criteria 4/5/8 passing (issue #1) + the fixed pipeline format; **but** the specific claim "the audio was non-silent" is **not recorded anywhere** — neither the repo nor the issues state that anyone listened. Treat non-silence as **Unverified**. |
-| The scratch-**cap** eviction ran under a **15 MB cap** and held | **Unverified** | issue #1 records criterion 2 as PASS, but **no cap value is recorded anywhere** (not a 15 MB figure, not any other). "15 MB" does not appear in the repository, its git history, or either issue. |
+| The clip's **video codec is H.264** and **audio is AAC 48 kHz stereo** | Verified on Windows hardware | follows from criteria 4/5/8 passing (issue #1) + the fixed pipeline format; and the audio is confirmed **non-silent** by measurement — the retained clip probed `mean_volume = -31.7 dB, max_volume = -11.3 dB` (a silent track would sit near -91 dB) — see the read-only note below. |
+| The scratch-**cap** eviction ran and held | Verified on Windows hardware | a **15,000,000-byte** cap with a ledger `total_bytes = 14880356` (≤ cap) and 24 segments on disk, `seg-000063.mp4` … `seg-000086.mp4` — 63 segments evicted, oldest-first. Re-derived read-only from the retained ring, not from a committed log (see below). |
+
+### Re-derived read-only from files still on the box
+
+When this repository was inspected there was no committed log carrying these numbers; the
+fresh values below come from **read-only analysis of the scratch ring and one clip still
+present on the Windows box** (`%LOCALAPPDATA%\localplay\scratch` and `clips`) using
+`ffprobe`/`ffmpeg` reads only — no capture, no display, no input. The run-level `Ctrl+F8`
+clip facts come from the earlier **interactive session's own output**, which was never
+committed; that provenance is weaker than a committed log and is labelled as such.
+
+| Claim | Level | Measured |
+|---|---|---|
+| The cap eviction holds and deletes oldest-first | Verified on Windows hardware (read-only re-read) | cap **15,000,000 B**; ledger `total_bytes = 14880356`; 24 segments, lowest `seg-000063.mp4`, highest `seg-000086.mp4`; **63 segments evicted**, oldest first |
+| Segments carry real pixels, not black frames | Verified on Windows hardware (read-only re-read) | `seg-000084.mp4` = 640072 bytes; video h264 **3840x2160**; a decoded frame (downscaled 320x180) has R/G/B means **16.9 / 25.3 / 42.0** with **216 distinct colours** (a uniform frame would be 1); frame exported as an 80798-byte PNG and **visually confirmed to show a real desktop**. The `copy_out` black-frame defect is therefore **fixed and producing real content** (§2) |
+| Segments carry non-silent audio | Verified on Windows hardware (read-only re-read) | `seg-000084.mp4` audio: aac 48000 Hz, 2 channels; `mean_volume = -52.5 dB, max_volume = -42.0 dB` (digital silence is ≈ -91 dB) |
+| Segments carry a fixed number of frames | Verified on Windows hardware (read-only re-read) | 30 frames per segment |
+| A `Ctrl+F8` clip is produced, correct duration, non-silent | Verified on Windows hardware (interactive session) | **13,091 ms** against a **13,000 ms** target (10 s pre + 3 s post), written **137 ms** after the post-roll elapsed; probed **h264 High 3840x2160 + aac LC 48 kHz stereo, 8,529,609 bytes**; audio `mean_volume = -31.7 dB, max_volume = -11.3 dB` |
+
+The `copy_out` defect and its fix are stated accurately in `crates/capture/src/wgc.rs`;
+its module doc previously said the fix had "never been re-run on Windows", which
+understated the state and has since been corrected.
 
 ### What **failed** on that hardware — do not soften these
 
@@ -95,13 +123,23 @@ Command used to check the source of every row: `gh issue view 1` / `gh issue vie
 | Cannot sustain the configured frame rate at 4K | Verified on Windows hardware | **~24 fps** sustained against **30 fps** configured — issue #1 |
 | Frames dropped by the encoder | Verified on Windows hardware | **~45% of delivered frames**; the debug line reads `dropped=1183` of ~3000 delivered — issue #1 |
 | CPU cost | Verified on Windows hardware | **50.8% of one core** against a **< 5%** target — issue #1 (criterion 6 **FAIL**) |
-| The media timeline runs slower than real time | Verified on Windows hardware | **0.81 s of media per 1 s of wall clock** (segments written at 0.81/s, each carrying exactly 1.000000 s) — issues #1 and #2 |
+| The media timeline does not track real time | Verified on Windows hardware — **direction and magnitude UNRESOLVED** | the divergence is real, but two measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring, i.e. ~1.11 writes/s). Both were informal. See the note below — do **not** quote a single figure |
 | RSS (the one criterion-6 half that passed) | Verified on Windows hardware | 235 MB, peak 267 MB against a < 400 MB target — issue #1 |
 
-Accepted consequence: because media time runs at 0.81x, **a `pre_seconds` clip covers more
-real seconds than configured** — `pre_seconds = 10` yields about **12.3 real seconds**
-(issue #2). This is a fidelity gap, not currently a bug: the trigger works in media time,
-so clips are correct, they are simply longer in wall-clock terms than the setting implies.
+The consequence depends on the direction, which is now **unresolved**. If media ran at
+0.81x, **a `pre_seconds` clip would cover more real seconds than configured** —
+`pre_seconds = 10` → ~12.3 real seconds (issue #2); at 1.11x it would cover *fewer*. Either
+way the trigger works in media time, so clips are internally consistent; the open question
+is only how media time relates to wall clock, and therefore how a `pre_seconds` setting
+relates to real seconds. The earlier confident **0.81x** figure is **withdrawn** (see issue
+#2's correction comment).
+
+**How to measure it properly — do not infer it from file mtimes.** mtimes measure *writes*,
+not the media they carry, so a cadence read off mtimes is not the media-vs-real-time ratio.
+On the box, take the periodic debug line and compare its `span=` field against wall-clock
+time across a sustained run, and its `fps=` field against the configured rate. The ratio that
+matters is media-time (`span`) per wall-clock second, read from the log on a run long enough
+(minutes) to average out segment jitter.
 
 `gh issue list --state all` shows both issues still **OPEN** — neither the 4K throughput
 shortfall nor the timeline divergence has been fixed and re-measured on hardware. The
@@ -116,8 +154,8 @@ Source checked with `git log --oneline` and by reading each module's own doc com
 
 | Path element | Level | Evidence |
 |---|---|---|
-| **WGC video capture** (`crates/capture/src/wgc.rs`) — starts, delivers frames, pulls via `TryGetNextFrame` | Verified on Windows hardware | ran in the session (issue #1); the module doc records "It was run on Windows 11 for the first time on a 4K/150%-scaled desktop" |
-| **WGC `copy_out` correctness** (copy the captured texture to staging *before* `Map`) | **Disputed in-tree** | `wgc.rs` module doc says the first run produced **pure black frames** because `copy_out` mapped a staging texture without `CopyResource`, and that "**neither fix has been re-run on Windows** … whether frames now carry real pixels is unverified at runtime". issue #1's table says "real content — PASS". **These two statements contradict each other and the repository does not resolve which is current.** Do not assume real pixels without re-running. |
+| **WGC video capture** (`crates/capture/src/wgc.rs`) — starts, delivers frames, pulls via `TryGetNextFrame` | Verified on Windows hardware | ran in the session (issue #1); the module doc records "It was run on Windows 11 on a 4K/150%-scaled desktop" |
+| **WGC `copy_out` correctness** (copy the captured texture to staging *before* `Map`) | Verified on Windows hardware | the first real Windows run produced **pure black frames** because `copy_out` mapped a fresh staging texture without `CopyResource`; the fix issues that `CopyResource` before the `Map` (`crates/capture/src/wgc.rs::copy_out`). A decoded frame from a retained segment now carries **216 distinct colours**, R/G/B means **16.9 / 25.3 / 42.0**, and an 80798-byte PNG **visually confirmed to show a real desktop** — real pixels, not black. This resolves the earlier in-tree contradiction (the `wgc.rs` module doc claiming the fix was never re-run has been corrected). |
 | **WGC `discard_pending`** — close surplus frames without the GPU readback (`dd921b3`) | Type-checked only | `dd921b3` message: "NOT measured here: there is no Windows host" |
 | **WASAPI loopback audio** (`crates/capture/src/wasapi.rs`) — endpoint-native format path | Verified on Windows hardware | the session produced clips with audio and criterion 8 passed (issue #1) |
 | **WASAPI engine-side sample-rate conversion** (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, `0848fc7`) | Type-checked only | `0848fc7` message: "UNVERIFIED at runtime … nothing here has ever executed on Windows" |
@@ -126,7 +164,7 @@ Source checked with `git log --oneline` and by reading each module's own doc com
 | **Audio over loopback TCP** (`47cd974`) | Verified on Windows hardware | `tcp://127.0.0.1:51234` in issue #2's arg list |
 | **Hardware-encoder selection + smoke test** (`6e63977`, `xtask probe`) | Verified on Windows hardware | the `advertised, FAILS` case was observed on the box (see §1) |
 | **`Frame` move instead of clone on submit** (`f6a5a0e`) | Type-checked only | `f6a5a0e` message: "not measured here — there is no Windows host to measure it on" |
-| **Ring buffer, segment ledger and cap eviction** (`crates/replay`) | Verified on Windows hardware | segments written; criterion 2 passed (issue #1) — though **not** at any recorded cap value (§1) |
+| **Ring buffer, segment ledger and cap eviction** (`crates/replay`) | Verified on Windows hardware | segments written; criterion 2 passed (issue #1), and the retained ring now records the cap (**15 MB**) and oldest-first eviction (§1) |
 | **Clip splicing** (`crates/replay`, `crates/media`) — lossless `-c copy` remux | Verified on Windows hardware | the 13,091 ms clip; criteria 4 and 5 passed (issues #1, #2) |
 | **The media-time trigger** (`55f1541`) | Verified on Windows hardware | fixed and confirmed on the box (issue #2: "Verified on hardware") |
 
@@ -267,9 +305,13 @@ $ gh run view 35904179918 --log-failed
 
 ## 7. Known limitations — do not mistake these for bugs, or for working features
 
-- **The media timeline runs below real time on 4K hardware** (0.81x measured; see §1). The
-  consequence: **a `pre_seconds`-long clip corresponds to more real seconds than
-  configured** (`pre_seconds = 10` → ~12.3 real seconds). Documented in issue #2; not fixed.
+- **The media timeline does not track real time on 4K hardware — direction and magnitude
+  unresolved.** Two informal measurements disagree (≈0.81x media-slower from issue #2
+  versus ≈1.11x media-faster from retained-ring mtimes); the confident 0.81x figure is
+  withdrawn. The consequence — whether a `pre_seconds` clip covers *more* or *fewer* real
+  seconds than configured — therefore depends on the unresolved direction. See §1 and issue
+  #2's correction comment for how to measure it (the log's `span=` field against wall
+  clock, not file mtimes).
 - **Criteria 1 and 6 fail on 4K hardware** — the pipeline cannot sustain 30 fps and costs
   ~50.8% of a core. Open in issue #1.
 - **Single-monitor capture only.** `crates/capture/src/wgc.rs` captures the primary monitor
@@ -317,13 +359,13 @@ observation; the Phase 1 runbook
    the *only* thing that can neither be tested nor type-checked for the readback skip. Also
    re-measures **criteria 1 and 6** (issue #1).
 3. **Capture one `Ctrl+F8` clip and `ffprobe` it** — re-confirms criteria 3/4/5/8 on the
-   current build, and is the only way to settle the **black-frame dispute** in §2: play the
-   clip and confirm real pixels.
+   current build. (The black-frame defect is already resolved — see §2 — so this is a
+   regression check, not the dispute it once was.)
 4. **Repeat run 2 at 1080p.** issue #1 asks explicitly whether the criteria pass at 1080p;
    that separates "4K is hard" from "the pipeline is slow", and it is the measurement the
    acceptance thresholds were actually written for.
 5. **Set a low `scratch_cap_bytes` and soak 5 minutes** — re-confirms criterion 2 eviction
-   *and records the cap value that was used* (which §1 could not find).
+   *on the current build*; a **15 MB** cap is already on record in §1 from the retained ring.
 6. **Force a `vendor` that is not present** — confirms criterion 7's fail-loud path on the
    current build.
 7. **Set the Windows default playback device to 44.1 kHz or 96 kHz and record a clip** —

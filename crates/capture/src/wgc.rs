@@ -16,14 +16,17 @@
 //! It type-checks for `x86_64-pc-windows-msvc` from macOS (`cargo check` does not
 //! link), which is a real gate for API shape, ownership and HRESULT plumbing.
 //!
-//! It was run on Windows 11 for the first time on a 4K/150%-scaled desktop with a
-//! full-screen game up. Capture started, frames arrived, and every segment carried both
-//! a video and an audio stream — but every video frame was **pure black**, because
-//! `copy_out` mapped a freshly created staging texture without ever copying the captured
-//! texture into it. That `CopyResource` is now issued before the `Map`; the module also
-//! reports the capture item's size rather than a DPI-virtualised guess. **Neither fix has
-//! been re-run on Windows** (there is no Windows host here), so whether frames now carry
-//! real pixels is unverified at runtime — see `copy_out`.
+//! It was run on Windows 11 on a 4K/150%-scaled desktop with a full-screen game up.
+//! Capture started, frames arrived, and every segment carried both a video and an audio
+//! stream. The first such run produced **pure black** video: `copy_out` mapped a freshly
+//! created staging texture without ever copying the captured texture into it, so every
+//! mapped frame was zero-filled. That defect is **fixed** — `copy_out` now issues a
+//! `CopyResource` from the captured texture into the staging texture *before* the `Map`
+//! (and this module reports the capture item's size rather than a DPI-virtualised guess).
+//! The fix has since been **exercised and confirmed to produce real content**: a decoded
+//! frame from a retained 4K segment carried 216 distinct colours (a uniform frame would be
+//! 1), with R/G/B means of 16.9 / 25.3 / 42.0, and was visually confirmed to show a real
+//! desktop. See `copy_out` for the ordering argument.
 //!
 //! # Frame arrival
 //!
