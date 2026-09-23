@@ -86,7 +86,10 @@ read-only re-read of files retained on the box (see §1). They move from *Unveri
 background half (§3, §8) then added three claims of its own: two at *verified on the dev
 host* — the background logic, and the trigger path driven through a real recording — and one
 at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller, which needs
-a Windows message queue to run.
+a Windows message queue to run. The measured-rate change (§4) adds one more at *verified on
+the dev host* — the rate decision, its new config key and the probe's own bounds are tested,
+and the startup lines were produced by real runs — while the *accuracy* of its measurement at
+4K on the target hardware is explicitly not claimed: 20 → 21 Verified on the dev host.
 
 ---
 
@@ -156,10 +159,40 @@ time across a sustained run, and its `fps=` field against the configured rate. T
 matters is media-time (`span`) per wall-clock second, read from the log on a run long enough
 (minutes) to average out segment jitter.
 
+**What the dev host adds — a refinement of the hypothesis, not a measurement of the box.**
+Measured here (ffmpeg 9.0.2, the real argument list), with the segment muxer in place a
+declared `-framerate R` makes ffmpeg resample the output onto a rigid `1/R` grid and
+*duplicate* frames to fill the gaps left by whatever the pipeline could not deliver: a pipe
+fed 122 frames at ~24 fps with 30 declared encoded 180 frames, `dup=58 drop=0`. So the media
+clock is the *declared* grid, and it advances at (output frames the encoder can emit per
+second) ÷ `R`: 1.0× when the encoder can emit `R` frames a second even if many are
+duplicates, and proportionally less when it cannot. Two consequences worth recording, both
+measured here and neither of them the mechanism the issue text assumed:
+
+- **Dropped frames do not become holes in the timeline; they slow the whole clock.** A gap
+  in what arrives is re-filled with duplicates when the encoder has the headroom, so the
+  media clock stays glued to the wall clock and the *pictures* repeat. It is only when the
+  encoder cannot emit `R` frames a second that the clock itself slips — uniformly, not
+  hole-by-hole.
+- **The declared rate therefore shows up directly in the ratio.** An A/B on this host,
+  identical content and configuration except for the new `encode.adapt_fps` (4K output
+  scaled from the 1280x720 stub, 12 s of media): declaring the *measured* 62 fps gave
+  **0.94×**; declaring the *configured* 120 fps gave **0.69×**. That is consistent with the
+  box's 0.81× being "the encoder could emit ~24 frames a second while 30 were declared" —
+  but it is a hypothesis about the box, not a measurement of it: this host's libx264
+  duplicates readily, the box's run did not appear to, and the `span=`-vs-wall-clock reading
+  prescribed above is still the only thing that will settle it.
+
 `gh issue list --state all` shows both issues still **OPEN** — neither the 4K throughput
-shortfall nor the timeline divergence has been fixed and re-measured on hardware. The
+shortfall nor the timeline divergence has been **re-measured on hardware**, and that
+re-measurement is what closing them needs. The
 readback-skip commit ([`dd921b3`](#4-added-since-the-windows-session)) was the first
-attempt at issue #1 and says in its own message that it was not measured on Windows.
+attempt at issue #1 and says in its own message that it was not measured on Windows. What
+has changed since, and what the next run on the box is for, is the measured-rate change in
+§4: the pipeline no longer declares a rate it cannot deliver — one measured value is given
+to both the pacer and the encoder child — so the media clock can no longer slip *because
+the declared rate exceeded what the encoder could emit*. Whether that is the whole of the
+box's shortfall is what its next run has to show.
 
 ---
 
@@ -258,6 +291,19 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | Desktop background half: tray, global clip hotkey, hide-on-close, `[app] start_with_system` | `225a1fe`, `e3fcb95`, `d20d748` | Verified on the dev host (headless: pure logic + a real recording driven through the trigger path). **Never observed on any machine**: no tray icon drawn, no window closed, no key pressed, no Run-key write executed |
 | A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
+| The pipeline **declares the rate it can actually deliver**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate` (issues #1/#2) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, and its numbers do not transfer to NVENC (hardware, content-blind). The harness's criterion-1 checks were split so adaptation cannot hide a shortfall (see §1) |
+
+The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
+dev host (stub capture, `--dev-software-encoder`, so the encoder is libx264 at the stub's
+1280x720 — **these numbers are this host's and say nothing about the box's**):
+
+```text
+# encode.fps = 30, measured far above it: nothing is reduced
+INFO localplay_recorder: encode rate: 326.8fps sustainable at 1280x720 with libx264 (491 frames over 1.5s); encode.fps = 30 is within that, so capture runs at the configured 30fps
+
+# encode.fps = 120 against a 4K output: reduced to the measured rate
+WARN localplay_recorder: encode.fps = 120 is not achievable at 1280x720 on this machine: 61.9fps sustainable at 1280x720 frames scaled to a 3840x2160 output with libx264 (95 frames over 1.5s). Capturing at 61fps instead — the same rate the encoder child is told — so that the media timeline tracks real time and a configured pre_seconds of footage is that many real seconds. The configured rate was not reached at this resolution: lower encode.output_size (e.g. "1920x1080") or encode.fps to a rate this machine holds, or set encode.adapt_fps = false to declare 120fps anyway and accept dropped frames and a timeline that runs slower than real time.
+```
 
 ---
 
@@ -272,8 +318,9 @@ $ gh run list --limit 10
 
 What a green run proves:
 
-- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 359
-  tests, `cargo test --workspace --features localplay-encoder/test-encoders`;
+- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 375
+  tests as measured on the dev host at this pass, `cargo test --workspace --features
+  localplay-encoder/test-encoders` (0 failed, 1 ignored);
 - **`cargo check` for `x86_64-pc-windows-msvc`** of the cross-checkable crates
   (`capture`, `encoder`, `events`, `replay`, `media`, `xtask`) — *type-checking*, not
   running. No MSVC linker is needed because `check` stops before linking;
