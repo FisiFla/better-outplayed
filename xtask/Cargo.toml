@@ -28,6 +28,23 @@ zip = { version = "5", default-features = false, features = ["deflate-flate2"] }
 # backend, so building the sidecar tooling needs no C toolchain.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# `xtask verify` samples the running CLI's CPU time and working set with the same two
+# Win32 calls the runbook's PowerShell recipe reads (`GetProcessTimes`,
+# `K32GetProcessMemoryInfo`). Target-specific, so a non-Windows development host never
+# builds it — and it is the same `windows-sys` the capture backend already pulls in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+# The same two numbers on the development host (macOS), through `proc_pid_rusage`: a
+# syscall rather than the `ps` subprocess, so the harness still samples when a sandboxed
+# shell denies `ps` — which is exactly what happened the first time it was run here.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 

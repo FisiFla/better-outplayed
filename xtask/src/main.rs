@@ -1,10 +1,12 @@
-//! Build helpers: sidecar acquisition and encoder probing.
+//! Build helpers: sidecar acquisition, encoder probing, and the verification harness.
 
+mod probe;
 mod sidecars;
+mod verify;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match run() {
@@ -21,6 +23,7 @@ fn run() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("sidecars") => sidecars_command(&args[1..]),
         Some("probe") => probe_encoders(),
+        Some("verify") => verify::verify_command(&args[1..]),
         _ => bail!(usage()),
     }
 }
@@ -29,7 +32,8 @@ fn usage() -> &'static str {
     "usage:\n  \
      xtask sidecars record [--target <triple>]   # download, hash, rewrite sidecars.toml\n  \
      xtask sidecars fetch  [--target <triple>]   # verify the recorded hash, then extract\n  \
-     xtask probe                                 # which hardware encoders this machine can run"
+     xtask probe                                 # which hardware encoders this machine can run\n  \
+     xtask verify [--seconds N] [--report PATH]  # run the Phase 1 acceptance checks, write a report"
 }
 
 /// The repository root. `xtask` is a workspace member, so its manifest sits one level down.
@@ -100,44 +104,6 @@ fn sidecars_command(args: &[String]) -> Result<()> {
 fn probe_encoders() -> Result<()> {
     let bin = localplay_media::FfmpegBinaries::discover(None)
         .context("locating ffmpeg; is it on PATH, or in the sidecar directory?")?;
-    let out = Command::new(&bin.ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .context("running `ffmpeg -encoders`")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-
-    println!("{}", bin.ffmpeg.display());
-    let mut usable = 0;
-    for name in ["h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"] {
-        // Two questions, and only the second one is the answer. `-encoders` says the build
-        // carries the encoder; the smoke test says *this machine* can run it, which is
-        // what a `vendor` value in the config depends on. A vendor can advertise an
-        // encoder it cannot initialise — measured on a box with no AMD hardware, ffmpeg
-        // listed h264_amf and died with `DLL amfrt64.dll failed to open` when asked to use
-        // it — so a row that says only "listed" is not enough to trust.
-        let state = if !text.lines().any(|l| l.contains(name)) {
-            "not advertised".to_string()
-        } else {
-            match localplay_media::smoke_test_encoder(&bin, name) {
-                Ok(()) => {
-                    usable += 1;
-                    "advertised, WORKS".to_string()
-                }
-                Err(reason) => format!("advertised, FAILS: {reason}"),
-            }
-        };
-        println!("{name:<12} {state}");
-    }
-    println!(
-        "\nWORKS means ffmpeg listed it AND encoded one 320x240 frame with it. A vendor value \
-         only works when it lands on WORKS. This is a synthetic frame: it does not capture \
-         the screen and does not inject input."
-    );
-    if usable == 0 {
-        println!(
-            "No hardware encoder on this machine can encode a frame; the capture app will \
-             refuse to start rather than fall back to CPU encoding."
-        );
-    }
+    print!("{}", probe::probe(&bin)?.render());
     Ok(())
 }

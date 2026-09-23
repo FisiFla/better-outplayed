@@ -1076,11 +1076,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "libc",
  "localplay-media",
  "serde",
  "sha2",
  "tempfile",
  "toml",
+ "windows-sys",
  "zip",
 ]
 

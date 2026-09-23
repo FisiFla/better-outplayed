@@ -1,0 +1,11 @@
+# Cargo aliases for this workspace.
+#
+# `cargo xtask <command>` is how the runbook and the verification ledger invoke the
+# repository's own build tool (`xtask/`): `cargo xtask probe`, `cargo xtask verify`,
+# `cargo xtask sidecars fetch`. The alias is what makes that spelling work; without it the
+# equivalent is `cargo run -p xtask -- <command>`.
+#
+# It lives in the workspace rather than in a user's ~/.cargo/config.toml so that the
+# commands the documentation names are the commands a fresh checkout can run.
+[alias]
+xtask = "run --package xtask --"
