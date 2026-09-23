@@ -2686,6 +2686,13 @@ fn walk_rs(dir: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for e in entries.filter_map(|e| e.ok()) {
         let p = e.path();
+        // Prune build output and VCS metadata: `target/` holds the whole crates.io
+        // registry cache, whose vendored sources would otherwise be walked (and
+        // could trip the assertions) on every run.
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if p.is_dir() && (name == "target" || name == ".git") {
+            continue;
+        }
         if p.is_dir() {
             out.extend(walk_rs(&p));
         } else if p.extension().is_some_and(|x| x == "rs") {
