@@ -58,17 +58,25 @@ impl CaptureBackend for StubCapture {
     }
 
     /// Real-time paced, so the CLI's buffer runs at 1x like a real capture source.
+    ///
+    /// Returns `None` when the next frame is not due within `timeout`. That is what
+    /// lets a single-threaded caller drive video and audio together without either
+    /// stream starving (see the CLI loop in Task 13).
     /// `drain_for` deliberately bypasses pacing to keep tests fast.
-    fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<Frame>> {
+    fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>> {
         let started = self
             .started_at
             .ok_or_else(|| anyhow::anyhow!("capture not started"))?;
         let due = Duration::from_micros(
             self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64,
         );
-        if let Some(sleep) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(sleep);
+        let Some(sleep) = due.checked_sub(started.elapsed()) else {
+            return Ok(Some(self.render_next())); // already due
+        };
+        if sleep > timeout {
+            return Ok(None);
         }
+        std::thread::sleep(sleep);
         Ok(Some(self.render_next()))
     }
 
@@ -114,14 +122,21 @@ impl AudioBackend for StubAudio {
         Ok(())
     }
 
-    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+    /// Real-time paced like `StubCapture::next_frame`. Returns `None` when the next
+    /// 10ms block is not due within `timeout`; a `Duration::ZERO` timeout makes this
+    /// a non-blocking "is anything due?" check for the CLI's drain loop.
+    fn next_buffer(&mut self, timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
         let started = self
             .started_at
             .ok_or_else(|| anyhow::anyhow!("audio capture not started"))?;
         let due = Duration::from_millis(self.block_index * 10);
-        if let Some(sleep) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(sleep);
+        let Some(sleep) = due.checked_sub(started.elapsed()) else {
+            return Ok(Some(self.next_block())); // already due
+        };
+        if sleep > timeout {
+            return Ok(None);
         }
+        std::thread::sleep(sleep);
         Ok(Some(self.next_block()))
     }
 
@@ -165,5 +180,53 @@ mod tests {
         // 48000Hz / 100 blocks = 480 frames = 960 samples stereo = 1920 bytes.
         assert_eq!(blocks[0].data.len(), 1920);
         assert!(blocks[0].data.iter().all(|b| *b == 0), "stub audio is silence");
+    }
+
+    #[test]
+    fn next_frame_with_zero_timeout_returns_none_when_not_due() {
+        // 10 fps => frames are 100ms apart, a comfortable margin over the handful of
+        // microseconds that elapse between the two calls below.
+        let cfg = StubConfig { width: 8, height: 8, fps: 10 };
+        let mut cap = StubCapture::new(cfg);
+        cap.start().unwrap();
+        // The initial frame (pts 0) is due immediately.
+        assert!(cap.next_frame(Duration::ZERO).unwrap().is_some());
+        // The next frame is due 100ms later: a zero timeout must not invent it.
+        let started = std::time::Instant::now();
+        assert!(
+            cap.next_frame(Duration::ZERO).unwrap().is_none(),
+            "must return None rather than block or fabricate a frame"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "a zero timeout must not block waiting for the frame"
+        );
+    }
+
+    #[test]
+    fn next_frame_with_a_generous_timeout_returns_some() {
+        let cfg = StubConfig { width: 8, height: 8, fps: 10 };
+        let mut cap = StubCapture::new(cfg);
+        cap.start().unwrap();
+        // Consume the immediately-due frame, then ask for the next one, which is due
+        // 100ms out, with a timeout long enough to wait for it.
+        assert!(cap.next_frame(Duration::ZERO).unwrap().is_some());
+        assert!(
+            cap.next_frame(Duration::from_secs(1)).unwrap().is_some(),
+            "a generous timeout must sleep until due and return the frame"
+        );
+    }
+
+    #[test]
+    fn next_buffer_with_zero_timeout_returns_none_when_not_due() {
+        let mut a = StubAudio::new(AudioFormat::default());
+        a.start().unwrap();
+        // Block 0 is due immediately.
+        assert!(a.next_buffer(Duration::ZERO).unwrap().is_some());
+        // Block 1 is due 10ms later: a zero timeout must not block for it.
+        assert!(
+            a.next_buffer(Duration::ZERO).unwrap().is_none(),
+            "must return None rather than block or fabricate a block"
+        );
     }
 }
