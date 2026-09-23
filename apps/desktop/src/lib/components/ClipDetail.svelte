@@ -195,6 +195,15 @@
     display: block;
     width: calc(100% - 32px);
     margin: 0 16px;
+    /*
+     * The box is width-driven and capped in height, so the height that *paints* is normally
+     * the media's own. `aspect-ratio` is what keeps it there when there is no media yet:
+     * an unloaded `<video>` has an intrinsic size of 300x150, and in this column it is a
+     * flex item — so without this the pane's flexbox shrinks the player to its 150px
+     * intrinsic height until metadata arrives, and a clip whose file cannot be read leaves
+     * it that way for good. A 640x360 clip needs 488px at this width; 368 is the cap.
+     */
+    aspect-ratio: 16 / 9;
     max-height: 46vh;
     background: #000;
     border: 1px solid var(--line);

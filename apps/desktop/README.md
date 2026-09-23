@@ -13,6 +13,9 @@ ffmpeg for trims and thumbnails. Nothing else.
 ```
 apps/desktop/
 ├── package.json, vite.config.ts, tsconfig.json, svelte.config.js, index.html
+├── scripts/
+│   ├── shots.mjs             # headless render + screenshot + assertion run (`npm run shots`)
+│   └── png-stats.mjs         # the minimal PNG decoder that proves a shot is not blank
 ├── src/                      # Svelte 5 + TypeScript
 │   ├── App.svelte            # the shell: list / detail / storage panel, all state
 │   ├── app.css               # the dark palette and the two-pane layout
@@ -90,6 +93,27 @@ npx @tauri-apps/cli@^2 dev      # cargo-tauri is not installed globally
 `cargo-tauri` is deliberately not assumed: `@tauri-apps/cli` is a devDependency here, so
 `npx` resolves the pinned version.
 
+### Looking at it without opening a window
+
+```sh
+cd apps/desktop
+npm run shots          # build, serve dist/, screenshot it headlessly into target/
+```
+
+`npm run shots` builds the frontend, serves `dist/` from a throwaway static server, loads it
+in headless Chromium with the Tauri IPC replaced by a mock, drives the real UI with real
+pointer events and writes PNGs plus a per-shot blank-detection table to
+`<repo>/target/desktop-shots/` (gitignored). It fails on a blank, transparent, white or
+error-page screenshot, on a contrast ratio below WCAG AA, and on any console, page or HTTP
+error it cannot explain.
+
+The mock reaches the window through the test-only seam in `src/main.ts`: the page must be
+loaded with `?test-clip-source=1` *and* have set `globalThis.__localplayClipSource`, so a
+shipped window — loaded from `tauri://localhost/` — cannot be armed at all. Headless
+Chromium is downloaded into `target/desktop-shots/browsers/` on first use
+(`npm run shots:browser` does just that step). Media for the fixtures is generated with the
+ffmpeg on `PATH`; without ffmpeg the run still produces screenshots and says so.
+
 ### This crate is not a workspace member
 
 `apps/desktop/src-tauri` is its own workspace (and is `exclude`d from the root one).
@@ -123,14 +147,23 @@ Run and passing:
 cd apps/desktop && npm test          # 86 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
+cd apps/desktop && npm run shots     # 10 headless screenshots, 123 assertions, 0 failures
 cd apps/desktop/src-tauri && cargo test    # 43 tests, against a real store and real ffmpeg
 cd apps/desktop/src-tauri && cargo clippy  # no warnings outside test bodies
 ```
 
-**Never run, and therefore unverified:** the window itself has never been opened — no
-display is assumed on the development host, and none was used. Nothing about layout,
-rendering, pointer interaction, `<video>` playback, or the asset-protocol scope check has
-been seen working. The JavaScript-level logic behind all of it is unit-tested, and the
-Rust command bodies are tested end to end, but the two are only joined by the assertions in
-`src/lib/ipc.test.ts` — which pin the command names and argument keys against the Rust
-source — and by the build.
+**Seen, headlessly:** the frontend rendered in Chromium at 1280x800, in nine states, with the
+built bundle and a mocked `ClipSource` — the clip list, the detail view, the timeline, a
+drag of both trim handles (3240ms → 9331ms, from real pointer input), a scrub that moved both
+the playhead and the `<video>`, the trim notice, and the storage panel's "this cap cannot be
+met" verdict. Text contrast was measured, not eyeballed (6.5:1 to 16:1 against their own
+backgrounds). `npm run shots` regenerates all of it and is the check that fails if any of it
+breaks.
+
+**Still never opened:** the Tauri window itself. No display was used and no webview was
+launched, so none of the following has been seen working: the shell and OS window chrome,
+the configured window size and DPI scaling, WebKit/WebView2 (the screenshots are Chromium),
+the asset-protocol scope check and range requests over `asset:` URLs (the screenshots' media
+came from a plain static server), real `<video>` playback of a real clip file, and the trim's
+ffmpeg stream copy (the screenshots' trim was a mock mutating an array, which is why the clip
+it returns plays black).

@@ -26,6 +26,11 @@ build/
 # someone reading this file and concluding only the repository root is covered.
 apps/desktop/node_modules/
 apps/desktop/dist/
+# Playwright's own output directories, in case a future run adds a @playwright/test config
+# beside the `npm run shots` script (whose screenshots and browser download already live
+# under the ignored target/).
+playwright-report/
+test-results/
 
 # --- Tauri ---
 src-tauri/gen/schemas/

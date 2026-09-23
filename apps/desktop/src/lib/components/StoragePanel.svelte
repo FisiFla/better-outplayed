@@ -47,7 +47,7 @@
       <dt>Age limit</dt>
       <dd>{stats.max_age_days} days</dd>
     </div>
-    <div>
+    <div class="wide">
       <dt>Clips directory</dt>
       <dd class="mono path">{stats.clips_dir}</dd>
     </div>
@@ -128,6 +128,16 @@
 
   .path {
     overflow-wrap: anywhere;
+  }
+
+  /*
+   * The directory spans both columns. An absolute path is one unbreakable token longer than
+   * a half-width column, and `overflow-wrap: anywhere` breaks it wherever it has to — which
+   * in a 166px column means splitting it mid-word ("Videos\l / ocalplay\clips"). Full width
+   * fits the path on one line instead.
+   */
+  dl > .wide {
+    grid-column: 1 / -1;
   }
 
   .verdict {
