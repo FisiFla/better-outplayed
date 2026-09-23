@@ -14,7 +14,18 @@ tracing.workspace = true
 tempfile.workspace = true
 
 [features]
+# Gates the software (libx264) encode path and `EncodeConfig::for_tests_software`.
+# Deliberately NOT a default feature: a default would put the CPU-encoder path into
+# release builds, and the project has no CPU fallback by design (spec §3.2).
 test-encoders = []
+
+# The integration test builds a software encoder, so it needs the feature. Declaring
+# that here (rather than making the feature a default) is what lets a bare
+# `cargo test` compile: Cargo skips this target instead of failing on a constructor
+# that `cfg(feature = "test-encoders")` keeps out of the library.
+[[test]]
+name = "segmenting"
+required-features = ["test-encoders"]
 
 [lints]
 workspace = true
