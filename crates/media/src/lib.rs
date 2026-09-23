@@ -4,5 +4,5 @@ pub mod binaries;
 pub mod edit;
 pub mod probe;
 
-pub use binaries::FfmpegBinaries;
-pub use probe::{smoke_test_encoder, AvDrift, MediaInfo};
+pub use binaries::{wait_with_deadline, FfmpegBinaries};
+pub use probe::{ffmpeg_reason, smoke_test_encoder, AvDrift, MediaInfo};

@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 pub mod ffmpeg;
 pub mod probe;
+pub mod throughput;
 
-pub use ffmpeg::FfmpegEncoder;
+pub use ffmpeg::{video_input_args, video_output_args, FfmpegEncoder};
 pub use probe::select_vendor;
+pub use throughput::{frames_per_second, measure_sustainable_fps, ThroughputMeasurement};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -163,6 +165,19 @@ pub trait Encoder: Send {
     /// encoder compares each frame against this value and refuses a mismatch out loud
     /// (see `pump_once_counted` in the CLI), because the failure is otherwise silent.
     fn source_size(&self) -> (u32, u32);
+
+    /// The frame rate this encoder's raw video input was declared with —
+    /// [`EncodeConfig::fps`], which is the `-framerate` the child was spawned with
+    /// (`localplay_encoder::video_input_args`).
+    ///
+    /// Read back for the same reason as [`Encoder::source_size`]: it is what the child was
+    /// *actually* told, as opposed to what a caller believes it asked for. The engine
+    /// builds its [`crate::pump::FramePacer`] from this value (see
+    /// `localplay_recorder::Recorder::start_with_measure`), so the rate the capture loop
+    /// admits is, by construction, the rate the encoder is encoding at — the two agreeing
+    /// is the fix for the measured 4K defect where the pipeline declared a rate it could
+    /// not deliver (issues #1 and #2).
+    fn input_fps(&self) -> u32;
 
     /// Video frames discarded because the encoder could not keep up.
     ///

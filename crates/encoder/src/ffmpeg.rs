@@ -150,6 +150,81 @@ const AUDIO_QUEUE_BLOCKS: usize = 32;
 /// Bytes queued by the caller, written to the child by a dedicated thread.
 type WriterHandle = JoinHandle<std::io::Result<()>>;
 
+/// Seconds per scratch segment — which is also the forced-keyframe interval, and therefore
+/// what makes a clip a lossless concatenation of whole segments (spec §6.3).
+pub fn keyframe_seconds(cfg: &EncodeConfig) -> f64 {
+    cfg.segment_ms as f64 / 1000.0
+}
+
+/// The GOP that puts a keyframe at every segment boundary.
+fn gop_frames(cfg: &EncodeConfig) -> u32 {
+    (cfg.fps as f64 * keyframe_seconds(cfg)).round().max(1.0) as u32
+}
+
+/// The ffmpeg arguments that declare the **video input and its rate**.
+///
+/// Shared by the two places that drive this encoder — the long-lived child that records
+/// ([`FfmpegEncoder::spawn`]) and the startup throughput probe that measures what the
+/// machine can sustain before it is asked to record anything
+/// (`crate::throughput::measure_sustainable_fps`) — because a measurement of a *different*
+/// ffmpeg invocation is not a measurement of this one. The geometry, the pixel format and
+/// above all the declared rate have to be the same on both sides for the number the probe
+/// returns to mean anything about the recording that follows.
+///
+/// `-framerate` is the rawvideo demuxer's own option and deliberately NOT the CLI's input
+/// `-r`: `-r` makes ffmpeg treat the input as constant-rate and re-stamp every frame onto a
+/// rigid 1/fps grid, which discards the arrival timestamp the next option exists to record
+/// (see the module comment for the measurement). Both spellings declare the same nominal
+/// rate to the rawvideo demuxer; only this one leaves the real timestamps alone.
+pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
+    let mut args: Vec<String> = ["-f", "rawvideo", "-pix_fmt", "bgra"].map(str::to_string).to_vec();
+    // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size (what the
+    // capture backend delivers), never the encode output size.
+    args.extend(["-s".to_string(), format!("{}x{}", cfg.source_size.0, cfg.source_size.1)]);
+    // The nominal rate: what the pipeline declares the stream to be. It is one number for
+    // both consumers — this argument and the pacer that feeds the pipe — see
+    // `localplay_recorder::FpsDecision`.
+    args.extend(["-framerate".to_string(), cfg.fps.to_string()]);
+    // Timestamps come from the moment each frame is read, i.e. its arrival time, not from a
+    // declared frame rate. This is what keeps the media timeline glued to the wall clock:
+    // `segments * segment_time` stays real seconds even when capture delivers at a rate
+    // other than `cfg.fps`, so the post-roll the hotkey waits for is actually reached.
+    // Video only — audio's timeline is the exact 48kHz sample count and must not be
+    // jittered by socket arrival (module comment: "The media timeline is the wall clock,
+    // not the frame count").
+    args.extend(["-use_wallclock_as_timestamps".to_string(), "1".to_string()]);
+    args.extend(["-i".to_string(), "pipe:0".to_string()]);
+    args
+}
+
+/// The ffmpeg arguments that describe **the encoder for that video input**: the scale
+/// filter when the output differs from the capture, the codec, its bitrate and its keyframe
+/// schedule.
+///
+/// Shared with the throughput probe for the same reason as [`video_input_args`]: the probe
+/// has to pay for the work the recording pays for. It writes to the null muxer, so the
+/// forced keyframes and the scale cost it exactly what they cost the segmenter.
+pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    // Frames arrive at `source_size`; when the caller asked for a different output size,
+    // scale to it. Equal sizes add no filter, which avoids a pointless pass.
+    if cfg.source_size != cfg.output_size {
+        args.extend([
+            "-vf".to_string(),
+            format!("scale={}:{}", cfg.output_size.0, cfg.output_size.1),
+        ]);
+    }
+    args.extend(["-c:v".to_string(), cfg.encoder_name().to_string()]);
+    args.extend(["-b:v".to_string(), format!("{}k", cfg.bitrate_kbps)]);
+    args.extend(["-g".to_string(), gop_frames(cfg).to_string()]);
+    // Forced keyframes are what make segment boundaries cuttable (spec §6.3).
+    args.extend([
+        "-force_key_frames".to_string(),
+        format!("expr:gte(t,n_forced*{})", keyframe_seconds(cfg)),
+    ]);
+    args
+}
+
 pub struct FfmpegEncoder {
     child: Child,
     video_tx: Option<SyncSender<Vec<u8>>>,
@@ -161,6 +236,10 @@ pub struct FfmpegEncoder {
     /// the caller so a frame of any other size can be refused instead of being sliced
     /// into the pipe at the wrong stride (see `Encoder::source_size`).
     source_size: (u32, u32),
+    /// The rate the rawvideo pipe was declared with (`-framerate {fps}`), reported back so
+    /// the caller that paces capture can pace to exactly the number the child was told
+    /// (see `Encoder::input_fps`).
+    input_fps: u32,
     /// Frames dropped because a queue was full. Atomics because the count is written on
     /// the submitting thread and read through `&self` (see `Encoder::dropped_frames`).
     dropped_video: AtomicU64,
@@ -178,8 +257,7 @@ impl FfmpegEncoder {
             .with_context(|| format!("creating {}", cfg.scratch_dir.display()))?;
 
         let pattern = cfg.scratch_dir.join("seg-%06d.mp4");
-        let keyframe_secs = cfg.segment_ms as f64 / 1000.0;
-        let gop = (cfg.fps as f64 * keyframe_secs).round().max(1.0) as u32;
+        let keyframe_secs = keyframe_seconds(cfg);
 
         // Audio comes in over loopback TCP. Bind before spawning the child: the port
         // has to be in the argument list, and `:0` makes the OS pick a free one, which
@@ -198,45 +276,16 @@ impl FfmpegEncoder {
             // `-nostdin` keeps ffmpeg from consuming our stdin for interactive
             // commands, which would steal raw video frames.
             .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            // Video input: raw BGRA frames on stdin.
-            .args(["-f", "rawvideo", "-pix_fmt", "bgra"])
-            // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size
-            // (what the capture backend delivers), never the encode output size.
-            .args(["-s", &format!("{}x{}", cfg.source_size.0, cfg.source_size.1)])
-            // The nominal rate. This is the demuxer's own `framerate` option and
-            // deliberately NOT the CLI's input `-r`: `-r` makes ffmpeg treat the input
-            // as constant-rate and re-stamp every frame onto a rigid 1/fps grid, which
-            // discards the arrival timestamp the next option exists to record (see the
-            // module comment for the measurement). Both spellings declare the same
-            // nominal rate to the rawvideo demuxer; only this one leaves the real
-            // timestamps alone.
-            .args(["-framerate", &cfg.fps.to_string()])
-            // Timestamps come from the moment each frame is read, i.e. its arrival time,
-            // not from a declared frame rate. This is what keeps the media timeline
-            // glued to the wall clock: `segments * segment_time` stays real seconds even
-            // when capture delivers at a rate other than `cfg.fps`, so the post-roll the
-            // hotkey waits for is actually reached. Video only — audio's timeline is the
-            // exact 48kHz sample count and must not be jittered by socket arrival
-            // (module comment: "The media timeline is the wall clock, not the frame
-            // count").
-            .args(["-use_wallclock_as_timestamps", "1"])
-            .args(["-i", "pipe:0"])
+            // Video input: raw BGRA frames on stdin, at the declared rate. Shared with the
+            // startup throughput probe — see [`video_input_args`], which is also where the
+            // `-framerate`-not-`-r` rule and the arrival timestamps are documented.
+            .args(video_input_args(cfg))
             // Audio input: raw s16le PCM over loopback TCP. This is the transport that
             // works on Windows as well as here — see the module comment.
-            .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", &audio_url]);
-        // Frames arrive at `source_size`; when the caller asked for a different output
-        // size, scale to it. Equal sizes add no filter, which avoids a pointless pass.
-        if cfg.source_size != cfg.output_size {
-            cmd.args(["-vf", &format!("scale={}:{}", cfg.output_size.0, cfg.output_size.1)]);
-        }
-        cmd.args(["-c:v", cfg.encoder_name()])
-            .args(["-b:v", &format!("{}k", cfg.bitrate_kbps)])
-            .args(["-g", &gop.to_string()])
-            // Forced keyframes are what make segment boundaries cuttable (spec §6.3).
-            .args([
-                "-force_key_frames",
-                &format!("expr:gte(t,n_forced*{keyframe_secs})"),
-            ])
+            .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", &audio_url])
+            // The encoder for that video input: scale (when asked for), codec, bitrate and
+            // the keyframe schedule. Shared with the probe for the same reason.
+            .args(video_output_args(cfg))
             .args(["-c:a", "aac", "-b:a", &format!("{}k", cfg.audio_bitrate_kbps)])
             .args(["-f", "segment"])
             .args(["-segment_time", &keyframe_secs.to_string()])
@@ -290,6 +339,7 @@ impl FfmpegEncoder {
             audio_writer: Some(audio_writer),
             encoder_name: cfg.encoder_name(),
             source_size: cfg.source_size,
+            input_fps: cfg.fps,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             drained_stderr: None,
@@ -490,6 +540,10 @@ impl Encoder for FfmpegEncoder {
         self.source_size
     }
 
+    fn input_fps(&self) -> u32 {
+        self.input_fps
+    }
+
     fn dropped_frames(&self) -> u64 {
         self.dropped_video.load(Ordering::Relaxed)
     }
@@ -631,6 +685,78 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A configuration the argument builders can be exercised with. Small on purpose: these
+    /// tests are about the argument *list*, not about encoding anything.
+    fn args_cfg(fps: u32, segment_ms: u64) -> EncodeConfig {
+        let mut cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            1280,
+            720,
+            fps,
+            ".".into(),
+            segment_ms,
+        );
+        cfg.bitrate_kbps = 20_000;
+        cfg
+    }
+
+    /// The rate in the child's argument list is `EncodeConfig::fps`, and nothing else. This
+    /// is the number the pacer is built from as well (see `Encoder::input_fps`): one value,
+    /// two consumers, which is the fix for issues #1/#2 — so a change that makes ffmpeg
+    /// declare a different rate from the one the pipeline paces to has to fail here.
+    #[test]
+    fn the_declared_rate_is_the_configurations_fps_and_it_is_declared_as_framerate() {
+        for fps in [10u32, 24, 30, 60] {
+            let cfg = args_cfg(fps, 1000);
+            let args = video_input_args(&cfg);
+            let at = |flag: &str| {
+                let i = args
+                    .iter()
+                    .position(|a| a == flag)
+                    .unwrap_or_else(|| panic!("{flag} missing from {args:?}"));
+                args.get(i + 1).cloned().unwrap_or_default()
+            };
+            assert_eq!(at("-framerate"), fps.to_string(), "the declared rate: {args:?}");
+            assert_eq!(at("-s"), "1280x720", "the rawvideo pipe is the SOURCE size: {args:?}");
+            assert!(
+                !args.iter().any(|a| a == "-r"),
+                "`-r` before `-i` re-stamps every frame onto a rigid grid and undoes the \
+                 arrival timestamps this option records (measured; see the module comment): \
+                 {args:?}"
+            );
+            assert_eq!(at("-use_wallclock_as_timestamps"), "1", "{args:?}");
+        }
+    }
+
+    /// The scale filter is added only when the output size differs, and the GOP follows the
+    /// declared rate — both of which the throughput probe inherits, because it builds its
+    /// argument list from these same two functions.
+    #[test]
+    fn the_output_arguments_scale_only_when_asked_and_size_the_gop_from_the_rate() {
+        let same = args_cfg(30, 1000);
+        assert!(
+            !video_output_args(&same).iter().any(|a| a == "-vf"),
+            "equal sizes must not add a pointless scale pass"
+        );
+
+        let mut scaled = args_cfg(30, 1000);
+        scaled.output_size = (1920, 1080);
+        let args = video_output_args(&scaled);
+        let vf = args.iter().position(|a| a == "-vf").expect("a scale filter");
+        assert_eq!(args[vf + 1], "scale=1920:1080");
+        assert!(args.contains(&"-c:v".to_string()));
+
+        // One keyframe per segment: at 30fps and 1s segments the GOP is 30, at 2s it is 60.
+        let gop = |cfg: &EncodeConfig| {
+            let args = video_output_args(cfg);
+            let i = args.iter().position(|a| a == "-g").expect("-g");
+            args[i + 1].parse::<u32>().expect("a GOP number")
+        };
+        assert_eq!(gop(&args_cfg(30, 1000)), 30);
+        assert_eq!(gop(&args_cfg(30, 2000)), 60);
+        assert_eq!(gop(&args_cfg(24, 1000)), 24);
+    }
+
     #[test]
     fn a_payload_that_fits_is_queued_and_not_counted_as_dropped() {
         let (tx, rx) = mpsc::sync_channel::<u32>(1);
@@ -702,6 +828,7 @@ mod tests {
             audio_writer: None,
             encoder_name: "h264_amf",
             source_size: (320, 240),
+            input_fps: 30,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             drained_stderr: None,

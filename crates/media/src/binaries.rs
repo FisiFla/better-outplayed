@@ -259,7 +259,12 @@ pub fn run_with_stdin(mut cmd: Command, input: Vec<u8>, timeout: Duration) -> Re
 ///
 /// Polling rather than blocking is what makes the timeout real: a wedged child would
 /// otherwise park the caller forever.
-fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Result<()> {
+///
+/// Public because one caller cannot use the two helpers above: the encoder's startup
+/// throughput probe (`localplay_encoder::throughput`) feeds frames *in a loop for a bounded
+/// window*, so it owns its own writing and needs exactly this from here — a deadline that
+/// really ends, and a child that is killed and reaped rather than leaked when it expires.
+pub fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait().context("polling ffmpeg child")? {

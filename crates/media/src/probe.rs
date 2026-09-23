@@ -233,10 +233,10 @@ pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), Str
     if out.status.success() {
         return Ok(());
     }
-    Err(reason_from(&String::from_utf8_lossy(&out.stderr)))
+    Err(ffmpeg_reason(&String::from_utf8_lossy(&out.stderr)))
 }
 
-/// ffmpeg's explanation of a failed smoke test, condensed onto one line.
+/// ffmpeg's explanation of a failed probe, condensed onto one line.
 ///
 /// Shapes this handles, both measured against ffmpeg 9.0.2:
 ///
@@ -253,7 +253,11 @@ pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), Str
 /// summary is kept because it is ffmpeg's statement of what went wrong overall. Middle
 /// lines are usually a restatement of the first two, so only the first two and the last are
 /// used, and the result is capped so it cannot become a wall of text in a log or a table.
-fn reason_from(stderr: &str) -> String {
+///
+/// Public because it is the *only* actionable diagnosis of a failing ffmpeg child, and the
+/// encoder's own probes (`localplay_encoder::probe`, `localplay_encoder::throughput`) have
+/// to report the same words this side does rather than a paraphrase of them.
+pub fn ffmpeg_reason(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
