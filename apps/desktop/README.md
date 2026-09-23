@@ -24,20 +24,25 @@ apps/desktop/
 │       ├── types.ts          # the DTOs, mirrored from src-tauri/src/commands.rs
 │       ├── ipc.ts            # every `invoke` in the application
 │       ├── time.ts           # duration/byte/date formatting
+│       ├── recording.ts      # recorder + hotkey readout rules
 │       ├── trim.ts           # trim-range clamping, validation, timeline geometry
 │       ├── clips.ts          # clip-list view model
-│       └── components/       # ClipList, ClipDetail, Timeline, StoragePanel
+│       └── components/       # ClipList, ClipDetail, RecordingPanel, Timeline, StoragePanel
 └── src-tauri/
     ├── Cargo.toml            # its own workspace — see below
     ├── build.rs, capabilities/default.json
     ├── tauri.conf.json       # product metadata, the sidecar resource map, app/bundle config
     ├── tauri.windows.conf.json, tauri.macos.conf.json   # bundle targets per platform
-    ├── icons/                # generated icon set + `app-icon.png`, the placeholder source
+    ├── icons/                # generated icon set, `app-icon.png` (the placeholder source),
+    │                         # and the three tray icons (`tray-{idle,recording,attention}.png`)
     └── src/
         ├── main.rs           # the entry point
-        ├── lib.rs            # state + the thin `#[tauri::command]` wrappers
+        ├── lib.rs            # state + the thin `#[tauri::command]` wrappers + the Tauri half
+        │                     #   of the background wiring (tray, hotkey thread, close-to-hide)
+        ├── background.rs     # the tray menu, the hotkey status, the close rule, autostart —
+        │                     #   all of it plain functions, plus their tests
         ├── commands.rs       # everything the commands actually do, plus its tests
-        └── config.rs         # the `[storage]` half of config.toml
+        └── config.rs         # the `[storage]` / `[hotkeys]` / `[app]` half of config.toml
 ```
 
 ## The IPC commands
@@ -56,6 +61,9 @@ with **no Tauri runtime and no window**.
 | `trim_clip(id, start_ms, end_ms)` | `localplay_media::edit::trim_lossless` | A **stream copy** (`-c copy`), never a re-encode. Writes `<name>.trim-<start>-<end>.<ext>` beside the original, probes the result and indexes it. |
 | `thumbnail(id, at_ms)` | `localplay_media::edit::thumbnail` | One JPEG in the thumbnails cache, reused on the next request. |
 | `delete_clip(id)` | `Store::delete_clip_returning_path` | Row first, then the file (spec §8.2). Reports an orphan rather than hiding a failed unlink. |
+
+| `start_recording`, `stop_recording`, `recording_status`, `clip_now` | `RecorderHost` | The recording engine the CLI also drives. `clip_now` waits for the post-roll, so it — like a start — runs off the webview thread. |
+| `app_status()` | `AppState` | The clip hotkey (the chord, and whether a listener is really installed), where `config.toml` was read from, and the sentence that explains closing the window. Read once; none of it changes while the process runs. |
 
 Failures are a serialisable `CommandError { code, message }` with a machine-readable code
 (`clip_not_found`, `invalid_range`, `out_of_range`, `invalid_input`, `ffmpeg_unavailable`,
@@ -126,6 +134,33 @@ frontend it names (`apps/desktop/dist`) does not exist, so membership would make
 `cargo test --workspace` depend on `npm run build` having run first. Run its tests from
 `apps/desktop/src-tauri`.
 
+## Background: tray, hotkey, close-to-hide
+
+The window is a review pane. The application is a **tray application that can record with no
+window at all**, and that is the half this directory's `background.rs` owns:
+
+| Behaviour | Where the decision lives | Tested? |
+|---|---|---|
+| Close the window → hide it (never quit, never end a recording); quit only from the tray | `background::close_action` | Yes, in `background.rs` — the rule is a function so a test can pin it |
+| `Ctrl+F8` takes a clip, through `RecorderHost::clip_now` (the same call the Save clip button makes) | `background::install_hotkey` + `on_hotkey_press` | Yes: one press → exactly one clip, driven against a real recording (`commands.rs`) |
+| A chord that cannot be registered is reported, not swallowed | `background::install_hotkey`, and `localplay_events::hotkey` returning the `RegisterHotKey` error | Yes (the parse and Windows-only branches); the registration itself needs Windows |
+| The tray icon, tooltip and dynamic menu labels | `TrayView::{tray_state, tooltip, rendering}` and `MenuAction::{label, enabled}` | Yes, as pure values |
+| Menu item → the calls it makes (including stop-before-quit) | `background::dispatch`, over the `Shell` trait | Yes, against a recording fake |
+| `[app] start_with_system` → a Run-key entry | `background::sync_autostart`, `reg_argv`, `registered_path` | The decision table and the `reg.exe` argv: yes. The registry write: **no — Windows only** |
+
+Two things it deliberately does *not* do. It does not add a second trigger: there is one
+`clip_now`, and the button, the tray item, the hotkey and the CLI all reach it. And it does
+not add a settings panel: the chord is `[hotkeys] clip`, autostart is `[app]
+start_with_system`, and the window prints *which file* it read so the file can be found (the
+tray's "Open config file" opens it). What is **not** verified is what needs a desktop: that
+the tray appears, that the icon changes, that the X hides the window and that a real
+keypress arrives. See [`../../docs/verification-status.md`](../../docs/verification-status.md).
+
+Tauri features enabled for this, and why: `tray-icon` (there is no `tauri::tray` without it)
+and `image-png` (so the committed `icons/tray-*.png` can be decoded by `Image::from_bytes`).
+No plugin and no capability were added — the tray, the window and the autostart entry are all
+Rust-side, and the webview is granted nothing new.
+
 ## Deliberately not here
 
 - **No capture, no window enumeration, no input synthesis.** The capture crates exist and
@@ -153,21 +188,24 @@ frontend it names (`apps/desktop/dist`) does not exist, so membership would make
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 101 vitest tests
+cd apps/desktop && npm test          # 108 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
-cd apps/desktop && npm run shots     # 10 headless screenshots, 123 assertions, 0 failures
-cd apps/desktop/src-tauri && cargo test    # 55 tests, against a real store and real ffmpeg
-cd apps/desktop/src-tauri && cargo clippy  # no warnings outside test bodies
+cd apps/desktop && npm run shots     # 14 headless screenshots, 201 assertions, 0 failures
+cd apps/desktop/src-tauri && cargo test    # 103 tests, against a real store and real ffmpeg
+cd apps/desktop/src-tauri && cargo clippy  # no warnings in shipping code
 ```
 
-**Seen, headlessly:** the frontend rendered in Chromium at 1280x800, in nine states, with the
+**Seen, headlessly:** the frontend rendered in Chromium at 1280x800, in ten states, with the
 built bundle and a mocked `ClipSource` — the clip list, the detail view, the timeline, a
 drag of both trim handles (3240ms → 9331ms, from real pointer input), a scrub that moved both
-the playhead and the `<video>`, the trim notice, and the storage panel's "this cap cannot be
-met" verdict. Text contrast was measured, not eyeballed (6.5:1 to 16:1 against their own
-backgrounds). `npm run shots` regenerates all of it and is the check that fails if any of it
-breaks.
+the playhead and the `<video>`, the trim notice, the recorder panel while it is recording
+(the chord to press and the sentence that explains closing the window are in it), and a
+state where the hotkey could **not** be registered (`11-hotkey-not-installed`: the alert, the
+reason and the second-instance case, with Start recording still offered, because the window
+works without a hotkey). Text contrast was measured, not eyeballed (6.5:1 to 16:1 against
+their own backgrounds). `npm run shots` regenerates all of it and is the check that fails if
+any of it breaks.
 
 **Still never opened:** the Tauri window itself. No display was used and no webview was
 launched, so none of the following has been seen working: the shell and OS window chrome,
@@ -176,3 +214,13 @@ the asset-protocol scope check and range requests over `asset:` URLs (the screen
 came from a plain static server), real `<video>` playback of a real clip file, and the trim's
 ffmpeg stream copy (the screenshots' trim was a mock mutating an array, which is why the clip
 it returns plays black).
+
+**And nothing about the background half has been *observed* — only tested.** No tray icon has
+been drawn on any taskbar, no left click has opened its menu, no window has been closed to
+watch it hide, no `Ctrl+F8` has been pressed, and the `reg.exe` autostart write has never run
+(the suite is not allowed to touch a real Run key). What *is* established is narrower and
+should be read as exactly that: the decisions are unit-tested, the trigger path writes a real
+clip through the real engine, and the Windows-only code compiles for
+`x86_64-pc-windows-msvc` (`cargo check --target`, which CI runs for `crates/events` — where
+the `RegisterHotKey` call lives). The per-item levels are in
+[`../../docs/verification-status.md`](../../docs/verification-status.md).

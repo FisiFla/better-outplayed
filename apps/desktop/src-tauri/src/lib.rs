@@ -1,11 +1,18 @@
 //! The Tauri shell: state, wiring, and the `#[tauri::command]` wrappers that delegate to
 //! [`commands`].
 //!
-//! There is deliberately no logic in this file. Each wrapper resolves the application
-//! state and hands the call to a plain function in `commands.rs`, which is what lets the
-//! whole command layer be tested without a Tauri runtime and without a window (see the
-//! test module at the bottom of `commands.rs`, and spec §12 on why this project does not
-//! put a GUI on the critical path of its tests).
+//! There is deliberately no *logic* in this file. Each wrapper resolves the application
+//! state and hands the call to a plain function in `commands.rs`; the background half — the
+//! tray, the hotkey thread and the window's close — is *wired* here but *decided* in
+//! [`background`]. This file's job is to be the one place that knows Tauri's types, and to
+//! be obviously correct while doing it.
+//!
+//! That split is what lets the command layer and the background logic be tested without a
+//! Tauri runtime and without a window (the test modules at the bottom of `commands.rs` and
+//! `background.rs`, and spec §12 on why this project does not put a GUI on the critical path
+//! of its tests). What it does **not** do is test the wiring below: the tray really
+//! appearing, the window really hiding and a key really arriving all need a desktop, and
+//! `docs/verification-status.md` §8 lists them item by item rather than implying otherwise.
 
 pub mod background;
 pub mod commands;

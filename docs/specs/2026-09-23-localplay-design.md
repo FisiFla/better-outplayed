@@ -492,6 +492,13 @@ max_age_days      = 7
 [hotkeys]
 clip = "Ctrl+F8"
 
+[app]
+# Added with the desktop shell (Phase 2). Start localplay with Windows: the app owns a
+# value under HKCU\...\CurrentVersion\Run, and false removes it if this app wrote it.
+# The config file is the only switch (there is no settings dialog), it is applied at
+# startup, and it is Windows-only — the CLI is never autostarted.
+start_with_system = false
+
 [events]
 lol_poll_enabled = true
 gsi_port         = 45671

@@ -42,7 +42,7 @@ against the synthetic backends), so its own report is part of what you are check
 first row to look at is `capture_started` — if the WGC line is missing, or the geometry is
 `1280x720`, the session has no desktop (or the stub ran) and the rest of that report says
 nothing. It cannot check the GUI, a real keypress, anything needing a real game, or the
-live clock divergence; §8 lists what stays manual.
+live clock divergence; §9 lists what stays manual.
 
 [issue #1]: https://github.com/FisiFla/localplay/issues/1
 [issue #2]: https://github.com/FisiFla/localplay/issues/2
@@ -74,17 +74,19 @@ Counting the distinct significant claims about the system made in §1–§4, eac
 | Level | Count |
 |---|---|
 | Verified on Windows hardware | 19 |
-| Verified on the dev host | 18 |
-| Type-checked only | 5 |
+| Verified on the dev host | 20 |
+| Type-checked only | 6 |
 | Unverified | 0 |
 
 The per-item tables below are the source of truth; the tally is a summary. Three items the
 previous pass could not confirm — the scratch-cap value, whether the audio was non-silent,
 and whether the WGC `copy_out` fix produces real pixels — have since been **verified** by a
 read-only re-read of files retained on the box (see §1). They move from *Unverified* to
-*Verified on Windows hardware*: 16 → 19 Verified, 3 → 0 Unverified. The other numbers are
-unchanged because the fresh read re-confirmed claims already counted at that level rather
-than raising new ones.
+*Verified on Windows hardware*: 16 → 19 Verified, 3 → 0 Unverified. The desktop shell's
+background half (§3, §8) then added three claims of its own: two at *verified on the dev
+host* — the background logic, and the trigger path driven through a real recording — and one
+at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller, which needs
+a Windows message queue to run.
 
 ---
 
@@ -208,6 +210,9 @@ executes a Windows API.
 | `localplay-cli` drives the engine (`667a2e8`) | Verified on the dev host | CLI integration tests in `apps/localplay-cli/tests/` |
 | Desktop IPC command layer + session-review window (`e77c061`, `2528285`) | Verified on the dev host | desktop-shell Rust tests (run in CI, `apps/desktop/src-tauri`) |
 | Desktop **recording wiring** — Start/Stop/Save clip over the engine (`ce81aef`, `bf87be0`) | Verified on the dev host (headless) | frontend `vitest` (`apps/desktop/src/lib/recording.test.ts` etc.), shell Rust tests, and headless render screenshots (`2f0be65`). **No GUI window is opened.** |
+| Desktop **background half** — the tray menu and its state-dependent labels, the tooltip and icon state, the menu-action → shell-call mapping, the close-to-hide rule, the `[app]` defaults and the autostart decision table | Verified on the dev host | `apps/desktop/src-tauri/src/background.rs` unit tests (pure functions over plain data), `config.rs` tests for the new `[hotkeys]`/`[app]` reader, `apps/desktop/src/lib/recording.test.ts` for the two display rules, and the headless screenshot state `11-hotkey-not-installed`. **The tray, the window hide and the keypress themselves are not covered by any of this** — see §9. |
+| The hotkey **trigger path** in the GUI — one press, one clip, through `RecorderHost::clip_now` | Verified on the dev host (headless) | `apps/desktop/src-tauri/src/commands.rs::one_hotkey_press_writes_exactly_one_clip_through_the_recorder` drives a **real** recording (stub capture source, libx264, a real ring, a real splice, a real index row) and asserts exactly one clip file, one index row and one count in the engine. The press is an in-process call — no input is synthesised. |
+| **Hotkey registration failure is reported** (`225a1fe` in `crates/events`) | Type-checked only (Windows) + verified on the dev host (the parse half) | the `listen` path that carries `RegisterHotKey`'s error back and returns it — with the chord named — compiles for `x86_64-pc-windows-msvc` and **has never run**: registering a chord needs a Windows message queue. The parse-failure and "no global hotkey on this platform" branches are unit-tested (`background::install_hotkey`). |
 | **Sidecar pipeline** (`07b9d83`) — fetch + SHA-256 verify + allowlisted extract | Verified on the dev host | `xtask/src/sidecars.rs` unit tests (zip-slip rejected, symlink rejected, mismatch refused, allowlist honoured) |
 | **Phase 4 — LoL Live Client poller** (`3ae0a01`) | Verified on the dev host (mocks only) | `crates/events/tests/lol_mock.rs` drives a real TLS server on loopback; see §5 |
 | **Phase 4 — CS2/Dota 2 GSI listener** (`32774ff`) | Verified on the dev host (mocks only) | `crates/events/tests/gsi_listener.rs` over real loopback sockets |
@@ -250,6 +255,8 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | CI workflow (tests + Windows cross-check + frontend) | `42b68a9` | Verified on the dev host |
 | GSI accept-loop blocking-mode fix | `c5abc58` | Verified on the dev host (CI) |
 | Self-test clip trigger (`--self-test-clip-after`) — the clip path without synthetic input | `d8ec96b` | Verified on the dev host (an integration test drives it end to end over real ffmpeg); never run on Windows |
+| Desktop background half: tray, global clip hotkey, hide-on-close, `[app] start_with_system` | `225a1fe`, `e3fcb95`, `d20d748` | Verified on the dev host (headless: pure logic + a real recording driven through the trigger path). **Never observed on any machine**: no tray icon drawn, no window closed, no key pressed, no Run-key write executed |
+| A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
 
 ---
@@ -265,7 +272,7 @@ $ gh run list --limit 10
 
 What a green run proves:
 
-- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 339
+- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 359
   tests, `cargo test --workspace --features localplay-encoder/test-encoders`;
 - **`cargo check` for `x86_64-pc-windows-msvc`** of the cross-checkable crates
   (`capture`, `encoder`, `events`, `replay`, `media`, `xtask`) — *type-checking*, not
@@ -357,6 +364,18 @@ $ gh run view 35904179918 --log-failed
   CS2/Dota 2 client was ever contacted; the payloads are canned fixtures and the servers are
   mocks in the test process (see `docs/plans/2026-09-23-localplay-phase-4-integrations.md`
   §5 for the full, itemised list of what that leaves unproven).
+- **The desktop shell has never been a background application in practice.** The tray icon,
+  its menu, the icon/tooltip state changes, the close-to-hide behaviour, the notification-like
+  hint and the `Ctrl+F8` keypress are all **unobserved**: no window has been opened, no
+  taskbar has drawn an icon and no key has been pressed. What exists is unit-tested logic
+  (`background.rs`), a trigger path that really writes a clip when it is called
+  (`commands.rs`), and Windows-target compilation of the registration code. §9 lists it item
+  by item, because "the tray is tested" is the kind of sentence that gets read as "the tray
+  works".
+- **`[app] start_with_system` has never written a registry value.** The sync's decision table
+  and the `reg.exe` argument lists are unit-tested, and the spawn is compiled for Windows;
+  nothing has run. The suite deliberately does not exercise the Windows path, because that
+  would write the real `HKCU\...\Run` of whoever ran the tests.
 - **The harness is unproven on Windows.** `cargo xtask verify` (`07b90fc`) has run only on
   the development host, against the stub capture backend and the software encoder. Its
   logic is tested there (parsers, the report writer, the criterion-7 path, the trigger),
@@ -368,7 +387,44 @@ $ gh run view 35904179918 --log-failed
 
 ---
 
-## 8. What to run on Windows next
+## 8. The desktop shell's background half, item by item
+
+Added by `225a1fe` (the shared hotkey), `e3fcb95` (the shell's tray, hotkey and hide-on-close
+wiring) and `d20d748` (the window's copy of it). It exists because the GUI had **no hotkey at
+all** and could not run without a window: the headline feature — press `Ctrl+F8`, get a clip —
+worked in the CLI and not in the app, and closing the window ended the recording.
+
+Every row below is what is actually established. **No window was opened, no taskbar drew an
+icon, and no key was pressed while any of it was written**, and nothing here may synthesise
+input (the trigger is always an in-process call).
+
+| Item | Level | Evidence / what it would take |
+|---|---|---|
+| The chord is parsed once and normalised for display (`Ctrl+F8`) | Verified on the dev host | `crates/events/src/hotkey.rs` tests: parse, display round trip, a chord with no main key rejected |
+| A `RegisterHotKey` failure is returned to the caller, naming the chord, instead of being swallowed | Type-checked only | `cargo check -p localplay-events --target x86_64-pc-windows-msvc`. Registering a chord needs a Windows message queue, so no test has ever produced either outcome on a real machine |
+| The GUI installs the hotkey from `[hotkeys] clip` and a press takes a clip through `RecorderHost::clip_now` — the same call the button and the CLI make | Verified on the dev host | `background::install_hotkey` (the suite exercises the "no global hotkey off Windows" branch) and `commands.rs::one_hotkey_press_writes_exactly_one_clip_through_the_recorder`, which drives a **real** recording end to end and asserts exactly one clip file, one index row and one clip in the engine's counter |
+| **The keypress itself** — that pressing the chord reaches that listener on a real machine | **Unverified** | Needs Windows and a keyboard. `RegisterHotKey` + `GetMessageW` is the CLI's own path (and the CLI's hotkey was exercised interactively in the 2026-09-23 session), but the desktop app's wiring of it has never run |
+| The tray's state: icon choice, tooltip, and the labels that follow the setting | Verified on the dev host (as data) | `background.rs` tests over `TrayView` / `MenuAction`; the three icons are decoded by a test (`the_tray_icons_are_decodable_pngs_of_one_size`) |
+| **The tray existing at all** — an icon on a taskbar, a menu that opens, a click that dispatches | **Unverified** | Needs a desktop. The wiring is Tauri's `TrayIconBuilder` and a menu built from `MenuAction::ALL`; the ids and the action → call mapping are tested, the rendering is not |
+| Close hides the window and never quits, so a recording survives | Verified on the dev host (the rule) / **Unverified** (the behaviour) | `background::close_action()` is pinned by a test; that the window hides and the process lives needs a window |
+| Recording continues while the window is hidden | **Unverified in the GUI**; structurally true | nothing in the recording path reads the window (the engine runs on its own threads and the window is a reader), and the CLI's headless runs are the same engine — but the GUI's own case needs a window to hide |
+| Quit from the tray flushes the encoder first | Verified on the dev host (the order) | `dispatch(MenuAction::Quit)` → `stop_recording`, then `quit`, asserted against a recording fake |
+| `[hotkeys]`/`[app]` config defaults (`Ctrl+F8`, `start_with_system = false`) and the example file carrying them | Verified on the dev host | `config.rs` tests, including one that reads `config.example.toml`'s text |
+| The autostart decision (`enable` / `repair` / `remove` / `leave alone`) and the `reg.exe` argument shapes | Verified on the dev host | `background::sync_autostart` against a fake `reg.exe`, plus each of the three argv shapes |
+| **The registry write itself** | **Unverified** | Needs Windows. The suite must not write a real `HKCU\...\Run` value, so `apply_autostart`'s Windows arm is compiled and never executed |
+| The window's copy of all of this: the hotkey line, the config path, the close hint | Verified on the dev host (headless pixels) | `apps/desktop/src/lib/recording.test.ts`, and the screenshot states `09-recording` and `11-hotkey-not-installed` |
+
+**The collision decision, stated once.** `RegisterHotKey` registers a chord system-wide, so
+the CLI and the desktop app pointed at the same `config.toml` **cannot both hold it**. Nothing
+coalesces them and nothing double-fires: the second one to start fails to register and is told
+so — the app in its window, its tooltip and its log (and it stays usable, because the button
+and the tray still work), the CLI by refusing to start at all (a buffer run whose hotkey does
+nothing is not worth starting). The alternative — a lock file or an IPC handshake — would add
+a second failure mode to a mechanism the OS already arbitrates.
+
+---
+
+## 9. What to run on Windows next
 
 The smallest ordered set of runs that moves the most items from *type-checked* to
 *verified*, from cheapest to most informative. Each is a single command plus an
@@ -424,3 +480,21 @@ observation; the Phase 1 runbook
 9. **Play one bot game (League) and one CS2 round** — the last step for the Phase 4
    integrations, and the only one that can validate the payload shapes, the TLS handshake
    with Riot's certificate, and the GSI token echo.
+10. **Start the desktop app and press `Ctrl+F8` with the window hidden.** Start recording from
+    the window, close the window (it must *hide*, and the tray icon must still be there),
+    press `Ctrl+F8`, then reopen from the tray: one clip must appear in the list with the
+    window never having been on screen. This is the headline behaviour and no test can reach
+    it — see §8. Read the log line `the clip hotkey Ctrl+F8 is installed` first; if it says
+    `NOT installed` instead, the chord was taken and the reason is in that line.
+11. **Run the CLI and the app against the same `config.toml` at once.** Whichever starts
+    second must report that the chord could not be registered — the app in its window and its
+    tooltip, the CLI by refusing to buffer — and exactly one of them must be able to take a
+    clip. A silent second success would mean the collision detection is not wired.
+12. **Check the tray's own items**: show/hide the window, start and stop recording from the
+    menu, save a clip from the menu, open the config file (it must reveal `config.toml` in
+    Explorer, or its folder when the file does not exist), and quit — quitting while
+    recording must flush the encoder (the clip written before the quit must be complete).
+13. **Set `[app] start_with_system = true`, restart the app, and check `reg query
+    HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v localplay`.** Then set it back
+    to `false`, restart, and check the value is gone and nothing else in the Run key was
+    touched. Nothing has ever written that value.

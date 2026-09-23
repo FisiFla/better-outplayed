@@ -97,6 +97,18 @@ encode, no quality loss. The consequence is honest and intentional: cuts snap to
 nearest keyframe. Clip export works around this by forcing a keyframe on the buffer
 boundary; arbitrary scrubbing trims accept keyframe granularity.
 
+**Background operation (the desktop app).** `localplay.exe` is a tray application: the
+window is a review pane you open when you want it, and *closing* it hides it, because a
+clipper that exits when its window closes ends the recording every time its user tidies the
+screen. The clip hotkey (`[hotkeys] clip`, `Ctrl+F8` by default) is registered with
+`RegisterHotKey` at startup and is what takes a clip while the window is hidden; the tray
+icon and its tooltip carry the recording state, and the tray menu shows/hides the window,
+starts and stops recording, saves a clip now, opens `config.toml` and quits. A chord that
+cannot be registered — another application already owns it, or another localplay does, since
+the CLI and the desktop app cannot both hold one chord — is reported in the window, in the
+tooltip and in the log, and the window keeps working without it. `[app] start_with_system`
+(default `false`) is the Windows Run-key entry.
+
 **Game events.** Two local-only sources, no network egress:
 - *League of Legends* — poll `https://127.0.0.1:2999/liveclientdata/allgamedata`
   (self-signed cert on loopback) for kills/deaths/objectives.
@@ -272,8 +284,10 @@ stays manual.
       [issue #1](https://github.com/FisiFla/localplay/issues/1)). The fixes written since
       that run are **type-checked, not re-run on Windows**.
 - [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
-      recording wiring exist; they are exercised **headlessly in CI, never opened as a real
-      window on Windows**.
+      recording wiring exist, and so do the tray, the global clip hotkey and the
+      hide-on-close behaviour that make it a background application; all of it is exercised
+      **headlessly in CI, never opened as a real window on Windows** — the tray, the
+      keypress and the hide have never been observed on any machine.
 - [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified)*
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
       tested against local mocks; **never run against a real game** — see the
