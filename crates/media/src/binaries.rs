@@ -1,19 +1,68 @@
 //! Locating and invoking the ffmpeg sidecar binaries.
 
 use anyhow::{bail, Context, Result};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-/// The directory ffmpeg/ffprobe are expected to live in for a packaged build.
+/// Name of the directory holding `ffmpeg`/`ffprobe`, in every layout localplay runs in.
+///
+/// It is the same word in all of them — a checkout, a `cargo run` target directory, and an
+/// installed application — because the bundler's resource mapping is written against it
+/// (`apps/desktop/src-tauri/tauri.conf.json`) and a test in the desktop crate pins the two
+/// together. Change it here and the installer starts putting the sidecars somewhere the
+/// lookup no longer reads.
+pub const SIDECAR_DIR_NAME: &str = "binaries";
+
+/// The directory ffmpeg/ffprobe are expected to live in for a packaged build: `binaries/`
+/// next to the executable.
+///
+/// On Windows that is the whole story — the NSIS and MSI installers put resources in the
+/// installation directory, i.e. beside the `.exe`. Inside a macOS `.app` it is not, because
+/// the executable lives in `Contents/MacOS` and resources in `Contents/Resources`; that
+/// second location is [`resource_sidecar_dirs_from`].
 pub fn sidecar_dir() -> PathBuf {
     sidecar_dir_from(&exe_dir())
 }
 
 /// Testable core of [`sidecar_dir`].
 fn sidecar_dir_from(exe_dir: &Path) -> PathBuf {
-    exe_dir.join("binaries")
+    exe_dir.join(SIDECAR_DIR_NAME)
+}
+
+/// The directories a *bundler* puts the sidecars in, for the executable at `exe_dir`.
+///
+/// Tauri's resource directory is not the same path on every platform, and that difference
+/// decides whether an installed app can find its own ffmpeg:
+///
+/// - **Windows** (`nsis`/`msi`): resources are installed into the installation directory,
+///   so `binaries/` lands next to the `.exe`. That is already [`sidecar_dir_from`], which
+///   is why nothing is added here — Tauri documents its own `resource_dir` as "the
+///   directory that contains the main executable" on Windows, and the installer's resource
+///   mapping targets exactly that, so the first candidate on the search list covers it.
+/// - **macOS** (`.app`): resources go to `<Foo>.app/Contents/Resources` while the
+///   executable sits in `<Foo>.app/Contents/MacOS`. Different directory, so it has to be
+///   named here — otherwise a packaged app would never look inside its own bundle, fall
+///   through to `PATH`, and refuse to start on a machine that has no ffmpeg installed,
+///   which is the entire point of the sidecar pipeline.
+///
+/// The `.app` shape is recognised from the directory structure rather than from
+/// `cfg!(target_os)`: the rule is then testable on any host, and a bundle assembled on one
+/// platform is found on the platform that runs it. Linux is deliberately absent — the
+/// Phase 1 target is Windows only (spec §2), and an AppImage layout nothing here builds
+/// would be a lookup path with no way to verify it.
+pub fn resource_sidecar_dirs_from(exe_dir: &Path) -> Vec<PathBuf> {
+    let in_macos_bundle = exe_dir.file_name() == Some(OsStr::new("MacOS"))
+        && exe_dir.parent().and_then(Path::file_name) == Some(OsStr::new("Contents"));
+    if !in_macos_bundle {
+        return Vec::new();
+    }
+    match exe_dir.parent() {
+        Some(contents) => vec![contents.join("Resources").join(SIDECAR_DIR_NAME)],
+        None => Vec::new(),
+    }
 }
 
 /// Directory holding the running executable, or `.` when it cannot be determined.
@@ -35,10 +84,14 @@ fn exe_dir() -> PathBuf {
 /// checkout rather than an installation, and uses that directory's `binaries/` if it is
 /// there.
 ///
-/// Priority is unaffected: this is only ever consulted *after* the directory next to the
-/// executable, so an installed sidecar can never be shadowed by a stale checkout. The walk
-/// also stops at the first `Cargo.toml` it finds, so no ancestor directory outside a
-/// project root can supply binaries by accident.
+/// Priority is unaffected: this is only ever consulted *after* both installed locations
+/// ([`sidecar_dir_from`] and [`resource_sidecar_dirs_from`]), so a shipped sidecar can
+/// never be shadowed by a stale checkout. The walk also stops at the first `Cargo.toml` it
+/// finds, so no ancestor directory outside a project root can supply binaries by accident.
+///
+/// It is deliberately *not* enough on its own for an installed app: a `Cargo.toml` above
+/// the installation directory is not something an installer ever creates, and a shipped
+/// app must not depend on one existing.
 pub fn dev_sidecar_dir() -> Option<PathBuf> {
     dev_sidecar_dir_from(&exe_dir())
 }
@@ -60,13 +113,38 @@ pub fn dev_sidecar_dir_from(exe_dir: &Path) -> Option<PathBuf> {
 }
 
 /// The ordered list of directories [`discover`] searches. Pure, so the ordering rules can
-/// be asserted without a filesystem: production location first, then the development
-/// checkout, then whatever is on `PATH`.
+/// be asserted without a filesystem: the location next to the executable, then the resource
+/// directory of an installed bundle, then the development checkout, then whatever is on
+/// `PATH`.
+///
+/// The order is the whole contract. Everything an installer can produce outranks everything
+/// a developer's machine can produce, so an application that was installed is never served
+/// a stale copy from a checkout that happens to sit above it, and `PATH` — the one source
+/// localplay cannot vouch for, since the LGPL-only, hardware-encoder-only build the spec
+/// assumes (spec §3; README, "A note on the `ffmpeg` build") is not what an arbitrary
+/// system ffmpeg is — comes last.
 fn search_candidates(exe_dir: &Path, path_dir: Option<PathBuf>) -> Vec<PathBuf> {
     let mut dirs = vec![sidecar_dir_from(exe_dir)];
+    dirs.extend(resource_sidecar_dirs_from(exe_dir));
     dirs.extend(dev_sidecar_dir_from(exe_dir));
     dirs.extend(path_dir);
-    dirs
+    dedupe(dirs)
+}
+
+/// Drop repeated directories, keeping the first occurrence.
+///
+/// The lists involved are at most four long, so a linear scan is the honest implementation.
+/// The reason to bother at all: on Windows the *bundler's* resource directory and
+/// "next to the executable" are the same path, which would otherwise print twice in the
+/// "Searched:" list of a failure message.
+fn dedupe(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique: Vec<PathBuf> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +154,8 @@ pub struct FfmpegBinaries {
 }
 
 impl FfmpegBinaries {
-    /// Resolve binaries: explicit dir, then next to the executable, then the checkout's
-    /// `binaries/`, then `PATH`.
+    /// Resolve binaries: an explicit directory, then next to the executable, then the
+    /// resources of an installed bundle, then a checkout's `binaries/`, then `PATH`.
     pub fn discover(explicit: Option<PathBuf>) -> Result<Self> {
         let candidates = search_candidates(&exe_dir(), which_dir("ffmpeg"));
         Self::discover_from(explicit, &candidates)
@@ -95,9 +173,10 @@ impl FfmpegBinaries {
         }
         if candidates.is_empty() {
             bail!(
-                "ffmpeg not found. Looked next to the executable ({}), in a checkout's \
-                 `binaries/` directory above it (a development-only fallback), and on PATH. \
-                 Run `cargo xtask sidecars fetch` or install ffmpeg.",
+                "ffmpeg not found. Looked next to the executable ({}), in the resources of an \
+                 installed app, in a checkout's `binaries/` directory above it (a \
+                 development-only fallback), and on PATH. Run `cargo xtask sidecars fetch` \
+                 or install ffmpeg.",
                 sidecar_dir().display()
             );
         }
@@ -109,7 +188,11 @@ impl FfmpegBinaries {
             }
         }
         bail!(
-            "ffmpeg not found. Searched: {}. Run `cargo xtask sidecars fetch` or install ffmpeg.",
+            "ffmpeg not found. Searched, in order: {}. That order is: next to the executable \
+             (where the bundled resources of an installed app are placed on Windows), then \
+             the resources of an installed macOS `.app` (`Contents/Resources`), then a \
+             checkout's `binaries/` directory above the executable (a development-only \
+             fallback), then PATH. Run `cargo xtask sidecars fetch`, or install ffmpeg.",
             candidates
                 .iter()
                 .map(|d| d.display().to_string())
@@ -214,6 +297,11 @@ mod tests {
             msg.contains("binaries"),
             "error must name the checkout's binaries/ fallback: {msg}"
         );
+        assert!(
+            msg.contains("resources of an installed app"),
+            "error must name the installed layout too, or a user of a broken installer has \
+             nothing to look at: {msg}"
+        );
     }
 
     #[test]
@@ -237,6 +325,28 @@ mod tests {
         std::fs::create_dir_all(root.join("binaries")).expect("creating binaries/");
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("writing Cargo.toml");
         (exe_dir, root.join("binaries"))
+    }
+
+    /// Write a complete `ffmpeg`/`ffprobe` pair into `dir`, creating it if needed.
+    fn write_sidecar_pair(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("creating a sidecar directory");
+        std::fs::write(dir.join(exe("ffmpeg")), b"binary").expect("writing ffmpeg");
+        std::fs::write(dir.join(exe("ffprobe")), b"binary").expect("writing ffprobe");
+    }
+
+    /// The layout `tauri build` produces inside a macOS `.app` for a `bundle.resources`
+    /// mapping of `binaries/`: the executable in `<Foo>.app/Contents/MacOS`, the sidecars
+    /// in `<Foo>.app/Contents/Resources/binaries`. Returns `(exe_dir, resource_dir)`.
+    ///
+    /// This is the tree that a packaged app actually runs in — see `docs/packaging.md` for
+    /// the `ls` of a real bundle it was checked against.
+    fn fake_installed_app(root: &Path) -> (PathBuf, PathBuf) {
+        let contents = root.join("localplay.app").join("Contents");
+        let exe_dir = contents.join("MacOS");
+        std::fs::create_dir_all(&exe_dir).expect("creating Contents/MacOS");
+        let resources = contents.join("Resources").join(SIDECAR_DIR_NAME);
+        write_sidecar_pair(&resources);
+        (exe_dir, resources)
     }
 
     #[test]
@@ -291,6 +401,179 @@ mod tests {
             vec![exe_dir.join("binaries"), dev, PathBuf::from("/usr/bin")],
             "order is: next to the executable, then the checkout, then PATH"
         );
+    }
+
+    /// The load-bearing test for packaging.
+    ///
+    /// `Contents/Resources/binaries` is **not** "next to the executable" — it is where the
+    /// bundler's `resources` mapping lands — so a lookup that only knew about
+    /// `exe_dir/binaries` would fall through to `PATH` in every installed copy of the app,
+    /// and refuse to start on a machine with no system ffmpeg. That is the exact defect this
+    /// test exists to make impossible to ship again.
+    #[test]
+    fn installed_app_finds_the_sidecars_in_its_own_bundle_resources() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (exe_dir, resources) = fake_installed_app(tmp.path());
+
+        let found = FfmpegBinaries::discover_from(
+            None,
+            &search_candidates(&exe_dir, Some(PathBuf::from("/usr/bin"))),
+        )
+        .expect("an installed app must find the sidecars it was bundled with");
+
+        assert_eq!(found.ffmpeg, resources.join(exe("ffmpeg")));
+        assert_eq!(found.ffprobe, resources.join(exe("ffprobe")));
+        assert!(
+            found.ffmpeg.starts_with(tmp.path().join("localplay.app")),
+            "the resolved binary must be inside the application bundle, was {}",
+            found.ffmpeg.display()
+        );
+    }
+
+    /// The Windows-shaped installation: resources installed *beside* the executable, so
+    /// `binaries/` sits in the installation directory and the plain `exe_dir` rule finds it.
+    /// Nothing platform-specific is needed for this — which is why the test pins the shape
+    /// rather than a code path: if the first candidate ever moved, this would notice.
+    #[test]
+    fn a_windows_style_install_finds_the_sidecars_next_to_the_executable() {
+        let tmp = TempDir::new().expect("temp dir");
+        let install = tmp.path().join("Program Files").join("localplay");
+        std::fs::create_dir_all(&install).expect("creating the installation directory");
+        write_sidecar_pair(&install.join(SIDECAR_DIR_NAME));
+
+        let found = FfmpegBinaries::discover_from(None, &search_candidates(&install, None))
+            .expect("the installer's own layout must be found");
+
+        assert_eq!(found.ffmpeg, install.join(SIDECAR_DIR_NAME).join(exe("ffmpeg")));
+    }
+
+    #[test]
+    fn a_bundle_searches_its_resources_before_the_checkout_and_before_path() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (exe_dir, resources) = fake_installed_app(tmp.path());
+        // The app sits inside a developer's checkout, so the development fallback is live
+        // too: the bundle's resources must still come first.
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("writing Cargo.toml");
+        let checkout = tmp.path().join("binaries");
+        write_sidecar_pair(&checkout);
+        assert_eq!(
+            search_candidates(&exe_dir, Some(PathBuf::from("/usr/bin"))),
+            vec![exe_dir.join(SIDECAR_DIR_NAME), resources, checkout, PathBuf::from("/usr/bin")],
+            "order is: next to the executable, then the bundle's resources, then the \
+             checkout, then PATH"
+        );
+    }
+
+    /// Precedence with every source populated at once, resolved rather than merely ordered.
+    #[test]
+    fn an_installed_sidecar_outranks_the_checkout_and_path() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (exe_dir, resources) = fake_installed_app(tmp.path());
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("writing Cargo.toml");
+        let stale_checkout = tmp.path().join("binaries");
+        write_sidecar_pair(&stale_checkout);
+        let on_path = tmp.path().join("on-path");
+        write_sidecar_pair(&on_path);
+
+        let found =
+            FfmpegBinaries::discover_from(None, &search_candidates(&exe_dir, Some(on_path.clone())))
+                .expect("one of the four sources has the pair");
+
+        assert_eq!(
+            found.ffmpeg,
+            resources.join(exe("ffmpeg")),
+            "the shipped sidecar must win over both the checkout and PATH"
+        );
+        assert_ne!(found.ffmpeg, stale_checkout.join(exe("ffmpeg")));
+        assert_ne!(found.ffmpeg, on_path.join(exe("ffmpeg")));
+    }
+
+    #[test]
+    fn the_checkout_fallback_outranks_path_when_nothing_is_installed() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (exe_dir, checkout) = fake_checkout(tmp.path());
+        write_sidecar_pair(&checkout);
+        let on_path = tmp.path().join("on-path");
+        write_sidecar_pair(&on_path);
+
+        let found =
+            FfmpegBinaries::discover_from(None, &search_candidates(&exe_dir, Some(on_path.clone())))
+                .expect("the checkout pair is found");
+
+        assert_eq!(found.ffmpeg, checkout.join(exe("ffmpeg")));
+        assert_ne!(found.ffmpeg, on_path.join(exe("ffmpeg")));
+    }
+
+    #[test]
+    fn a_pair_next_to_the_executable_outranks_the_bundle_resources() {
+        // Reachable if something puts a pair in `Contents/MacOS/binaries` (a hand-assembled
+        // folder, or Tauri's `externalBin` mechanism, which copies into `Contents/MacOS`).
+        // Stated as a rule so the order is a decision rather than an accident of how the
+        // candidate list happens to be built.
+        let tmp = TempDir::new().expect("temp dir");
+        let (exe_dir, resources) = fake_installed_app(tmp.path());
+        let beside_the_exe = exe_dir.join(SIDECAR_DIR_NAME);
+        write_sidecar_pair(&beside_the_exe);
+
+        let found = FfmpegBinaries::discover_from(None, &search_candidates(&exe_dir, None))
+            .expect("the pair next to the executable is found");
+
+        assert_eq!(found.ffmpeg, beside_the_exe.join(exe("ffmpeg")));
+        assert_ne!(found.ffmpeg, resources.join(exe("ffmpeg")));
+    }
+
+    #[test]
+    fn a_directory_that_is_not_an_app_bundle_has_no_resource_location() {
+        // A false positive here would put a directory that cannot exist on the search list
+        // and print it in every "ffmpeg not found" message.
+        let tmp = TempDir::new().expect("temp dir");
+        let install = tmp.path().join("Program Files/localplay");
+        std::fs::create_dir_all(&install).expect("creating the installation directory");
+        assert!(resource_sidecar_dirs_from(&install).is_empty());
+
+        // `MacOS` is not enough on its own: the parent has to be a `Contents` directory.
+        let not_a_bundle = tmp.path().join("somewhere/MacOS");
+        std::fs::create_dir_all(&not_a_bundle).expect("creating somewhere/MacOS");
+        assert!(resource_sidecar_dirs_from(&not_a_bundle).is_empty());
+    }
+
+    /// The same lookup, but pointed at a bundle that was actually built rather than a tree
+    /// this test wrote: the difference between "the rule is right" and "the artifact is
+    /// shaped the way the rule expects".
+    ///
+    /// Opt-in, because it needs a build artifact that CI does not produce and that no unit
+    /// test should depend on. Point it at a bundle and it resolves the executable's own
+    /// `Contents/MacOS` directory through the production code path:
+    ///
+    /// ```text
+    /// LOCALPLAY_APP_BUNDLE=apps/desktop/src-tauri/target/release/bundle/macos/localplay.app \
+    ///   cargo test -p localplay-media --lib a_real_app_bundle_beats_path
+    /// ```
+    ///
+    /// `which_dir` is real (not a made-up directory), so when it finds a system ffmpeg this
+    /// also demonstrates that the copy inside the bundle wins over `PATH`.
+    #[test]
+    fn a_real_app_bundle_beats_path() {
+        let Ok(app) = std::env::var("LOCALPLAY_APP_BUNDLE") else {
+            return;
+        };
+        let app = PathBuf::from(app);
+        let exe_dir = app.join("Contents").join("MacOS");
+        assert!(
+            exe_dir.is_dir(),
+            "LOCALPLAY_APP_BUNDLE must point at a `.app` directory: {} has no Contents/MacOS",
+            app.display()
+        );
+
+        let candidates = search_candidates(&exe_dir, which_dir("ffmpeg"));
+        let found = FfmpegBinaries::discover_from(None, &candidates)
+            .unwrap_or_else(|e| panic!("nothing found in the built bundle {}\n{e}", app.display()));
+
+        assert_eq!(
+            found.ffmpeg,
+            app.join("Contents").join("Resources").join(SIDECAR_DIR_NAME).join(exe("ffmpeg"))
+        );
+        assert!(found.ffprobe.is_file(), "{:?} exists too", found.ffprobe);
     }
 
     #[test]
