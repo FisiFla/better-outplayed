@@ -10,6 +10,13 @@ members = [
     "apps/localplay-cli",
     "xtask",
 ]
+# The Phase 2 desktop shell is a workspace of its own, and deliberately not a member:
+# `tauri::generate_context!` reads `src-tauri/tauri.conf.json` at compile time and fails
+# when the frontend it names (`apps/desktop/dist`) has not been built, so membership would
+# make every `cargo test --workspace` depend on a `npm run build` having run first. It is
+# excluded rather than merely left out, so that widening `members` to `apps/*` later
+# cannot pull it in by accident. Run its tests from `apps/desktop/src-tauri`.
+exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

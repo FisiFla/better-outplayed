@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      The window is dark-mode only (spec §9), and it is dark from the first painted frame
+      rather than after the stylesheet loads: this is the same colour as the window
+      background configured in src-tauri/tauri.conf.json.
+    -->
+    <meta name="color-scheme" content="dark" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0b0c10;
+      }
+    </style>
+    <title>localplay</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

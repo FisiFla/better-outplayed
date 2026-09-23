@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "localplay",
+  "version": "0.1.0",
+  "identifier": "io.github.fisifla.better-outplayed",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "localplay",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 940,
+        "minHeight": 600,
+        "resizable": true,
+        "theme": "Dark",
+        "backgroundColor": "#0b0c10"
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$LOCALDATA/localplay/clips/**",
+          "$LOCALDATA/localplay/thumbnails/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  }
+}

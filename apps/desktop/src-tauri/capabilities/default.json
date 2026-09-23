@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The default capability for the localplay review window: the core Tauri APIs and nothing else. There is no filesystem, shell, http or dialog permission here — clip files reach the webview through the asset protocol, whose scope is configured in tauri.conf.json and extended at runtime in src/lib.rs to the resolved clips directory.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

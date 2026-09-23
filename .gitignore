@@ -21,9 +21,15 @@ build/
 .vite/
 *.tsbuildinfo
 .eslintcache
+# The desktop app's two generated directories. The patterns above already match them at any
+# depth; they are named here so that `apps/desktop/` cannot be committed by accident by
+# someone reading this file and concluding only the repository root is covered.
+apps/desktop/node_modules/
+apps/desktop/dist/
 
 # --- Tauri ---
 src-tauri/gen/schemas/
+**/src-tauri/gen/
 **/src-tauri/target/
 *.app
 *.dmg
@@ -65,7 +71,14 @@ ringbuffer/
 *.webm
 *.avi
 *.flv
-*.ts
+# MPEG transport streams — NOT a blanket `*.ts`. That pattern was here, and it silently
+# ignored every TypeScript file in the repository as well; the desktop app is written in
+# TypeScript, so the rule is scoped to the directories media can actually land in.
+clips/**/*.ts
+captures/**/*.ts
+recordings/**/*.ts
+scratch/**/*.ts
+ringbuffer/**/*.ts
 *.m4s
 *.m2ts
 *.part
