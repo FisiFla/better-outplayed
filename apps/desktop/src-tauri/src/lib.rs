@@ -7,19 +7,36 @@
 //! test module at the bottom of `commands.rs`, and spec §12 on why this project does not
 //! put a GUI on the critical path of its tests).
 
+pub mod background;
 pub mod commands;
 pub mod config;
 
+use background::{
+    AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,
+};
 use commands::{
     AppPaths, ClipDto, CommandError, DeleteOutcome, Deps, ErrorCode, RecorderHost,
     RecordedClipDto, RecordingStatusDto, StorageConfigView, StorageStats, ThumbnailRef,
 };
-use config::{RecordingConfig, StorageConfig};
+use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use localplay_media::FfmpegBinaries;
 use localplay_store::Store;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::image::Image;
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Manager, State, WindowEvent, Wry};
+
+/// The one window this application has (`tauri.conf.json` declares it).
+const MAIN_WINDOW: &str = "main";
+
+/// How often the tray re-derives itself from the recorder.
+///
+/// The same half-second the window polls at: the counters it reads are atomics, and the
+/// tray only touches the OS when what it would show has actually changed.
+const TRAY_POLL: Duration = Duration::from_millis(500);
 
 /// Everything the commands run against, resolved once at startup.
 pub struct AppState {
@@ -38,6 +55,11 @@ pub struct AppState {
     /// to resolve the application data directory and the ffmpeg sidecar binaries, and
     /// both are already here.
     recorder: RecorderHost,
+    /// What installing the clip hotkey concluded at startup: the chord, whether a listener
+    /// is really there, and why not when it is not. The window shows this instead of
+    /// assuming the hotkey works — a hotkey that silently does nothing is the worst outcome
+    /// this feature has (`docs/verification-status.md`).
+    hotkey: HotkeyStatus,
 }
 
 impl AppState {
@@ -47,7 +69,11 @@ impl AppState {
     /// that can neither list nor delete anything, which leaves the shell with nothing to
     /// show; the caller logs the reason and stops, the same way the CLI refuses to start
     /// when it cannot open its own index.
-    pub fn open(app_data_dir: &Path, storage: StorageConfig) -> Result<Self, CommandError> {
+    pub fn open(
+        app_data_dir: &Path,
+        storage: StorageConfig,
+        hotkey: HotkeyStatus,
+    ) -> Result<Self, CommandError> {
         std::fs::create_dir_all(app_data_dir).map_err(|e| {
             CommandError::new(
                 ErrorCode::Io,
@@ -106,12 +132,24 @@ impl AppState {
         );
 
         let recorder = RecorderHost::new(app_data_dir.to_path_buf(), bins.clone());
-        Ok(Self { store: Mutex::new(store), bins, paths, storage, warnings, recorder })
+        Ok(Self { store: Mutex::new(store), bins, paths, storage, warnings, recorder, hotkey })
     }
 
     /// The recording engine this window drives. No UI is built unless it can record.
     pub fn recorder(&self) -> &RecorderHost {
         &self.recorder
+    }
+
+    /// What installing the clip hotkey concluded at startup.
+    pub fn hotkey(&self) -> &HotkeyStatus {
+        &self.hotkey
+    }
+
+    /// The `config.toml` this process read — the file the tray's "open config file" item
+    /// reveals and the window names, because this project's configuration story is a file
+    /// in a directory rather than a settings dialog.
+    pub fn config_path(&self) -> PathBuf {
+        self.recorder.config_path()
     }
 
     /// The paths the asset protocol has to be allowed to serve (spec §9).
@@ -234,17 +272,37 @@ async fn clip_now(state: State<'_, AppState>) -> Result<RecordedClipDto, Command
     state.recorder.clip_now()
 }
 
+/// What the window shows about the half of the shell that is not a window: the clip hotkey,
+/// where the configuration was read from, and what closing the window does.
+///
+/// It exists so that the two things a user cannot otherwise discover — *which chord to
+/// press* and *whether that chord is actually installed* — are on screen, and so that "the
+/// config is a file" is a path they can read rather than a guess.
+#[tauri::command(rename_all = "snake_case")]
+fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
+    let config_path = state.config_path();
+    Ok(AppStatus {
+        hotkey: state.hotkey().clone(),
+        config_exists: config_path.is_file(),
+        config_path: config_path.to_string_lossy().into_owned(),
+        close_hint: background::CLOSE_HINT.to_string(),
+    })
+}
+
 /// Start the desktop application.
 ///
 /// Nothing in this crate calls this in a test: it opens a window, and neither this
 /// development host nor the test suite has a display for one. Everything it wires together
-/// is verified through the command layer instead.
+/// is verified through the command layer, `background`'s pure functions and its own tests
+/// instead — see the module docs of `background.rs` for exactly what that does and does not
+/// prove.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
 
     let app_data_dir = config::app_data_dir();
-    let storage = match StorageConfig::load(&app_data_dir.join("config.toml")) {
+    let config_path = app_data_dir.join("config.toml");
+    let storage = match StorageConfig::load(&config_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::error!("{err}");
@@ -253,7 +311,40 @@ pub fn run() {
         }
     };
 
-    let state = match AppState::open(&app_data_dir, storage) {
+    // The config story, said once at startup the way the CLI says it: which file, and
+    // whether it was there at all. A user who has just edited `[hotkeys] clip` reads the
+    // path here rather than wondering which copy of the file the app found.
+    let background_cfg = BackgroundConfig::load(&config_path);
+    if config_path.is_file() {
+        tracing::info!("config: {}", config_path.display());
+    } else {
+        tracing::info!(
+            "config: {} does not exist; the values in config.example.toml are in force",
+            config_path.display()
+        );
+    }
+
+    // The hotkey, installed before anything can want to trigger it. The *listener* is
+    // registered here; the thread that turns a press into a clip is started in `setup`,
+    // because it needs the application handle to reach the recorder.
+    let (hotkey_status, presses) = match &background_cfg {
+        Ok(cfg) => background::install_hotkey(&cfg.clip_hotkey),
+        Err(err) => (
+            HotkeyStatus::not_installed(
+                "(none)",
+                format!("the config file could not be read, so no hotkey is installed: {}", err.message),
+            ),
+            None,
+        ),
+    };
+    match &hotkey_status.error {
+        // Loud on purpose. This is the failure that would otherwise be invisible until a
+        // user pressed the key in a game and nothing happened.
+        Some(error) => tracing::error!("the clip hotkey is NOT installed — {error}"),
+        None => tracing::info!("the clip hotkey {} is installed", hotkey_status.chord),
+    }
+
+    let state = match AppState::open(&app_data_dir, storage, hotkey_status.clone()) {
         Ok(state) => state,
         Err(err) => {
             tracing::error!("{err}");
@@ -281,6 +372,29 @@ pub fn run() {
                 }
             }
             app.manage(state);
+
+            // The start-with-Windows entry, if the config asks for it. Best effort and
+            // never fatal: an autostart entry that could not be written must not stop a
+            // recording session. Windows only; elsewhere it reports why it did nothing.
+            if let Ok(cfg) = &background_cfg {
+                match std::env::current_exe() {
+                    Ok(exe) => match background::apply_autostart(cfg.start_with_system, &exe) {
+                        Ok(outcome) => tracing::info!(
+                            "start_with_system = {}: {}",
+                            cfg.start_with_system,
+                            outcome.describe()
+                        ),
+                        Err(err) => tracing::warn!("autostart was not applied: {err}"),
+                    },
+                    Err(err) => tracing::warn!("autostart was not applied: {err}"),
+                }
+            }
+
+            if let Err(err) = wire_background(app.handle().clone(), hotkey_status.clone(), presses) {
+                // A shell with no tray and no hotkey is still a review window, so this is a
+                // warning rather than a refusal to start — but it is never silent.
+                tracing::error!("the tray and the hotkey thread were not installed: {err}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -293,10 +407,365 @@ pub fn run() {
             start_recording,
             stop_recording,
             recording_status,
-            clip_now
+            clip_now,
+            app_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running the localplay desktop shell");
+}
+
+/// Install the tray and start the two threads that keep it (and the hotkey) live.
+///
+/// Called once, from `setup`. Split out of `run` so that the wiring is one screen long and
+/// the decisions it makes are all `background`'s.
+fn wire_background(
+    app: AppHandle,
+    hotkey: HotkeyStatus,
+    presses: Option<std::sync::mpsc::Receiver<()>>,
+) -> tauri::Result<()> {
+    let shell = AppShell { app };
+    let icons = TrayIcons::load()?;
+    let wiring = Arc::new(TrayWiring::install(&shell, &hotkey, icons)?);
+    // The menu callback needs the wiring, and a Tauri menu callback only gets the handle:
+    // so the wiring is managed too, and looked up by type. (`AppState` was managed by the
+    // caller, before any of this.)
+    shell.app.manage(Arc::clone(&wiring));
+
+    // The tray follows the recorder on its own: a hotkey press, a tray action, and the
+    // engine stopping by itself all have to move the icon, and none of them goes through
+    // the webview. This thread is the process's lifetime; it ends when the process does.
+    {
+        let shell = shell.clone();
+        let wiring = Arc::clone(&wiring);
+        let hotkey = hotkey.clone();
+        std::thread::Builder::new()
+            .name("localplay-tray".into())
+            .spawn(move || loop {
+                std::thread::sleep(TRAY_POLL);
+                wiring.refresh(&shell, &hotkey);
+            })?;
+    }
+
+    // The press loop. `on_hotkey_press` is the single trigger: one press, one
+    // `RecorderHost::clip_now`, the same call the window's Save clip button makes.
+    if let Some(presses) = presses {
+        let shell = shell.clone();
+        let wiring = Arc::clone(&wiring);
+        let hotkey = hotkey.clone();
+        std::thread::Builder::new()
+            .name("localplay-hotkey-press".into())
+            .spawn(move || {
+                // `recv` blocks until a press or the channel closes (which happens when the
+                // listener thread ends — at process exit).
+                while presses.recv().is_ok() {
+                    let outcome = background::on_hotkey_press(|| shell.clip_now());
+                    if outcome.saved_a_clip() {
+                        tracing::info!("{} pressed: {}", hotkey.chord, outcome.describe());
+                    } else {
+                        tracing::warn!("{} pressed: {}", hotkey.chord, outcome.describe());
+                    }
+                    wiring.set_last_press(outcome.describe());
+                    wiring.refresh(&shell, &hotkey);
+                }
+            })?;
+    }
+
+    // The window's close, which hides rather than quits (`background::close_action` — the
+    // rule that keeps a recording alive when a user tidies their screen).
+    if let Some(window) = shell.window() {
+        let shell = shell.clone();
+        let wiring = Arc::clone(&wiring);
+        let hotkey = hotkey.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if background::close_action() == CloseAction::Hide {
+                    api.prevent_close();
+                    if let Err(err) = shell.hide_window() {
+                        tracing::warn!("the window was closed but could not be hidden: {err}");
+                    } else {
+                        tracing::info!(
+                            "the window is hidden: recording continues, and localplay stays in \
+                             the tray. Quit from the tray menu (there is no other way out)."
+                        );
+                    }
+                    wiring.refresh(&shell, &hotkey);
+                }
+            }
+        });
+    }
+
+    wiring.refresh(&shell, &hotkey);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// The Tauri half of `background`: the window, the recorder, the tray and the file manager.
+// Nothing here decides anything — every branch it takes is a value from `background`.
+// ---------------------------------------------------------------------------------------
+
+/// The real [`Shell`]: the window, the recorder and the platform's file manager.
+#[derive(Clone)]
+struct AppShell {
+    app: AppHandle,
+}
+
+impl AppShell {
+    fn window(&self) -> Option<tauri::WebviewWindow> {
+        self.app.get_webview_window(MAIN_WINDOW)
+    }
+
+    /// The application state, or the reason there is none.
+    ///
+    /// `try_state` rather than `state`: the state is managed during `setup`, and a tray
+    /// event that somehow arrives before that must be reported, not panic a window process.
+    fn state(&self) -> Result<State<'_, AppState>, CommandError> {
+        self.app.try_state::<AppState>().ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::Recording,
+                "the application state is not available yet",
+            )
+        })
+    }
+
+    /// Whether `config.toml` exists — the tray's "open config" label says which it opens.
+    fn config_exists(&self) -> bool {
+        self.app.try_state::<AppState>().map(|state| state.config_path().is_file()).unwrap_or(false)
+    }
+}
+
+impl Shell for AppShell {
+    fn window_visible(&self) -> Result<bool, String> {
+        match self.window() {
+            Some(window) => window.is_visible().map_err(|err| err.to_string()),
+            None => Ok(false),
+        }
+    }
+
+    fn show_window(&self) -> Result<(), String> {
+        let window = self.window().ok_or_else(|| "the window is gone".to_string())?;
+        // Unminimise first: a window restored from the taskbar is minimised as often as it
+        // is hidden, and `show` alone would leave it in the tray area it was restored from.
+        let _ = window.unminimize();
+        window.show().and_then(|()| window.set_focus()).map_err(|err| err.to_string())
+    }
+
+    fn hide_window(&self) -> Result<(), String> {
+        self.window()
+            .ok_or_else(|| "the window is gone".to_string())?
+            .hide()
+            .map_err(|err| err.to_string())
+    }
+
+    fn status(&self) -> Result<RecordingStatusDto, CommandError> {
+        self.state()?.recorder().status()
+    }
+
+    fn start_recording(&self) -> Result<RecordingStatusDto, CommandError> {
+        // Exactly what the window's Start button does: re-read `config.toml`, then start
+        // (`RecorderHost::start_from_config`).
+        self.state()?.recorder().start_from_config()
+    }
+
+    fn stop_recording(&self) -> Result<RecordingStatusDto, CommandError> {
+        self.state()?.recorder().stop()
+    }
+
+    fn clip_now(&self) -> Result<RecordedClipDto, CommandError> {
+        self.state()?.recorder().clip_now()
+    }
+
+    fn open_config(&self) -> Result<PathBuf, String> {
+        let state = self
+            .app
+            .try_state::<AppState>()
+            .ok_or_else(|| "the application state is not available yet".to_string())?;
+        let path = state.config_path();
+        let (program, args) = background::reveal_command(&path, background::FileManager::current());
+        std::process::Command::new(&program)
+            .args(&args)
+            .spawn()
+            .map_err(|err| format!("could not run {program}: {err}"))?;
+        Ok(path)
+    }
+
+    fn quit(&self) -> Result<(), String> {
+        // `exit` rather than `close`: every window is destroyed, the process ends, and the
+        // recorder was already flushed by `background::dispatch`'s Quit arm.
+        self.app.exit(0);
+        Ok(())
+    }
+}
+
+/// The three tray icons, decoded once at startup.
+///
+/// Generated from the application icon (`icons/icon.png`) with the background keyed out and
+/// a state badge added; `cargo test` decodes them, so a corrupt or missing file fails a test
+/// rather than a tray.
+struct TrayIcons {
+    idle: Image<'static>,
+    recording: Image<'static>,
+    attention: Image<'static>,
+}
+
+impl TrayIcons {
+    fn load() -> tauri::Result<Self> {
+        Ok(Self {
+            idle: Image::from_bytes(include_bytes!("../icons/tray-idle.png"))?,
+            recording: Image::from_bytes(include_bytes!("../icons/tray-recording.png"))?,
+            attention: Image::from_bytes(include_bytes!("../icons/tray-attention.png"))?,
+        })
+    }
+
+    fn for_state(&self, state: TrayState) -> Image<'static> {
+        match state {
+            TrayState::Idle => self.idle.clone(),
+            TrayState::Recording => self.recording.clone(),
+            TrayState::Attention => self.attention.clone(),
+        }
+    }
+}
+
+/// The tray and the menu items whose labels follow the state.
+///
+/// `rendering` is the whole visible surface as one comparable value
+/// ([`TrayView::rendering`]), so "did anything change?" is an equality check and the OS is
+/// only touched when something really moved — this runs every half second.
+struct TrayWiring {
+    tray: tauri::tray::TrayIcon<Wry>,
+    window_item: MenuItem<Wry>,
+    recording_item: MenuItem<Wry>,
+    clip_item: MenuItem<Wry>,
+    config_item: MenuItem<Wry>,
+    icons: TrayIcons,
+    rendering: Mutex<TrayRendering>,
+    /// One short line about the last hotkey press, for the tooltip. This is how a user who
+    /// is in a game with the window hidden learns that the press did nothing.
+    last_press: Mutex<Option<String>>,
+}
+
+impl TrayWiring {
+    fn install(shell: &AppShell, hotkey: &HotkeyStatus, icons: TrayIcons) -> tauri::Result<Self> {
+        let view = TrayView {
+            status: &RecordingStatusDto::from(localplay_recorder::RecorderStatus::stopped()),
+            hotkey,
+            window_visible: true,
+            config_exists: shell.config_exists(),
+            last_press: None,
+        };
+
+        let mut builder = MenuBuilder::new(&shell.app);
+        let mut items: Vec<MenuItem<Wry>> = Vec::new();
+        for action in MenuAction::ALL {
+            if action.separator_before() {
+                builder = builder.separator();
+            }
+            let item = MenuItemBuilder::with_id(action.id(), action.label(&view))
+                .enabled(action.enabled(&view))
+                .build(&shell.app)?;
+            builder = builder.item(&item);
+            items.push(item);
+        }
+        let menu = builder.build()?;
+
+        let tray = TrayIconBuilder::with_id("localplay")
+            .icon(icons.for_state(view.tray_state()))
+            .tooltip(view.tooltip())
+            .menu(&menu)
+            // Left click opens the menu (the Windows convention), which is where "Show the
+            // window" lives. There is no separate click handler to get out of step with it.
+            .show_menu_on_left_click(true)
+            .on_menu_event(move |app, event| {
+                let shell = AppShell { app: app.clone() };
+                let id = event.id().as_ref().to_string();
+                let Some(action) = MenuAction::from_id(&id) else {
+                    tracing::warn!("the tray sent an id this build did not create: {id}");
+                    return;
+                };
+                let outcome = background::dispatch(action, &shell);
+                tracing::info!("tray: {id} → {}", outcome.describe());
+                // The wiring's own refresh, from the callback: the poll thread would catch
+                // up within half a second, but a menu whose label is already stale when it
+                // reopens is a menu that lies twice.
+                if let Some(wiring) = app.try_state::<Arc<TrayWiring>>() {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        wiring.refresh(&shell, state.hotkey());
+                    }
+                }
+            })
+            .build(&shell.app)?;
+
+        let find = |action: MenuAction| {
+            items
+                .iter()
+                .find(|item| item.id().as_ref() == action.id())
+                .expect("every action was built above")
+                .clone()
+        };
+
+        Ok(Self {
+            tray,
+            window_item: find(MenuAction::ShowHideWindow),
+            recording_item: find(MenuAction::ToggleRecording),
+            clip_item: find(MenuAction::SaveClip),
+            config_item: find(MenuAction::OpenConfig),
+            icons,
+            rendering: Mutex::new(view.rendering()),
+            last_press: Mutex::new(None),
+        })
+    }
+
+    fn set_last_press(&self, line: String) {
+        *self.last_press.lock().unwrap_or_else(|err| err.into_inner()) = Some(line);
+    }
+
+    /// Re-derive the tray from the shell and apply what changed.
+    fn refresh(&self, shell: &AppShell, hotkey: &HotkeyStatus) {
+        let status = match shell.status() {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!("the tray could not read the recorder's status: {}", err.message);
+                return;
+            }
+        };
+        let last_press = self.last_press.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let view = TrayView {
+            status: &status,
+            hotkey,
+            window_visible: shell.window_visible().unwrap_or(true),
+            config_exists: shell.config_exists(),
+            last_press: last_press.as_deref(),
+        };
+        let wanted = view.rendering();
+
+        let mut current = self.rendering.lock().unwrap_or_else(|err| err.into_inner());
+        if *current == wanted {
+            return;
+        }
+        if current.state != wanted.state {
+            if let Err(err) = self.tray.set_icon(Some(self.icons.for_state(wanted.state))) {
+                tracing::warn!("the tray icon could not be changed: {err}");
+            }
+        }
+        if current.tooltip != wanted.tooltip {
+            if let Err(err) = self.tray.set_tooltip(Some(wanted.tooltip.clone())) {
+                tracing::warn!("the tray tooltip could not be changed: {err}");
+            }
+        }
+        for (item, label) in [
+            (&self.window_item, &wanted.window_label),
+            (&self.recording_item, &wanted.recording_label),
+            (&self.clip_item, &wanted.clip_label),
+            (&self.config_item, &wanted.config_label),
+        ] {
+            if let Err(err) = item.set_text(label) {
+                tracing::warn!("a tray menu label could not be changed: {err}");
+            }
+        }
+        if let Err(err) = self.clip_item.set_enabled(wanted.clip_enabled) {
+            tracing::warn!("the tray's clip item could not be enabled or disabled: {err}");
+        }
+        *current = wanted;
+    }
 }
 
 fn init_tracing() {
@@ -316,6 +785,14 @@ mod tests {
         StorageConfig::example().unwrap()
     }
 
+    /// The hotkey status a test's shell gets: the documented chord, and the truth about
+    /// *this* build (`install_hotkey` asks `hotkey::supported`, so off Windows the tests
+    /// exercise the "nothing is listening, and here is why" path rather than a chord that
+    /// could never fire). No test registers a real chord: that needs Windows.
+    fn hotkey_status() -> HotkeyStatus {
+        background::install_hotkey(crate::config::DEFAULT_CLIP_HOTKEY).0
+    }
+
     /// The directory holding this crate's manifest, i.e. `apps/desktop/src-tauri`: the
     /// place `tauri.conf.json` and the platform configs resolve their relative paths from.
     fn tauri_dir() -> PathBuf {
@@ -326,6 +803,55 @@ mod tests {
         let path = tauri_dir().join(file);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {file}: {e}"));
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing {file}: {e}"))
+    }
+
+    /// The tray icons, decoded — they are committed binary assets, and a corrupt one is a
+    /// tray with no icon (or a build that fails on someone else's machine). No runtime is
+    /// involved: this is the same decode the tray does at startup.
+    #[test]
+    fn the_tray_icons_are_decodable_pngs_of_one_size() {
+        let icons = TrayIcons::load().expect("the embedded tray icons must decode");
+
+        for (state, image) in [
+            ("idle", &icons.idle),
+            ("recording", &icons.recording),
+            ("attention", &icons.attention),
+        ] {
+            assert_eq!((image.width(), image.height()), (32, 32), "the {state} icon is 32x32");
+            assert_eq!(
+                image.rgba().len(),
+                32 * 32 * 4,
+                "the {state} icon is RGBA, four bytes to a pixel"
+            );
+            let transparent = image.rgba().chunks_exact(4).filter(|px| px[3] == 0).count();
+            assert!(
+                transparent > 500,
+                "the {state} icon must keep the app icon's keyed-out background, not sit on \
+                 the taskbar as an opaque block ({transparent} transparent pixels)"
+            );
+        }
+
+        // The state badge is the whole point: three identical icons would make "recording"
+        // a claim the taskbar cannot back up.
+        assert_ne!(icons.idle.rgba(), icons.recording.rgba(), "idle and recording differ");
+        assert_ne!(
+            icons.recording.rgba(),
+            icons.attention.rgba(),
+            "recording and attention differ"
+        );
+    }
+
+    /// The config story, from the state a command would answer from: the path the window
+    /// shows and the tray's "open config" item reveals is the one this process would read.
+    #[test]
+    fn the_state_names_the_config_file_this_process_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("localplay");
+        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+
+        assert_eq!(state.config_path(), app_dir.join("config.toml"));
+        assert!(!state.config_path().is_file(), "nothing has written it in this test");
+        assert!(state.asset_roots().contains(&state.paths.clips_dir));
     }
 
     /// The half of the packaging contract that `crates/media` cannot check by itself.
@@ -436,7 +962,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
 
-        let state = AppState::open(&app_dir, storage()).unwrap();
+        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
 
         assert!(app_dir.join("localplay.db").is_file(), "the index is created");
         assert!(app_dir.join("clips").is_dir(), "and so is the clips directory");
@@ -455,7 +981,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
 
-        let first = AppState::open(&app_dir, storage()).unwrap();
+        let first = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
         let id = {
             let store = first.store.lock().unwrap();
             store
@@ -470,7 +996,7 @@ mod tests {
         };
         drop(first);
 
-        let second = AppState::open(&app_dir, storage()).unwrap();
+        let second = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
         let clips = second.with_deps(commands::list_clips).unwrap();
         assert_eq!(clips.len(), 1, "the second open reads what the first wrote");
         assert_eq!(clips[0].id, id);
@@ -480,7 +1006,7 @@ mod tests {
     fn the_asset_roots_are_the_clips_directory_and_the_thumbnail_cache() {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
-        let state = AppState::open(&app_dir, storage()).unwrap();
+        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
 
         assert_eq!(state.asset_roots(), vec![app_dir.join("clips"), app_dir.join("thumbnails")]);
     }
@@ -493,7 +1019,7 @@ mod tests {
         let configured =
             StorageConfig { clips_dir: elsewhere.to_string_lossy().into_owned(), ..storage() };
 
-        let state = AppState::open(&app_dir, configured).unwrap();
+        let state = AppState::open(&app_dir, configured, hotkey_status()).unwrap();
 
         assert!(elsewhere.is_dir(), "the configured directory is created");
         assert_eq!(state.asset_roots()[0], elsewhere, "and it is what playback is scoped to");
@@ -515,7 +1041,7 @@ mod tests {
         .unwrap();
 
         let storage = StorageConfig::load(&app_dir.join("config.toml")).unwrap();
-        let state = AppState::open(&app_dir, storage).unwrap();
+        let state = AppState::open(&app_dir, storage, hotkey_status()).unwrap();
 
         assert_eq!(state.with_deps(commands::storage_stats).unwrap().cap_bytes, 2048);
     }

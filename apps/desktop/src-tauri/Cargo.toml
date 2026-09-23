@@ -19,13 +19,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `protocol-asset` is what serves clip files to the <video> element (spec §9) without a
 # hand-rolled file server.
-tauri = { version = "2", features = ["protocol-asset"] }
+# `tray-icon` is what Tauri v2 gates `tauri::tray` / the menu API behind: without it there
+# is no system tray at all. `image-png` is what lets `Image::from_bytes` decode the PNG tray
+# icons this crate embeds (`icons/tray-*.png`); without it the only icon source would be
+# `include_image!`'s raw RGBA at build time. Nothing else is enabled — no dialog, no shell,
+# no filesystem plugin — and no capability grants the webview anything new.
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 # The Phase 1 crates are reused as-is. Nothing here re-implements them: the shell reads
 # the index, edits clips and probes them, and it *records* through the same engine the CLI
 # drives (`localplay-recorder`), which owns capture, audio, the encoder and the ring.
 localplay-media = { path = "../../../crates/media" }
 localplay-store = { path = "../../../crates/store" }
 localplay-recorder = { path = "../../../crates/recorder" }
+# The global clip hotkey (spec §7.4). The desktop shell installs the *same* `RegisterHotKey`
+# listener the CLI does, from the same `[hotkeys] clip` key — there is one hotkey
+# implementation in this repository, and this is the dependency that makes that true.
+localplay-events = { path = "../../../crates/events" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -35,6 +44,16 @@ tauri-build = { version = "2", features = [] }
 tempfile = "3"
 # Contract tests assert the exact JSON keys the TypeScript interfaces mirror.
 serde_json = "1"
+# The integration test drives a **real** recording (a real encoder child, a real ring, a
+# real splice and a real index row) through the tray's and the hotkey's trigger path. It
+# needs the engine's synthetic capture source (so that no test opens a capture session on
+# the host's display) and the software encoder path (this host has no GPU encoder), both of
+# which are test-only entry points in the crates below — see the notes in their manifests.
+# Dev-dependencies are not built for `cargo build`, so the shipping binary still has
+# neither.
+localplay-capture = { path = "../../../crates/capture" }
+localplay-recorder = { path = "../../../crates/recorder", features = ["test-encoders"] }
+localplay-encoder = { path = "../../../crates/encoder", features = ["test-encoders"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

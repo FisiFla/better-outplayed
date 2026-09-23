@@ -22,6 +22,8 @@
 //! Timeline.svelte`).
 
 use crate::config::RecordingConfig;
+#[cfg(test)]
+use localplay_capture::stub::StubConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
@@ -920,6 +922,30 @@ impl RecorderHost {
     /// backend, the ring, ffmpeg) happens here, on the caller's thread, so a machine that
     /// cannot record says so now instead of failing inside a background thread.
     pub fn start(&self, settings: &RecordingConfig) -> Result<RecordingStatusDto, CommandError> {
+        self.start_with(settings, Sources::Platform, false)
+    }
+
+    /// Start from the `config.toml` this host reads, exactly as the window's Start button
+    /// does.
+    ///
+    /// The tray's "Start recording" item and the hotkey's own recording both go through here
+    /// rather than loading the file themselves, so there is one place where "what a start
+    /// means" is decided — including the fact that the file is re-read at start time and not
+    /// at window-open time (see `config.rs`).
+    pub fn start_from_config(&self) -> Result<RecordingStatusDto, CommandError> {
+        let settings = RecordingConfig::load(&self.config_path())?;
+        self.start(&settings)
+    }
+
+    /// The body of a start. `sources` and `dev_software_encoder` are the engine's own
+    /// choices, passed through unchanged: shipping code takes [`Self::start`], which is
+    /// exactly [`Sources::Platform`] with the software encoder off.
+    fn start_with(
+        &self,
+        settings: &RecordingConfig,
+        sources: Sources,
+        dev_software_encoder: bool,
+    ) -> Result<RecordingStatusDto, CommandError> {
         let bins = self.bins.as_ref().ok_or_else(|| {
             CommandError::new(
                 ErrorCode::FfmpegUnavailable,
@@ -948,10 +974,8 @@ impl RecorderHost {
             // no switch for it and must not: the engine refuses to substitute a stub on
             // Windows, so there is no path here that captures nothing while looking like a
             // recording.
-            sources: Sources::Platform,
-            // The desktop shell never encodes on the CPU: there is no UI for it, and
-            // principle 3 rules it out (spec §3.2).
-            dev_software_encoder: false,
+            sources,
+            dev_software_encoder,
         };
 
         let recorder = Recorder::start(cfg).map_err(|err| {
@@ -960,6 +984,25 @@ impl RecorderHost {
         let status = RecordingStatusDto::from(recorder.status());
         *slot = Some(Arc::new(recorder));
         Ok(status)
+    }
+
+    /// **TEST-ONLY.** Start with the engine's synthetic sources and its software encoder.
+    ///
+    /// Why this exists: the tray and the hotkey both end at [`Self::clip_now`], and the only
+    /// convincing test of that path is a *real* recording — a real encoder child process, a
+    /// real ring on disk, a real splice and a real index row. [`Sources::Platform`] is that
+    /// path on Windows but is a live Windows Graphics Capture session there, which no test
+    /// may open; [`Sources::Stub`] is the same engine over synthetic frames, and it is
+    /// unreachable from a configuration file by construction (`localplay_recorder::Sources`
+    /// documents that). Gated on `cfg(test)`, so a shipped binary has no such entry point at
+    /// all — the CLI's equivalent is its `--dev-software-encoder` feature.
+    #[cfg(test)]
+    pub fn start_for_test_with_stub_sources(
+        &self,
+        settings: &RecordingConfig,
+    ) -> Result<RecordingStatusDto, CommandError> {
+        let stub = StubConfig { width: 1280, height: 720, fps: settings.encode.fps };
+        self.start_with(settings, Sources::Stub(stub), true)
     }
 
     /// Stop the recording, flush the encoder and return the final status.
@@ -1027,7 +1070,7 @@ mod tests {
     use super::*;
     use localplay_media::binaries::run_with_timeout;
     use std::process::Command;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A cap nothing reaches and an age nothing exceeds: the policy is a no-op, so a test
     /// that is not about the policy cannot trip over it.
@@ -1807,6 +1850,111 @@ mod tests {
             err.message
         );
         assert!(!host.status().unwrap().running, "a failed start leaves nothing running");
+    }
+
+    /// **The integration test for the feature the background half exists for.**
+    ///
+    /// One press of the configured chord calls `RecorderHost::clip_now` — the same call the
+    /// window's Save clip button and the CLI's driver loop make — and that call really does
+    /// produce a clip: a real encoder child process, a real ring on disk, a real lossless
+    /// splice and a real row in the index.
+    ///
+    /// The trigger is an in-process function call. **No key, button or mouse event is
+    /// synthesised, simulated or injected anywhere in this test or in the code it drives** —
+    /// what needs Windows is `RegisterHotKey` (the chord itself), and everything on either
+    /// side of it is what this test covers. The capture source is the engine's synthetic
+    /// stub, so the suite opens no capture session on the host's display, and the encoder is
+    /// libx264, because a CI host has no GPU encoder.
+    #[test]
+    fn one_hotkey_press_writes_exactly_one_clip_through_the_recorder() {
+        const PRE_SECONDS: u64 = 2;
+        const POST_SECONDS: u64 = 1;
+
+        let f = Fixture::new();
+        let host = host(&f, true);
+
+        // The example config, shrunk to something that runs in seconds: a 2s pre-roll, a 1s
+        // post-roll, 10fps, and the capture backend's own size.
+        let mut settings = RecordingConfig::example().unwrap();
+        settings.buffer.pre_seconds = PRE_SECONDS;
+        settings.buffer.post_seconds = POST_SECONDS;
+        settings.buffer.segment_time = 1;
+        settings.buffer.scratch_cap_bytes = 512 * 1024 * 1024;
+        settings.encode.fps = 10;
+        settings.encode.output_size = String::new();
+        settings.storage.max_total_bytes = u64::MAX;
+        settings.storage.max_age_days = 3_650;
+
+        let started = host.start_for_test_with_stub_sources(&settings).unwrap();
+        assert!(started.running, "the engine is capturing before any press");
+
+        // Wait for the ring to hold the whole window — the same wait the CLI's self-test
+        // does before its trigger, and for the same reason: the engine refuses a trigger
+        // that asks for footage it does not have yet.
+        let need_ms = (PRE_SECONDS + POST_SECONDS) * 1_000;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = host.status().unwrap();
+            if status.span_ms >= need_ms {
+                break;
+            }
+            assert!(
+                status.running,
+                "the engine stopped while the ring was filling: {:?}",
+                status.error
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the ring never held {need_ms}ms of media (last: {}ms)",
+                status.span_ms
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // THE PRESS. `on_hotkey_press` is the function the hotkey thread calls; the closure
+        // is the call the button makes.
+        let outcome = crate::background::on_hotkey_press(|| host.clip_now());
+
+        let status = host.status().unwrap();
+        assert!(outcome.saved_a_clip(), "the press saved no clip: {outcome:?}");
+        assert_eq!(status.clips, 1, "the engine counted exactly one clip, not two");
+
+        // One file on disk, named as the trigger path names them.
+        let clips: Vec<PathBuf> = std::fs::read_dir(&f.paths.clips_dir)
+            .expect("the clips directory exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("clip-") && name.ends_with(".mp4"))
+            })
+            .collect();
+        assert_eq!(clips.len(), 1, "expected exactly one clip file, got {clips:?}");
+
+        // And it is real media of the configured window, produced by the real splice.
+        let info = MediaInfo::probe(&f.bins, &clips[0]).expect("the clip is readable media");
+        let expected_ms = (PRE_SECONDS + POST_SECONDS) * 1_000;
+        assert!(
+            (info.duration_ms as i64 - expected_ms as i64).abs() <= 800,
+            "clip duration {}ms is not the configured window ({expected_ms}ms ± the segment \
+             grid)",
+            info.duration_ms
+        );
+        assert_eq!(
+            info.video.as_ref().expect("a video stream").codec,
+            "h264",
+            "the software encoder is libx264 in a test build"
+        );
+
+        // One row in the index — the row `clip_now` wrote, in the store this shell reads.
+        let rows = f.store.list_clips().unwrap();
+        assert_eq!(rows.len(), 1, "the clip was indexed exactly once");
+        assert_eq!(rows[0].path, clips[0], "and the row names the file on disk");
+
+        // A stop flushes the encoder and closes the capture session.
+        let stopped = host.stop().unwrap();
+        assert!(!stopped.running);
     }
 
     #[test]

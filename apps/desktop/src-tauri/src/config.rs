@@ -155,6 +155,104 @@ impl RecordingConfig {
     }
 }
 
+/// The `[hotkeys]` and `[app]` sections — what the shell's *background* half needs.
+///
+/// The third reader of the same file (see the module docs for why there is more than one):
+/// `[storage]` opens the review window, `[buffer]`/`[encode]`/`[storage]` start a recording,
+/// and these two install the global clip hotkey and, optionally, the start-with-system
+/// entry. The values are *read once at startup* and are not re-read when a window opens: a
+/// hotkey is registered once and owned until the process exits, which is exactly why the
+/// tray offers "open config file" and the panel shows the path it came from.
+///
+/// Both sections are optional **here**, deliberately: a `config.toml` a user wrote for the
+/// CLI carries them, but a hand-trimmed file that does not is still a working window with
+/// the documented default chord rather than a shell that refuses to open. The CLI's own
+/// `Config` requires both; this is the front-end that can default them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundConfig {
+    /// `[hotkeys] clip`, verbatim. Parsed by `localplay_events::hotkey::Hotkey` — the same
+    /// parser the CLI uses — so one file means one chord to both front-ends.
+    pub clip_hotkey: String,
+    /// `[app] start_with_system`: whether the shell should own a start-with-Windows entry.
+    pub start_with_system: bool,
+}
+
+/// The chord used when `config.toml` has no `[hotkeys]` section.
+///
+/// A copy of `config.example.toml`'s value on purpose — the example is what the CLI falls
+/// back to and what a fresh install is documented to do — and pinned to it by a test below,
+/// because two spellings of "the default" that disagree is exactly the kind of drift a
+/// default exists to prevent. (It cannot be read from the example at *this* point without a
+/// parse that would need the same default.)
+pub const DEFAULT_CLIP_HOTKEY: &str = "Ctrl+F8";
+
+impl BackgroundConfig {
+    /// The settings from the repository's example config — the fallback when no
+    /// `config.toml` exists yet.
+    pub fn example() -> Result<Self, CommandError> {
+        Self::from_toml(EXAMPLE_CONFIG)
+    }
+
+    pub fn from_toml(text: &str) -> Result<Self, CommandError> {
+        #[derive(Deserialize)]
+        struct File {
+            hotkeys: Option<HotkeySection>,
+            #[serde(default)]
+            app: Option<AppSection>,
+        }
+        #[derive(Deserialize)]
+        struct HotkeySection {
+            clip: String,
+        }
+        #[derive(Deserialize)]
+        struct AppSection {
+            #[serde(default)]
+            start_with_system: bool,
+        }
+
+        let file: File = toml::from_str(text).map_err(|err| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "the config file's [hotkeys] section could not be read, so the clip \
+                     hotkey cannot be installed: {err}"
+                ),
+            )
+        })?;
+        Ok(Self {
+            clip_hotkey: file.hotkeys.map(|h| h.clip).unwrap_or_else(|| {
+                tracing::info!(
+                    "config.toml has no [hotkeys] section; using the documented default \
+                     \"{DEFAULT_CLIP_HOTKEY}\""
+                );
+                DEFAULT_CLIP_HOTKEY.to_string()
+            }),
+            start_with_system: file.app.map(|a| a.start_with_system).unwrap_or(false),
+        })
+    }
+
+    /// Read the background settings from `path`, or fall back to the example when the file
+    /// does not exist. A file that exists but is malformed is an error, as everywhere else
+    /// in this module: a typo'd hotkey must be reported, not silently replaced.
+    pub fn load(path: &Path) -> Result<Self, CommandError> {
+        if !path.is_file() {
+            tracing::info!(
+                "no config at {}; the clip hotkey and [app] settings come from \
+                 config.example.toml",
+                path.display()
+            );
+            return Self::example();
+        }
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            CommandError::new(
+                ErrorCode::Io,
+                format!("could not read the config file {}: {err}", path.display()),
+            )
+        })?;
+        Self::from_toml(&text)
+    }
+}
+
 /// The application data directory, by the same rule the CLI uses.
 ///
 /// Duplicated on purpose (see the module docs): the two binaries must agree on this path
@@ -286,5 +384,94 @@ mod tests {
     fn the_app_data_directory_ends_in_localplay() {
         // Whatever the host provides, the two binaries must land in the same subdirectory.
         assert_eq!(app_data_dir().file_name().unwrap(), "localplay");
+    }
+
+    // -- the [hotkeys] / [app] half -------------------------------------------------------
+
+    #[test]
+    fn the_background_settings_fall_back_to_the_example_config() {
+        // A fresh install has no `config.toml`: the hotkey must still be the documented
+        // Ctrl+F8 and start-with-system must still be off.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BackgroundConfig::load(&dir.path().join("config.toml")).unwrap();
+
+        assert_eq!(cfg, BackgroundConfig::example().unwrap());
+        assert_eq!(cfg.clip_hotkey, DEFAULT_CLIP_HOTKEY);
+        assert!(!cfg.start_with_system, "start_with_system is off unless it is asked for");
+    }
+
+    #[test]
+    fn the_example_config_carries_the_documented_hotkey_and_the_off_default() {
+        // `config.example.toml` is what a fresh install *does*, so the fallback constant
+        // above and the example must not drift apart. (This is the recursion-free way to
+        // pin them: the constant is the fallback for a file with no [hotkeys] at all.)
+        let example = BackgroundConfig::example().expect("config.example.toml must stay readable");
+        assert_eq!(example.clip_hotkey, DEFAULT_CLIP_HOTKEY);
+        assert!(!example.start_with_system, "the example must not autostart by default");
+
+        // And the file really carries the section, rather than the parse defaulting it: a
+        // user reading the example has to be able to find the switch it mentions.
+        assert!(
+            EXAMPLE_CONFIG.contains("[app]") && EXAMPLE_CONFIG.contains("start_with_system = false"),
+            "config.example.toml must document [app] start_with_system = false"
+        );
+    }
+
+    #[test]
+    fn a_file_without_the_hotkey_section_still_gets_the_default_chord() {
+        // The CLI would reject this file; the window must not. The chord it gets is the
+        // documented one, not an empty string that would fail to parse later.
+        let cfg = BackgroundConfig::from_toml(
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\nmax_age_days = 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.clip_hotkey, DEFAULT_CLIP_HOTKEY);
+        assert!(!cfg.start_with_system);
+    }
+
+    #[test]
+    fn reads_the_hotkey_and_the_app_section_when_the_file_sets_them() {
+        let cfg = BackgroundConfig::from_toml(
+            "[hotkeys]\nclip = \"Alt+F9\"\n\n[app]\nstart_with_system = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.clip_hotkey, "Alt+F9", "the user's chord is used verbatim");
+        assert!(cfg.start_with_system);
+    }
+
+    #[test]
+    fn a_malformed_hotkey_section_is_reported_rather_than_defaulted() {
+        // `clip = 8` is a typo a user will make. Falling back to Ctrl+F8 here would leave
+        // them pressing a key that is not the one they configured.
+        let err = BackgroundConfig::from_toml("[hotkeys]\nclip = 8\n").unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains("[hotkeys]"),
+            "the message must name the section: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_malformed_config_file_is_reported_with_its_path_for_the_hotkey_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[hotkeys\nclip = ").unwrap();
+
+        let err = BackgroundConfig::load(&path).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        // And the recorder's own reader agrees that the file is broken: one file, one
+        // verdict, whichever part of the shell reads it.
+        assert!(StorageConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_malformed_app_section_is_reported_rather_than_defaulted() {
+        let err = BackgroundConfig::from_toml("[app]\nstart_with_system = \"yes\"\n").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 }

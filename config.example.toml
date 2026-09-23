@@ -51,6 +51,21 @@ max_age_days = 7
 [hotkeys]
 clip = "Ctrl+F8"
 
+[app]
+# Start localplay with Windows (the desktop app; the CLI is never autostarted).
+#
+# `true`  = the app owns a value under
+#           HKCU\Software\Microsoft\Windows\CurrentVersion\Run — the per-user Run key — so
+#           the tray icon and the clip hotkey are there again after a reboot.
+# `false` = that value is removed, if this app put it there. Nothing else in the Run key is
+#           ever touched: the value name is localplay's own.
+#
+# The file is the only switch: this project has no settings UI, and an autostart entry that
+# disagreed with the file would be a second, invisible source of truth. It is applied at
+# startup, so a change needs a restart. Windows only — off Windows the app says so and does
+# nothing.
+start_with_system = false
+
 [events]
 # --- League of Legends (Riot's Live Client Data API) -------------------------------
 # Poll https://127.0.0.1:2999/liveclientdata/allgamedata while a game is running and turn
