@@ -6,7 +6,7 @@ use crate::splice::{ClipMetadata, ClipSplicer};
 use crate::window::{self, WindowError};
 use anyhow::{Context, Result};
 use localplay_media::FfmpegBinaries;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct BufferConfig {

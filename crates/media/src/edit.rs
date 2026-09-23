@@ -69,7 +69,7 @@ pub fn concat_lossless(bin: &FfmpegBinaries, list_file: &Path, dst: &Path) -> Re
     expect_success(cmd, "concat", dst)
 }
 
-fn expect_success(mut cmd: Command, what: &str, dst: &Path) -> Result<()> {
+fn expect_success(cmd: Command, what: &str, dst: &Path) -> Result<()> {
     let out = run_with_timeout(cmd, EDIT_TIMEOUT)?;
     if !out.status.success() {
         bail!(

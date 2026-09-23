@@ -39,12 +39,18 @@ fn sidecars_fetch() -> Result<()> {
     if manifest.contains("RECORD_ME") {
         bail!(
             "sidecars.toml has an unrecorded sha256. Run `cargo xtask sidecars record` on a \
-             trusted network, review the diff, and commit the recorded hash."
+             trusted network, review the diff, and commit the recorded hash. Fetching will \
+             then extract the archives into {}.",
+            binaries_dir().display()
         );
     }
     // Download to a temp file, verify sha256, then extract into binaries/.
     // Deliberately not implemented with a placeholder: see the note below.
-    bail!("not implemented in this task; see the note in the plan")
+    bail!(
+        "not implemented in this task; when implemented it will verify the archive against \
+         the recorded sha256 and extract into {} — see the note in the plan",
+        binaries_dir().display()
+    )
 }
 
 fn sidecars_record() -> Result<()> {
