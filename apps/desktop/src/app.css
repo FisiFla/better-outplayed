@@ -1,0 +1,178 @@
+/**
+ * The window's styles. Dark mode only (spec §9) — there is no light theme, no
+ * `prefers-color-scheme` branch and no theme switch, so every colour here is a
+ * deliberate choice for a dark surface rather than a variable that flips.
+ */
+
+:root {
+  --bg: #0b0c10;
+  --panel: #14161c;
+  --panel-2: #191c24;
+  --line: #262a35;
+  --text: #e6e8ee;
+  --muted: #99a0b0;
+  --accent: #5eead4;
+  --accent-dim: #2b6f64;
+  --danger: #f87171;
+  --warn: #fbbf24;
+  --star: #fbbf24;
+
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/*
+ * Nothing in this application makes a network request (principle 1), so the only scrolling
+ * is inside the two panes.
+ */
+#app {
+  height: 100vh;
+  overflow: hidden;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+p {
+  margin: 0;
+}
+
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, 'Cascadia Mono', Menlo, monospace;
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* -- shell layout -------------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: minmax(320px, 380px) 1fr;
+  height: 100%;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.pane-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 16px 10px;
+}
+
+/* -- primitives ---------------------------------------------------------------------- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+  color: #eafffb;
+  font-weight: 600;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+.banner {
+  margin: 0 16px 12px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.banner.error {
+  border-color: var(--danger);
+  color: #ffd9d9;
+}
+
+.banner.notice {
+  border-color: var(--accent-dim);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.empty {
+  padding: 24px 16px;
+  color: var(--muted);
+}
