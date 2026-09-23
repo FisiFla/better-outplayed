@@ -197,15 +197,39 @@ pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
     args
 }
 
-/// The ffmpeg arguments that describe **the encoder for that video input**: the scale
-/// filter when the output differs from the capture, the codec, its bitrate and its keyframe
-/// schedule.
+/// The ffmpeg arguments that describe **the encoder for that video input**: how frames are
+/// passed to it, the scale filter when the output differs from the capture, the codec, its
+/// bitrate and its keyframe schedule.
 ///
 /// Shared with the throughput probe for the same reason as [`video_input_args`]: the probe
 /// has to pay for the work the recording pays for. It writes to the null muxer, so the
 /// forced keyframes and the scale cost it exactly what they cost the segmenter.
 pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    // THE load-bearing option of the whole timeline. Do not remove it.
+    //
+    // ffmpeg's default (`-fps_mode auto`) picks a constant-rate conversion for this output,
+    // and a constant-rate conversion can only produce a rigid `1/R` grid — so a stream whose
+    // frames arrive at anything other than the declared `-framerate R` gets *resampled onto
+    // that grid*: missing frames are free to invent (duplicated), surplus ones are dropped.
+    // With the segment muxer in play that is not a cosmetic metadata difference, it IS the
+    // media clock. Measured on the dev host with the real argument list (4K output,
+    // libx264, ~8 frames a second arriving against a declared 120): 1631 frames were
+    // encoded from 39 delivered, `dup=1592`, every segment reported `avg_frame_rate=120/1`,
+    // and the ring's media clock then advanced at (frames the encoder can emit) ÷ R rather
+    // than at the wall clock — the segments themselves appeared at 0.66 per second, so
+    // `span=` fell behind real time for ever (issue #2).
+    //
+    // `passthrough` removes the conversion: each frame reaches the muxer with the timestamp
+    // it already has, which for this input is its arrival time (`-use_wallclock_as_timestamps
+    // 1`, see [`video_input_args`]). Media time then advances with the wall clock *by
+    // construction*, whatever rate frames arrive at, and a machine that cannot keep up drops
+    // frames — visible as holes in the picture and as a lower `avg_frame_rate` — instead of
+    // silently stretching the clock. `-vsync 0` is the same option's older spelling; the
+    // modern one is used because ffmpeg 5.1 renamed it (and the pinned Windows sidecar
+    // carries the new name: `strings binaries/ffmpeg.exe` finds `fps_mode` and its
+    // error text).
+    args.extend(["-fps_mode".to_string(), "passthrough".to_string()]);
     // Frames arrive at `source_size`; when the caller asked for a different output size,
     // scale to it. Equal sizes add no filter, which avoids a pointless pass.
     if cfg.source_size != cfg.output_size {
@@ -755,6 +779,31 @@ mod tests {
         assert_eq!(gop(&args_cfg(30, 1000)), 30);
         assert_eq!(gop(&args_cfg(30, 2000)), 60);
         assert_eq!(gop(&args_cfg(24, 1000)), 24);
+    }
+
+    /// The frame-rate conversion is off, on every arm.
+    ///
+    /// This is the option that makes the media timeline the wall clock rather than a declared
+    /// grid (see [`video_output_args`] and the module comment): with the default constant-rate
+    /// conversion, ffmpeg *invents* frames to fill a declared `1/R` grid, so media time
+    /// advances at (frames the encoder can emit) ÷ R instead of tracking real time. A change
+    /// that removes it, renames it back to a spelling the sidecar does not know, or moves it
+    /// before the input (where it would be ignored) has to fail here.
+    #[test]
+    fn frames_are_passed_through_and_never_resampled_onto_a_declared_grid() {
+        for (fps, segment_ms) in [(30u32, 1000u64), (60, 500), (120, 1000)] {
+            let cfg = args_cfg(fps, segment_ms);
+            let output = video_output_args(&cfg);
+            let i = output
+                .iter()
+                .position(|a| a == "-fps_mode")
+                .unwrap_or_else(|| panic!("-fps_mode missing from {output:?}"));
+            assert_eq!(output[i + 1], "passthrough", "at {fps}fps: {output:?}");
+            assert!(
+                !output.iter().any(|a| a == "-r" || a == "-fpsmax"),
+                "a frame-rate override re-introduces the grid this option removes: {output:?}"
+            );
+        }
     }
 
     #[test]

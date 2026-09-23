@@ -161,12 +161,27 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     assert_eq!(clip.metadata.size_bytes, std::fs::metadata(&clip.metadata.path).unwrap().len());
     assert_eq!(clip.metadata.encoder, "libx264", "the encoder that actually ran");
     // The window is `[trigger - pre, trigger + post]` in media terms and is spliced from
-    // whole segments, so the file covers the request to within one segment — never less
-    // (the post-roll is waited for), and never much more (whole segments, not the ring).
+    // whole segments, so the file covers the request to within one segment and never much
+    // more (whole segments, not the ring).
+    //
+    // It can now be *shorter* than the request by one frame interval per segment, and that is
+    // the honest shape of it rather than a defect: since the timeline fix
+    // (`-fps_mode passthrough`, `localplay_encoder::ffmpeg`) a scratch segment holds the frames
+    // that arrived while it was open — measured here at 10fps, ~940ms of media per 1000ms
+    // segment, because the frame that would have crossed the boundary belongs to the next
+    // segment and this one ends at the last frame that did arrive. Before the fix ffmpeg
+    // resampled the arrival timestamps onto a 1/R grid, so every segment held exactly
+    // `segment_time` of *invented* smoothness and the `span=` the ring read (segments ×
+    // segment_time) was an over-estimate of footage that had to be waited for: the clip was
+    // then the length it claimed and the footage in it was seconds old.
     let requested_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    let frame_ms = 1000 / u64::from(FPS);
+    let segments_in_window = requested_ms / (SEGMENT_SECONDS * 1000) + 1;
+    let slack_ms = segments_in_window * frame_ms;
     assert!(
-        clip.metadata.duration_ms >= requested_ms,
-        "the clip must cover the full pre+post window: {}ms for a {requested_ms}ms request",
+        clip.metadata.duration_ms + slack_ms >= requested_ms,
+        "the clip must cover the pre+post window within one frame interval per segment \
+         ({slack_ms}ms of slack): {}ms for a {requested_ms}ms request",
         clip.metadata.duration_ms
     );
     assert!(
