@@ -1,13 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "localplay",
+  "mainBinaryName": "localplay",
   "version": "0.1.0",
   "identifier": "io.github.fisifla.better-outplayed",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "npm run sidecars:check"
   },
   "app": {
     "windows": [
@@ -35,8 +37,23 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../../../binaries/": "binaries/"
+    },
+    "publisher": "FisiFla",
+    "copyright": "Copyright (c) 2026 FisiFla",
+    "category": "Video",
+    "homepage": "https://github.com/FisiFla/localplay",
+    "shortDescription": "Local, zero-cloud game clipping and replay buffer for Windows",
+    "longDescription": "localplay keeps the last 30-120 seconds of gameplay in a ring buffer and writes a lossless clip to disk the instant you press a hotkey or your game reports an event. No account, no telemetry, no cloud upload, no Overwolf runtime. Windows 10 1903+ / Windows 11, x86_64, with a hardware encoder (NVENC, QuickSync or AMF)."
   }
 }

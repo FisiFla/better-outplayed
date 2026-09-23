@@ -316,6 +316,121 @@ mod tests {
         StorageConfig::example().unwrap()
     }
 
+    /// The directory holding this crate's manifest, i.e. `apps/desktop/src-tauri`: the
+    /// place `tauri.conf.json` and the platform configs resolve their relative paths from.
+    fn tauri_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn config(file: &str) -> serde_json::Value {
+        let path = tauri_dir().join(file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {file}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing {file}: {e}"))
+    }
+
+    /// The half of the packaging contract that `crates/media` cannot check by itself.
+    ///
+    /// An installed app finds its ffmpeg by looking in `<resource dir>/binaries/`; the
+    /// bundler writes each `bundle.resources` entry to `<resource dir>/<destination>`. If
+    /// those two ever disagree the installer ships the sidecars to a path nothing reads, the
+    /// app falls back to `PATH`, and the failure lands on a user's machine — which is the
+    /// defect this test exists to make impossible to ship again. The directory name is read
+    /// from the media crate rather than spelled out here, so renaming it there fails here.
+    #[test]
+    fn the_bundle_maps_the_sidecars_where_discovery_reads_them() {
+        let config = config("tauri.conf.json");
+
+        assert_eq!(
+            config["bundle"]["active"],
+            serde_json::Value::Bool(true),
+            "bundling must be on, or there is no distributable artifact at all"
+        );
+
+        let resources = config["bundle"]["resources"]
+            .as_object()
+            .expect("bundle.resources is a path-to-destination map");
+        assert_eq!(resources.len(), 1, "exactly one mapping rule, the sidecar directory");
+        let (source, destination) = resources.iter().next().unwrap();
+        let destination = destination.as_str().expect("the destination is a string");
+
+        assert_eq!(
+            destination.trim_end_matches('/'),
+            localplay_media::binaries::SIDECAR_DIR_NAME,
+            "the bundler must write the sidecars into the directory `FfmpegBinaries::discover` \
+             reads: `binaries/` under the resource directory"
+        );
+
+        // The source is the directory `cargo xtask sidecars fetch` writes, i.e. the same
+        // one `FfmpegBinaries::discover`'s development fallback reads from a checkout.
+        assert_eq!(source, "../../../binaries/");
+        assert!(
+            tauri_dir().join(source).is_dir(),
+            "{} must exist for the bundle to be buildable at all: `tauri-build` refuses to \
+             compile when a mapped resource path is missing, which is why the directory \
+             carries a committed `.gitkeep`",
+            tauri_dir().join(source).display()
+        );
+    }
+
+    /// The metadata the installers are built from, and the icon files they name. Both are
+    /// things a bundle silently gets wrong: a non-existent icon path fails the bundling
+    /// step, and the placeholder identifier Tauri rejects (`com.tauri.dev`) is one typo away.
+    #[test]
+    fn the_bundle_metadata_and_icons_are_present_and_plausible() {
+        let config = config("tauri.conf.json");
+        let bundle = &config["bundle"];
+
+        assert_eq!(config["productName"], "localplay");
+        assert_eq!(config["mainBinaryName"], "localplay", "the installed exe is localplay");
+        assert_eq!(config["version"], "0.1.0", "in step with the workspace version");
+
+        let identifier = config["identifier"].as_str().expect("identifier");
+        assert_ne!(identifier, "com.tauri.dev", "Tauri refuses to bundle the placeholder id");
+        assert!(
+            identifier.matches('.').count() >= 2
+                && identifier
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+            "identifier must be a reverse-DNS id: {identifier}"
+        );
+
+        for key in ["publisher", "copyright", "category", "homepage", "shortDescription"] {
+            let value = bundle[key].as_str().unwrap_or_else(|| panic!("bundle.{key} is set"));
+            assert!(!value.trim().is_empty(), "bundle.{key} is empty");
+        }
+        assert_eq!(bundle["publisher"], "FisiFla", "the copyright holder in LICENSE-MIT");
+
+        let icons = bundle["icon"].as_array().expect("bundle.icon is a list");
+        assert!(!icons.is_empty(), "a bundle needs at least one icon");
+        for icon in icons {
+            let path = tauri_dir().join(icon.as_str().expect("icon paths are strings"));
+            assert!(
+                path.is_file(),
+                "bundle.icon names {}, which does not exist — the bundling step would fail",
+                path.display()
+            );
+        }
+    }
+
+    /// The installer targets, which are the only reason the platform configs exist: a build
+    /// must not try to produce another platform's artifact.
+    #[test]
+    fn every_platform_config_narrows_the_bundle_targets() {
+        for (file, expected) in [
+            ("tauri.windows.conf.json", vec!["nsis"]),
+            ("tauri.macos.conf.json", vec!["app"]),
+        ] {
+            let config = config(file);
+            let targets: Vec<&str> = config["bundle"]["targets"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{file} sets an explicit list of bundle targets"))
+                .iter()
+                .map(|t| t.as_str().expect("targets are strings"))
+                .collect();
+            assert_eq!(targets, expected, "{file}");
+        }
+    }
+
     #[test]
     fn opening_the_shell_creates_the_index_and_the_clips_directory() {
         let dir = tempfile::tempdir().unwrap();

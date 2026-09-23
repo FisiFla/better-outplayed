@@ -48,6 +48,16 @@ src-tauri/gen/schemas/
 binaries/
 **/binaries/*
 !**/binaries/.gitkeep
+# ...with one exception, and it is not the binaries themselves. Tauri's
+# `bundle.resources` (apps/desktop/src-tauri/tauri.conf.json) maps this very directory
+# into the installer, and `tauri-build` refuses to compile when a mapped resource path
+# does not exist -- so the *directory* has to be present in a fresh clone or the desktop
+# crate cannot build at all. A resident `.gitkeep` is what makes it present. The two rules
+# below exist because git cannot re-include a file inside an excluded directory: the
+# directory is re-included first, then everything in it is ignored again, `.gitkeep` aside.
+!binaries/
+binaries/*
+!binaries/.gitkeep
 ffmpeg
 ffmpeg.exe
 ffprobe
