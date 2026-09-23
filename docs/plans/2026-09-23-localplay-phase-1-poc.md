@@ -3483,10 +3483,29 @@ const _: PixelFormat = PixelFormat::Bgra8;
 > of Phase 1 and must be written on Windows with a debugger attached. Do **not**
 > mark this task complete until `localplay-cli buffer` reports a real frame counter.
 
-- [ ] **Step 3: Verify it compiles on Windows**
+- [ ] **Step 3: Verify it compiles for Windows**
 
-Run (on Windows): `cargo check -p localplay-capture --target x86_64-pc-windows-msvc`
-Expected: compiles.
+The Windows target can be **type-checked from macOS**, which is a real gate even
+though it is not a runtime test — `cargo check` does not link:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+CARGO_HOME="$PWD/target/cargo-home" cargo check -p localplay-capture -p localplay-events \
+  --target x86_64-pc-windows-msvc
+```
+
+Expected: compiles. **This gate already earned its keep** — it caught a genuine type
+error in the `#[cfg(windows)]` hotkey code (`RegisterHotKey` requires
+`HOT_KEY_MODIFIERS`, not `u32`) that is unreachable from a macOS build.
+
+Note: `cargo check --workspace --target x86_64-pc-windows-msvc` does **not** work from
+macOS, because `rusqlite`'s `bundled` feature compiles SQLite's C source through
+`cc-rs` and there is no Windows C toolchain here. Cross-check the individual Rust
+crates instead. This is also why the platform backend selection lives in
+`crates/capture` rather than the CLI: it keeps every `#[cfg(windows)]` line inside a
+crate that can be cross-checked.
+
+A real build and a real run on Windows hardware is still required (Task 17).
 
 - [ ] **Step 4: Commit**
 
@@ -3564,10 +3583,15 @@ impl AudioBackend for WasapiLoopback {
 }
 ```
 
-- [ ] **Step 3: Verify it compiles on Windows**
+- [ ] **Step 3: Verify it compiles for Windows**
 
-Run (on Windows): `cargo check -p localplay-capture --target x86_64-pc-windows-msvc`
-Expected: compiles.
+```bash
+CARGO_HOME="$PWD/target/cargo-home" cargo check -p localplay-capture \
+  --target x86_64-pc-windows-msvc
+```
+
+Expected: compiles. See Task 14 Step 3 for why this works from macOS and what it
+does and does not prove.
 
 - [ ] **Step 4: Commit**
 
