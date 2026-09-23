@@ -1533,17 +1533,25 @@ impl CaptureBackend for StubCapture {
     }
 
     /// Real-time paced, so the CLI's buffer runs at 1x like a real capture source.
+    ///
+    /// Returns `None` when the next frame is not due within `timeout`. That is what
+    /// lets a single-threaded caller drive video and audio together without either
+    /// stream starving (see the CLI loop in Task 13).
     /// `drain_for` deliberately bypasses pacing to keep tests fast.
-    fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<Frame>> {
+    fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>> {
         let started = self
             .started_at
             .ok_or_else(|| anyhow::anyhow!("capture not started"))?;
         let due = Duration::from_micros(
             self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64,
         );
-        if let Some(sleep) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(sleep);
+        let Some(sleep) = due.checked_sub(started.elapsed()) else {
+            return Ok(Some(self.render_next())); // already due
+        };
+        if sleep > timeout {
+            return Ok(None);
         }
+        std::thread::sleep(sleep);
         Ok(Some(self.render_next()))
     }
 
@@ -1589,14 +1597,18 @@ impl AudioBackend for StubAudio {
         Ok(())
     }
 
-    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+    fn next_buffer(&mut self, timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
         let started = self
             .started_at
             .ok_or_else(|| anyhow::anyhow!("audio capture not started"))?;
         let due = Duration::from_millis(self.block_index * 10);
-        if let Some(sleep) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(sleep);
+        let Some(sleep) = due.checked_sub(started.elapsed()) else {
+            return Ok(Some(self.next_block())); // already due
+        };
+        if sleep > timeout {
+            return Ok(None);
         }
+        std::thread::sleep(sleep);
         Ok(Some(self.next_block()))
     }
 
@@ -1648,7 +1660,9 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         48,
         30,
         dir.path().to_path_buf(),
-        1, // 1s segments
+        // MILLISECONDS. See the note in Task 10 — this unit is easy to get wrong
+        // and a ">= 2 segments" assertion will not catch it.
+        1_000,
     );
 
     let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
@@ -1678,6 +1692,14 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     let info = localplay_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
     assert!(info.video.is_some(), "segment must contain video");
     assert!(info.audio.is_some(), "segment must contain audio");
+    // Guards the `segment_ms` unit. Passing 1 instead of 1_000 silently produces
+    // 1ms segments, which still satisfies the ">= 2 segments" check above — so
+    // without this assertion the unit error goes unnoticed.
+    assert!(
+        (900..=1100).contains(&info.duration_ms),
+        "segment duration {}ms should be ~1000ms (segment_ms is milliseconds)",
+        info.duration_ms
+    );
 }
 ```
 
@@ -2064,7 +2086,7 @@ git commit -m "feat(encoder): single ffmpeg child with video and audio pipe inpu
 //! The PoC's core loop, exercised end to end off-Windows with stub sources.
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
+use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
 use std::time::Duration;
@@ -2081,7 +2103,10 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
         48,
         10,
         scratch.path().to_path_buf(),
-        1, // 1s segments
+        // MILLISECONDS, not seconds. This parameter is `segment_ms`; passing 1
+        // here yields 1ms segments while RingBuffer models them as 1000ms each,
+        // which silently breaks the window math.
+        1_000,
     );
     let cfg = BufferConfig {
         pre_ms: 3_000,
@@ -2096,7 +2121,9 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
     let mut encoder = FfmpegEncoder::spawn(&bin, &encode).unwrap();
     let mut ring = RingBuffer::start(
         &bin,
-        cfg,
+        // Cloned because `RingBuffer::start` takes BufferConfig by value and the
+        // cap is asserted against below.
+        cfg.clone(),
         scratch.path().to_path_buf(),
         "libx264".to_string(),
     )
@@ -3205,7 +3232,11 @@ fn run_buffer() -> Result<()> {
         if let Some(frame) = capture.next_frame(Duration::from_millis(5))? {
             encoder.submit_video(&frame)?;
         }
-        if let Some(block) = audio.next_buffer(Duration::from_millis(5))? {
+        // Drain every audio block that is already due. Audio blocks are 10ms while
+        // video frames are 16.7ms at 60fps, so submitting a single block per loop
+        // iteration would run audio at ~60% speed and desync the clip.
+        // A zero timeout makes `next_buffer` a non-blocking "is anything due?" check.
+        while let Some(block) = audio.next_buffer(Duration::ZERO)? {
             encoder.submit_audio(&block)?;
         }
 
