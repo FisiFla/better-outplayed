@@ -209,6 +209,14 @@ fn handle(
     sink: &EventSink,
     counters: &mut Counters,
 ) -> Result<()> {
+    // `accept` inherits the listener's non-blocking flag on macOS/*BSD (unlike Linux and
+    // Windows), and a non-blocking socket *ignores* the read/write timeouts set below: every
+    // read that finds no buffered data fails with `WouldBlock` at once, which `http` reads as
+    // a malformed request (400) instead of the 403/200 the client should see. Put the
+    // accepted socket back into blocking mode first, so the timeouts below are the
+    // connection's real bound — which is exactly the design the accept loop documents. On
+    // Windows and Linux `accept` already yields a blocking socket, so this is a no-op there.
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_nodelay(true);
