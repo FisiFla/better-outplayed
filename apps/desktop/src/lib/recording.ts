@@ -1,0 +1,121 @@
+/**
+ * The recording readout: how a live `RecordingStatus` becomes text.
+ *
+ * Pure functions over a value — no DOM, no state — for the same reason `time.ts` is: the
+ * window cannot be opened by this project's test suite, so the display rules are pinned by
+ * tests rather than eyeballed.
+ *
+ * The numbers come from `localplay-recorder`, the engine the CLI also drives, so what is
+ * described here is a real capture (or the honest absence of one). Nothing in this file
+ * invents a value the engine does not publish: a rate that has not been measured yet says
+ * so, rather than printing `0.0fps` next to a running recorder.
+ */
+
+import { basename } from './clips';
+import { formatBytes, formatDuration } from './time';
+import type { RecordedClip, RecordingStatus } from './types';
+
+/** How the panel describes the recorder: three states, one readout. */
+export type RecordingState = 'idle' | 'recording' | 'failed';
+
+/**
+ * Which of the three states the engine is in.
+ *
+ * `failed` is checked first: a recorder that stopped for a failure still has counters, and
+ * showing them under a "not recording" label would hide the reason it stopped.
+ */
+export function recordingState(status: RecordingStatus | null): RecordingState {
+  if (status === null) return 'idle';
+  if (status.error !== null) return 'failed';
+  return status.running ? 'recording' : 'idle';
+}
+
+/** The badge text for a state. */
+export function recordingLabel(status: RecordingStatus | null): string {
+  switch (recordingState(status)) {
+    case 'recording':
+      return 'REC';
+    case 'failed':
+      return 'stopped';
+    default:
+      return 'not recording';
+  }
+}
+
+/**
+ * The achieved rate against the configured one — `29.8 / 30 fps`.
+ *
+ * `localplay-recorder` measures the achieved rate over a one-second window and reports 0.0
+ * until the first window closes, deliberately (a rate over 200ms is noise). So a running
+ * recorder whose rate has not been measured yet says "measuring…", and an idle one shows a
+ * dash: `0.0 / 30 fps` on a healthy recorder would read as a failure that is not there.
+ */
+export function formatRate(status: RecordingStatus | null): string {
+  if (status === null || !status.running) return '—';
+  if (!(status.fps > 0)) return 'measuring…';
+  return `${status.fps.toFixed(1)} / ${status.configured_fps} fps`;
+}
+
+/**
+ * How far the media timeline has drifted from the wall clock, in words.
+ *
+ * Positive means the media timeline is *behind* real time — the measured 0.81x case on 4K
+ * hardware, where a clip's configured `pre_seconds` of media covers more real seconds than
+ * configured. It is reported rather than hidden because it is the reason the trigger is
+ * taken from media time (see `localplay-recorder`'s trigger path).
+ */
+export function formatDrift(status: RecordingStatus | null): string {
+  if (status === null || !status.running) return '—';
+  const drift = Math.round(status.drift_ms);
+  const direction = drift >= 0 ? 'behind' : 'ahead of';
+  return `${Math.abs(drift)}ms ${direction} real time`;
+}
+
+/**
+ * What the frame accounting says, or `null` when there is nothing to report.
+ *
+ * `dropped` is the encoder's own count of frames it discarded because its queue was full:
+ * the machine cannot encode at `encode.fps`, which is a timeline problem and not only a
+ * quality one. `skipped` is the pacer dropping surplus frames *without* reading them back,
+ * which is the optimisation working — it is normal and is only mentioned when it happens.
+ */
+export function describeFrames(status: RecordingStatus | null): string | null {
+  if (status === null) return null;
+  const parts: string[] = [];
+  if (status.dropped > 0) {
+    parts.push(
+      `${status.dropped} frame${status.dropped === 1 ? '' : 's'} dropped by the encoder — ` +
+        `this machine is not keeping up with ${status.configured_fps}fps`,
+    );
+  }
+  if (status.skipped > 0) {
+    parts.push(
+      `${status.skipped} frame${status.skipped === 1 ? '' : 's'} skipped without a GPU readback`,
+    );
+  }
+  if (status.dropped_audio > 0) {
+    parts.push(`${status.dropped_audio} audio blocks dropped`);
+  }
+  return parts.length === 0 ? null : `${parts.join('; ')}.`;
+}
+
+/**
+ * The notice for a clip that was just taken.
+ *
+ * A clip that could not be indexed is reported as exactly that, with its path: the file is
+ * on disk and it is what the user asked for, but it will not be in the list, and the
+ * storage policy cannot see it. Saying "saved" about it would be a lie a user would only
+ * discover later.
+ */
+export function describeRecordedClip(clip: RecordedClip): string {
+  const name = basename(clip.path);
+  const length = formatDuration(clip.duration_ms);
+  const size = formatBytes(clip.size_bytes);
+  if (clip.id === null) {
+    return (
+      `Wrote ${name} (${length}, ${size}, ${clip.codec}) but it could not be indexed, ` +
+      'so it will not appear in the list and the storage policy cannot manage it.'
+    );
+  }
+  return `Saved ${name} (${length}, ${size}, ${clip.codec}) as clip #${clip.id}.`;
+}

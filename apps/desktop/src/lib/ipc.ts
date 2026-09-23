@@ -22,6 +22,8 @@ import type {
   CommandError,
   DeleteOutcome,
   ErrorCode,
+  RecordedClip,
+  RecordingStatus,
   StorageStats,
   ThumbnailRef,
 } from './types';
@@ -34,6 +36,15 @@ export interface ClipSource {
   trimClip(id: number, startMs: number, endMs: number): Promise<ClipDto>;
   thumbnail(id: number, atMs: number): Promise<ThumbnailRef>;
   deleteClip(id: number): Promise<DeleteOutcome>;
+  /**
+   * Recording, through the same engine the CLI drives (`localplay-recorder`). These four
+   * are the only commands that make the shell capture anything, and none of them is
+   * called by this window on its own initiative: the user presses the button.
+   */
+  startRecording(): Promise<RecordingStatus>;
+  stopRecording(): Promise<RecordingStatus>;
+  recordingStatus(): Promise<RecordingStatus>;
+  clipNow(): Promise<RecordedClip>;
   /** An `asset:` URL for an absolute path, for `<video>` and `<img>`. */
   assetUrl(path: string): string;
 }
@@ -47,6 +58,10 @@ export const tauriIpc: ClipSource = {
     invoke<ClipDto>('trim_clip', { id, start_ms: startMs, end_ms: endMs }),
   thumbnail: (id, atMs) => invoke<ThumbnailRef>('thumbnail', { id, at_ms: atMs }),
   deleteClip: (id) => invoke<DeleteOutcome>('delete_clip', { id }),
+  startRecording: () => invoke<RecordingStatus>('start_recording'),
+  stopRecording: () => invoke<RecordingStatus>('stop_recording'),
+  recordingStatus: () => invoke<RecordingStatus>('recording_status'),
+  clipNow: () => invoke<RecordedClip>('clip_now'),
   assetUrl: (path) => convertFileSrc(path),
 };
 

@@ -64,6 +64,51 @@ export interface DeleteOutcome {
   thumbnails_removed: number;
 }
 
+/** The live recording status, as `recording_status` returns it. */
+export interface RecordingStatus {
+  /** False also means "never started": there is one status shape, not two. */
+  running: boolean;
+  /** Video frames submitted to the encoder this session. */
+  frames: number;
+  /** Completed segments in the scratch ring. */
+  segments: number;
+  /** Bytes the ring holds on disk. */
+  bytes: number;
+  /** Media time on disk, in ms: how much footage a clip can be cut from. */
+  span_ms: number;
+  /** Encoder frames dropped because its queue was full. */
+  dropped: number;
+  /** The same for audio blocks. */
+  dropped_audio: number;
+  /** Frames the capture source offered that were skipped without being read back. */
+  skipped: number;
+  /** Achieved frame rate over the last second; 0 until one has been measured. */
+  fps: number;
+  /** What `encode.fps` asked for. */
+  configured_fps: number;
+  /** Wall clock minus media time, ms. Positive means media time is behind real time. */
+  drift_ms: number;
+  /** Clips written this session. */
+  clips: number;
+  /** Why the engine stopped, when it stopped for a failure. */
+  error: string | null;
+}
+
+/** What a clip trigger produced, as `clip_now` returns it. */
+export interface RecordedClip {
+  /**
+   * The `clips` row, or `null` when the file was written but the index write failed —
+   * the clip exists on disk and will not appear in the list, and the UI has to say so.
+   */
+  id: number | null;
+  path: string;
+  duration_ms: number;
+  size_bytes: number;
+  codec: string;
+  /** The clip's first frame on the engine's media timeline. */
+  started_at_ms: number;
+}
+
 /** The machine-readable half of a command failure. */
 export type ErrorCode =
   | 'clip_not_found'
@@ -73,7 +118,8 @@ export type ErrorCode =
   | 'ffmpeg_unavailable'
   | 'store'
   | 'media'
-  | 'io';
+  | 'io'
+  | 'recording';
 
 /** A structured command failure, as `CommandError` serialises it. */
 export interface CommandError {

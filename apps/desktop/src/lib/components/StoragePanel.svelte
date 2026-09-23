@@ -22,7 +22,7 @@
   const favouritePercent = $derived(percentOf(stats.favourite_bytes, stats.cap_bytes));
 </script>
 
-<section class="panel">
+<section class="panel storage">
   <h2>Storage</h2>
 
   <div class="bar" role="img" aria-label="{usedPercent.toFixed(0)}% of the cap is used">

@@ -227,6 +227,54 @@ const FAVOURITES_OVER_CAP_FIXTURE = {
   },
 };
 
+/**
+ * A running recorder's status, exactly as `recording_status` publishes it.
+ *
+ * The numbers are the shape `localplay-recorder` gives (see its `RecorderStatus`): 12
+ * completed one-second segments, 480 frames submitted, a rate measured over the last
+ * second, and the 320 frames the pacer skipped *without* a GPU readback. `drift_ms` is
+ * positive because media time lags real time on capture hardware — the reason the trigger
+ * is taken from media time at all.
+ */
+const RECORDING_STATUS = {
+  running: true,
+  frames: 480,
+  segments: 12,
+  bytes: 41_943_040,
+  span_ms: 12_000,
+  dropped: 0,
+  dropped_audio: 0,
+  skipped: 320,
+  fps: 29.83,
+  configured_fps: 30,
+  drift_ms: 1_258,
+  clips: 1,
+  error: null,
+};
+
+/**
+ * The clip `clip_now` returns: the engine's own metadata plus the row it was indexed as.
+ *
+ * The path is Windows-shaped because that is the machine this application ships to; the id
+ * is 43, which is in the thumbnail set this script generates, so the row the list gains has
+ * a real picture in it.
+ */
+const NEW_CLIP = {
+  id: 43,
+  path: `${CLIPS_DIR}\\clip-2026-09-23_19-31-02_saved_from_the_window.mp4`,
+  duration_ms: 12_021,
+  size_bytes: 26_624,
+  codec: 'h264_nvenc',
+  started_at_ms: 42_000,
+};
+
+/** The library, with a recorder running and a clip ready to be taken. */
+const RECORDING_FIXTURE = {
+  ...LIST_FIXTURE,
+  recording: RECORDING_STATUS,
+  clipNow: NEW_CLIP,
+};
+
 /** No ffmpeg: the placeholder thumbnails, the error banner and `warnings[]` all at once. */
 const NO_FFMPEG_FIXTURE = {
   ...LIST_FIXTURE,
@@ -249,6 +297,23 @@ const NO_FFMPEG_FIXTURE = {
  */
 function installMockSource(fixture) {
   const clips = fixture.clips.map((c) => ({ ...c }));
+  // The recorder's status is state, not a constant: `save_clip` bumps the clip counter and
+  // a stop flips `running`, exactly as the engine's own counters would.
+  let recording = fixture.recording ?? {
+    running: false,
+    frames: 0,
+    segments: 0,
+    bytes: 0,
+    span_ms: 0,
+    dropped: 0,
+    dropped_audio: 0,
+    skipped: 0,
+    fps: 0,
+    configured_fps: 0,
+    drift_ms: 0,
+    clips: 0,
+    error: null,
+  };
   const find = (id) => clips.find((c) => c.id === id);
   const notFound = (id) => ({ code: 'clip_not_found', message: `clip #${id} is not in the index` });
   const basename = (p) => String(p).split(/[\\/]/).pop() ?? '';
@@ -312,6 +377,37 @@ function installMockSource(fixture) {
         bytes_reclaimed: removed ? removed.size_bytes : 0,
         thumbnails_removed: removed ? 1 : 0,
       };
+    },
+    async startRecording() {
+      // Nothing here starts a capture — a fixture cannot, and must not: the real
+      // `start_recording` opens a session on the display. The state it would move to is
+      // what this returns.
+      recording = fixture.recordingAfterStart ?? fixture.recording ?? { ...recording, running: true };
+      return { ...recording };
+    },
+    async stopRecording() {
+      recording = { ...recording, running: false };
+      return { ...recording };
+    },
+    async recordingStatus() {
+      return { ...recording };
+    },
+    async clipNow() {
+      const written = { ...fixture.clipNow };
+      // The engine writes the file and indexes it, so the list gains a row — which is what
+      // makes the window's refresh-after-mutate path visible in the screenshot.
+      clips.unshift({
+        id: written.id,
+        path: written.path,
+        started_at_ms: written.started_at_ms,
+        duration_ms: written.duration_ms,
+        size_bytes: written.size_bytes,
+        codec: written.codec,
+        favourite: false,
+        created_at_ms: fixture.trimmedAtMs,
+      });
+      recording = { ...recording, clips: recording.clips + 1 };
+      return { ...written };
     },
     // Where Tauri would hand back an `asset:` URL, this hands back the static server's.
     assetUrl: (path) => `/media/${basename(path)}`,
@@ -609,8 +705,11 @@ async function layoutAudit(page) {
       main: rect('.main'),
       mainScroll: scroller('.main'),
       clipList: scroller('.sidebar ul'),
-      storage: rect('.sidebar .panel'),
-      storageScroll: scroller('.sidebar .panel'),
+      // `.storage`, not `.panel`: the sidebar's first panel is the recorder (added with
+      // the recording UI), and this audit is about the storage panel's arithmetic.
+      storage: rect('.sidebar .storage'),
+      storageScroll: scroller('.sidebar .storage'),
+      recorder: rect('.sidebar .recorder'),
       timeline: rect('.timeline'),
       track: rect('.track'),
       player: rect('.player'),
@@ -655,8 +754,17 @@ const states = [
       );
       check(
         this.name,
-        (await page.locator('.sidebar .panel').count()) === 0,
+        (await page.locator('.sidebar .storage').count()) === 0,
         'no storage panel: `storage_stats` failed too, and the panel is not invented',
+      );
+      // The recorder panel is structural (it is where recording is driven the moment the
+      // IPC answers), and with no status it says so rather than showing invented numbers.
+      const recorder = page.locator('.sidebar .recorder');
+      check(this.name, await recorder.isVisible(), 'the recorder panel is still rendered');
+      check(
+        this.name,
+        ((await recorder.locator('.badge').textContent()) ?? '').trim() === 'not recording',
+        'and reports that nothing is recording',
       );
     },
   },
@@ -1003,7 +1111,7 @@ const states = [
     title: 'storage panel: the favourites alone exceed the cap',
     group: 'overcap',
     fixture: FAVOURITES_OVER_CAP_FIXTURE,
-    extraShots: [{ name: '07-storage-panel-closeup', selector: '.sidebar .panel' }],
+    extraShots: [{ name: '07-storage-panel-closeup', selector: '.sidebar .storage' }],
     async verify(page) {
       await waitForThumbnails(page, 8);
       const verdict = page.locator('.panel .verdict.bad');
@@ -1081,6 +1189,117 @@ const states = [
         .trim();
       check(this.name, okVerdict.includes('The cap can be met'), 'the cap verdict is still the good one');
       check(this.name, okVerdict.includes('delete 2 clips'), `the planned deletion count is stated (${JSON.stringify(okVerdict)})`);
+    },
+  },
+  {
+    name: '09-recording',
+    title: 'recording: the REC badge, the live counters and Save clip',
+    group: 'recording',
+    fixture: RECORDING_FIXTURE,
+    async verify(page) {
+      const panel = page.locator('.sidebar .recorder');
+      check(this.name, await panel.isVisible(), 'the recorder panel is the sidebar\'s first panel');
+      check(
+        this.name,
+        ((await panel.locator('.badge').textContent()) ?? '').trim() === 'REC',
+        'the badge says REC while the engine runs',
+      );
+      check(this.name, (await panel.locator('.dot').count()) === 1, 'and carries the marker dot');
+      check(
+        this.name,
+        await panel.getByRole('button', { name: 'Stop recording' }).isVisible(),
+        'the primary action is Stop while recording',
+      );
+      check(
+        this.name,
+        (await panel.getByRole('button', { name: 'Start recording' }).count()) === 0,
+        'and Start is not offered on top of a running recording',
+      );
+      check(
+        this.name,
+        await panel.getByRole('button', { name: 'Save clip' }).isEnabled(),
+        'Save clip is enabled — the trigger is reachable',
+      );
+
+      // The readout, field by field, against the status the engine published.
+      const readout = ((await panel.textContent()) ?? '').replace(/\s+/g, ' ');
+      for (const expected of [
+        '0:12.0 of media',
+        '12 (40 MiB)',
+        '480',
+        '29.8 / 30 fps',
+        '1258ms behind real time',
+      ]) {
+        check(this.name, readout.includes(expected), `the readout shows ${expected}`);
+      }
+      check(
+        this.name,
+        readout.includes('320 frames skipped without a GPU readback'),
+        'the skipped frames are accounted for rather than silent',
+      );
+      check(
+        this.name,
+        !readout.includes('dropped by the encoder'),
+        'and no encoder drop is claimed: there is none',
+      );
+
+      await waitForThumbnails(page, 6);
+      const layout = await layoutAudit(page);
+      check(
+        this.name,
+        insideViewport(layout.recorder, layout.viewport),
+        `the recorder panel fits the window (bottom ${layout.recorder.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
+      check(
+        this.name,
+        layout.storage.bottom <= layout.viewport.height + 0.5,
+        `and the storage panel is still fully visible below it (bottom ${layout.storage.bottom.toFixed(0)})`,
+      );
+
+      await auditContrast(page, this.name, {
+        '.recorder .badge.recording': 'REC badge',
+        '.recorder dt': 'recorder label',
+        '.recorder dd': 'recorder value',
+        '.recorder .footnote': 'recorder footnote',
+      });
+    },
+  },
+  {
+    name: '10-clip-saved',
+    title: 'recording: Save clip writes a clip, reports it and lists it',
+    group: 'recording',
+    fixture: RECORDING_FIXTURE,
+    async verify(page) {
+      // A real pointer event on the button the panel renders; the mock answers with the
+      // clip `clip_now` would return, and the list is refreshed exactly as it is after a
+      // real trigger.
+      await page.locator('.sidebar .recorder').getByRole('button', { name: 'Save clip' }).click();
+
+      const notice = page.locator('.banner.notice');
+      await notice.waitFor({ state: 'visible', timeout: 10_000 });
+      const text = ((await notice.textContent()) ?? '').replace(/\s+/g, ' ').trim();
+      check(
+        this.name,
+        text.includes('Saved clip-2026-09-23_19-31-02_saved_from_the_window.mp4'),
+        `the notice names the file that was written (${JSON.stringify(text.slice(0, 90))})`,
+      );
+      check(this.name, text.includes('(0:12.0, 26 KiB, h264_nvenc)'), 'and its length, size and codec');
+      check(this.name, text.includes('as clip #43'), 'and the row it was indexed as');
+
+      const names = await page.locator('.name').allTextContents();
+      check(this.name, names.length === 7, `the list gained the clip (${names.length} rows)`);
+      check(
+        this.name,
+        names[0] === 'clip-2026-09-23_19-31-02_saved_from_the_window.mp4',
+        'the clip that was just saved is the newest row',
+      );
+      check(
+        this.name,
+        await page.locator('.name').first().isVisible(),
+        'and the row is on screen, not below the fold',
+      );
+      const errorBanner = await page.locator('.banner.error').count();
+      check(this.name, errorBanner === 0, 'saving a clip reports no error');
     },
   },
 ];
@@ -1360,25 +1579,36 @@ async function main() {
 }
 
 /** Print the contrast table and fail on anything that is not readable. */
-async function auditContrast(page, state) {
-  const table = await contrastAudit(page, {
-    '.sidebar h2': 'pane heading',
-    '.pane-head .muted': 'clip count',
-    '.name': 'clip name',
-    '.sub.muted': 'clip metadata',
-    '.chip': 'fact chip',
-    '.panel .verdict.bad': 'storage warning',
-    '.panel .verdict.ok': 'storage verdict',
-    '.panel dt': 'panel label',
-    '.panel dd': 'panel value',
-    '.panel .footnote': 'panel footnote',
-    '.timeline .legend .muted': 'selection length',
-    '.timeline .playhead-readout': 'playhead readout',
-    '.timeline .hint': 'timeline hint',
-    '.panel.trim .selection .mono': 'trim range',
-    '.panel.trim .lossless': 'lossless note',
-    '.panel.trim .note': 'trim footnote',
-  });
+/**
+ * The text every state has to keep readable, and which panel each piece lives in.
+ *
+ * The selectors are scoped to the panel they describe rather than to `.panel` alone: the
+ * sidebar's first panel is the recorder (added with the recording UI), and
+ * `document.querySelector` would otherwise have measured the recorder's footnote where the
+ * label says "storage warning" — an audit that silently checks the wrong element.
+ */
+const CONTRAST_LABELS = {
+  '.sidebar h2': 'pane heading',
+  '.pane-head .muted': 'clip count',
+  '.name': 'clip name',
+  '.sub.muted': 'clip metadata',
+  '.chip': 'fact chip',
+  '.storage .verdict.bad': 'storage warning',
+  '.storage .verdict.ok': 'storage verdict',
+  '.storage dt': 'panel label',
+  '.storage dd': 'panel value',
+  '.storage .footnote': 'panel footnote',
+  '.timeline .legend .muted': 'selection length',
+  '.timeline .playhead-readout': 'playhead readout',
+  '.timeline .hint': 'timeline hint',
+  '.panel.trim .selection .mono': 'trim range',
+  '.panel.trim .lossless': 'lossless note',
+  '.panel.trim .note': 'trim footnote',
+};
+
+/** Print the contrast table and fail on anything that is not readable. */
+async function auditContrast(page, state, extra = {}) {
+  const table = await contrastAudit(page, { ...CONTRAST_LABELS, ...extra });
   log('    contrast audit (WCAG 2.1 AA: 4.5 normal text, 3.0 large)');
   for (const row of table) {
     if (row.missing) {

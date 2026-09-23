@@ -11,12 +11,24 @@
   import { onMount } from 'svelte';
   import ClipDetail from './lib/components/ClipDetail.svelte';
   import ClipList from './lib/components/ClipList.svelte';
+  import RecordingPanel from './lib/components/RecordingPanel.svelte';
   import StoragePanel from './lib/components/StoragePanel.svelte';
   import { describeDelete, describeTrim, resolveSelection, thumbnailAtMs, toClipViews } from './lib/clips';
   import type { ClipView } from './lib/clips';
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
-  import type { StorageStats, TrimRange } from './lib/types';
+  import { describeRecordedClip } from './lib/recording';
+  import type { RecordingStatus, StorageStats, TrimRange } from './lib/types';
+
+  /**
+   * How often the recorder's counters are read.
+   *
+   * They come from atomics on the recording thread (`RecorderHost::status`), so a poll
+   * cannot disturb a capture that is trying to hold 60fps; half a second is under the
+   * ~200ms tick the engine itself publishes on, which is the fastest this readout can
+   * meaningfully change.
+   */
+  const RECORDING_POLL_MS = 500;
 
   interface Props {
     /** Injected so the window can be driven without the Tauri runtime. */
@@ -27,11 +39,15 @@
 
   let clips = $state<ClipView[]>([]);
   let stats = $state<StorageStats | null>(null);
+  /** The engine's live counters; `null` until the first poll answers. */
+  let recording = $state<RecordingStatus | null>(null);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   let selectedId = $state<number | null>(null);
   /** A command is in flight; the controls that mutate are held while it is. */
   let busy = $state(false);
+  /** A recording command is in flight (a start handshake, a stop, or a clip trigger). */
+  let recordingBusy = $state(false);
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let loaded = $state(false);
@@ -74,6 +90,69 @@
         // fail the same way and there is nothing to learn from trying them.
         if (errorCode(err) === 'ffmpeg_unavailable') return;
       }
+    }
+  }
+
+  /**
+   * Read the recorder's status. Never blocks the recording loop, and never throws into the
+   * user's face: a failed poll is reported once through the banner and the readout keeps
+   * the last values it had.
+   */
+  async function refreshRecording() {
+    try {
+      recording = await source.recordingStatus();
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function startRecording() {
+    recordingBusy = true;
+    try {
+      recording = await source.startRecording();
+      notice =
+        'Recording. The buffer fills in the background; press Save clip (or Ctrl+F8 in the CLI) to write one.';
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      recordingBusy = false;
+    }
+  }
+
+  async function stopRecording() {
+    recordingBusy = true;
+    try {
+      recording = await source.stopRecording();
+      notice = 'Recording stopped; the encoder was flushed.';
+    } catch (err) {
+      error = errorMessage(err);
+      // The stop may have failed *after* the recorder went away, so the readout is
+      // refreshed either way rather than left claiming a recording that is not running.
+      await refreshRecording();
+    } finally {
+      recordingBusy = false;
+    }
+  }
+
+  /**
+   * Take a clip now.
+   *
+   * This is the one command that takes real time: the engine waits for the post-roll to be
+   * on disk (seconds) before it splices, so the button stays held while it runs. The clip
+   * is written into the clips directory this window lists, which is why the list is
+   * refreshed straight afterwards.
+   */
+  async function saveClip() {
+    recordingBusy = true;
+    try {
+      const clip = await source.clipNow();
+      notice = describeRecordedClip(clip);
+      await refresh();
+      void loadThumbnails();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      recordingBusy = false;
     }
   }
 
@@ -131,14 +210,29 @@
     return clips.find((clip) => clip.id === id)?.name ?? `clip #${id}`;
   }
 
-  onMount(async () => {
-    await refresh();
-    void loadThumbnails();
+  onMount(() => {
+    // Thumbnails are requested per clip, so they must wait for the list to arrive — which
+    // is why this is one sequential step rather than three independent ones.
+    void (async () => {
+      await refresh();
+      void loadThumbnails();
+    })();
+    // The recorder's counters are independent of the library, and are polled from here on.
+    void refreshRecording();
+    const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
+    return () => clearInterval(poll);
   });
 </script>
 
 <div class="shell">
   <aside class="sidebar">
+    <RecordingPanel
+      status={recording}
+      busy={recordingBusy}
+      onStart={startRecording}
+      onStop={stopRecording}
+      onClip={saveClip}
+    />
     <div class="pane-head">
       <h2>Clips</h2>
       <span class="muted">{clips.length} indexed</span>
@@ -205,5 +299,9 @@
 
   .main .banner:first-child {
     margin-top: 14px;
+  }
+
+  .sidebar .pane-head {
+    border-top: 1px solid var(--line);
   }
 </style>

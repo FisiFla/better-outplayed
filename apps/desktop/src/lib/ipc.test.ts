@@ -74,12 +74,16 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.trimClip(1, 0, 100))).toBe('trim_clip');
     expect(await wireName(() => tauriIpc.thumbnail(1, 0))).toBe('thumbnail');
     expect(await wireName(() => tauriIpc.deleteClip(1))).toBe('delete_clip');
+    expect(await wireName(() => tauriIpc.startRecording())).toBe('start_recording');
+    expect(await wireName(() => tauriIpc.stopRecording())).toBe('stop_recording');
+    expect(await wireName(() => tauriIpc.recordingStatus())).toBe('recording_status');
+    expect(await wireName(() => tauriIpc.clipNow())).toBe('clip_now');
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
-    // The commands the six methods above actually reached, compared against the handler
-    // list in src-tauri/src/lib.rs. A command added on one side and not the other fails
-    // here rather than as "Command not found" in a window.
+    // The commands the methods above actually reached, compared against the handler list
+    // in src-tauri/src/lib.rs. A command added on one side and not the other fails here
+    // rather than as "Command not found" in a window.
     const reached = [
       await wireName(() => tauriIpc.listClips()),
       await wireName(() => tauriIpc.storageStats()),
@@ -87,6 +91,10 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.trimClip(1, 0, 100)),
       await wireName(() => tauriIpc.thumbnail(1, 0)),
       await wireName(() => tauriIpc.deleteClip(1)),
+      await wireName(() => tauriIpc.startRecording()),
+      await wireName(() => tauriIpc.stopRecording()),
+      await wireName(() => tauriIpc.recordingStatus()),
+      await wireName(() => tauriIpc.clipNow()),
     ];
 
     expect([...reached].sort()).toEqual([...registeredCommands()].sort());
@@ -110,11 +118,18 @@ describe('the argument keys', () => {
   });
 
   it('sends exactly the parameters each Rust command declares', async () => {
+    // The recording commands take none: every one of them is answered from the shell's own
+    // state, so their arguments are the empty set and the Rust side must declare no
+    // parameters either.
     const sent = {
       set_favourite: await wireArgs(() => tauriIpc.setFavourite(3, true)),
       trim_clip: await wireArgs(() => tauriIpc.trimClip(3, 1_000, 2_000)),
       thumbnail: await wireArgs(() => tauriIpc.thumbnail(3, 1_000)),
       delete_clip: await wireArgs(() => tauriIpc.deleteClip(3)),
+      start_recording: await wireArgs(() => tauriIpc.startRecording()),
+      stop_recording: await wireArgs(() => tauriIpc.stopRecording()),
+      recording_status: await wireArgs(() => tauriIpc.recordingStatus()),
+      clip_now: await wireArgs(() => tauriIpc.clipNow()),
     };
 
     for (const [command, args] of Object.entries(sent)) {
@@ -129,6 +144,16 @@ describe('the argument keys', () => {
     expect(mockedInvoke).toHaveBeenCalledWith('list_clips');
     await tauriIpc.storageStats();
     expect(mockedInvoke).toHaveBeenCalledWith('storage_stats');
+    // The recording commands take no arguments either: the shell already knows its
+    // application data directory and its config file.
+    await tauriIpc.startRecording();
+    expect(mockedInvoke).toHaveBeenCalledWith('start_recording');
+    await tauriIpc.stopRecording();
+    expect(mockedInvoke).toHaveBeenCalledWith('stop_recording');
+    await tauriIpc.recordingStatus();
+    expect(mockedInvoke).toHaveBeenCalledWith('recording_status');
+    await tauriIpc.clipNow();
+    expect(mockedInvoke).toHaveBeenCalledWith('clip_now');
   });
 });
 
