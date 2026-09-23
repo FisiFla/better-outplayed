@@ -1946,37 +1946,54 @@ impl Encoder for FfmpegEncoder {
 }
 ```
 
-> **CORRECTION — the code block above does not compile or run as written.** Two
-> defects, both confirmed by a standalone repro during implementation (Task 9 is
-> committed and working; `crates/encoder/src/ffmpeg.rs` is the authoritative version):
+> **CORRECTION — the code block above does not compile or run as written.** Three
+> defects, all confirmed during implementation (Task 9 is committed and working;
+> `crates/encoder/src/ffmpeg.rs` is the authoritative version):
 >
 > 1. **`ChildStdout` is `Read`, not `Write`.** `Stdio::piped()` hands the parent the
 >    *read* end of the child's stdout, so `audio_in.write_all(...)` cannot compile —
->    and the parent could not write into that pipe at all. Fix: construct our own
->    pipe with `std::io::pipe()` (stable since Rust 1.87), pass the `PipeReader` to
->    the child via `Stdio::from(audio_reader)`, and keep the `PipeWriter` in the
->    parent. `pipe:0` / `pipe:1` and `-nostdin` are unchanged.
+>    and the parent could not write into that pipe at all. This was first worked
+>    around with `std::io::pipe()`, which is superseded by defect 3 below.
 > 2. **Synchronous writes deadlock.** ffmpeg's muxer refuses to pull one input far
 >    ahead of the other. Writing all video then all audio (which is exactly what this
 >    task's own test does) fills the video pipe and blocks forever — reproduced
 >    standalone: stalled after ~53 frames, killed by a 15s watchdog, zero segments.
->    Fix: give each pipe its own writer thread fed by an unbounded `mpsc` channel, so
+>    Fix: give each input its own writer thread fed by an unbounded `mpsc` channel, so
 >    `submit_video`/`submit_audio` enqueue and return immediately. `finish()` drops
->    both senders (closing the pipes → EOF), joins the threads, then waits on the
+>    both senders (closing the inputs → EOF), joins the threads, then waits on the
 >    child.
+> 3. **`-i pipe:1` is a Unix-only trick and breaks on Windows.** ffmpeg's pipe
+>    protocol parses the descriptor number and calls a plain CRT `read(fd, …)`; on
+>    Windows the CRT opens descriptor 1 as write-only, so `read(1, …)` fails with
+>    `EBADF`. macOS permits reading fd 1, which is precisely why the test suite
+>    passed and hid the problem. **The audio input is now loopback TCP:**
+>    `TcpListener::bind("127.0.0.1:0")`, the ephemeral port interpolated into
+>    `-i tcp://127.0.0.1:{port}`, and the pump thread accepts (with a connect
+>    deadline) and streams PCM over the socket. Video still uses `pipe:0`, which is
+>    the documented, portable path. Named pipes were considered and rejected: they
+>    are Windows-only code this project cannot verify from its macOS dev host,
+>    whereas `tcp://` is one `#[cfg]`-free path the macOS tests genuinely exercise.
+>    This is loopback-only IPC, not egress.
+>    - Two follow-on hazards, both now fixed in code: the listener must be
+>      non-blocking to enforce the accept deadline, but **BSD/macOS propagate
+>      `O_NONBLOCK` to the accepted socket** (Linux does not), which made
+>      `write_all` fail with `EAGAIN` under load — so the accepted socket is
+>      explicitly set back to blocking. This was reproducible: 2 of 3 suite runs
+>      failed before the fix, 10 of 10 passed after.
 >
 > The corrected shape is: `video_tx/audio_tx: Option<Sender<Vec<u8>>>`,
 > `video_writer/audio_writer: Option<JoinHandle<io::Result<()>>>`, plus
 > `fn pump<W: Write>(rx: Receiver<Vec<u8>>, mut sink: W)` which drains the channel
-> into the pipe and closes it on return. Because the trait takes `&Frame`/
+> into the sink and closes it on return. Because the trait takes `&Frame`/
 > `&AudioBuffer`, each submit clones the byte buffer — one extra memcpy per frame,
 > acceptable for the PoC but a known cost at 1080p60 (and an argument for the
 > Phase 2 native-MFT backend).
 >
 > Two further notes: `FfmpegEncoder` has no `Drop`, so dropping it without `finish()`
 > leaves the ffmpeg child running — the CLI must always call `finish()`. And
-> `tests/segmenting.rs` requires `--features test-encoders`, because integration
-> tests do not inherit the library's `cfg(test)`.
+> `tests/segmenting.rs` is gated with `required-features = ["test-encoders"]` so a
+> bare `cargo test` compiles and skips it, while
+> `--features localplay-encoder/test-encoders` runs it.
 
 Add `crates/encoder/src/probe.rs` — this is criterion 7's implementation, and it is
 what makes "no silent CPU fallback" real rather than aspirational:
