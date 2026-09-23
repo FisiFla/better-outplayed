@@ -603,6 +603,48 @@ it is not a check of the live source clocks. (See [Known gaps](#known-gaps).)
 `clip-<ts>.concat.txt` intermediate and the scratch `seg-*.mp4` files are inputs to the
 splice, not what you probe — probe the finished `clip-*.mp4`.
 
+### Checking an endpoint that is not natively 48 kHz
+
+The audio backend opens the loopback stream asking the audio **engine** to convert to the
+pipeline's 48 kHz stereo s16 (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`), so a default playback device whose native mix
+format is 44.1 kHz or 96 kHz — the usual default for USB DACs and wireless gaming
+headsets — no longer refuses to start. This build has **no Rust-side resampling**, and
+that engine-side conversion has never been observed: this is where it gets observed.
+Set the machine's default playback device to 44.1 kHz (or 96 kHz) in Windows Sound
+settings first, or there is nothing to check.
+
+1. Play something audible (a game, a video, music), then take a clip as in criterion 3.
+2. In the log, find the line printed when audio capture starts:
+
+   ```
+   WASAPI loopback capture started on the default render endpoint native_sample_rate=44100 native_channels=2 native_sample_format=F32 requested_sample_rate=48000 requested_channels=2 requested_sample_format="s16" converting=true
+   ```
+
+3. Probe the clip's audio stream:
+
+   ```powershell
+   ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"
+   ```
+
+**Expected observation (PASS)** — all three:
+
+- The log line names the endpoint's real, non-48 kHz rate, `requested_sample_rate=48000`
+  and `converting=true`. That pair is the evidence the *engine* did the conversion.
+- `ffprobe` reports `sample_rate=48000`, `channels=2` (`codec_name=aac`).
+- The clip's audio is **audible** and lip-sync is correct, as in the steps above.
+
+**FAILURE looks like**
+
+- The app refuses to start with an `Initialize` error naming the requested 48000 Hz stereo
+  s16 format: on this box the engine would not convert, so the format could not be
+  produced. Report it — with the `native_sample_rate` / `native_channels` /
+  `native_sample_format` values — and **do not** set the device to 48 kHz and call the
+  check passed; that is the cliff this change exists to remove.
+- `ffprobe` reports an audio stream that is not 48000 Hz stereo: the requested format was
+  not what came back, and the clip's audio timeline is mislabelled.
+- The clip's audio is silent.
+
 ---
 
 ## Known gaps
@@ -615,11 +657,16 @@ not softened; do not read a pass elsewhere as coverage of them.
   `cargo check --target x86_64-pc-windows-msvc` from macOS. Neither has ever run on
   Windows; **no frame has ever been captured**, and no audio sample has ever come through
   WASAPI. This runbook is the first place they get a real run.
-- **The audio mix-format gate fails loudly on a non-48 kHz endpoint.** WASAPI loopback
-  only produces 48 kHz stereo, and there is **no resampling**. A default playback device
-  whose shared-mode mix format is not 48 kHz is refused **by name** at startup ("… is
-  <rate>Hz, but localplay captures at 48000Hz and does not resample yet …"). Set the
-  device to 48000 Hz in Windows Sound settings.
+- **Engine-side sample-rate conversion has never been observed.** The WASAPI backend now
+  initialises the loopback stream with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+  AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` and asks for 48 kHz stereo s16, so the audio
+  engine is supposed to convert a 44.1 kHz or 96 kHz endpoint instead of refusing it. The
+  `Initialize` call and that conversion are **type-checked only** — never run. If the
+  engine declines, the app still refuses to start: loudly, naming the requested format,
+  and **without** a silent fallback to the endpoint's own rate (that would mislabel the
+  clip's audio timeline). The check is the last step of criterion 8, "Checking an endpoint
+  that is not natively 48 kHz", on a machine whose default playback device is set to
+  44.1 kHz or 96 kHz.
 - **Live-source clock divergence is still unmeasured.** A/V drift *within each produced
   clip* is now logged (see criterion 8), but that only checks that the two muxed streams
   line up. The divergence between the two *live* capture clocks — the WGC video clock and
