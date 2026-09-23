@@ -122,7 +122,9 @@ tempfile = "3"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-unwrap_used = "deny"
+# `warn`, not `deny`: test bodies legitimately use `unwrap()` everywhere, and
+# denying it would make `cargo test` fail to compile.
+unwrap_used = "warn"
 ```
 
 - [ ] **Step 2: Create each crate**
@@ -148,9 +150,6 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
-
-[features]
-test-encoders = ["test-encoders"]
 ```
 
 `crates/capture/Cargo.toml` additionally carries the Windows dependency:
@@ -165,6 +164,98 @@ test-encoders = []
 
 > Add the real `windows` feature list in Task 14 with `cargo add windows --features ...`;
 > do not hand-guess the version.
+
+`crates/replay/Cargo.toml` needs media for splicing and both test-only sources:
+
+```toml
+[package]
+name = "localplay-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+localplay-media = { path = "../media" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+localplay-capture = { path = "../capture" }
+localplay-encoder = { path = "../encoder" }
+tempfile.workspace = true
+
+# Forwards to the encoder's feature so the pipeline is testable off-Windows.
+[features]
+test-encoders = ["localplay-encoder/test-encoders"]
+
+[lints]
+workspace = true
+```
+
+`crates/encoder/Cargo.toml`:
+
+```toml
+[package]
+name = "localplay-encoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+localplay-capture = { path = "../capture" }
+localplay-media = { path = "../media" }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+test-encoders = []
+
+[lints]
+workspace = true
+```
+
+`crates/events/Cargo.toml`:
+
+```toml
+[package]
+name = "localplay-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [] }
+
+[lints]
+workspace = true
+```
+
+`crates/store/Cargo.toml`:
+
+```toml
+[package]
+name = "localplay-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true
+```
 
 Each `src/lib.rs` starts minimal:
 
@@ -193,6 +284,11 @@ localplay-replay  = { path = "../../crates/replay" }
 localplay-media   = { path = "../../crates/media" }
 localplay-events  = { path = "../../crates/events" }
 localplay-store   = { path = "../../crates/store" }
+
+# Enables the hidden `--dev-software-encoder` flag for pipeline smoke tests on a
+# host with no GPU encoder. Never enabled in a release build.
+[features]
+test-encoders = ["localplay-encoder/test-encoders"]
 
 [lints]
 workspace = true
@@ -603,7 +699,10 @@ fn fixture(dir: &std::path::Path) -> std::path::PathBuf {
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
             "-t", "3",
             "-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
-            "-c:a", "aac", "-shortest",
+            // `-ac 2` matters: `sine` defaults to mono, but the real pipeline
+            // captures 48kHz stereo, so a mono fixture would not exercise the
+            // same muxing path (criterion 8).
+            "-c:a", "aac", "-ac", "2", "-shortest",
         ])
         .arg(&out)
         .status()
@@ -1060,20 +1159,6 @@ pub fn newly_complete(observed: &[u64], highest_known: Option<u64>) -> Vec<u64> 
         .filter(|seq| highest_known.is_none_or(|known| *seq > known))
         .collect()
 }
-
-/// `None` is treated as "nothing known yet" for older rustc versions.
-trait IsNoneOr {
-    fn is_none_or(self, f: impl FnOnce(u64) -> bool) -> bool;
-}
-
-impl IsNoneOr for Option<u64> {
-    fn is_none_or(self, f: impl FnOnce(u64) -> bool) -> bool {
-        match self {
-            None => true,
-            Some(v) => f(v),
-        }
-    }
-}
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
@@ -1380,11 +1465,12 @@ pub struct StubConfig {
 pub struct StubCapture {
     cfg: StubConfig,
     frame_index: u64,
+    started_at: Option<std::time::Instant>,
 }
 
 impl StubCapture {
     pub fn new(cfg: StubConfig) -> Self {
-        Self { cfg, frame_index: 0 }
+        Self { cfg, frame_index: 0, started_at: None }
     }
 
     /// Produce the frames for `elapsed`, without sleeping.
@@ -1418,10 +1504,22 @@ impl StubCapture {
 impl CaptureBackend for StubCapture {
     fn start(&mut self) -> anyhow::Result<()> {
         self.frame_index = 0;
+        self.started_at = Some(std::time::Instant::now());
         Ok(())
     }
 
+    /// Real-time paced, so the CLI's buffer runs at 1x like a real capture source.
+    /// `drain_for` deliberately bypasses pacing to keep tests fast.
     fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<Frame>> {
+        let started = self
+            .started_at
+            .ok_or_else(|| anyhow::anyhow!("capture not started"))?;
+        let due = Duration::from_micros(
+            self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64,
+        );
+        if let Some(sleep) = due.checked_sub(started.elapsed()) {
+            std::thread::sleep(sleep);
+        }
         Ok(Some(self.render_next()))
     }
 
@@ -1434,11 +1532,12 @@ impl CaptureBackend for StubCapture {
 pub struct StubAudio {
     format: AudioFormat,
     block_index: u64,
+    started_at: Option<std::time::Instant>,
 }
 
 impl StubAudio {
     pub fn new(format: AudioFormat) -> Self {
-        Self { format, block_index: 0 }
+        Self { format, block_index: 0, started_at: None }
     }
 
     pub fn drain_for(&mut self, elapsed: Duration) -> Vec<AudioBuffer> {
@@ -1462,10 +1561,18 @@ impl StubAudio {
 impl AudioBackend for StubAudio {
     fn start(&mut self) -> anyhow::Result<()> {
         self.block_index = 0;
+        self.started_at = Some(std::time::Instant::now());
         Ok(())
     }
 
     fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        let started = self
+            .started_at
+            .ok_or_else(|| anyhow::anyhow!("audio capture not started"))?;
+        let due = Duration::from_millis(self.block_index * 10);
+        if let Some(sleep) = due.checked_sub(started.elapsed()) {
+            std::thread::sleep(sleep);
+        }
         Ok(Some(self.next_block()))
     }
 
@@ -1788,19 +1895,88 @@ impl Encoder for FfmpegEncoder {
 }
 ```
 
-Add to `crates/encoder/Cargo.toml`:
+Add `crates/encoder/src/probe.rs` — this is criterion 7's implementation, and it is
+what makes "no silent CPU fallback" real rather than aspirational:
 
-```toml
-[dependencies]
-localplay-capture = { path = "../capture" }
-localplay-media = { path = "../media" }
+```rust
+//! Choosing a hardware encoder, and failing loudly when there isn't one.
 
-[dev-dependencies]
-tempfile.workspace = true
+use crate::{VideoCodec, Vendor};
+use anyhow::{bail, Context, Result};
+use localplay_media::FfmpegBinaries;
+use std::process::Command;
 
-[features]
-test-encoders = []
+/// Vendors tried, in order, for `vendor = "auto"`.
+const AUTO_ORDER: [Vendor; 3] = [Vendor::Nvenc, Vendor::Qsv, Vendor::Amf];
+
+/// Pick a hardware encoder, or explain precisely why none is usable.
+///
+/// There is no software fallback (spec §3.2). A CPU encode would silently destroy
+/// in-game performance, so failing loudly is the correct behaviour.
+pub fn select_vendor(bin: &FfmpegBinaries, requested: &str, codec: VideoCodec) -> Result<Vendor> {
+    // Resolve the request before touching ffmpeg, so a bad config value fails
+    // immediately and does not depend on the machine's hardware.
+    let candidates: Vec<Vendor> = match requested {
+        "auto" => AUTO_ORDER.to_vec(),
+        "nvenc" => vec![Vendor::Nvenc],
+        "qsv" => vec![Vendor::Qsv],
+        "amf" => vec![Vendor::Amf],
+        other => bail!("unknown encode.vendor: {other}"),
+    };
+
+    let advertised = advertised_encoders(bin)?;
+    if let Some(vendor) = candidates
+        .iter()
+        .find(|v| advertised.iter().any(|e| *e == codec.hw_encoder_name(**v)))
+    {
+        return Ok(*vendor);
+    }
+
+    let wanted: Vec<&str> = candidates.iter().map(|v| codec.hw_encoder_name(*v)).collect();
+    bail!(
+        "no usable hardware encoder. ffmpeg advertises none of: {}. \
+         Install the GPU vendor runtime (NVIDIA driver / Intel graphics driver / \
+         AMD Adrenalin), or set encode.vendor to a vendor this machine has. \
+         localplay will not fall back to CPU encoding because it would cost game performance.",
+        wanted.join(", ")
+    )
+}
+
+/// Encoder names ffmpeg advertises. `-encoders` lines look like:
+/// ` V....D h264_nvenc  NVIDIA NVENC H.264 encoder (codec h264)`.
+fn advertised_encoders(bin: &FfmpegBinaries) -> Result<Vec<String>> {
+    let out = Command::new(&bin.ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .with_context(|| format!("running {}", bin.ffmpeg.display()))?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_vendor_name_fails_without_probing_ffmpeg() {
+        // A bogus binary path proves validation happens before any spawn.
+        let bin = FfmpegBinaries {
+            ffmpeg: "/nonexistent/ffmpeg".into(),
+            ffprobe: "/nonexistent/ffprobe".into(),
+        };
+        let err = select_vendor(&bin, "voodoo", VideoCodec::H264).unwrap_err();
+        assert!(err.to_string().contains("voodoo"), "got: {err}");
+    }
+}
 ```
+
+Add `pub mod probe;` to `crates/encoder/src/lib.rs`, and `pub use probe::select_vendor;`.
+
+> The `xtask probe` task (Task 16) prints the raw `-encoders` listing for debugging;
+> this module is the programmatic selection the CLI actually uses.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -1862,7 +2038,13 @@ fn triggering_produces_a_clip_with_video_and_audio_and_stays_under_the_cap() {
     let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 10 });
     let mut audio = StubAudio::new(AudioFormat::default());
     let mut encoder = FfmpegEncoder::spawn(&bin, &encode).unwrap();
-    let mut ring = RingBuffer::start(&bin, cfg).expect("start ring buffer");
+    let mut ring = RingBuffer::start(
+        &bin,
+        cfg,
+        scratch.path().to_path_buf(),
+        "libx264".to_string(),
+    )
+    .expect("start ring buffer");
 
     // 6 seconds of timeline: segments 0..5 exist, so 0..4 are complete.
     for frame in video.drain_for(Duration::from_secs(6)) {
@@ -2005,10 +2187,18 @@ pub struct RingBuffer {
     scratch_dir: PathBuf,
     ledger: SegmentLedger,
     highest_known: Option<u64>,
+    /// Name of the encoder actually in use, recorded on every clip so an ffprobe
+    /// mismatch is detectable (spec §11 criterion 5).
+    encoder: String,
 }
 
 impl RingBuffer {
-    pub fn start(bin: &FfmpegBinaries, cfg: BufferConfig, scratch_dir: PathBuf) -> Result<Self> {
+    pub fn start(
+        bin: &FfmpegBinaries,
+        cfg: BufferConfig,
+        scratch_dir: PathBuf,
+        encoder: String,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&scratch_dir)
             .with_context(|| format!("creating {}", scratch_dir.display()))?;
         std::fs::create_dir_all(&cfg.clips_dir)
@@ -2019,6 +2209,7 @@ impl RingBuffer {
             scratch_dir,
             ledger: SegmentLedger::default(),
             highest_known: None,
+            encoder,
         })
     }
 
@@ -2113,7 +2304,7 @@ impl RingBuffer {
             );
         }
         let out = self.cfg.clips_dir.join(format!("{stem}.mp4"));
-        let meta = ClipSplicer::splice(&self.bin, &win, &out, "unknown")?;
+        let meta = ClipSplicer::splice(&self.bin, &win, &out, &self.encoder)?;
         Ok(meta)
     }
 }
@@ -2833,12 +3024,14 @@ mod config;
 
 use anyhow::{bail, Context, Result};
 use config::Config;
-use localplay_capture::stub::{StubCapture, StubConfig};
-use localplay_capture::CaptureBackend;
+use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
+use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use localplay_encoder::probe::select_vendor;
+use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_events::hotkey::Hotkey;
 use localplay_media::FfmpegBinaries;
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -2895,20 +3088,33 @@ fn run_buffer() -> Result<()> {
         clips_dir: clips_dir.clone(),
     };
 
-    // Phase 1 wires the stub source so the pipeline runs on any platform. Task 14/15
-    // swap this for WgcCapture + WasapiLoopback behind the same traits.
-    let mut ring = RingBuffer::start(&bin, buffer_cfg.clone(), scratch_dir.clone())?;
+    // `--dev-software-encoder` only exists when built with the test-encoders feature.
+    let dev_software = std::env::args().any(|a| a == "--dev-software-encoder");
+    let (mut encoder, encoder_name) = build_encoder(&bin, &cfg, &scratch_dir, dev_software)?;
+    tracing::info!("encoding with {encoder_name}");
+
+    // Phase 1 wires the stub sources so the pipeline runs on any platform. Tasks 14/15
+    // swap these for WgcCapture + WasapiLoopback behind the same traits.
+    let mut ring = RingBuffer::start(
+        &bin,
+        buffer_cfg.clone(),
+        scratch_dir.clone(),
+        encoder_name.clone(),
+    )?;
     let adopted = ring.adopt_existing()?;
     if adopted > 0 {
         tracing::info!("adopted {adopted} segments from a previous run");
     }
 
+    let (width, height) = parse_output_size(&cfg.encode.output_size, 1920, 1080);
     let mut capture: Box<dyn CaptureBackend> = Box::new(StubCapture::new(StubConfig {
-        width: 1920,
-        height: 1080,
+        width,
+        height,
         fps: cfg.encode.fps,
     }));
+    let mut audio: Box<dyn AudioBackend> = Box::new(StubAudio::new(AudioFormat::default()));
     capture.start()?;
+    audio.start()?;
 
     let hotkeys = localplay_events::hotkey::listen(hotkey)?;
     let clock = localplay_events::CaptureClock::new();
@@ -2924,8 +3130,10 @@ fn run_buffer() -> Result<()> {
     let mut last_scan = Instant::now();
     loop {
         if let Some(frame) = capture.next_frame(Duration::from_millis(5))? {
-            tracing::trace!("frame at {:?}", frame.pts);
-            let _ = frame;
+            encoder.submit_video(&frame)?;
+        }
+        if let Some(block) = audio.next_buffer(Duration::from_millis(5))? {
+            encoder.submit_audio(&block)?;
         }
 
         if last_scan.elapsed() >= Duration::from_millis(200) {
@@ -2975,6 +3183,79 @@ fn run_buffer() -> Result<()> {
             );
         }
     }
+}
+
+/// Build the encoder. Hardware is the only shipping path.
+///
+/// `dev_software` exists solely so the pipeline can be smoke-tested on a host with
+/// no GPU encoder, and is only reachable when the CLI is built with
+/// `--features test-encoders`. It is never reachable from the config file.
+fn build_encoder(
+    bin: &FfmpegBinaries,
+    cfg: &Config,
+    scratch_dir: &Path,
+    dev_software: bool,
+) -> Result<(Box<dyn Encoder>, String)> {
+    let (width, height) = parse_output_size(&cfg.encode.output_size, 1920, 1080);
+    let codec = match cfg.encode.codec.as_str() {
+        "h264" => VideoCodec::H264,
+        "hevc" => VideoCodec::Hevc,
+        other => bail!("unsupported encode.codec: {other}"),
+    };
+    let segment_ms = cfg.buffer.segment_time * 1000;
+
+    let encode_cfg = if dev_software {
+        #[cfg(feature = "test-encoders")]
+        {
+            tracing::warn!(
+                "--dev-software-encoder: using libx264. This is for smoke-testing the \
+                 pipeline only and is NOT a supported configuration."
+            );
+            EncodeConfig::for_tests_software(
+                codec,
+                width,
+                height,
+                cfg.encode.fps,
+                scratch_dir.to_path_buf(),
+                segment_ms,
+            )
+        }
+        #[cfg(not(feature = "test-encoders"))]
+        {
+            bail!("--dev-software-encoder requires building with `--features test-encoders`");
+        }
+    } else {
+        let vendor = select_vendor(bin, &cfg.encode.vendor, codec)?;
+        EncodeConfig::hardware(
+            codec,
+            vendor,
+            width,
+            height,
+            cfg.encode.fps,
+            cfg.encode.bitrate_kbps,
+            segment_ms,
+            scratch_dir.to_path_buf(),
+        )
+    };
+
+    let encoder = FfmpegEncoder::spawn(bin, &encode_cfg)?;
+    let name = encoder.active_encoder().to_string();
+    Ok((Box::new(encoder), name))
+}
+
+/// `"1920x1080"`, or `""` for the supplied default.
+fn parse_output_size(spec: &str, default_w: u32, default_h: u32) -> (u32, u32) {
+    if spec.trim().is_empty() {
+        return (default_w, default_h);
+    }
+    spec.split_once('x')
+        .and_then(|(w, h)| {
+            Some((
+                w.trim().parse::<u32>().ok()?,
+                h.trim().parse::<u32>().ok()?,
+            ))
+        })
+        .unwrap_or((default_w, default_h))
 }
 
 fn unix_seconds() -> u64 {
