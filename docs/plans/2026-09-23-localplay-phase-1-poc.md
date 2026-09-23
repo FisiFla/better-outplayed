@@ -263,6 +263,23 @@ Each `src/lib.rs` starts minimal:
 //! localplay media drivers.
 ```
 
+`xtask/Cargo.toml` (the plan's file list names it but no contents were given, so this
+is the canonical shape):
+
+```toml
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+```
+
+`xtask/src/main.rs` is a doc comment plus an empty `fn main() {}` for now; Task 16
+fills it in.
+
 `apps/localplay-cli/Cargo.toml`:
 
 ```toml
@@ -1112,7 +1129,8 @@ mod tests {
 
     #[test]
     fn does_not_re_emit_already_known_segments() {
-        assert_eq!(newly_complete(&[0, 1, 2], Some(1)), vec![2]);
+        // seq 3 is the max observed, so only 2 is newly complete and > the known 1.
+        assert_eq!(newly_complete(&[0, 1, 2, 3], Some(1)), vec![2]);
     }
 
     #[test]
@@ -1206,15 +1224,17 @@ mod tests {
 
     #[test]
     fn selects_whole_segments_covering_the_window() {
-        let w = resolve(&ledger(20), 10_000, 30_000, 5_000).unwrap();
+        // 5s pre-roll from t=10s over a 20s buffer => segments 5..=14.
+        let w = resolve(&ledger(20), 10_000, 5_000, 5_000).unwrap();
         assert_eq!(w.seqs(), vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert!(!w.truncated_front);
     }
 
     #[test]
     fn clamps_and_reports_when_the_window_starts_before_the_buffer() {
-        // 3s of buffer, but 30s of pre-roll requested.
-        let w = resolve(&ledger(3), 2_000, 30_000, 5_000).unwrap();
+        // 3s of buffer, 30s of pre-roll requested, 1s post-roll so the buffer
+        // already reaches the needed timeline.
+        let w = resolve(&ledger(3), 2_000, 30_000, 1_000).unwrap();
         assert_eq!(w.seqs(), vec![0, 1, 2]);
         assert!(w.truncated_front, "caller must be able to warn about a short pre-roll");
     }
@@ -1297,7 +1317,11 @@ pub fn resolve(
 
     let want_start = trigger_ms.saturating_sub(pre_ms);
     let want_end = needed_ms;
-    let truncated_front = want_start < ledger.segments()[0].start_ms;
+    // `saturating_sub` clamps a pre-roll reaching before t=0 down to 0, so compare
+    // the *unclamped* request against the buffer's first segment to still detect a
+    // short pre-roll. Comparing want_start instead can never report truncation.
+    let buffer_start = ledger.segments()[0].start_ms;
+    let truncated_front = trigger_ms < pre_ms.saturating_add(buffer_start);
 
     let segments: Vec<Segment> = ledger
         .segments()
