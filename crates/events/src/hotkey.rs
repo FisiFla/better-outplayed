@@ -52,7 +52,7 @@ fn parse_key(key: Option<&str>) -> Result<u32> {
 #[cfg(windows)]
 pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+        RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
@@ -60,15 +60,15 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     std::thread::Builder::new()
         .name("localplay-hotkey".into())
         .spawn(move || {
-            let mut modifiers = 0u32;
+            let mut modifiers = HOT_KEY_MODIFIERS(0);
             if hk.ctrl {
-                modifiers |= MOD_CONTROL.0;
+                modifiers |= MOD_CONTROL;
             }
             if hk.alt {
-                modifiers |= MOD_ALT.0;
+                modifiers |= MOD_ALT;
             }
             if hk.shift {
-                modifiers |= MOD_SHIFT.0;
+                modifiers |= MOD_SHIFT;
             }
             // SAFETY: called on a dedicated thread that owns the message queue.
             unsafe {
