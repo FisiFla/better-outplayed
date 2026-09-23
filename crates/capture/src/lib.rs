@@ -2,7 +2,23 @@
 
 use std::time::Duration;
 
+pub mod platform;
 pub mod stub;
+
+#[cfg(windows)]
+pub mod wgc;
+
+/// The monotonic clock base shared by the video and audio backends.
+///
+/// Both backends take their `pts` from this one `Instant`, so A/V alignment is
+/// derivable: the two streams are measured from the same origin (spec §5.1) rather
+/// than each starting a private timeline at its own `start` call. `Instant` is the
+/// QPC clock on Windows, which is what the spec means by "QPC-based".
+#[cfg(windows)]
+pub(crate) fn clock_base() -> std::time::Instant {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(std::time::Instant::now)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
