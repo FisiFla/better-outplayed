@@ -1,0 +1,23 @@
+{
+  "auth": {
+    "token": "fixture-token-not-a-secret"
+  },
+  "provider": {
+    "name": "Counter-Strike: Global Offensive",
+    "appid": 730,
+    "version": 14013,
+    "steamid": "76561198000000001",
+    "timestamp": 1700000000
+  },
+  "map": {
+    "mode": "",
+    "name": "",
+    "phase": "",
+    "round": 0,
+    "team_ct": { "score": 0 },
+    "team_t": { "score": 0 }
+  },
+  "round": {
+    "phase": ""
+  }
+}

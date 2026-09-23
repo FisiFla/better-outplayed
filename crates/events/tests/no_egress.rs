@@ -9,7 +9,7 @@
 //!   one that pins the loopback address
 //!   ([`certificate_verification_is_relaxed_in_exactly_one_place`]);
 //! * every `TcpListener::bind` in the tree is pinned to loopback, and nothing in the tree
-//!   binds every interface ([`a_listener_binds_loopback_only`]).
+//!   binds every interface ([`the_gsi_listener_binds_loopback_only`]).
 //!
 //! A guard that passes for the wrong reason is worse than no guard, so each exemption below
 //! is by path and carries its reason — and every check reads **code**, with `//` comment
@@ -117,7 +117,7 @@ fn certificate_verification_is_relaxed_in_exactly_one_place() {
 }
 
 #[test]
-fn a_listener_binds_loopback_only() {
+fn the_gsi_listener_binds_loopback_only() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for entry in walk_rs(&root) {
         let rel = entry.to_string_lossy().replace('\\', "/");
@@ -180,10 +180,11 @@ fn only_the_loopback_modules_talk_to_a_socket_at_all() {
         connecting,
         vec![
             "crates/events/src/lol/client.rs".to_string(),
+            "crates/events/tests/gsi_listener.rs".to_string(),
             "crates/events/tests/lol_mock.rs".to_string(),
         ],
-        "the tree's outbound sockets are the League client and the test that drives its \
-         loopback mock; anything else needs a reason and an exemption here"
+        "the tree's outbound sockets are the League client and the tests that drive the \
+         loopback mocks; anything else needs a reason and an exemption here"
     );
 }
 

@@ -6,6 +6,7 @@
 //!   speak (spec §5.3, §5.5).
 //! * [`hotkey`] — the global `RegisterHotKey` listener (spec §7.4), which needs no game.
 //! * [`lol`] — the League of Legends Live Client Data poller (spec §7.1).
+//! * [`gsi`] — the CS2 / Dota 2 Game State Integration listener (spec §7.2).
 //! * [`wire`] — the HTTP/1.1 framing the two integrations share.
 //!
 //! # Both integrations are loopback-only, by construction
@@ -15,6 +16,7 @@
 //!
 //! * the League client ([`lol::client::LoopbackClient`]) is address-pinned to an
 //!   [`lol::Endpoint`], and an `Endpoint` can only be built for a loopback address;
+//! * the GSI listener binds `127.0.0.1` ([`gsi::bind`]) and refuses any other address.
 //!
 //! `tests/no_egress.rs` checks both statically over the tree, including that the one
 //! place that relaxes TLS verification is the one file that cannot address anything but
@@ -31,6 +33,7 @@ use std::fmt;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+pub mod gsi;
 pub mod hotkey;
 pub mod lol;
 pub mod wire;

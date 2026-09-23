@@ -1,0 +1,22 @@
+{
+  "auth": {
+    "token": "fixture-token-not-a-secret"
+  },
+  "provider": {
+    "name": "Dota 2",
+    "appid": 570,
+    "version": 45,
+    "steamid": "76561198000000003",
+    "timestamp": 1700000200
+  },
+  "map": {
+    "name": "start",
+    "matchid": "7400123456",
+    "game_time": 900,
+    "game_state": "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS"
+  },
+  "player": [
+    { "steamid": "76561198000000009", "name": "FisiFla", "kills": 4, "deaths": 2, "assists": 6 },
+    { "steamid": "76561198000000010", "name": "SomeoneElse", "kills": 1, "deaths": 1, "assists": 0 }
+  ]
+}
