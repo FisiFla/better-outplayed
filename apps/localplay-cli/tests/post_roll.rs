@@ -10,7 +10,7 @@
 //! is developed on, so the code had never run once.
 //!
 //! The hotkey itself is still untested (it needs Windows). What *is* tested here is the
-//! wait it drives, in isolation: `localplay_cli::pump_until_span` over stub capture
+//! wait it drives, in isolation: `localplay_recorder::pump_until_span` over stub capture
 //! sources and a real ffmpeg encoder.
 //!
 //! Gating: this file is deliberately **not** `#![cfg(feature = "test-encoders")]`.
@@ -30,7 +30,7 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::{pump_until_span, FramePacer};
+use localplay_recorder::{pump_until_span, FramePacer, PumpCounts};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
@@ -100,7 +100,7 @@ impl Fixture {
         )
         .expect("start ring buffer");
 
-        // Feed the pipeline in real time, through the same `pump_once` the CLI's loop
+        // Feed the pipeline in real time, through the same `pump_once` the engine's loop
         // and the post-roll wait use. The media timeline comes from the wall clock, so
         // this is what makes the stubs produce footage at all: an unpaced burst of the
         // same frames lands within a few milliseconds of capture time and encodes as a
@@ -111,7 +111,7 @@ impl Fixture {
         let mut pacer = FramePacer::new(FPS);
         let feed_until = Instant::now() + PRE_FED;
         while Instant::now() < feed_until {
-            localplay_cli::pump_once(&mut pacer, &mut capture, &mut audio, &mut encoder)
+            localplay_recorder::pump_once(&mut pacer, &mut capture, &mut audio, &mut encoder)
                 .expect("feeding the fixture's stubs");
         }
 
@@ -133,8 +133,8 @@ impl Fixture {
         Self { _scratch: scratch, _clips: clips, bin, ring, capture, audio, encoder, pacer }
     }
 
-    /// Exactly the call the hotkey branch makes.
-    fn pump(&mut self, need_ms: u64, budget: Duration) -> anyhow::Result<()> {
+    /// Exactly the call the trigger makes, returning what the wait pumped.
+    fn pump(&mut self, need_ms: u64, budget: Duration) -> anyhow::Result<PumpCounts> {
         pump_until_span(
             &mut self.pacer,
             &mut self.ring,
@@ -154,7 +154,7 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     // One iteration of the steady-state pump the CLI loop uses and `pump_until_span`
     // shares. The stub clock has caught up with real time by now, so whether a frame is
     // due does not matter: what matters is that a pump iteration cannot fail.
-    localplay_cli::pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    localplay_recorder::pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
         .expect("a pump iteration must not fail");
 
     let before = fx.ring.stats();
@@ -261,7 +261,7 @@ fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
     fx.pump(PRE_MS, Duration::from_secs(30))
         .expect("top the buffer up to a full pre-roll");
 
-    // Exactly the CLI's hotkey branch: the trigger position comes from the ledger, in
+    // Exactly the engine's trigger path: the trigger position comes from the ledger, in
     // media time; `need_ms` is `post_ms` further along that same timeline; the budget is
     // the wall-clock wait for it (post-roll + margin, as the CLI sizes it).
     let trigger_ms = fx.ring.stats().span_ms;

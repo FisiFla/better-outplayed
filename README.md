@@ -130,11 +130,12 @@ localplay/
 │   ├── capture/                # WGC + DXGI backends behind one trait
 │   ├── encoder/                # ffmpeg sidecar + NVENC/QSV/AMF selection
 │   ├── replay/                 # ring buffer, trigger windows, clip splice
+│   ├── recorder/               # the recording engine both front-ends drive
 │   ├── media/                  # ffmpeg/ffprobe sidecar driver, lossless trim
 │   ├── events/                 # LoL Live Client, CS2/Dota2 GSI, hotkeys
 │   └── store/                  # SQLite schema + clip/session index
 ├── apps/
-│   ├── localplay-cli/          # headless PoC binary (Phase 1)
+│   ├── localplay-cli/          # headless binary: a hotkey driver over `recorder`
 │   └── desktop/
 │       ├── src-tauri/          # Tauri v2 app, IPC commands, tray (Phase 2)
 │       └── src/                # Svelte frontend (timeline, scrubber, settings)

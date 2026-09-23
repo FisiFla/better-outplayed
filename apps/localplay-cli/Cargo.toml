@@ -10,6 +10,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
+# The recording engine. The CLI's own code drives it and nothing else: the pipeline —
+# capture, encoder, ring, trigger, clip index — lives in `localplay-recorder`, which the
+# desktop shell drives too. The sub-crates below are still named here because this
+# package's integration tests build fixtures out of them directly (the stubs, a raw
+# `FfmpegEncoder`, a `RingBuffer`).
+localplay-recorder = { path = "../../crates/recorder" }
 localplay-capture = { path = "../../crates/capture" }
 localplay-encoder = { path = "../../crates/encoder" }
 localplay-replay  = { path = "../../crates/replay" }
@@ -18,9 +24,10 @@ localplay-events  = { path = "../../crates/events" }
 localplay-store   = { path = "../../crates/store" }
 
 # Enables the hidden `--dev-software-encoder` flag for pipeline smoke tests on a
-# host with no GPU encoder. Never enabled in a release build.
+# host with no GPU encoder. Never enabled in a release build. Forwarded to the engine,
+# which is where the flag is acted on.
 [features]
-test-encoders = ["localplay-encoder/test-encoders"]
+test-encoders = ["localplay-encoder/test-encoders", "localplay-recorder/test-encoders"]
 
 # The post-roll regression test (`tests/post_roll.rs`) needs a scratch directory and
 # a clips directory of its own.
@@ -32,6 +39,9 @@ tempfile.workspace = true
 # opt-in). The test file is not `cfg`-gated, because the feature the suite enables on the
 # command line (`--features localplay-encoder/test-encoders`) is not this package's.
 localplay-encoder = { path = "../../crates/encoder", features = ["test-encoders"] }
+# The same trick for the engine: a test build can reach its software-encoder path, while
+# `cargo build` cannot (see the crate's own manifest).
+localplay-recorder = { path = "../../crates/recorder", features = ["test-encoders"] }
 
 [lints]
 workspace = true

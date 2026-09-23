@@ -8,7 +8,7 @@
 //! first real Windows run found exactly that shape: on a 4K display at 150% scaling the
 //! capture item was 3840x2160 while the pipe had been declared 2560x1440, because the
 //! size came from a DPI-virtualised `GetSystemMetrics`. Nothing failed; the picture was
-//! simply wrong. The guard (`localplay_cli::pump_once_counted` → `guard_frame_size`)
+//! simply wrong. The guard (`localplay_recorder::pump_once_counted` → `guard_frame_size`)
 //! turns that silence into an error naming both sizes, and this test drives it through
 //! the real pump path over the real ffmpeg encoder.
 //!
@@ -25,7 +25,7 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::{pump_once, pump_once_counted, FramePacer};
+use localplay_recorder::{pump_once, pump_once_counted, FramePacer};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 

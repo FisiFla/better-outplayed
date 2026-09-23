@@ -8,15 +8,19 @@
 //! Gating and reach: the global hotkey cannot fire off Windows (`localplay_events::hotkey`
 //! installs a real `RegisterHotKey` message loop only there), so the CLI's capture loop
 //! itself cannot be driven from a test on this host. Everything the hotkey *branch* does
-//! after its post-roll wait can be, and is, driven here with the same calls the branch
-//! makes: `RingBuffer::trigger` to splice, `localplay_cli::index_clip` to index, and the
-//! policy functions to evict. Like the rest of this package's tests, it needs ffmpeg on
-//! `PATH` with a working libx264 (see `post_roll.rs` on why the test-encoders feature is
-//! guaranteed by the dev-dependency rather than by a `cfg` gate).
+//! after its post-roll wait can be, and is, driven here with the same calls the engine
+//! makes: `RingBuffer::trigger` to splice, `localplay_recorder::index_clip` to index, and
+//! the policy functions to evict. (Those calls are the recorder crate's rather than this
+//! library's since the pipeline moved there; what this file still pins is that the whole
+//! sequence — splice, index, plan, evict — works over real ffmpeg output.)
+//!
+//! Like the rest of this package's tests, it needs ffmpeg on `PATH` with a working
+//! libx264 (see `post_roll.rs` on why the test-encoders feature is guaranteed by the
+//! dev-dependency rather than by a `cfg` gate).
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::FramePacer;
+use localplay_recorder::FramePacer;
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 use localplay_replay::buffer::{BufferConfig, RingBuffer};
@@ -73,7 +77,7 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     let mut pacer = FramePacer::new(FPS);
     let trigger_ms = PRE_MS; // run-relative media time, exactly as the CLI takes it
     let need_ms = trigger_ms + POST_MS;
-    localplay_cli::pump_until_span(
+    localplay_recorder::pump_until_span(
         &mut pacer,
         &mut ring,
         &mut capture,
@@ -95,7 +99,7 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     store.migrate().expect("migrate the clip index");
 
     let started_at_ms = ring.ledger_origin_ms() + trigger_ms.saturating_sub(PRE_MS);
-    let id = localplay_cli::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
+    let id = localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
 
     let rows = store.list_clips().expect("list the indexed clips");
     assert_eq!(rows.len(), 1, "one clip, one row");

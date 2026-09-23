@@ -40,7 +40,7 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_cli::{pump_once_counted, FramePacer, PumpCounts};
+use localplay_recorder::{pump_once_counted, FramePacer, PumpCounts};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 use std::time::{Duration, Instant};

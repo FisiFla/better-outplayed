@@ -110,7 +110,10 @@ $env:RUST_LOG = "debug"            # PowerShell
 # or, in cmd.exe:  set RUST_LOG=debug
 ```
 
-For the ledger line alone (much less noise) use `$env:RUST_LOG = "localplay_cli=debug"`.
+For the ledger line alone (much less noise) use `$env:RUST_LOG = "localplay_recorder=debug"`.
+The status line is emitted by the recording engine (`crates/recorder`), which both the CLI
+and the desktop shell drive, so its tracing target is that crate's — the CLI's own lines
+(`clip index …`, `buffering …`) keep `localplay_cli`.
 
 To keep a transcript, run everything through a file. For example:
 

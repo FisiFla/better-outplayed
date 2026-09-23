@@ -1,6 +1,12 @@
 //! Root configuration: TOML in the app data directory, never environment variables.
+//!
+//! The `[buffer]`, `[encode]` and `[storage]` sections are the recorder's own types
+//! (`localplay_recorder::config`), because they describe the recording and the desktop
+//! shell parses them too. What stays here is what a headless front-end owns: the hotkey
+//! and the (Phase 4) game-event sources.
 
 use anyhow::{bail, Context, Result};
+use localplay_recorder::config::{BufferSection, EncodeSection, StorageSection};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -15,36 +21,11 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct BufferSection {
-    pub pre_seconds: u64,
-    pub post_seconds: u64,
-    pub segment_time: u64,
-    pub scratch_cap_bytes: u64,
-    pub scratch_dir: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EncodeSection {
-    pub vendor: String,
-    pub codec: String,
-    pub bitrate_kbps: u32,
-    pub fps: u32,
-    pub output_size: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AudioSection {
     pub enabled: bool,
     pub source: String,
     pub codec: String,
     pub bitrate_kbps: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StorageSection {
-    pub clips_dir: String,
-    pub max_total_bytes: u64,
-    pub max_age_days: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,5 +109,19 @@ mod tests {
             .replace("gsi_port = 45671", "gsi_port = 80");
         let err = Config::from_toml(&text).unwrap_err();
         assert!(err.to_string().contains("gsi_port"), "got: {err}");
+    }
+
+    #[test]
+    fn the_capture_sections_are_the_recorders_own_types() {
+        // The CLI does not re-declare `[buffer]`, `[encode]` or `[storage]`: the desktop
+        // shell parses the same sections into the same types, which is what keeps one
+        // config file meaning one thing to both front-ends.
+        let cfg = Config::from_toml(include_str!("../../../config.example.toml")).unwrap();
+        let buffer: localplay_recorder::BufferSection = cfg.buffer;
+        let encode: localplay_recorder::EncodeSection = cfg.encode;
+        let storage: localplay_recorder::StorageSection = cfg.storage;
+        assert_eq!(buffer.segment_time, 1);
+        assert_eq!(encode.codec, "h264");
+        assert_eq!(storage.max_age_days, 7);
     }
 }
