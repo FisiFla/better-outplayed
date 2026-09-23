@@ -181,8 +181,47 @@ function statsFor(clips, overrides = {}) {
   };
 }
 
+/**
+ * The shell's background half, as `app_status` returns it: the clip hotkey, the file it was
+ * read from, and the sentence that explains closing the window.
+ *
+ * The chord, the close hint and the failure text are the *Rust* side's own strings (see
+ * `src-tauri/src/background.rs` and `crates/events/src/hotkey.rs`), which is exactly why
+ * photographing them is worth doing: this is the text a user reads before pressing a key or
+ * clicking the X of a window that does not quit when it closes.
+ */
+const APP_STATUS = {
+  hotkey: { chord: 'Ctrl+F8', installed: true, error: null },
+  config_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\config.toml',
+  config_exists: true,
+  close_hint:
+    'Closing this window hides localplay in the tray; recording keeps running. Quit from the ' +
+    'tray menu when you are done.',
+};
+
+/**
+ * The same, on a machine where the chord is already taken — the failure this feature exists
+ * to make visible rather than silent. `config_exists: false` as well, so one screenshot
+ * carries both facts: a dead hotkey, and no `config.toml` to change it in.
+ */
+const APP_STATUS_NO_HOTKEY = {
+  ...APP_STATUS,
+  hotkey: {
+    chord: 'Ctrl+F8',
+    installed: false,
+    error:
+      'the chord Ctrl+F8 could not be registered (RegisterHotKey failed: the hot key is ' +
+      'already registered). Another application — or another localplay (the CLI and this app ' +
+      'cannot both hold one chord) — already owns it. Nothing will happen when Ctrl+F8 is ' +
+      'pressed. Close the other application, or set a different [hotkeys] clip in config.toml ' +
+      'and restart.',
+  },
+  config_exists: false,
+};
+
 const EMPTY_FIXTURE = {
   clips: [],
+  appStatus: APP_STATUS,
   clipsDir: CLIPS_DIR,
   thumbsDir: THUMBS_DIR,
   thumbnails: 'ok',
@@ -193,6 +232,7 @@ const EMPTY_FIXTURE = {
 
 const LIST_FIXTURE = {
   clips: listClips,
+  appStatus: APP_STATUS,
   clipsDir: CLIPS_DIR,
   thumbsDir: THUMBS_DIR,
   thumbnails: 'ok',
@@ -273,6 +313,12 @@ const RECORDING_FIXTURE = {
   ...LIST_FIXTURE,
   recording: RECORDING_STATUS,
   clipNow: NEW_CLIP,
+};
+
+/** The same library, but the clip hotkey could not be registered. */
+const NO_HOTKEY_FIXTURE = {
+  ...LIST_FIXTURE,
+  appStatus: APP_STATUS_NO_HOTKEY,
 };
 
 /** No ffmpeg: the placeholder thumbnails, the error banner and `warnings[]` all at once. */
@@ -391,6 +437,11 @@ function installMockSource(fixture) {
     },
     async recordingStatus() {
       return { ...recording };
+    },
+    // Read once, when the window opens: the chord is registered at startup and the config
+    // path does not move while the process runs.
+    async appStatus() {
+      return { ...fixture.appStatus, hotkey: { ...fixture.appStatus.hotkey } };
     },
     async clipNow() {
       const written = { ...fixture.clipNow };
@@ -1256,11 +1307,38 @@ const states = [
         `and the storage panel is still fully visible below it (bottom ${layout.storage.bottom.toFixed(0)})`,
       );
 
+      // The half of the shell that is not a window, in the one place a user can read it:
+      // the chord (and the fact that it works with this window hidden) and what closing the
+      // window does — the sentence that stops "my app disappeared" being a mystery.
+      const panelText = ((await panel.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(
+        this.name,
+        panelText.includes('Press Ctrl+F8 to take a clip'),
+        `the panel names the chord to press (${JSON.stringify((await panel.locator('.hotkey').textContent())?.trim().slice(0, 70))})`,
+      );
+      check(
+        this.name,
+        panelText.includes('with this window hidden'),
+        'and says it works with the window hidden',
+      );
+      check(
+        this.name,
+        panelText.includes('hides localplay in the tray'),
+        'and says what closing the window does',
+      );
+      check(
+        this.name,
+        panelText.includes('Config: C:\\Users\\player\\AppData\\Local\\localplay\\config.toml'),
+        'and names the config file this process read',
+      );
+
       await auditContrast(page, this.name, {
         '.recorder .badge.recording': 'REC badge',
+        '.recorder .hotkey': 'hotkey line',
         '.recorder dt': 'recorder label',
         '.recorder dd': 'recorder value',
         '.recorder .footnote': 'recorder footnote',
+        '.recorder .shell-notes .config': 'config path',
       });
     },
   },
@@ -1300,6 +1378,62 @@ const states = [
       );
       const errorBanner = await page.locator('.banner.error').count();
       check(this.name, errorBanner === 0, 'saving a clip reports no error');
+    },
+  },
+  {
+    name: '11-hotkey-not-installed',
+    title: 'no hotkey: the chord that failed is on screen, and the app still works',
+    group: 'nohotkey',
+    fixture: NO_HOTKEY_FIXTURE,
+    extraShots: [{ name: '11-hotkey-not-installed-closeup', selector: '.sidebar .recorder' }],
+    async verify(page) {
+      // The whole reason this panel exists in the shape it does. A hotkey that silently does
+      // nothing is the worst outcome this feature has, so the failure is an alert above the
+      // buttons — not a log line, and not a footnote under the numbers.
+      const panel = page.locator('.sidebar .recorder');
+      const alert = panel.locator('.hotkey.bad');
+      check(this.name, await alert.isVisible(), 'the hotkey failure is visible in the recorder panel');
+
+      const text = ((await alert.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(this.name, text.includes('Ctrl+F8'), `it names the chord that failed (${JSON.stringify(text.slice(0, 80))})`);
+      check(this.name, text.includes('NOT installed'), 'and says that nothing is listening');
+      check(this.name, text.includes('already registered'), 'and carries the reason the registration failed');
+      check(
+        this.name,
+        text.includes('another localplay'),
+        'including the second-instance case: the CLI and the app cannot both hold one chord',
+      );
+
+      const panelText = ((await panel.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(
+        this.name,
+        panelText.includes('No config.toml at'),
+        'and the config line says the example values are in force, naming the path',
+      );
+      check(
+        this.name,
+        panelText.includes('config.example.toml are'),
+        'so the defaults are not presented as configured values',
+      );
+
+      // Without a hotkey this is still a recording application — the alert is why it is not
+      // a refusal to start.
+      check(
+        this.name,
+        await panel.getByRole('button', { name: 'Start recording' }).isEnabled(),
+        'Start recording is still offered: the window works without the hotkey',
+      );
+      check(
+        this.name,
+        (await panel.locator('.badge').textContent())?.trim() === 'not recording',
+        'and the recorder is honestly idle',
+      );
+
+      await waitForThumbnails(page, 6);
+      await auditContrast(page, this.name, {
+        '.recorder .hotkey': 'hotkey alert',
+        '.recorder .shell-notes .config': 'config path',
+      });
     },
   },
 ];

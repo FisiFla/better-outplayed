@@ -78,6 +78,7 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.stopRecording())).toBe('stop_recording');
     expect(await wireName(() => tauriIpc.recordingStatus())).toBe('recording_status');
     expect(await wireName(() => tauriIpc.clipNow())).toBe('clip_now');
+    expect(await wireName(() => tauriIpc.appStatus())).toBe('app_status');
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
@@ -95,6 +96,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.stopRecording()),
       await wireName(() => tauriIpc.recordingStatus()),
       await wireName(() => tauriIpc.clipNow()),
+      await wireName(() => tauriIpc.appStatus()),
     ];
 
     expect([...reached].sort()).toEqual([...registeredCommands()].sort());
@@ -154,6 +156,9 @@ describe('the argument keys', () => {
     expect(mockedInvoke).toHaveBeenCalledWith('recording_status');
     await tauriIpc.clipNow();
     expect(mockedInvoke).toHaveBeenCalledWith('clip_now');
+    // `app_status` takes nothing either: the shell knows its own config path and hotkey.
+    await tauriIpc.appStatus();
+    expect(mockedInvoke).toHaveBeenCalledWith('app_status');
   });
 });
 

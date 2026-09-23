@@ -1,29 +1,36 @@
 <script lang="ts">
   /**
-   * The recorder panel: start, stop, take a clip, and the live readout.
+   * The recorder panel: start, stop, take a clip, and the live readout — plus the two facts
+   * about this shell's *background* half that a user cannot otherwise discover: which chord
+   * takes a clip (and whether it is really installed), and what closing the window does.
    *
    * This window OWNS nothing of the recording: the engine is `localplay-recorder` — the
    * same crate the CLI drives — and every number below comes from its status. What this
    * component decides is only what a person sees: three states (not recording, REC,
    * stopped with a reason), the counters while it runs, and two buttons.
    *
-   * It deliberately has no controls for things that do not exist yet: no hotkey binding, no
+   * It deliberately has no controls for things that do not exist yet: no hotkey *binding*
+   * (the chord is `[hotkeys] clip` in `config.toml`, and the panel names the file), no
    * encoder picker, no per-game event toggle. Those are settings (spec §10) or Phase 4, and
    * a disabled-looking control that cannot work is worse than no control.
    */
   import {
+    describeConfig,
     describeFrames,
+    describeHotkey,
     formatDrift,
     formatRate,
     recordingLabel,
     recordingState,
   } from '../recording';
   import { formatBytes, formatDuration } from '../time';
-  import type { RecordingStatus } from '../types';
+  import type { AppStatus, RecordingStatus } from '../types';
 
   interface Props {
     /** `null` until the first status has arrived. */
     status: RecordingStatus | null;
+    /** The background half — the hotkey, and where the config came from. `null` until read. */
+    app: AppStatus | null;
     /** A command is in flight; the buttons are held while it is. */
     busy?: boolean;
     onStart: () => void;
@@ -31,10 +38,12 @@
     onClip: () => void;
   }
 
-  let { status, busy = false, onStart, onStop, onClip }: Props = $props();
+  let { status, app = null, busy = false, onStart, onStop, onClip }: Props = $props();
 
   const state = $derived(recordingState(status));
   const frames = $derived(describeFrames(status));
+  const hotkey = $derived(describeHotkey(app?.hotkey ?? null));
+  const config = $derived(describeConfig(app));
 </script>
 
 <section class="panel recorder">
@@ -45,6 +54,10 @@
       {recordingLabel(status)}
     </span>
   </div>
+
+  {#if hotkey !== null}
+    <p class="hotkey" class:bad={hotkey.problem}>{hotkey.text}</p>
+  {/if}
 
   <div class="controls">
     {#if state === 'recording'}
@@ -107,6 +120,12 @@
       read failed — the banner above says which). Recording needs a GPU encoder (NVENC,
       Quick Sync or AMF) and writes to the same clips directory this window lists; the CLI
       records through this same engine.
+    </p>
+  {/if}
+
+  {#if app !== null}
+    <p class="muted footnote shell-notes">
+      {app.close_hint}{#if config !== null}<span class="config">{' '}{config}</span>{/if}
     </p>
   {/if}
 </section>
@@ -197,7 +216,30 @@
     border-left: 3px solid var(--warn);
   }
 
+  /*
+   * The hotkey line: the sentence that tells a user which key to press, or — when nothing is
+   * listening — the failure, which has to look like one. It is above the buttons on purpose:
+   * it is the control that actually gets used, and it is the one that can be dead.
+   */
+  .hotkey {
+    margin: 0;
+    padding: 4px 8px;
+    border-left: 3px solid var(--line);
+    background: var(--panel-2);
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  .hotkey.bad {
+    border-left-color: var(--warn);
+  }
+
   .footnote {
     font-size: 11px;
+  }
+
+  .shell-notes .config {
+    font-family: ui-monospace, SFMono-Regular, 'Cascadia Mono', Menlo, monospace;
+    overflow-wrap: anywhere;
   }
 </style>

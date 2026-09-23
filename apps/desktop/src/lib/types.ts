@@ -109,6 +109,38 @@ export interface RecordedClip {
   started_at_ms: number;
 }
 
+/**
+ * What the shell can say about the clip hotkey, as `app_status` returns it.
+ *
+ * `installed: false` is the interesting case: the chord is still named (it is what the user
+ * was told to press) and `error` says why nothing is listening — the chord is taken by
+ * another application or another localplay, or this build has no global hotkey at all.
+ */
+export interface HotkeyStatus {
+  /** The configured chord, normalised by the Rust side's `Hotkey` display (`Ctrl+F8`). */
+  chord: string;
+  /** True only when a listener is really installed in the running process. */
+  installed: boolean;
+  /** Why it is not installed; `null` exactly when `installed` is true. */
+  error: string | null;
+}
+
+/**
+ * The half of the shell that is not a window, as `app_status` returns it.
+ *
+ * This is the "the config is a file" contract: the window names the file this process read
+ * rather than offering a settings panel it does not have.
+ */
+export interface AppStatus {
+  hotkey: HotkeyStatus;
+  /** The `config.toml` this process read, `<app data>/config.toml`. */
+  config_path: string;
+  /** False when that file does not exist and the example's values are in force. */
+  config_exists: boolean;
+  /** What closing the window does, in the words the panel shows. */
+  close_hint: string;
+}
+
 /** The machine-readable half of a command failure. */
 export type ErrorCode =
   | 'clip_not_found'

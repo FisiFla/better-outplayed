@@ -13,7 +13,7 @@
 
 import { basename } from './clips';
 import { formatBytes, formatDuration } from './time';
-import type { RecordedClip, RecordingStatus } from './types';
+import type { AppStatus, HotkeyStatus, RecordedClip, RecordingStatus } from './types';
 
 /** How the panel describes the recorder: three states, one readout. */
 export type RecordingState = 'idle' | 'recording' | 'failed';
@@ -118,4 +118,44 @@ export function describeRecordedClip(clip: RecordedClip): string {
     );
   }
   return `Saved ${name} (${length}, ${size}, ${clip.codec}) as clip #${clip.id}.`;
+}
+
+/**
+ * How the panel describes the clip hotkey, and whether that is a problem.
+ *
+ * `problem` is the difference between a line of orientation and an alert: an *installed*
+ * hotkey is a sentence telling the user what to press; one that is not installed is a
+ * failure they have to act on — the chord is held by another application or by another
+ * localplay, or this build has no global hotkey at all. The reason is the shell's own
+ * sentence (it names the chord and the likely owner), not something invented here.
+ */
+export function describeHotkey(
+  hotkey: HotkeyStatus | null,
+): { text: string; problem: boolean } | null {
+  if (hotkey === null) return null;
+  if (hotkey.installed) {
+    return {
+      text: `Press ${hotkey.chord} to take a clip — with this window hidden, or in the tray.`,
+      problem: false,
+    };
+  }
+  const reason = hotkey.error ?? 'the reason was not reported.';
+  return { text: `The clip hotkey ${hotkey.chord} is NOT installed. ${reason}`, problem: true };
+}
+
+/**
+ * One line naming the configuration file this process read.
+ *
+ * The file is the only settings surface this application has, so the window says which one
+ * it found — and says plainly when there was none, rather than presenting the example's
+ * defaults as if they had been configured.
+ */
+export function describeConfig(status: AppStatus | null): string | null {
+  if (status === null) return null;
+  if (status.config_exists) return `Config: ${status.config_path}`;
+  return (
+    `No config.toml at ${status.config_path} yet — the values in config.example.toml are ` +
+    'in force. Create that file to change the hotkey; "Open config file" in the tray menu ' +
+    'opens its folder.'
+  );
 }

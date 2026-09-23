@@ -18,6 +18,7 @@
 
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import type {
+  AppStatus,
   ClipDto,
   CommandError,
   DeleteOutcome,
@@ -45,6 +46,12 @@ export interface ClipSource {
   stopRecording(): Promise<RecordingStatus>;
   recordingStatus(): Promise<RecordingStatus>;
   clipNow(): Promise<RecordedClip>;
+  /**
+   * The half of the shell that is not a window: the clip hotkey (the chord, and whether a
+   * listener is really installed), where `config.toml` was read from, and what closing the
+   * window does. Read once when the window opens — none of it changes while it runs.
+   */
+  appStatus(): Promise<AppStatus>;
   /** An `asset:` URL for an absolute path, for `<video>` and `<img>`. */
   assetUrl(path: string): string;
 }
@@ -62,6 +69,7 @@ export const tauriIpc: ClipSource = {
   stopRecording: () => invoke<RecordingStatus>('stop_recording'),
   recordingStatus: () => invoke<RecordingStatus>('recording_status'),
   clipNow: () => invoke<RecordedClip>('clip_now'),
+  appStatus: () => invoke<AppStatus>('app_status'),
   assetUrl: (path) => convertFileSrc(path),
 };
 

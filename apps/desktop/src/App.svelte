@@ -18,7 +18,7 @@
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
   import { describeRecordedClip } from './lib/recording';
-  import type { RecordingStatus, StorageStats, TrimRange } from './lib/types';
+  import type { AppStatus, RecordingStatus, StorageStats, TrimRange } from './lib/types';
 
   /**
    * How often the recorder's counters are read.
@@ -41,6 +41,8 @@
   let stats = $state<StorageStats | null>(null);
   /** The engine's live counters; `null` until the first poll answers. */
   let recording = $state<RecordingStatus | null>(null);
+  /** The clip hotkey and where the config came from; `null` until the first read answers. */
+  let app = $state<AppStatus | null>(null);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   let selectedId = $state<number | null>(null);
@@ -97,10 +99,30 @@
    * Read the recorder's status. Never blocks the recording loop, and never throws into the
    * user's face: a failed poll is reported once through the banner and the readout keeps
    * the last values it had.
+   *
+   * One thing here is not just a readout: `clips` is the engine's own count of clips written
+   * this session, and a *hotkey* press moves it without this window being involved at all.
+   * When it grows, the clip that was just taken is in the index, so the list is refreshed —
+   * otherwise a clip saved from the keyboard (or from the tray) would not appear until the
+   * user happened to toggle something else.
    */
   async function refreshRecording() {
     try {
-      recording = await source.recordingStatus();
+      const next = await source.recordingStatus();
+      const grew = recording !== null && next.clips > recording.clips;
+      recording = next;
+      if (grew) {
+        await refresh();
+        void loadThumbnails();
+      }
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function refreshApp() {
+    try {
+      app = await source.appStatus();
     } catch (err) {
       error = errorMessage(err);
     }
@@ -111,7 +133,7 @@
     try {
       recording = await source.startRecording();
       notice =
-        'Recording. The buffer fills in the background; press Save clip (or Ctrl+F8 in the CLI) to write one.';
+        'Recording. The buffer fills in the background; press Save clip for one now.';
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -219,6 +241,9 @@
     })();
     // The recorder's counters are independent of the library, and are polled from here on.
     void refreshRecording();
+    // Read once: a chord cannot change while the process runs (it is registered at startup),
+    // and neither can the path the config came from.
+    void refreshApp();
     const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
     return () => clearInterval(poll);
   });
@@ -228,6 +253,7 @@
   <aside class="sidebar">
     <RecordingPanel
       status={recording}
+      {app}
       busy={recordingBusy}
       onStart={startRecording}
       onStop={stopRecording}
