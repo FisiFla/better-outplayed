@@ -27,12 +27,21 @@ these is a bug, not a tradeoff.
 
 ## Status
 
-**Pre-alpha — repository initialized, PoC not yet landed.** Nothing here is usable
-yet. See [Roadmap](#roadmap) for what is actually built versus planned.
+**Pre-alpha, but far past "initialized".** The replay-buffer pipeline, the storage
+manager and the desktop app all exist; Phase 1 has run once on real Windows hardware; the
+game-event integrations are implemented. What that run *proved* and *refuted* — and,
+critically, the large amount of Windows code that has been written and type-checked but
+**never executed** — is recorded item by item in
+[`docs/verification-status.md`](docs/verification-status.md). **Read that file before
+trusting anything below.**
 
-The PoC targets Windows only. Development currently happens on a macOS host, which
-means the capture/encode path is written blind and must be verified on Windows
-hardware before it can be considered working.
+The short version: on 4K Windows hardware the pipeline runs and produces correct clips,
+but it cannot sustain the configured frame rate (**~24 fps against 30 configured, ~45% of
+frames dropped**) and costs **~50.8% of a CPU core** against a **< 5%** target. Everything
+added since that one session is type-checked for `x86_64-pc-windows-msvc` or tested on
+macOS — **not** verified on Windows. The *capture path* targets Windows only; off Windows
+the pipeline runs a synthetic stub, so a green `cargo test` proves none of the eight
+acceptance criteria.
 
 ---
 
@@ -125,32 +134,38 @@ boundary; arbitrary scrubbing trims accept keyframe granularity.
 
 ```
 localplay/
+├── .github/workflows/          # CI: tests + Windows cross-check + frontend (macOS runner)
 ├── Cargo.toml                  # workspace manifest
 ├── crates/
-│   ├── capture/                # WGC + DXGI backends behind one trait
-│   ├── encoder/                # ffmpeg sidecar + NVENC/QSV/AMF selection
-│   ├── replay/                 # ring buffer, trigger windows, clip splice
+│   ├── capture/                # WGC + WASAPI backends (Windows) behind one trait; stub elsewhere
+│   ├── encoder/                # ffmpeg sidecar child + NVENC/QSV/AMF selection
+│   ├── replay/                 # ring buffer, segment ledger, trigger windows, clip splice
 │   ├── recorder/               # the recording engine both front-ends drive
 │   ├── media/                  # ffmpeg/ffprobe sidecar driver, lossless trim
-│   ├── events/                 # LoL Live Client, CS2/Dota2 GSI, hotkeys
-│   └── store/                  # SQLite schema + clip/session index
+│   ├── events/                 # LoL Live Client, CS2/Dota2 GSI
+│   └── store/                  # SQLite schema + clip/session/event index, cleanup policy
 ├── apps/
 │   ├── localplay-cli/          # headless binary: a hotkey driver over `recorder`
 │   └── desktop/
-│       ├── src-tauri/          # Tauri v2 app, IPC commands, tray (Phase 2)
-│       └── src/                # Svelte frontend (timeline, scrubber, settings)
+│       ├── src-tauri/          # Tauri v2 app + IPC command layer over store/recorder
+│       └── src/                # Svelte frontend (recorder panel, clip list, player, trim)
 ├── docs/
-│   ├── specs/                  # design docs, one per phase
+│   ├── verification-status.md  # what is verified and how — READ IT FIRST
+│   ├── platform-traps.md       # OS behaviours (macOS/BSD vs Linux/Windows) that bite
+│   ├── specs/                  # design docs
 │   ├── plans/                  # task breakdowns, one per phase
-│   └── runbooks/               # manual verification procedures
-├── xtask/                      # build helpers, sidecar fetch/verify
+│   └── runbooks/               # manual (Windows) verification procedures
+├── xtask/                      # build helpers: `xtask sidecars fetch|record`, `xtask probe`
 ├── config.example.toml
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
 └── .gitignore
 ```
 
-The design spec is at
+Start with [`docs/verification-status.md`](docs/verification-status.md) — the honest
+ledger of what is verified, what is only type-checked, and what is unverified — and
+[`docs/platform-traps.md`](docs/platform-traps.md) for the OS behaviours that have already
+caused two bugs here. The design spec is at
 [`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md),
 the Phase 1 task breakdown at
 [`docs/plans/2026-09-23-localplay-phase-1-poc.md`](docs/plans/2026-09-23-localplay-phase-1-poc.md)
@@ -186,11 +201,13 @@ this yet: the payloads are canned fixtures and the servers are mocks in the test
 - **Node.js** 20+ and npm
 - **WebView2 Runtime** (preinstalled on Win11, evergreen on Win10)
 - A GPU with a hardware encoder: NVIDIA (NVENC), Intel (QuickSync), or AMD (AMF)
-- `ffmpeg`/`ffprobe` — fetched as sidecars by `xtask`, not committed
+- `ffmpeg`/`ffprobe` — either install them on `PATH`, **or fetch the pinned sidecars**
+  with `cargo xtask sidecars fetch` (see below). They are not committed.
 
-> **Note:** the current PoC is Windows-only. The repository does not yet build on
-> macOS or Linux, and the development host is macOS — so the capture path is
-> unverified until it runs on real Windows hardware.
+> **Note:** the *capture path* is Windows-only. The repository builds and its test suite
+> runs on macOS and Linux (CI runs it on `macos-latest`); off Windows the pipeline uses a
+> synthetic `StubCapture`, so a green test run proves none of the acceptance criteria — see
+> [`docs/verification-status.md`](docs/verification-status.md).
 
 ### Getting the sidecars
 
@@ -216,16 +233,29 @@ diff and committed. At runtime the app looks for `binaries/` next to the executa
 
 ## Roadmap
 
-- [ ] **Phase 0** — repo, tooling, design spec *(in progress)*
-- [ ] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC)
-- [ ] **Phase 2** — Tauri shell, timeline scrubber, clip trim/export
-- [ ] **Phase 3** — SQLite index, storage manager, auto-cleanup policies
+- [x] **Phase 0** — repo, tooling, design spec
+- [x] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC).
+      **Ran on real Windows hardware once** and produced correct clips, but two criteria
+      miss: at 4K it sustains ~24 fps against 30 configured (~45% of frames dropped) and
+      costs ~50.8% of a CPU core against a < 5% target (open as
+      [issue #1](https://github.com/FisiFla/localplay/issues/1)). The fixes written since
+      that run are **type-checked, not re-run on Windows**.
+- [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
+      recording wiring exist; they are exercised **headlessly in CI, never opened as a real
+      window on Windows**.
+- [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified)*
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
       tested against local mocks; **never run against a real game** — see the
       [Phase 4 note](docs/plans/2026-09-23-localplay-phase-4-integrations.md))*
 - [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer
 
-Phase 1 acceptance is verified on Windows hardware using the
+> **Caveat on every `[x]` above.** Only the Phase 1 capture path has ever run on Windows,
+> once, and it only partly passed. The Windows-specific code added since that run — and all
+> of Phases 2–4 — is type-checked for `x86_64-pc-windows-msvc` or tested on macOS, never
+> executed on Windows. The per-item truth, and the ordered list of the next Windows runs
+> that would change it, are in [`docs/verification-status.md`](docs/verification-status.md).
+
+Phase 1's eight acceptance criteria and how to run them are in the
 [Phase 1 verification runbook](docs/runbooks/phase-1-verification.md).
 
 ---
