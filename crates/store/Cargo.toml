@@ -7,6 +7,17 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+# The cleanup executor reports what it could not delete, where it happened (an orphaned
+# file is otherwise only visible as a path nobody logs). Runtime, not test-only.
+tracing.workspace = true
+
+# The cleanup integration test needs a real clips directory of its own, and it backdates
+# `created_at` on a row to exercise the age rule — the application deliberately has no
+# API for that (`created_at` is stamped by the store, never by the caller), so the test
+# reaches the column the way an operator would: with SQL.
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -255,6 +255,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
