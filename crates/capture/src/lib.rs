@@ -6,6 +6,8 @@ pub mod platform;
 pub mod stub;
 
 #[cfg(windows)]
+pub mod wasapi;
+#[cfg(windows)]
 pub mod wgc;
 
 /// The monotonic clock base shared by the video and audio backends.
