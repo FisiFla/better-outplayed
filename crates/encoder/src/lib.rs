@@ -111,7 +111,7 @@ pub struct EncodeConfig {
     /// second run would write `seg-000000.mp4` straight over the file the adopted
     /// ledger still points at — the ledger then names footage the new run has replaced.
     /// The caller computes the first free number from what is already on disk
-    /// (`RingBuffer::reserve_segment_number`) and passes it here.
+    /// (the ledger's reserved segment number) and passes it here.
     ///
     /// Fields are threaded through this struct rather than added as an argument to
     /// [`crate::FfmpegEncoder::spawn`] so that every caller of `spawn` (tests included)

@@ -90,7 +90,7 @@ impl MemoryRing {
     /// `EncodeOutput::FragmentedStream`; taking it here is what makes this ring the stream's one
     /// reader.
     ///
-    /// Creates the clips directory, as `RingBuffer::start` does and for the same reason: doing
+    /// Creates the clips directory for the same reason the file ring did: doing
     /// it here means a permissions or path problem is reported when the recording starts rather
     /// than at the moment the user presses the key and is waiting for a clip.
     pub fn start(stream: ChildStdout, setup: RingSetup) -> Result<Self> {
@@ -204,7 +204,7 @@ impl MemoryRing {
 
     /// Save a clip around `trigger_ms` out of the footage in RAM.
     ///
-    /// The same window arithmetic as `RingBuffer::trigger` — `[trigger - pre, trigger + post)` —
+    /// The same window arithmetic the trigger has always had — `[trigger - pre, trigger + post)` —
     /// and the same destination (`{stem}.mp4` in the clips directory), because the caller should
     /// not have to know which kind of ring it is talking to.
     pub fn trigger(

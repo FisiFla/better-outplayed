@@ -18,7 +18,8 @@
 //!
 //! # What it owns, and what it deliberately does not
 //!
-//! It owns the capture backend, the audio backend, the encoder, the [`RingBuffer`], the
+//! It owns the capture backend, the audio backend, the encoder, the ring (in RAM for a replay
+//! buffer, files for a session), the
 //! [`FramePacer`], the capture clock, the background thread that pumps them, and the clip
 //! index insertion. It owns **no** hotkey (a driver's business — the CLI installs one, the
 //! GUI calls [`Recorder::clip_now`] from a button) and **no** UI, and it reads no
@@ -129,7 +130,7 @@ pub use index::{
     CleanupReport, BOOKMARK_KIND,
 };
 pub use pump::{
-    guard_frame_size, pump_once, pump_once_counted, pump_once_counted_with_mic, pump_until_span,
+    guard_frame_size, pump_once, pump_once_counted, pump_once_counted_with_mic,
     pump_until_span_on, FramePacer, MediaRing, PumpCounts, RateMeter, FRAME_POLL,
     PACER_RESYNC_AFTER_INTERVALS, POST_ROLL_MARGIN, POST_ROLL_SCAN_INTERVAL, RATE_WINDOW,
 };
@@ -1978,7 +1979,7 @@ impl Engine {
         // `localplay_encoder::ffmpeg`) media time and the wall clock advance together, so
         // "10s of footage" and "10 real seconds" now agree on a machine of any speed — the
         // earlier divergence, media at 0.81x, is what the ledger records as fixed. If the
-        // buffer holds less than `pre_ms` of media at the trigger, `RingBuffer::trigger`
+        // buffer holds less than `pre_ms` of media at the trigger, the ring's `trigger`
         // already warns and splices the truncated front — that path is unchanged.
         let trigger_ms = self.ledger.span_ms()?;
         // Wall-clock value, kept for telemetry only: nothing below reads it, because mixing
@@ -2551,7 +2552,7 @@ fn build_encode_config(
 }
 
 /// Start the ffmpeg child for a configuration whose `start_number` has already been
-/// decided (see [`build_encode_config`] and `RingBuffer::reserve_segment_number`).
+/// decided (see [`build_encode_config`] and the ledger's reserved segment number).
 fn spawn_encoder(
     bin: &FfmpegBinaries,
     encode_cfg: &EncodeConfig,

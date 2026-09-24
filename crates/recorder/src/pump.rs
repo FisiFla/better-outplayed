@@ -12,7 +12,6 @@
 use anyhow::{bail, Context, Result};
 use localplay_capture::{AudioBackend, CaptureBackend, Frame};
 use localplay_encoder::Encoder;
-use localplay_replay::buffer::RingBuffer;
 use std::time::{Duration, Instant};
 
 /// A media timeline the pump can wait on: something that finds newly written segments and
@@ -23,26 +22,11 @@ use std::time::{Duration, Instant};
 /// which it was given. The two methods are the whole of what the wait needs — a scan and a
 /// span — so the trait is two methods wide and deliberately not the ring's interface.
 ///
-/// `RingBuffer` implements it here (the trait is this crate's, the type is
-/// `localplay-replay`'s, which is what makes the impl legal); its `scan` is
-/// `scan_once`, eviction included, exactly as before.
-pub trait MediaRing {
-    /// Find newly written segments and index them.
-    fn scan(&mut self) -> Result<()>;
-    /// Media time the ring can prove is on disk, in ms, run-relative.
-    fn span_ms(&self) -> u64;
-}
-
-impl MediaRing for RingBuffer {
-    fn scan(&mut self) -> Result<()> {
-        self.scan_once()
-    }
-
-    fn span_ms(&self) -> u64 {
-        self.stats().span_ms
-    }
-}
-
+/// [`crate::memory_ring::MemoryRing`] implements it here (the trait is this crate's, the type
+/// is, which is what makes the impl legal). Its `scan` is a no-op: nothing on disk changes
+/// behind it, because it is fed by its own reader thread. The file-backed ring this trait was
+/// introduced alongside — whose `scan` really did index new files — has since been removed.
+///
 /// Longest a single `next_frame` call waits for a frame to become due.
 ///
 /// The capture backends are real-time paced and return `None` when nothing is due
@@ -51,6 +35,19 @@ impl MediaRing for RingBuffer {
 /// keeps the loop off 100% CPU between frames — there is no separate `sleep` in the
 /// pump, because sleeping is exactly what starves the encoder.
 pub const FRAME_POLL: Duration = Duration::from_millis(5);
+
+/// A media timeline the pump can wait on: something that reports how much footage it holds.
+///
+/// The two methods are the whole of what the post-roll wait needs — a scan and a span — so the
+/// trait is two methods wide and deliberately not a ring's interface. `scan` exists because a
+/// ring whose segments appear on disk behind ffmpeg's back has to go and look; a ring fed by its
+/// own reader thread has nothing to look for and implements it as a no-op.
+pub trait MediaRing {
+    /// Find newly written segments and index them.
+    fn scan(&mut self) -> Result<()>;
+    /// Media time the ring can prove it holds, in ms, run-relative.
+    fn span_ms(&self) -> u64;
+}
 
 /// How often the scratch directory is re-scanned while waiting for a post-roll.
 ///
@@ -432,24 +429,10 @@ pub fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 /// wait itself submitted. Returns `Ok` once the span covers `need_ms`; a span already at
 /// or beyond `need_ms` on entry returns immediately. Errors if the budget elapses first,
 /// or if the capture/encode path fails.
-pub fn pump_until_span(
-    pacer: &mut FramePacer,
-    ring: &mut RingBuffer,
-    capture: &mut dyn CaptureBackend,
-    audio: &mut dyn AudioBackend,
-    encoder: &mut dyn Encoder,
-    need_ms: u64,
-    budget: Duration,
-) -> Result<PumpCounts> {
-    pump_until_span_on(pacer, ring, capture, audio, None, encoder, need_ms, budget)
-}
-
-/// [`pump_until_span`] over any [`MediaRing`], with an optional microphone input.
 ///
-/// Two things vary between the callers and nothing else does: which ledger the span comes
-/// from (the replay ring, or a full session's own segments — see
-/// [`crate::session::SessionRing`]) and whether a microphone is drained alongside the game
-/// audio. Both are parameters rather than a second wait loop, because this loop is the one
+/// Two things vary between the callers and nothing else does: which ring the span comes from
+/// (the replay buffer's, or a full session's own segments — see [`crate::session::SessionRing`])
+/// and whether a microphone is drained alongside the game audio. Both are parameters rather than a second wait loop, because this loop is the one
 /// place that must keep the encoder fed while it waits, and a second copy of it is a second
 /// chance to get that wrong.
 // Seven parameters plus the ring: the wait loop's handles are what it needs to keep feeding

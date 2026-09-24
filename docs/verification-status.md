@@ -845,7 +845,7 @@ directory and a filesystem ledger deleted the oldest; that write churn is gone i
 | **Constraint 1**: buffering writes nothing, and a saved clip is the only thing that is written | `crates/recorder/src/tests.rs` | **Verified** — `buffering_writes_nothing_to_disk_and_only_a_saved_clip_does` |
 | `buffer.ram_cap_bytes`, defaulting to 256 MiB, and the RAM budget that replaced the scratch cap as the engine's check | `crates/recorder/src/config.rs`, `config.example.toml` | **Verified on the dev host** — the default, the example, and a pre-existing config without the key |
 
-Full workspace suite on the dev host: **538 passed, 0 failed, 1 ignored**. The desktop shell's
+Full workspace suite on the dev host: **535 passed, 0 failed, 1 ignored**. The desktop shell's
 separate crate graph: **112 passed, 0 failed**. The Windows cross-check (`media`, `replay`,
 `encoder`, `capture`, `events`) is clean, and the Windows *run* is its own section below. Clippy on
 the touched crates adds no warning that was not already there.
@@ -943,35 +943,41 @@ encoder, as they do on the dev host. The hardware-encoder selection was verified
 §10, before this change, and this change does not touch it. A real capture run into a RAM buffer
 on Windows is still unperformed; what ran is the test suite with stub sources.
 
-### The open decision: what happens to the file ledger
+### The decision, and what it cost: the file ledger is gone
 
-Buffer mode goes to RAM **unconditionally**, which is what "no SSD writes while buffering" means.
-That leaves `RingBuffer` — the file ledger in `crates/replay/src/buffer.rs`, with its
-`scanner`/`SegmentLedger`/`window` helpers — **unreachable from the recorder**. It is not dead
-code: `apps/localplay-cli/tests/post_roll.rs` and `crates/replay/tests/end_to_end_clip.rs` still
-exercise it directly, and `SessionRing` shares its ledger helpers.
+The open question above was answered **by removing the type**, and the reasoning is worth keeping
+because the alternative was defensible. Buffer mode taking RAM unconditionally — which is what "no
+SSD writes while buffering" means — left `RingBuffer` reachable from nowhere. Keeping it as a
+second implementation would have meant adding a config key to select it, and a capability nothing
+selects is not really kept while its tests keep passing and its code keeps looking load-bearing.
 
-Two honest options, and this is a call for the owner, not for the next pass to make silently:
+What it provided that the other two modes do not: a replay buffer whose footage survives a crash.
+That is genuinely redundant here rather than lost. A crash-survivable *session* is session mode,
+which already exists; a crash-survivable *buffer* protects the seconds before a keypress that, by
+hypothesis, never happened. The task asked for RAM buffering and forbade nothing, so this is a
+judgement rather than a requirement — and it is reversible: `git log` has the type, its tests, and
+this section explaining them.
 
-1. **Delete it**, keeping whatever `SessionRing` still uses. The crash survivability it provided
-   is already session mode's job, and a type nothing in the application calls is a type that will
-   rot — its tests will keep passing while no user path reaches it.
-2. **Keep it**, as the documented way to get a crash-survivable *replay buffer* rather than a
-   crash-survivable *session* — a real difference, since a session records everything and a buffer
-   keeps the last N seconds. If this is wanted it needs a config key to reach it, because a mode
-   nothing can select is not really kept.
+The cost was not one file. Removing it meant something for every test and comment that named it,
+and **three of those were tests whose subject was not the ring at all**:
 
-Option 1 is smaller and matches the constraint as written. Option 2 preserves a capability the
-task neither asked for nor forbade. **No decision has been made, and nothing has been deleted** —
-but the case for deciding is stronger than when this section was first written, because the
-recorder no longer calls the type at all.
+| What named it | What was actually being tested | What happened |
+|---|---|---|
+| `apps/localplay-cli/tests/post_roll.rs` | the post-roll wait — the §10 bug where the wait starved ffmpeg | **retargeted** at the in-memory ring. Still three tests, now over the shipping path |
+| `apps/localplay-cli/tests/clip_index.rs` | the index — splice, index, evict | **retargeted**. The ring was only its clip producer |
+| `crates/replay/tests/end_to_end_clip.rs` | the file ring, end to end | **deleted** with its subject |
+| `crates/replay/src/buffer.rs` | the ring and its ledger numbering | **deleted**; `BufferConfig` and `BufferStats` stay, both still used by the recorder |
 
-One consequence worth stating precisely, because the task's own wording points at it: the two
-tests it names as the place to verify "no temporary files are created on disk while buffering" —
-`apps/localplay-cli/tests/post_roll.rs` and `crates/replay/tests/end_to_end_clip.rs` — both drive
-`RingBuffer` **directly** rather than through a `Recorder`, so neither can verify that claim about
-the shipping path. The claim is asserted where it is actually made instead, in the recorder's own
-suite (`buffering_writes_nothing_to_disk_and_only_a_saved_clip_does`), which is also the test that
-proves it on Windows. Those two files are therefore not just the tests the open decision would
-delete; they are tests whose subject no user path reaches any more, and they will keep passing
-while that is true.
+Splitting it that way is the point worth recording: the deletion was not one decision but four, and
+two of them were places where the file ring had been standing in for shared machinery. The suite
+went from 538 to 535 passing — three tests fewer, each removed with the thing it tested.
+
+**One consequence that was nearly missed.** The file ring was the only thing that *enforced*
+`[buffer].scratch_cap_bytes`: it evicted to that cap on every scan, and `session.rs` deliberately
+never does. With the ring gone the key has no reader at all, so it bounds nothing — and the note in
+this section said the opposite when it was first written, that it "bounds a directory that session
+mode writes into". That was wrong, and it was corrected in the key's own doc comment and in
+`config.example.toml` rather than left as a plausible sentence. The key is still accepted so
+existing configs keep parsing, and both places now say outright that it does nothing; what bounds
+disk usage is the `[storage]` policy. Removing the key outright is a user-facing change worth doing
+on its own evidence, not as a side effect of this one.

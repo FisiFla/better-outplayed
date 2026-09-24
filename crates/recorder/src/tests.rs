@@ -607,7 +607,7 @@ fn an_unusable_encoder_configuration_fails_before_any_capture_starts() {
     let err = Recorder::start(cfg).map(|_| ()).expect_err("that is not a vendor");
     assert!(err.to_string().contains("unknown encode.vendor"), "got: {err}");
 
-    // And the observable consequence of the ordering: `RingBuffer::start` creates the
+    // And the observable consequence of the ordering: the old file ring created the
     // scratch directory, and it runs after the encoder is resolved and after the capture
     // backend exists. Neither failure above reached it, so nothing was ever captured.
     assert!(
@@ -1220,7 +1220,7 @@ fn buffering_writes_nothing_to_disk_and_only_a_saved_clip_does() {
     });
     assert!(filled.running, "the recorder must report itself as running");
 
-    // Not a segment, not a partial file, not even the directory. `RingBuffer::start` created it
+    // Not a segment, not a partial file, not even the directory. The old file ring created it
     // and ffmpeg had written the first segment into it well inside this window.
     let written = entries_in(&scratch);
     assert!(

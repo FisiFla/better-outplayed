@@ -36,13 +36,14 @@ post_seconds = 5
 # therefore the granularity of lossless trimming (cuts snap to <= this value).
 # Lower = more precise cuts, higher = larger files.
 segment_time = 1
-# Hard ceiling on the scratch directory, in bytes. Oldest segments are evicted
-# first once this is exceeded. Default: 2 GiB.
+# Total bytes the scratch ring may occupy, in bytes (spec 8.1).
 #
-# Only full-session recordings use a scratch directory now. A replay buffer keeps the
-# last few minutes of unclipped footage in memory instead, so that buffering does not
-# write to the disk at all: nothing is written until a clip is saved. This key
-# therefore bounds a directory that session mode writes into and nothing else.
+# This key does nothing at present, and says so rather than being silently dropped.
+# It was the file-backed replay ring's eviction rule, checked on every scan; a replay
+# buffer now holds the last few minutes of unclipped footage in memory, where
+# `ram_cap_bytes` below is the cap that applies, and a full session deliberately never
+# evicts. What bounds disk usage in both cases is the [storage] policy, which evicts
+# whole clips and sessions. Left accepted so that existing configs keep parsing.
 scratch_cap_bytes = 2147483648
 # Empty = %LOCALAPPDATA%\localplay\scratch
 scratch_dir = ""

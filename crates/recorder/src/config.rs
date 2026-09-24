@@ -135,11 +135,15 @@ pub struct BufferSection {
     /// Length of one scratch segment. Also the keyframe interval, which is what makes a
     /// clip a lossless concatenation of whole segments (spec §6.3).
     pub segment_time: u64,
-    /// Total bytes the scratch ring may occupy. Enforced on every scan, and a violation
-    /// is fatal: a ring that overruns its cap is a disk that fills up (spec §8.1).
+    /// Total bytes the scratch ring may occupy (spec §8.1).
     ///
-    /// Only session mode has a scratch directory now: a replay buffer holds its footage in RAM,
-    /// so this cap bounds a directory that session mode writes into and nothing else.
+    /// **Nothing enforces this any more, and that is worth saying rather than leaving implied.**
+    /// It was the file-backed replay ring's rule, checked on every scan; a replay buffer now
+    /// holds its footage in RAM, where `ram_cap_bytes` is the cap that applies, and a session
+    /// deliberately never evicts — its segments are the recording the user asked for, and what
+    /// bounds disk usage for both is the `[storage]` policy, which evicts whole clips and
+    /// sessions. The key is still accepted so that configs carrying it keep parsing, and it is
+    /// documented here as doing nothing rather than being quietly dropped.
     pub scratch_cap_bytes: u64,
     /// Empty means `<app data dir>/scratch`.
     pub scratch_dir: String,

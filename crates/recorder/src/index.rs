@@ -360,7 +360,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The clip metadata `RingBuffer::trigger` hands back, without running ffmpeg.
+    /// The clip metadata a ring's `trigger` hands back, without running ffmpeg.
     fn metadata(path: PathBuf, size_bytes: u64) -> ClipMetadata {
         ClipMetadata { path, duration_ms: 12_000, size_bytes, encoder: "h264_nvenc".into() }
     }

@@ -98,7 +98,7 @@ impl Fixture {
         let mut audio = StubAudio::new(AudioFormat::default());
         let mut encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn encoder");
         let stream = encoder.take_output_stream().expect("the stream mode exposes its pipe");
-        let mut ring = MemoryRing::start(
+        let ring = MemoryRing::start(
             stream,
             RingSetup {
                 bin: bin.clone(),
@@ -293,14 +293,14 @@ fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
 
     // A full pre-roll first, so the window assertions below describe the ordinary press
     // (the buffer already holds `pre_ms` of media). A press before that is the existing
-    // truncated-front warning path in `RingBuffer::trigger`, not this test.
+    // truncated-front warning path in a ring's `trigger`, not this test.
     fx.pump(PRE_MS, Duration::from_secs(30))
         .expect("top the buffer up to a full pre-roll");
 
     // Exactly the engine's trigger path: the trigger position comes from the ledger, in
     // media time; `need_ms` is `post_ms` further along that same timeline; the budget is
     // the wall-clock wait for it (post-roll + margin, as the CLI sizes it).
-    let trigger_ms = fx.stats().span_ms;
+    let trigger_ms = fx.span_ms();
     assert!(trigger_ms >= PRE_MS, "sanity: the pre-roll must be fully buffered");
     let need_ms = trigger_ms + POST_MS;
     let budget = Duration::from_millis(POST_MS) + Duration::from_secs(5);

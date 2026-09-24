@@ -6,16 +6,16 @@
 //! The two modes look alike — a directory of `seg-%06d.mp4` files written by one ffmpeg
 //! segment muxer — and they are deliberately *not* the same object, because the one thing
 //! that defines the ring is the one thing a full session must not have: eviction.
-//! [`localplay_replay::buffer::RingBuffer::scan_once`] indexes new segments **and** calls
+//! A file-backed ring's `scan_once` indexed new segments **and** called
 //! `SegmentLedger::evict_to_cap`, which deletes the oldest segment files until the ring is
 //! under `buffer.scratch_cap_bytes`. A four-hour session has no oldest segment to spare,
 //! so [`SessionRing`] scans the same directory names with the same
 //! [`localplay_replay::scanner`] functions and never evicts anything.
 //!
 //! That bypass is *structural*, not a huge cap: `evict_to_cap` is not called on this
-//! ledger at all, and `localplay-replay` is a dependency this crate may not change (its
-//! `RingBuffer` has no "scan without evicting" entry point — see `finalise` for the one
-//! other place that limit shows, and the report that goes with this work for the gap).
+//! ledger at all — it is not called on this one. The file-backed ring had no "scan without
+//! evicting" entry point, which is why the scan lives here as its own small function rather
+//! than as a parameter; see `finalise` for the other place that limit shows.
 //! The re-expression is deliberately small: the scan, the sequence reservation and the
 //! clip window are [`localplay_replay`]'s public pieces
 //! ([`SegmentLedger`], [`scanner`], [`window`], [`ClipSplicer`]); nothing here re-implements
@@ -53,7 +53,7 @@ const MAX_SESSION_DIR_ATTEMPTS: u32 = 100;
 
 /// A session's segments, indexed and **never evicted**.
 ///
-/// The [`localplay_replay::buffer::RingBuffer`]'s cap-free twin: same directory convention,
+/// The removed file-backed ring's cap-free twin: same directory convention,
 /// same "a segment is only trusted once a strictly later one exists" scan rule, same
 /// timeline arithmetic — and no eviction, by construction (there is no cap here to pass).
 pub struct SessionRing {
@@ -142,7 +142,7 @@ impl SessionRing {
     }
 
     /// Index newly completed segments. **No eviction happens here** — that is the whole
-    /// difference from `RingBuffer::scan_once` (see the module docs).
+    /// difference from a file ring's `scan_once` (see the module docs).
     pub fn scan(&mut self) -> Result<()> {
         let observed = observed_seqs(&self.dir)?;
         for seq in newly_complete(&observed, self.highest_known) {
@@ -176,7 +176,7 @@ impl SessionRing {
     }
 
     /// This run's recorded media time, in ms — the same quantity
-    /// `RingBuffer::stats().span_ms` is, measured from the same zero.
+    /// a file ring's `stats().span_ms` is, measured from the same zero.
     pub fn span_ms(&self) -> u64 {
         self.ledger.span_ms().saturating_sub(self.origin_ms)
     }

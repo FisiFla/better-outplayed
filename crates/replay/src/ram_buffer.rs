@@ -1,6 +1,6 @@
 //! The in-memory replay ring: the last N seconds of footage, held in RAM.
 //!
-//! The file-based [`crate::buffer::RingBuffer`] asks ffmpeg to write one MP4 per second into a
+//! A file-based ring asks ffmpeg to write one MP4 per second into a
 //! scratch directory and then deletes the old ones, so an idle replay buffer is a continuous
 //! trickle of SSD writes for footage that is usually thrown away unclipped. This ring holds the
 //! same footage as a queue of fragments in memory instead, and **nothing is written to disk
@@ -272,7 +272,7 @@ impl MemoryRingBuffer {
     /// [`MemorySegment::is_closed`] exists.)
     ///
     /// This is the number a trigger's range is resolved against, and the in-memory counterpart
-    /// of `RingBuffer::stats().span_ms`.
+    /// of a file ring's `stats().span_ms`.
     pub fn span_ms(&self) -> u64 {
         self.segments.back().map(|s| s.end_ms).unwrap_or(0)
     }
