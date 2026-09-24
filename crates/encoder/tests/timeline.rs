@@ -88,12 +88,14 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
     let until = Instant::now() + FEED;
     let started = Instant::now();
     let mut frames: u64 = 0;
+    let mut audio_frames: u64 = 0;
     while Instant::now() < until {
         if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
             encoder.submit_video(frame).expect("submit video");
             frames += 1;
         }
         while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
+            audio_frames += block.frames as u64;
             encoder.submit_audio(block).expect("submit audio");
         }
     }
@@ -124,9 +126,11 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
     let frame_count_ms = frames * 1000 / u64::from(CONFIGURED_FPS);
     eprintln!(
         "{frames} frames ({DELIVERED_FPS}fps nominal, {CONFIGURED_FPS}fps configured) over \
-         {captured:?}: {} segments, video {video_ms}ms, audio {audio_ms}ms; the frame count \
+         {captured:?}: {} segments, video {video_ms}ms, audio {audio_ms}ms, fed audio \
+         {audio_frames} frames = {}ms; the frame count \
          alone would be {frame_count_ms}ms",
-        segments.len()
+        segments.len(),
+        audio_frames * 1_000 / u64::from(AudioFormat::default().sample_rate)
     );
 
     // The load-bearing assertion: the encoded footage covers the wall-clock seconds it was
@@ -139,9 +143,21 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
          {video_ms}ms, only {}ms more than the frame count implies",
         video_ms.saturating_sub(frame_count_ms)
     );
+    // The band is derived from the wall-clock window the pipeline was actually fed over,
+    // not from a hardcoded ~3s. `captured` measures that window (it is printed above), and
+    // under CPU contention the feed itself takes longer, so a longer `video_ms` is CORRECT
+    // rather than a failure: a fixed bound made this test flaky under `cargo test
+    // --workspace`, which runs test binaries in parallel, while it passed 5/5 in isolation
+    // — and it guards the most important property in this project, so it must not depend on
+    // host load. Segment granularity is 1s, so the encoded total is the window rounded up
+    // to the next segment boundary: never less than the window, never a full segment more.
+    // (The audio assertion below had the same defect — a fixed floor — and is derived from
+    // the fed sample count for the same reason.)
+    let captured_ms = captured.as_millis() as u64;
     assert!(
-        (2_800..=4_200).contains(&video_ms),
-        "3s of capture must encode as ~3s of video, got {video_ms}ms"
+        video_ms + 200 >= captured_ms && video_ms <= captured_ms + 1_200,
+        "the encoded footage must cover the {captured_ms}ms window it was captured over (to \
+         within one 1s segment), got {video_ms}ms"
     );
     // Segment *count* is a second view of the same thing: one segment per second of media,
     // so three seconds of wall clock cannot fit in the one or two files the old behaviour
@@ -151,11 +167,25 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
         "3s of wall clock at 1s segments must produce >= 3 segment files, got {}",
         segments.len()
     );
-    // Audio keeps its own exact timeline (the 48kHz sample count), which the video stream
-    // now agrees with rather than drifting away from.
+    // Audio keeps its own exact timeline: it is derived from the 48kHz sample count rather
+    // than from a clock, so the container's audio duration tracks the number of frames
+    // actually fed. That is the property worth pinning, and unlike the fixed ">= 2800ms"
+    // floor it replaced it does not depend on the host keeping up with the feed — under
+    // `cargo test --workspace` (test binaries in parallel) the loop above can be starved
+    // and legitimately deliver fewer audio blocks, which is what made that floor flaky
+    // while it passed every time in isolation. Both sides here shrink together, so the
+    // assertion holds under load.
+    //
+    // The tail: measured 207ms of a 3010ms feed is absent (2803ms in the container),
+    // because a segment ends at a video boundary and the audio arriving after the last
+    // video frame of the final segment is not muxed. 400ms bounds that tail; the upper
+    // bound exists so the assertion cannot pass by inventing audio that was never fed.
+    let fed_audio_ms = audio_frames * 1_000 / u64::from(AudioFormat::default().sample_rate);
     assert!(
-        audio_ms >= 2_800,
-        "the sample-count audio timeline must cover the feed too, got {audio_ms}ms"
+        audio_ms + 400 >= fed_audio_ms && audio_ms <= fed_audio_ms + 200,
+        "the audio timeline must track the submitted sample count (a segment-boundary tail of \
+         up to 400ms is expected): {audio_frames} frames were fed ({fed_audio_ms}ms) but the \
+         container says {audio_ms}ms"
     );
     assert!(
         video_ms.abs_diff(audio_ms) < 700,
