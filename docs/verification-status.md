@@ -821,3 +821,95 @@ What this is worth: the same gates, the same results, and **not** a substitute f
 respect — it ran on the machine that wrote the code, so it is exactly as good as the dev host
 is representative. The Windows cross-check is a `check`, not a run, either way. What it does
 mean is that nothing in this tree is currently waiting on a gate nobody has exercised.
+
+---
+
+## 12. In-memory replay buffering — half landed, and one open decision (`ec85169`)
+
+**This section is a note, not a claim.** It records work in progress so that the next pass does
+not have to rediscover it, and so that nobody reads the ticked items in the task list as
+delivered behaviour. Nothing below changes what the shipping recorder does.
+
+The goal: a replay buffer that writes **nothing** to the SSD while it is only buffering, and
+touches the disk only when a clip is saved. Today `-f segment` writes a file per second into a
+scratch directory and a filesystem ledger deletes the oldest. That churn is the thing being
+removed.
+
+### What has landed, and what each piece is worth
+
+| Piece | Where | Evidence level |
+|---|---|---|
+| `EncodeConfig::output` with `EncodeOutput::FragmentedStream`; `.stdout(Stdio::piped())`; `Encoder::take_output_stream()` | `crates/encoder/src/ffmpeg.rs` | **Verified on the dev host** — an element-for-element args test plus 3 tests that drive a real ffmpeg |
+| The stream mode writes no files | `crates/encoder/tests/stream_output.rs` | **Verified** — `the_stream_mode_writes_nothing_to_disk` asserts it, and the fragment timestamps are monotonic, and the fragments remux into a playable clip |
+| `FragmentSplitter` — fragmented-MP4 → `Fragment { seq, start_ms, duration_ms, keyframe, bytes }` | `crates/media/src/fragments.rs` | **Verified on the dev host** — 5 tests against a real ffmpeg stream, including byte-at-a-time equivalence |
+| `MemoryRingBuffer` — push, byte/duration eviction, window selection, `assemble` | `crates/replay/src/ram_buffer.rs` | **Verified on the dev host** — 8 tests |
+| `ClipSplicer::splice_from_memory` / `splice_stream` — `-i pipe:0 -c copy`, audio titles re-applied | `crates/replay/src/splice.rs`, `tests/ram_clip.rs` | **Verified on the dev host** — 2 tests that produce a probeable clip from a real stream and leave the scratch directory empty |
+
+### What has **not** landed: the recorder wiring, and it is the whole point
+
+`crates/recorder` still runs `Ledger::Buffer(RingBuffer)` — the file ledger — in replay-buffer
+mode. So **constraint 1 of this task is not satisfied by the shipping binary**: unclipped
+footage still goes to disk. The pieces above are used by tests, not by the recorder.
+
+The wiring was written, type-checked, and **reverted unlanded**, because it stalled the
+pipeline. The evidence, from a buffer-mode recording in the recorder's own suite:
+
+```
+after the buffer filled: frames: 21, segments: 1, bytes: 8372, span_ms: 900
+two seconds later:        frames: 21 -> 23, span 900ms -> 1000ms
+```
+
+Roughly one frame per second, where the pacer asked for ten. That signature — the pump and the
+span advancing in lockstep, both far below the configured rate — is the reader thread failing
+and the pipe backing up: ffmpeg blocks writing to a full stdout, so it stops draining stdin, so
+the encoder's frame channel fills and `push_frame` blocks, so the pump slows to whatever the
+reader is still moving. The reader's own `failure` slot stayed empty, which points at a
+**panic** in the reader thread — a panic unwinds without setting that slot. The prime suspect is
+`sample_span_ticks` (`crates/media/src/fragments.rs`), where `sample_count` is read from the
+stream and used to index: that indexing needs a checked multiply before it can be trusted with
+a number the stream chooses.
+
+**The next step is to log the reader thread's death before re-applying anything** — a
+`catch_unwind` or a panic hook at the `push` boundary, run against the recorder test that
+produced the numbers above. Guessing at the fix is what produced two wrong offsets already
+(see below); the difference here is that a wrong guess is a hang, not a failed assertion.
+
+### Two parse bugs found by measurement, not by reading
+
+Both were in `sample_span_ticks`, which reads a fragment's own sample durations out of its
+`moof` so the ring can know its length on arrival instead of borrowing the next fragment's
+start. Both were caught by a number disagreeing with reality:
+
+* `tfhd`'s conditional fields are positional, so `default_sample_duration` sits at an offset
+  that depends on which of `base_data_offset` and `sample_description_index` are present.
+* `trun`'s per-sample entries are **4 to 16 bytes wide, not 4** — a duration may be followed by
+  a size, flags and a composition offset. A fixed 4-byte stride sums those into the total, which
+  is how a one-second fragment measured **3576ms** and a 3000ms clip request came back as
+  2000ms.
+
+The rule the ring inherited from the file ledger — *a segment's end is proved by the next
+segment's start* — is kept as the fallback for a sample table this build cannot read. On disk it
+is free; in a stream it costs a whole fragment of span, and a clip's window is resolved against
+that span.
+
+### The open decision: what happens to the file ledger
+
+Buffer mode goes to RAM **unconditionally**, which is what "no SSD writes while buffering"
+means. That leaves `RingBuffer` — the file ledger in `crates/replay/src/buffer.rs`, and its
+`scanner`/`SegmentLedger`/`window` helpers — **unreachable from the recorder**, while roughly
+thirty tests still exercise it directly by constructing it.
+
+Two honest options, and this is a call for the owner, not for the next pass to make silently:
+
+1. **Delete it**, and let `SessionRing` keep the ledger helpers it still uses. The crash
+   survivability it provided is already session mode's job, and a type nothing calls is a type
+   that will rot.
+2. **Keep it**, as the documented way to get a crash-survivable *replay buffer* rather than a
+   crash-survivable *session* — which is a real difference: a session records everything, a
+   buffer keeps the last N seconds. If this is wanted, it needs a config key to reach it,
+   because a mode nothing can select is not really kept.
+
+Option 1 is smaller and matches the constraint as written. Option 2 preserves a capability that
+the task's own wording does not ask for and does not forbid. **No decision has been made**, and
+nothing has been deleted.
+
