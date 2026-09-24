@@ -1,6 +1,6 @@
 //! Lossless (stream-copy) media edits. These never re-encode.
 
-use crate::binaries::{run_with_timeout, FfmpegBinaries};
+use crate::binaries::{run_with_stdin, run_with_timeout, FfmpegBinaries};
 use crate::probe::{stream_layout, StreamLayout};
 use anyhow::{bail, Context, Result};
 use std::io::Write;
@@ -94,6 +94,58 @@ pub fn concat_lossless(bin: &FfmpegBinaries, list_file: &Path, dst: &Path) -> Re
     // concatenates a two-track recording must use [`concat_lossless_sized`] with the real count,
     // or the microphone's track would come out named "Game Audio".
     concat_lossless_sized(bin, list_file, dst, 0, 1)
+}
+
+/// Remux a **fragmented-MP4 byte stream** into an ordinary clip file with `-c copy`.
+///
+/// This is how a clip is saved out of an in-memory ring. The footage has only ever been in RAM,
+/// and the file written here — named by the caller — is the **only** thing that touches the disk
+/// during the whole buffer-and-save cycle.
+///
+/// `-i pipe:0`, deliberately: spilling the stream to a temporary file and remuxing *that* would
+/// reintroduce exactly the scratch churn this path exists to remove, at the one moment it is
+/// least forgivable — the user has pressed the key and is waiting for the clip.
+/// [`run_with_stdin`] writes the bytes on its own thread for the same reason the encoder does: a
+/// pipe's buffer is 64KiB here and as little as 4KiB for a Windows anonymous pipe, so a blocking
+/// write on this thread could stall before the deadline bounding it ever ran.
+///
+/// The audio tracks are re-named from [`audio_titles`], because a `-c copy` to a file carries no
+/// per-stream metadata: without this the clip's tracks come out anonymous, which is a defect
+/// measured on real hardware and fixed the same way in the file concat.
+pub fn remux_stream_lossless(
+    bin: &FfmpegBinaries,
+    bytes: Vec<u8>,
+    dst: &Path,
+    audio_streams: usize,
+) -> Result<()> {
+    if bytes.is_empty() {
+        bail!("refusing to remux an empty stream: there is no footage to write");
+    }
+    // The budget is derived from the bytes actually being moved, like the concat's: this is the
+    // same copy, from a pipe instead of a list of files.
+    let budget = copy_budget(bytes.len() as u64);
+    let mut cmd = Command::new(&bin.ffmpeg);
+    cmd.args(["-v", "error", "-y", "-i", "pipe:0", "-map", "0", "-c", "copy"]);
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(dst);
+
+    let out = run_with_stdin(cmd, bytes, budget)?;
+    if !out.status.success() {
+        bail!(
+            "remuxing the in-memory stream into {} failed: {}",
+            dst.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if !dst.is_file() {
+        bail!(
+            "remuxing the in-memory stream reported success but {} does not exist",
+            dst.display()
+        );
+    }
+    Ok(())
 }
 
 /// As [`concat_lossless`], with the copy's budget derived from the bytes being moved.

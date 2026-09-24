@@ -64,30 +64,7 @@ impl ClipSplicer {
         concat?;
 
         let info = localplay_media::MediaInfo::probe(bin, out)?;
-
-        // A/V offset **within the produced clip** (spec §11 criterion 8). This is the
-        // observable that matters: it compares the audio and video stream timelines of
-        // the muxed file. It is NOT the QPC-clock divergence between the two live
-        // capture sources, which would require instrumenting the capture path itself.
-        let stem = out
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("clip");
-        match info.av_drift() {
-            Some(d) => tracing::info!(
-                "clip {stem}: video {}ms audio {}ms drift {}ms",
-                d.video_ms,
-                d.audio_ms,
-                d.delta_ms
-            ),
-            None => tracing::warn!(
-                "clip {stem}: A/V drift unavailable — ffprobe reported no per-stream \
-                 duration (video {}ms, audio {}ms); the streams are present but the \
-                 offset cannot be computed honestly",
-                opt_ms(info.video.as_ref().and_then(|v| v.duration_ms)),
-                opt_ms(info.audio.as_ref().and_then(|a| a.duration_ms)),
-            ),
-        }
+        log_drift(out, &info);
 
         Ok(ClipMetadata {
             path: out.to_path_buf(),
@@ -95,6 +72,88 @@ impl ClipSplicer {
             size_bytes: info.size_bytes,
             encoder: encoder.to_string(),
         })
+    }
+
+    /// Concatenate a **range of in-memory fragments** into one lossless clip file.
+    ///
+    /// The counterpart of [`ClipSplicer::splice`] for a RAM ring, and deliberately the same
+    /// shape: the same `-c copy`, the same refusal to re-encode, the same A/V drift report, the
+    /// same `ClipMetadata`. The only difference is where the footage comes from — bytes that
+    /// have never been written to disk, instead of a list of files that already were.
+    ///
+    /// Everything the window carries is checked before ffmpeg is spawned, because each is a
+    /// silent-damage case rather than an error the muxer would raise:
+    ///
+    /// * **an empty window** has nothing to cut;
+    /// * **a first fragment that is not a keyframe** would make the clip open mid-GOP, and the
+    ///   first frames would decode as garbage (or not at all). `frag_keyframe` means this cannot
+    ///   happen from this ring — which is exactly why it is asserted rather than assumed;
+    /// * **an unclosed window** would put a fragment whose length nothing has proved at the tail
+    ///   of a file whose duration then lies. [`crate::MemoryRingBuffer::window`] already selects
+    ///   only closed fragments; this checks the invariant at the point of use.
+    pub fn splice_from_memory(
+        bin: &FfmpegBinaries,
+        window: &crate::ram_buffer::MemoryWindow<'_>,
+        out: &Path,
+        encoder: &str,
+    ) -> Result<ClipMetadata> {
+        let Some(first) = window.segments.first() else {
+            bail!("cannot splice an empty in-memory window");
+        };
+        if !first.keyframe {
+            bail!(
+                "the first fragment of this window starts at {}ms and is not a keyframe, so a \
+                 clip cut here would open mid-GOP",
+                first.start_ms
+            );
+        }
+        if window.segments.iter().any(|s| !s.is_closed()) {
+            bail!(
+                "this window contains a fragment whose end nothing has proved yet, so the \
+                 clip's duration would be a claim rather than a measurement"
+            );
+        }
+
+        let audio_tracks = window.audio_tracks();
+        localplay_media::edit::remux_stream_lossless(bin, window.assemble(), out, audio_tracks)?;
+
+        let info = localplay_media::MediaInfo::probe(bin, out)?;
+        log_drift(out, &info);
+
+        Ok(ClipMetadata {
+            path: out.to_path_buf(),
+            duration_ms: info.duration_ms,
+            size_bytes: info.size_bytes,
+            encoder: encoder.to_string(),
+        })
+    }
+}
+
+/// Log the A/V offset of a clip that was just written.
+///
+/// One definition, used by both splice paths, because the two must report the same number the
+/// same way: this is spec §11 criterion 8, and a reader comparing a RAM clip's log line against
+/// a file clip's has to be comparing the same measurement.
+///
+/// A/V offset **within the produced clip** — it compares the audio and video stream timelines of
+/// the muxed file. It is NOT the QPC-clock divergence between the two live capture sources,
+/// which would require instrumenting the capture path itself.
+fn log_drift(out: &Path, info: &localplay_media::MediaInfo) {
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+    match info.av_drift() {
+        Some(d) => tracing::info!(
+            "clip {stem}: video {}ms audio {}ms drift {}ms",
+            d.video_ms,
+            d.audio_ms,
+            d.delta_ms
+        ),
+        None => tracing::warn!(
+            "clip {stem}: A/V drift unavailable — ffprobe reported no per-stream \
+             duration (video {}ms, audio {}ms); the streams are present but the \
+             offset cannot be computed honestly",
+            opt_ms(info.video.as_ref().and_then(|v| v.duration_ms)),
+            opt_ms(info.audio.as_ref().and_then(|a| a.duration_ms)),
+        ),
     }
 }
 

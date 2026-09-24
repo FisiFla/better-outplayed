@@ -15,6 +15,9 @@ tracing.workspace = true
 [dev-dependencies]
 localplay-capture = { path = "../capture" }
 localplay-encoder = { path = "../encoder" }
+# The RAM-clip test reads ffprobe's stream tags to prove a saved clip's audio track is named
+# rather than anonymous, which is a JSON shape and not worth reinventing.
+serde_json.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

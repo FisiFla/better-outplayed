@@ -88,6 +88,20 @@ impl FragmentSplitter {
         self.buf.len()
     }
 
+    /// How many **audio** tracks the header declares.
+    ///
+    /// Needed by the save path, which has to re-apply the track names: a `-c copy` carries no
+    /// per-stream metadata, so `edit::audio_titles` must be told how many tracks to name. Zero
+    /// before the header has been seen.
+    pub fn audio_tracks(&self) -> usize {
+        self.tracks.values().filter(|(is_video, _)| !is_video).count()
+    }
+
+    /// How many video tracks the header declares. Zero before the header has been seen.
+    pub fn video_tracks(&self) -> usize {
+        self.tracks.values().filter(|(is_video, _)| *is_video).count()
+    }
+
     /// Feed bytes just read from the pipe; returns whatever fragments that completed.
     ///
     /// A fragment is only returned once its `mdat` has arrived in full, so every `Fragment` is
