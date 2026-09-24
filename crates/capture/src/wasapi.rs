@@ -63,7 +63,11 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 /// engine is asked to deliver: the audio timeline is exactly derivable from the byte
 /// count (spec §13). Kept in step with [`AudioFormat::default`], which is the same
 /// statement made for the whole workspace.
-const TARGET: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+///
+/// `pub(crate)` because the microphone backend targets this same format rather than spelling
+/// out a second one: two tracks in one container have one format between them, and a test
+/// pins the two backends to it.
+pub(crate) const TARGET: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
 
 /// Bytes per captured frame: two channels of 16-bit PCM. Every packet the engine hands
 /// back is already in this format, so the byte count is frames x this.
@@ -413,7 +417,11 @@ fn open_client() -> Result<Client> {
 }
 
 /// Frees the mix-format blob the audio engine hands back.
-struct MixFormatGuard(*mut WAVEFORMATEX);
+///
+/// `pub(crate)` so the microphone backend can hold one too — reading a capture endpoint's
+/// native format is the same call and the same free, and one implementation of it is why the
+/// two backends' log lines are comparable.
+pub(crate) struct MixFormatGuard(pub(crate) *mut WAVEFORMATEX);
 
 impl Drop for MixFormatGuard {
     fn drop(&mut self) {
@@ -429,7 +437,10 @@ impl Drop for MixFormatGuard {
 /// a format this code cannot classify is reported as [`SampleEncoding::Other`] rather
 /// than refused. The stream is always opened with [`requested_format`], and the engine
 /// converts whatever it finds.
-fn native_format(format: *const WAVEFORMATEX) -> NativeAudioFormat {
+///
+/// Shared with the microphone backend, which asks the same question of a capture endpoint: one
+/// answer to "what is this endpoint natively" across the crate.
+pub(crate) fn native_format(format: *const WAVEFORMATEX) -> NativeAudioFormat {
     // SAFETY: `format` points at the live WAVEFORMATEX returned by GetMixFormat, which
     // the caller frees only after this function has copied what it needs out of it.
     // `WAVEFORMATEX` is packed, so every field is copied out by value here rather than
@@ -490,7 +501,10 @@ fn pcm_encoding(bits_per_sample: u16) -> SampleEncoding {
 /// PCM are fully described without the SubFormat GUID, and plain PCM is the classic
 /// shared-mode request. With AUTOCONVERTPCM above, this is the format the engine converts
 /// the endpoint's native audio *into*.
-fn requested_format() -> WAVEFORMATEX {
+///
+/// Shared with the microphone backend: the request is the crate's one canonical format, so
+/// there is exactly one place where it is spelled out for WASAPI.
+pub(crate) fn requested_format() -> WAVEFORMATEX {
     // 16-bit samples, 2 bytes each.
     const BYTES_PER_SAMPLE: u16 = 2;
     let block_align = TARGET.channels * BYTES_PER_SAMPLE;

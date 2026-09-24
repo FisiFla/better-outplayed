@@ -5,6 +5,16 @@ use std::time::Duration;
 pub mod platform;
 pub mod stub;
 
+// The microphone backend: a cross-platform module (so the recorder's microphone path is
+// testable off Windows) whose real implementation is the `#[cfg(windows)]` half inside it.
+pub mod wasapi_mic;
+
+// The synthetic microphone the recorder's microphone path is tested with off Windows (see
+// `wasapi_mic::StubMicrophone`). Re-exported because it is a first-class part of the crate's
+// public surface: a test that wires up a microphone needs it, and the real backend only
+// exists on Windows.
+pub use wasapi_mic::StubMicrophone;
+
 #[cfg(windows)]
 pub mod wasapi;
 #[cfg(windows)]
