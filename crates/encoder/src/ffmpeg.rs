@@ -105,7 +105,7 @@
 //! copied the whole pixel buffer on every frame — 3840x2160 BGRA is 33.2MB, ~1GB/s of
 //! pure memcpy at 30fps — on the path that was already failing to keep up.
 
-use crate::{EncodeConfig, Encoder, SampleFormat};
+use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat};
 use anyhow::{bail, Context, Result};
 use localplay_capture::{AudioBuffer, Frame};
 use localplay_media::FfmpegBinaries;
@@ -400,21 +400,49 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         }
     }
 
-    args.extend(["-f", "segment"].iter().map(OsString::from));
-    args.extend(["-segment_time"].iter().map(OsString::from));
-    args.push(keyframe_seconds(cfg).to_string().into());
-    args.extend(["-segment_format", "mp4"].iter().map(OsString::from));
-    // Each segment starts at zero, which is what the concat at clip time relies on
-    // (spec §6.3): every segment is a self-contained unit starting at t=0.
-    args.extend(["-reset_timestamps", "1"].iter().map(OsString::from));
-    // Continue the numbering instead of restarting it. ffmpeg's segment muxer supports
-    // this as `segment_start_number`; plain `-start_number` is *not* an option of this
-    // muxer and is silently ignored (measured: with `-start_number 5` the first file was
-    // still `seg-000000.mp4`), which would leave the encoder overwriting files the adopted
-    // ledger still names.
-    args.extend(["-segment_start_number"].iter().map(OsString::from));
-    args.push(cfg.start_number.to_string().into());
-    args.push(cfg.scratch_dir.join(SEGMENT_PATTERN).into());
+    match cfg.output {
+        EncodeOutput::Segmented => {
+            args.extend(["-f", "segment"].iter().map(OsString::from));
+            args.extend(["-segment_time"].iter().map(OsString::from));
+            args.push(keyframe_seconds(cfg).to_string().into());
+            args.extend(["-segment_format", "mp4"].iter().map(OsString::from));
+            // Each segment starts at zero, which is what the concat at clip time relies on
+            // (spec §6.3): every segment is a self-contained unit starting at t=0.
+            args.extend(["-reset_timestamps", "1"].iter().map(OsString::from));
+            // Continue the numbering instead of restarting it. ffmpeg's segment muxer supports
+            // this as `segment_start_number`; plain `-start_number` is *not* an option of this
+            // muxer and is silently ignored (measured: with `-start_number 5` the first file was
+            // still `seg-000000.mp4`), which would leave the encoder overwriting files the adopted
+            // ledger still names.
+            args.extend(["-segment_start_number"].iter().map(OsString::from));
+            args.push(cfg.start_number.to_string().into());
+            args.push(cfg.scratch_dir.join(SEGMENT_PATTERN).into());
+        }
+        EncodeOutput::FragmentedStream => {
+            // A stream, not files: fragmented MP4 on the child's stdout, so nothing is written
+            // to the SSD while the user is merely waiting for something worth clipping.
+            //
+            // `frag_keyframe` is what keeps `segment_ms` meaningful here. It starts a new
+            // fragment on every keyframe, and `video_output_args` already forces one per
+            // `segment_ms` (`-force_key_frames expr:gte(t,n_forced*…`) for the segmenter's
+            // sake — so a fragment boundary IS a segment boundary, the same cut granularity
+            // from the same interval, with no second keyframe argument to keep in step.
+            // Without it ffmpeg would fragment on its own schedule and a range of fragments
+            // would not line up with the trigger.
+            //
+            // `empty_moov` + `default_base_moof` make the stream self-describing from the
+            // first byte and free of a seek-back-to-patch-the-header requirement, which is
+            // what a pipe cannot provide. Measured shape: a 1249-byte `ftyp`+`moov`, then one
+            // `moof`+`mdat` per second carrying a monotonic `tfdt`.
+            args.extend(["-f", "mp4"].iter().map(OsString::from));
+            args.extend(
+                ["-movflags", "empty_moov+frag_keyframe+default_base_moof"]
+                    .iter()
+                    .map(OsString::from),
+            );
+            args.push("pipe:1".into());
+        }
+    }
 
     args
 }
@@ -424,6 +452,12 @@ const SEGMENT_PATTERN: &str = "seg-%06d.mp4";
 
 pub struct FfmpegEncoder {
     child: Child,
+    /// The child's stdout, when it was spawned with [`EncodeOutput::FragmentedStream`].
+    ///
+    /// Taken by the first caller that asks (`Encoder::take_output_stream`), because a pipe has
+    /// exactly one reader: whoever holds it owns the stream, and the buffer that keeps the last
+    /// minute of footage in memory is the thing that should.
+    output_stream: Option<std::process::ChildStdout>,
     video_tx: Option<SyncSender<Vec<u8>>>,
     audio_tx: Option<SyncSender<Vec<u8>>>,
     /// The microphone's queue into its own pump thread. `None` when the child was spawned
@@ -506,10 +540,14 @@ impl FfmpegEncoder {
             // contract for `mic_audio: None` is explained.
             .args(ffmpeg_args(cfg, &audio_url, mic_url.as_deref()))
             .stdin(Stdio::piped())
-            // Nothing is expected on stdout any more (it used to carry the audio
-            // pipe). Route it to the null device so ffmpeg can never write into our
-            // own stdout, where a stray byte would corrupt a caller's output.
-            .stdout(Stdio::null())
+            // Stdout carries the encoded stream in `FragmentedStream` mode and nothing at all in
+            // `Segmented` mode (it used to carry the audio pipe, before that moved to loopback
+            // TCP). In `Segmented` mode it is routed to the null device so ffmpeg can never
+            // write into *our* stdout, where a stray byte would corrupt a caller's output.
+            .stdout(match cfg.output {
+                EncodeOutput::Segmented => Stdio::null(),
+                EncodeOutput::FragmentedStream => Stdio::piped(),
+            })
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| {
@@ -522,6 +560,11 @@ impl FfmpegEncoder {
 
         // Video goes to the child's stdin; the audio listeners are moved into their
         // threads, which accept ffmpeg's connections there.
+        //
+        // Stdout is the *output* in `FragmentedStream` mode, so it is taken here and kept for
+        // the caller that owns the in-memory buffer. In `Segmented` mode it was routed to the
+        // null device and `take()` yields `None`.
+        let output_stream = child.stdout.take();
         let video_in = child.stdin.take().context("child stdin unavailable")?;
 
         let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
@@ -556,6 +599,7 @@ impl FfmpegEncoder {
 
         Ok(Self {
             child,
+            output_stream,
             video_tx: Some(video_tx),
             audio_tx: Some(audio_tx),
             mic_tx,
@@ -846,6 +890,10 @@ impl Encoder for FfmpegEncoder {
 
     fn mic_port(&self) -> Option<u16> {
         self.mic_port
+    }
+
+    fn take_output_stream(&mut self) -> Option<std::process::ChildStdout> {
+        self.output_stream.take()
     }
 }
 
@@ -1250,6 +1298,7 @@ mod tests {
         // audio listener; this is the smallest thing that has a child with stderr.
         let mut encoder = FfmpegEncoder {
             child,
+            output_stream: None,
             video_tx: None,
             audio_tx: None,
             mic_tx: None,

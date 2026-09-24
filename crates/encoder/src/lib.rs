@@ -137,6 +137,49 @@ pub struct EncodeConfig {
     pub mic_audio: Option<MicAudioSpec>,
     /// `None` means "real hardware encoder" — the only shipping configuration.
     pub(crate) software_encoder: Option<&'static str>,
+    /// Where the encoded stream goes: files on disk, or a fragmented-MP4 pipe.
+    ///
+    /// Defaults to [`EncodeOutput::Segmented`] everywhere, so every existing caller and test
+    /// keeps the behaviour it had. See [`EncodeOutput`] for what the other mode is for.
+    pub output: EncodeOutput,
+}
+
+/// Where an encoder's output goes.
+///
+/// The choice is a *storage* one, not a codec one: both modes run the same ffmpeg, the same
+/// encoder and the same forced-keyframe interval, and both produce footage a clip can be cut
+/// from with `-c copy`. What differs is whether the footage is on disk while it is only being
+/// *buffered*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeOutput {
+    /// `-f segment` into [`EncodeConfig::scratch_dir`]: one self-contained file per
+    /// `segment_ms`, each starting at zero.
+    ///
+    /// A file per second is what makes a crash survivable — the footage is on disk as it is
+    /// recorded — and session mode depends on exactly that. It is also SSD write churn while
+    /// the user is merely *waiting* for something worth clipping, which is what
+    /// [`EncodeOutput::FragmentedStream`] exists to avoid.
+    Segmented,
+    /// Fragmented MP4 on the child's **stdout** (`pipe:1`): one `moof`+`mdat` fragment per
+    /// forced keyframe, and **no file is written at all**.
+    ///
+    /// The caller reads that stream and keeps it in memory (`localplay_replay`'s
+    /// `MemoryRingBuffer`), so an idle replay buffer touches the disk only when a clip is
+    /// actually saved.
+    ///
+    /// Three things make this work, all of them measured before this was written:
+    ///
+    /// * `empty_moov+frag_keyframe+default_base_moof` produces a small `ftyp`+`moov` header
+    ///   (1249 bytes for a 6s 320x180 capture) followed by one `moof`+`mdat` per fragment, so
+    ///   the header can be kept once and any *contiguous range* of fragments appended to it is
+    ///   a valid fragmented MP4;
+    /// * `frag_keyframe` puts a fragment boundary on every forced keyframe, so `segment_ms`
+    ///   stays the cut granularity — the same interval, meaning the same thing, as it does for
+    ///   the segmenter;
+    /// * each fragment carries a `tfdt` (base media decode time) in the track's timescale
+    ///   (15360 for video, 48000 for audio in that measurement), which is monotonic and is how
+    ///   a fragment's `[start_ms, end_ms)` is computed without decoding anything.
+    FragmentedStream,
 }
 
 impl EncodeConfig {
@@ -167,6 +210,9 @@ impl EncodeConfig {
             // argument list this encoder has always built.
             mic_audio: None,
             software_encoder: Some(codec.hw_encoder_name(vendor)),
+            // Files on disk, which is the shipping behaviour and the one that survives a
+            // crash. A caller that wants no disk churn sets this to `FragmentedStream`.
+            output: EncodeOutput::Segmented,
         }
     }
 
@@ -196,6 +242,7 @@ impl EncodeConfig {
             start_number: 0,
             mic_audio: None,
             software_encoder: None,
+            output: EncodeOutput::Segmented,
         }
     }
 
@@ -272,8 +319,7 @@ pub trait Encoder: Send {
     fn input_fps(&self) -> u32;
 
     /// Video frames discarded because the encoder could not keep up.
-    ///
-    /// A live capture has no way to slow the world down: when the encoder's queue is
+    ///    /// A live capture has no way to slow the world down: when the encoder's queue is
     /// full the correct behaviour is to drop the frame and carry on (see the queue note
     /// in [`crate::ffmpeg`]), not to block the capture loop and not to fail. Dropping is
     /// only defensible if it is *counted*, so a soak can tell a clean run from one that
@@ -307,6 +353,21 @@ pub trait Encoder: Send {
     /// input was bound to, and tell "microphone enabled" apart from "microphone requested but
     /// not wired up".
     fn mic_port(&self) -> Option<u16> {
+        None
+    }
+
+    /// Take the encoder's fragmented-MP4 **output stream**, when it was spawned with
+    /// [`EncodeOutput::FragmentedStream`].
+    ///
+    /// `None` for a segmented encoder: its output is files on disk and there is no stream to
+    /// read. The default is `None` rather than an error, so "this encoder produces files"
+    /// cannot be confused with "somebody already took the stream".
+    ///
+    /// **Taken, not borrowed.** A pipe has exactly one reader, and the reader is the in-memory
+    /// ring buffer — which outlives any borrow it could take from an encoder whose lifetime it
+    /// does not control. Taking it makes the ownership explicit and makes a second caller's
+    /// `None` honest: there is one stream, and it has gone where it was sent.
+    fn take_output_stream(&mut self) -> Option<std::process::ChildStdout> {
         None
     }
 }
