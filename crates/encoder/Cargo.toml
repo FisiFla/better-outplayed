@@ -33,5 +33,11 @@ required-features = ["test-encoders"]
 name = "timeline"
 required-features = ["test-encoders"]
 
+# The microphone is a second audio input: this test proves it lands as a second tagged
+# track carrying its own audio, so it builds a software encoder too and needs the same gate.
+[[test]]
+name = "microphone"
+required-features = ["test-encoders"]
+
 [lints]
 workspace = true

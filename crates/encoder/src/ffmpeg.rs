@@ -1,10 +1,31 @@
-//! One ffmpeg process, a pipe video input, a loopback-TCP audio input, segmented
-//! MP4 output.
+//! One ffmpeg process, a pipe video input, **two optional loopback-TCP audio inputs**,
+//! segmented MP4 output.
 //!
 //! Video arrives on `pipe:0` — the child's stdin, which `std::process` hands us as a
 //! write end directly, so it needs no socket. Audio arrives on
 //! `tcp://127.0.0.1:{port}`: we bind a listener on an ephemeral loopback port and
 //! ffmpeg dials it, because for an input URL ffmpeg's tcp protocol is the CLIENT.
+//!
+//! ## Two audio inputs, one transport, one clock discipline
+//!
+//! The child declares up to three inputs, in this order:
+//!
+//! | input | stream | transport |
+//! |---|---|---|
+//! | 0 | raw BGRA video | `pipe:0` |
+//! | 1 | system/game audio | `tcp://127.0.0.1:{game_audio_port}` |
+//! | 2 | microphone (`EncodeConfig::mic_audio`) | `tcp://127.0.0.1:{mic_audio_port}` |
+//!
+//! Input 2 exists only when [`EncodeConfig::mic_audio`] is `Some`, and then the output
+//! carries both audio tracks: `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and
+//! `Microphone`. The microphone is a **second listener bound the same way**, pumped by the
+//! same [`pump_audio`] function on its own thread — its timing conventions are not a
+//! reimplementation but the same code: PCM is written as it is submitted, the media timeline
+//! is the sample count, starvation shows up as a stall in ffmpeg's own input, and a full
+//! queue drops and counts a block rather than blocking the capture loop
+//! ([`enqueue_or_drop`]). One writer thread *per input* is load-bearing, not tidiness:
+//! ffmpeg will not pull one input far ahead of another, so writing two inputs
+//! synchronously from one thread deadlocks the moment either sink's buffer fills.
 //!
 //! ## Why audio does not come in on `pipe:1`
 //!
@@ -84,10 +105,11 @@
 //! copied the whole pixel buffer on every frame — 3840x2160 BGRA is 33.2MB, ~1GB/s of
 //! pure memcpy at 30fps — on the path that was already failing to keep up.
 
-use crate::{EncodeConfig, Encoder};
+use crate::{EncodeConfig, Encoder, SampleFormat};
 use anyhow::{bail, Context, Result};
 use localplay_capture::{AudioBuffer, Frame};
 use localplay_media::FfmpegBinaries;
+use std::ffi::OsString;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -144,8 +166,29 @@ const VIDEO_QUEUE_FRAMES: usize = 4;
 /// Blocks are 1920 B at 48kHz stereo s16le, so this is ~61 KB — 320 ms of audio, ~1600x
 /// cheaper per millisecond of slack than the video queue. Audio is given more slack than
 /// video for that reason: a dropped block is a hole in the sound, and the memory saved by
-/// trimming this number would be noise.
+/// trimming this number would be noise. The microphone's queue (`FfmpegEncoder::mic_tx`) is
+/// sized the same way, because it carries the same kind of payload.
 const AUDIO_QUEUE_BLOCKS: usize = 32;
+
+/// The format the **game/system** audio input has always been declared with: raw s16le PCM
+/// at 48kHz stereo.
+///
+/// Named rather than inlined because the microphone input is declared by the same function
+/// ([`audio_input_args`]): two inputs declared by one piece of code cannot drift from each
+/// other, which is what makes "both audio streams share one clock discipline" mechanical
+/// rather than a promise. These are the pipeline's published values
+/// (`localplay_capture::AudioFormat::default`), not settings.
+const GAME_AUDIO_SAMPLE_RATE: u32 = 48_000;
+const GAME_AUDIO_CHANNELS: u16 = 2;
+
+/// What an audio input is called in error messages and in the writer thread's name.
+///
+/// The game audio keeps the exact wording every existing report already uses, so a
+/// single-audio failure reads as it did before the microphone existed; the second input
+/// names itself, which is the difference between "the audio input failed" and "the
+/// microphone input failed".
+const GAME_AUDIO_LABEL: &str = "audio";
+const MICROPHONE_LABEL: &str = "microphone";
 
 /// Bytes queued by the caller, written to the child by a dedicated thread.
 type WriterHandle = JoinHandle<std::io::Result<()>>;
@@ -249,12 +292,145 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     args
 }
 
+/// The ffmpeg arguments that declare **one raw-PCM loopback audio input**: its format, its
+/// sample rate, its channel count and the URL ffmpeg dials.
+///
+/// Both audio inputs are declared by this function — the game/system one from the constants
+/// above, the microphone from [`crate::MicAudioSpec`] — so the two cannot be declared
+/// differently: same demuxer, same option order, same meaning for every number. That is the
+/// "one clock discipline" of the module comment applied to the *transport*, and it is also
+/// what makes the microphone's format a checked value rather than a copy of a literal: a
+/// rate or channel count that disagrees with the PCM actually submitted shifts the
+/// microphone track against the other two streams instead of failing.
+fn audio_input_args(
+    url: &str,
+    sample_rate: u32,
+    channels: u16,
+    sample_format: SampleFormat,
+) -> Vec<String> {
+    vec![
+        "-f".to_string(),
+        sample_format.ffmpeg_name().to_string(),
+        "-ar".to_string(),
+        sample_rate.to_string(),
+        "-ac".to_string(),
+        channels.to_string(),
+        "-i".to_string(),
+        url.to_string(),
+    ]
+}
+
+/// The **complete** ffmpeg argument list for one recording child, program name excepted.
+///
+/// Every argument this encoder ever passes is built here, as a pure function of the
+/// configuration and the two loopback URLs, and [`FfmpegEncoder::spawn`] does nothing with
+/// the result but hand it to `Command::args`. That is deliberate: it is what lets a test
+/// assert the whole argument list element for element, and in particular assert the
+/// microphone's contract — with [`EncodeConfig::mic_audio`] `None`, this vector is what it
+/// was before the second input existed, byte for byte
+/// (`the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list`).
+///
+/// `OsString` rather than `String` because the segment pattern at the end is a real path:
+/// an `EncodeConfig::scratch_dir` that is not valid UTF-8 must reach ffmpeg as the bytes it
+/// actually is. `Command::args` takes them as-is either way.
+fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Vec<OsString> {
+    let mut args: Vec<OsString> =
+        ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    // (`-nostdin` is what keeps ffmpeg from consuming our stdin for interactive commands,
+    // which would steal raw video frames; `-loglevel error` is why a failure's reason is
+    // read out of stderr by `drain_stderr` rather than scraped from a progress line.)
+
+    // Input 0 — video: raw BGRA frames on the child's stdin, at the declared rate. Shared
+    // with the startup throughput probe — see [`video_input_args`], which is also where the
+    // `-framerate`-not-`-r` rule and the arrival timestamps are documented.
+    args.extend(video_input_args(cfg).into_iter().map(OsString::from));
+
+    // Input 1 — system/game audio: raw s16le PCM over loopback TCP. This is the transport
+    // that works on Windows as well as here — see the module comment.
+    args.extend(
+        audio_input_args(
+            audio_url,
+            GAME_AUDIO_SAMPLE_RATE,
+            GAME_AUDIO_CHANNELS,
+            SampleFormat::S16Le,
+        )
+        .into_iter()
+        .map(OsString::from),
+    );
+
+    // Input 2 — the microphone, when one was configured. Declared by the same function as
+    // input 1 and pumped by the same function too, so the second track cannot invent its
+    // own timing conventions; only the numbers come from the caller's `MicAudioSpec`.
+    if let Some(mic_url) = mic_url {
+        let spec = cfg.mic_audio.expect(
+            "a microphone URL is only ever passed when EncodeConfig::mic_audio is Some",
+        );
+        args.extend(
+            audio_input_args(mic_url, spec.sample_rate, spec.channels, spec.sample_format)
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+
+    // The encoder for input 0: scale (when asked for), codec, bitrate and the keyframe
+    // schedule. Shared with the probe for the same reason.
+    args.extend(video_output_args(cfg).into_iter().map(OsString::from));
+    args.extend(["-c:a", "aac", "-b:a"].iter().map(OsString::from));
+    args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
+
+    // Only with a second audio input does the output have to be mapped explicitly: with
+    // ONE audio input ffmpeg's default stream selection already picks exactly input 0's
+    // video and input 1's audio, which is why the single-track list has never carried a
+    // `-map` (and why it still must not: with `mic_audio: None` the list is unchanged).
+    // With two audio inputs the default would pick ONE of them, so both are mapped and both
+    // are tagged — a two-track container whose tracks cannot be told apart is not the
+    // feature. Input order is the source of both indices: 1 is the game audio, which
+    // `Encoder::submit_audio` feeds, and 2 the microphone, which `Encoder::submit_mic_audio`
+    // feeds.
+    if mic_url.is_some() {
+        args.extend(
+            [
+                "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                "-metadata:s:a:0", "title=Game Audio",
+                "-metadata:s:a:1", "title=Microphone",
+            ]
+            .iter()
+            .map(OsString::from),
+        );
+    }
+
+    args.extend(["-f", "segment"].iter().map(OsString::from));
+    args.extend(["-segment_time"].iter().map(OsString::from));
+    args.push(keyframe_seconds(cfg).to_string().into());
+    args.extend(["-segment_format", "mp4"].iter().map(OsString::from));
+    // Each segment starts at zero, which is what the concat at clip time relies on
+    // (spec §6.3): every segment is a self-contained unit starting at t=0.
+    args.extend(["-reset_timestamps", "1"].iter().map(OsString::from));
+    // Continue the numbering instead of restarting it. ffmpeg's segment muxer supports
+    // this as `segment_start_number`; plain `-start_number` is *not* an option of this
+    // muxer and is silently ignored (measured: with `-start_number 5` the first file was
+    // still `seg-000000.mp4`), which would leave the encoder overwriting files the adopted
+    // ledger still names.
+    args.extend(["-segment_start_number"].iter().map(OsString::from));
+    args.push(cfg.start_number.to_string().into());
+    args.push(cfg.scratch_dir.join(SEGMENT_PATTERN).into());
+
+    args
+}
+
+/// The segment muxer's file-name pattern inside [`EncodeConfig::scratch_dir`].
+const SEGMENT_PATTERN: &str = "seg-%06d.mp4";
+
 pub struct FfmpegEncoder {
     child: Child,
     video_tx: Option<SyncSender<Vec<u8>>>,
     audio_tx: Option<SyncSender<Vec<u8>>>,
+    /// The microphone's queue into its own pump thread. `None` when the child was spawned
+    /// without a second audio input — see [`EncodeConfig::mic_audio`].
+    mic_tx: Option<SyncSender<Vec<u8>>>,
     video_writer: Option<WriterHandle>,
     audio_writer: Option<WriterHandle>,
+    mic_writer: Option<WriterHandle>,
     encoder_name: &'static str,
     /// The geometry the rawvideo pipe was declared with (`-s {w}x{h}`), reported back to
     /// the caller so a frame of any other size can be refused instead of being sliced
@@ -264,10 +440,20 @@ pub struct FfmpegEncoder {
     /// the caller that paces capture can pace to exactly the number the child was told
     /// (see `Encoder::input_fps`).
     input_fps: u32,
+    /// The loopback port the microphone input was bound to, reported by
+    /// `Encoder::mic_port`. `None` when there is no microphone input.
+    mic_port: Option<u16>,
+    /// What the child was told the microphone input is (`-f/-ar/-ac`), kept so
+    /// [`Encoder::submit_mic_audio`] can refuse a block whose own format disagrees with the
+    /// declaration instead of putting the track on a timeline of the wrong length.
+    mic_spec: Option<crate::MicAudioSpec>,
     /// Frames dropped because a queue was full. Atomics because the count is written on
     /// the submitting thread and read through `&self` (see `Encoder::dropped_frames`).
     dropped_video: AtomicU64,
     dropped_audio: AtomicU64,
+    /// Microphone blocks dropped, for the same reason and by the same mechanism as
+    /// [`FfmpegEncoder::dropped_audio`].
+    dropped_mic_audio: AtomicU64,
     /// Text already read out of ffmpeg's stderr, which a pipe can only give up once
     /// (see [`FfmpegEncoder::drain_stderr`]). Two different reports can want it — the
     /// writer failure that explains a dead encoder, and [`Encoder::finish`] — and the
@@ -279,9 +465,6 @@ impl FfmpegEncoder {
     pub fn spawn(bin: &FfmpegBinaries, cfg: &EncodeConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.scratch_dir)
             .with_context(|| format!("creating {}", cfg.scratch_dir.display()))?;
-
-        let pattern = cfg.scratch_dir.join("seg-%06d.mp4");
-        let keyframe_secs = keyframe_seconds(cfg);
 
         // Audio comes in over loopback TCP. Bind before spawning the child: the port
         // has to be in the argument list, and `:0` makes the OS pick a free one, which
@@ -295,35 +478,32 @@ impl FfmpegEncoder {
             .port();
         let audio_url = format!("tcp://127.0.0.1:{audio_port}");
 
+        // The microphone is a SECOND listener of exactly the same kind, bound at the same
+        // point (before the child exists) because its port has to be in the argument list
+        // too. Binding here is also what makes "the microphone could not be brought up" a
+        // failure of the start rather than a recording that quietly carries one track: a
+        // bind that fails returns from `spawn` with the error, and nothing is recorded.
+        let mic: Option<(TcpListener, u16)> = match cfg.mic_audio {
+            Some(_) => {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .context("binding the microphone input listener on 127.0.0.1")?;
+                let port = listener
+                    .local_addr()
+                    .context("reading the microphone input listener's port")?
+                    .port();
+                Some((listener, port))
+            }
+            None => None,
+        };
+        let mic_url = mic.as_ref().map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
+
         let mut cmd = Command::new(&bin.ffmpeg);
         cmd
-            // `-nostdin` keeps ffmpeg from consuming our stdin for interactive
-            // commands, which would steal raw video frames.
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            // Video input: raw BGRA frames on stdin, at the declared rate. Shared with the
-            // startup throughput probe — see [`video_input_args`], which is also where the
-            // `-framerate`-not-`-r` rule and the arrival timestamps are documented.
-            .args(video_input_args(cfg))
-            // Audio input: raw s16le PCM over loopback TCP. This is the transport that
-            // works on Windows as well as here — see the module comment.
-            .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", &audio_url])
-            // The encoder for that video input: scale (when asked for), codec, bitrate and
-            // the keyframe schedule. Shared with the probe for the same reason.
-            .args(video_output_args(cfg))
-            .args(["-c:a", "aac", "-b:a", &format!("{}k", cfg.audio_bitrate_kbps)])
-            .args(["-f", "segment"])
-            .args(["-segment_time", &keyframe_secs.to_string()])
-            .args(["-segment_format", "mp4"])
-            // Each segment starts at zero, which is what the concat at clip time relies
-            // on (spec §6.3): every segment is a self-contained unit starting at t=0.
-            .args(["-reset_timestamps", "1"])
-            // Continue the numbering instead of restarting it. ffmpeg's segment muxer
-            // supports this as `segment_start_number`; plain `-start_number` is *not* an
-            // option of this muxer and is silently ignored (measured: with
-            // `-start_number 5` the first file was still `seg-000000.mp4`), which would
-            // leave the encoder overwriting files the adopted ledger still names.
-            .args(["-segment_start_number", &cfg.start_number.to_string()])
-            .arg(&pattern)
+            // The whole argument list, built in one place so that what a test asserts is
+            // what the child is spawned with — see [`ffmpeg_args`], which is also where the
+            // microphone's input/mapping/tagging lives and where the byte-identical
+            // contract for `mic_audio: None` is explained.
+            .args(ffmpeg_args(cfg, &audio_url, mic_url.as_deref()))
             .stdin(Stdio::piped())
             // Nothing is expected on stdout any more (it used to carry the audio
             // pipe). Route it to the null device so ffmpeg can never write into our
@@ -339,8 +519,8 @@ impl FfmpegEncoder {
             )
         })?;
 
-        // Video goes to the child's stdin; the audio listener is moved into the audio
-        // thread, which accepts ffmpeg's connection there.
+        // Video goes to the child's stdin; the audio listeners are moved into their
+        // threads, which accept ffmpeg's connections there.
         let video_in = child.stdin.take().context("child stdin unavailable")?;
 
         let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
@@ -352,20 +532,43 @@ impl FfmpegEncoder {
             .context("spawning video writer thread")?;
         let audio_writer = std::thread::Builder::new()
             .name("ffmpeg-audio-in".into())
-            .spawn(move || pump_audio(audio_listener, audio_rx, audio_port))
+            .spawn(move || pump_audio(audio_listener, audio_rx, audio_port, GAME_AUDIO_LABEL))
             .context("spawning audio writer thread")?;
+
+        // The microphone pump is a thread of its own, and that is not tidiness: ffmpeg
+        // will not pull one input far ahead of the other, so a single thread writing both
+        // audio inputs would deadlock as soon as either socket's buffer filled (the module
+        // comment on threading; this bug was fixed once already). It runs the same
+        // `pump_audio` as the game audio — same accept-with-deadline, same blocking-mode
+        // fix, same drop policy — so the two tracks cannot diverge in timing conventions.
+        let (mic_tx, mic_writer, mic_port) = match mic {
+            Some((listener, port)) => {
+                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
+                let writer = std::thread::Builder::new()
+                    .name("ffmpeg-mic-in".into())
+                    .spawn(move || pump_audio(listener, rx, port, MICROPHONE_LABEL))
+                    .context("spawning microphone writer thread")?;
+                (Some(tx), Some(writer), Some(port))
+            }
+            None => (None, None, None),
+        };
 
         Ok(Self {
             child,
             video_tx: Some(video_tx),
             audio_tx: Some(audio_tx),
+            mic_tx,
             video_writer: Some(video_writer),
             audio_writer: Some(audio_writer),
+            mic_writer,
             encoder_name: cfg.encoder_name(),
             source_size: cfg.source_size,
             input_fps: cfg.fps,
+            mic_port,
+            mic_spec: cfg.mic_audio,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
+            dropped_mic_audio: AtomicU64::new(0),
             drained_stderr: None,
         })
     }
@@ -383,16 +586,23 @@ fn pump<W: Write>(rx: mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<(
 /// Accept ffmpeg's connection to the audio input, then stream the queued PCM into it.
 ///
 /// Dropping the socket at the end closes it, which is ffmpeg's EOF on the audio input.
+///
+/// `what` names the input in anything that fails (`"audio"` for the game/system input,
+/// `"microphone"` for the second one). Both inputs run this exact function — same accept
+/// with a deadline, same accepted-socket fix, same write loop — which is what the module
+/// comment means by one clock discipline: the microphone is not a second implementation of
+/// the transport, it is the same one on a different port.
 fn pump_audio(
     listener: TcpListener,
     rx: mpsc::Receiver<Vec<u8>>,
     port: u16,
+    what: &str,
 ) -> std::io::Result<()> {
-    let stream = accept_within(&listener, port, AUDIO_CONNECT_TIMEOUT)?;
+    let stream = accept_within(&listener, port, AUDIO_CONNECT_TIMEOUT, what)?;
     // PCM arrives in small blocks (10ms = 1920 bytes at 48kHz stereo s16le) and ffmpeg
     // is reading them in real time, so Nagle would add nothing but latency here.
     stream.set_nodelay(true).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("disabling Nagle on the audio input socket: {e}"))
+        std::io::Error::new(e.kind(), format!("disabling Nagle on the {what} input socket: {e}"))
     })?;
     pump(rx, stream)
 }
@@ -405,15 +615,19 @@ fn pump_audio(
 /// `accept()` would hang `finish()` for no stated reason. Polling turns that into a
 /// message naming the port and the deadline. `WouldBlock` is the only error that means
 /// "not yet"; anything else is a real failure and is returned as-is.
+///
+/// `what` names the input the listener belongs to (`"audio"` / `"microphone"`) in the
+/// failure messages; it changes no behaviour.
 fn accept_within(
     listener: &TcpListener,
     port: u16,
     timeout: Duration,
+    what: &str,
 ) -> std::io::Result<TcpStream> {
     listener.set_nonblocking(true).map_err(|e| {
         std::io::Error::new(
             e.kind(),
-            format!("making the audio input listener non-blocking: {e}"),
+            format!("making the {what} input listener non-blocking: {e}"),
         )
     })?;
     let deadline = Instant::now() + timeout;
@@ -426,7 +640,7 @@ fn accept_within(
                 if !peer.ip().is_loopback() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("audio input connection from non-loopback peer {peer}"),
+                        format!("{what} input connection from non-loopback peer {peer}"),
                     ));
                 }
                 // The listener is non-blocking SOLELY so this poll loop can enforce a
@@ -438,15 +652,19 @@ fn accept_within(
                 // non-blocking socket makes `write_all` fail with `WouldBlock`
                 // (`EAGAIN`, os error 35) the instant ffmpeg's receive buffer fills,
                 // which is a race on how fast the pump fills it: the intermittent
-                // failure this line fixes. A blocking accepted socket is the correct
-                // design here: the pump runs on its own dedicated thread fed by a
-                // bounded channel, so the backpressure of a blocking write can still
-                // never propagate to `submit_audio` on the caller's thread: the submit
-                // drops the block instead of waiting for room (see `enqueue_or_drop`).
+                // failure this line fixes, and the one that bit the game-audio input
+                // twice (docs/platform-traps.md, trap 1). The microphone listener is a
+                // SECOND copy of this accept path, so it needs this line for exactly the
+                // same reason — not "probably fine because the audio one works".
+                // A blocking accepted socket is the correct design here: the pump runs on
+                // its own dedicated thread fed by a bounded channel, so the backpressure
+                // of a blocking write can still never propagate to `submit_audio` /
+                // `submit_mic_audio` on the caller's thread: the submit drops the block
+                // instead of waiting for room (see `enqueue_or_drop`).
                 stream.set_nonblocking(false).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
-                        format!("making the accepted audio input socket blocking: {e}"),
+                        format!("making the accepted {what} input socket blocking: {e}"),
                     )
                 })?;
                 return Ok(stream);
@@ -456,7 +674,7 @@ fn accept_within(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
-                            "ffmpeg never connected to the audio input on 127.0.0.1:{port} \
+                            "ffmpeg never connected to the {what} input on 127.0.0.1:{port} \
                              within {timeout:?}"
                         ),
                     ));
@@ -512,31 +730,75 @@ impl Encoder for FfmpegEncoder {
         queued.map_err(|e| self.explain_dead_writer(e))
     }
 
+    /// Queue a **microphone** block on the second input, or drop it if that queue is full.
+    /// Same reasoning and the same drop counting as [`Encoder::submit_audio`]; the counter
+    /// is `Encoder::dropped_mic_audio_blocks`.
+    ///
+    /// Unlike the game audio (whose format is a constant of the pipeline), the microphone's
+    /// format is what the *caller* declared in `EncodeConfig::mic_audio`, and it is what the
+    /// child was told (`-f/-ar/-ac`). A block whose own format disagrees with that
+    /// declaration is refused rather than queued: the bytes would be read as a different
+    /// length, so the microphone track would sit on a timeline of the wrong length for the
+    /// whole clip and nothing downstream could tell. Same failure mode as a frame of the
+    /// wrong geometry on the video pipe (`Encoder::source_size`), so the same answer.
+    fn submit_mic_audio(&mut self, audio: AudioBuffer) -> Result<()> {
+        let Some(tx) = self.mic_tx.as_ref() else {
+            bail!(
+                "this encoder was spawned without a microphone input \
+                 (EncodeConfig::mic_audio was None); the block was refused rather than \
+                 silently dropped"
+            );
+        };
+        let spec = self
+            .mic_spec
+            .expect("a microphone queue exists only when a microphone spec was configured");
+        if audio.format.sample_rate != spec.sample_rate || audio.format.channels != spec.channels
+        {
+            bail!(
+                "microphone block is {}Hz {}ch but the input was declared as {}Hz {}ch \
+                 (EncodeConfig::mic_audio); accepting it would put the microphone track on \
+                 a timeline of the wrong length",
+                audio.format.sample_rate,
+                audio.format.channels,
+                spec.sample_rate,
+                spec.channels
+            );
+        }
+        let queued = enqueue_or_drop(tx, audio.data, &self.dropped_mic_audio, MICROPHONE_LABEL);
+        queued.map_err(|e| self.explain_dead_writer(e))
+    }
+
     fn finish(&mut self) -> Result<()> {
         // Dropping the senders ends each pump loop, closing the video pipe and the
-        // audio socket — which is what tells ffmpeg the inputs have ended.
+        // audio sockets — which is what tells ffmpeg the inputs have ended.
         self.video_tx.take();
         self.audio_tx.take();
-        // Join both writers before reporting: the audio thread may still be waiting
+        self.mic_tx.take();
+        // Join every writer before reporting: an audio thread may still be waiting
         // out its connect deadline, and abandoning it would leave a listener that a
         // later connection could reach after this encoder is done.
         let video_res = join_writer(self.video_writer.take(), "video");
-        let audio_res = join_writer(self.audio_writer.take(), "audio");
+        let audio_res = join_writer(self.audio_writer.take(), GAME_AUDIO_LABEL);
+        let mic_res = join_writer(self.mic_writer.take(), MICROPHONE_LABEL);
 
         // The connect deadline is the one failure that leaves ffmpeg alive but silent:
-        // it never opened the audio input, so it never read video either, and waiting
-        // on it below would block forever. Kill it, then report the deadline along
-        // with whatever it managed to log.
-        if let Err(audio_err) = &audio_res {
-            if is_connect_deadline(audio_err) {
-                let _ = self.child.kill();
-                let status = self.child.wait().context("reaping ffmpeg")?;
-                let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
-                bail!(
-                    "{audio_err:#}; ffmpeg status after the deadline was {status}, stderr: {}",
-                    stderr.trim()
-                );
-            }
+        // it never opened the input, so it never read video either, and waiting on it
+        // below would block forever. Kill it, then report the deadline along with
+        // whatever it managed to log. Either audio input hitting that deadline has the
+        // same consequence and the same handling — and past this point the report names
+        // which input it was, because `pump_audio` puts the label in the message.
+        let deadline = [audio_res.as_ref().err(), mic_res.as_ref().err()]
+            .into_iter()
+            .flatten()
+            .find(|err| is_connect_deadline(err));
+        if let Some(err) = deadline {
+            let _ = self.child.kill();
+            let status = self.child.wait().context("reaping ffmpeg")?;
+            let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+            bail!(
+                "{err:#}; ffmpeg status after the deadline was {status}, stderr: {}",
+                stderr.trim()
+            );
         }
 
         // ffmpeg's own exit status and stderr explain a failed start (a bad encoder
@@ -553,6 +815,7 @@ impl Encoder for FfmpegEncoder {
         }
         video_res?;
         audio_res?;
+        mic_res?;
         Ok(())
     }
 
@@ -574,6 +837,14 @@ impl Encoder for FfmpegEncoder {
 
     fn dropped_audio_blocks(&self) -> u64 {
         self.dropped_audio.load(Ordering::Relaxed)
+    }
+
+    fn dropped_mic_audio_blocks(&self) -> u64 {
+        self.dropped_mic_audio.load(Ordering::Relaxed)
+    }
+
+    fn mic_port(&self) -> Option<u16> {
+        self.mic_port
     }
 }
 
@@ -660,10 +931,11 @@ impl FfmpegEncoder {
     }
 }
 
-/// Whether a writer error is the audio thread's connect deadline.
+/// Whether a writer error is an audio thread's connect deadline.
 ///
-/// `accept_within` is the only place in this module that raises `TimedOut`, and the
-/// audio thread is the only thread that calls it, so the error kind is the signal.
+/// `accept_within` is the only place in this module that raises `TimedOut`, and the two
+/// audio threads are its only callers (one per audio input), so the error kind is the
+/// signal — and the message it carries names which input it was.
 fn is_connect_deadline(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -806,6 +1078,112 @@ mod tests {
         }
     }
 
+    /// The argument list as the os-string vector `Command::args` receives it, for
+    /// comparison with a written-out expectation. Every element is ASCII here; only the
+    /// segment pattern is a path, and it is derived the same way on both sides.
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// The microphone's contract, in the direction that must never regress: with
+    /// `mic_audio: None` the child is spawned with **exactly** the arguments it was spawned
+    /// with before the second audio input existed.
+    ///
+    /// The baseline below is transcribed element for element from `FfmpegEncoder::spawn` as
+    /// it stood before this change — written out in full, deliberately, because an
+    /// expectation built from the builders under test would assert nothing at all. Adding,
+    /// removing, reordering or re-spelling anything on the single-audio path fails here, and
+    /// that is the point: an argument list that only *looks* equivalent is how the
+    /// `-start_number`/`-segment_start_number` and `-r`/`-framerate` mistakes happened (see
+    /// the comments in [`ffmpeg_args`]).
+    #[test]
+    fn the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list() {
+        let cfg = args_cfg(30, 1_000);
+
+        let got = strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", None));
+        let mut expected: Vec<String> = vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin",
+            // Input 0: raw BGRA video on stdin, at the declared rate, timed from arrival.
+            "-f", "rawvideo", "-pix_fmt", "bgra", "-s", "1280x720", "-framerate", "30",
+            "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
+            // Input 1: raw s16le PCM over loopback TCP.
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
+            // The video encoder: the passthrough frame-rate mode, the codec, its bitrate,
+            // its GOP and its forced keyframes.
+            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-g", "30",
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
+            // The audio codec, then the segment muxer and its numbering.
+            "-c:a", "aac", "-b:a", "128k", "-f", "segment", "-segment_time", "1",
+            "-segment_format", "mp4", "-reset_timestamps", "1", "-segment_start_number", "0",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        // The one element that is a real path, built the way the encoder builds it, so the
+        // comparison does not depend on the platform's path separator.
+        expected.push(cfg.scratch_dir.join("seg-%06d.mp4").to_string_lossy().into_owned());
+
+        assert_eq!(
+            got, expected,
+            "the single-audio argument list must be byte-identical to the pre-change list. \
+             Note what is absent: no `-map` and no `-metadata` — with one audio input \
+             ffmpeg's default stream selection already picks exactly input 0's video and \
+             input 1's audio, which is why the microphone is the only thing that adds them"
+        );
+    }
+
+    /// The other direction: enabling the microphone adds *its own input* and the
+    /// mapping/tagging, and moves nothing else.
+    ///
+    /// The frozen shapes are all visible here: input 2 is `tcp://127.0.0.1:{mic_audio_port}`
+    /// declared from the caller's `MicAudioSpec`, and the output carries
+    /// `-map 0:v -map 1:a -map 2:a` with `-metadata:s:a:0 title=Game Audio` and
+    /// `-metadata:s:a:1 title=Microphone`. The video arguments — including the
+    /// `-fps_mode passthrough` that keeps the media timeline on the wall clock — are the
+    /// same elements in the same order as the single-audio list, because the second audio
+    /// input is declared between them and changes nothing about them.
+    #[test]
+    fn enabling_the_microphone_adds_its_own_input_its_mapping_and_its_tags() {
+        let mut cfg = args_cfg(30, 1_000);
+        // Deliberately NOT the default spec. The sample rate and the channel count are
+        // numbers the child is *told* (`-ar` / `-ac`), and a spec that never reaches them
+        // would put the microphone track on a timeline of the wrong length.
+        cfg.mic_audio = Some(crate::MicAudioSpec {
+            sample_rate: 44_100,
+            channels: 1,
+            sample_format: SampleFormat::S16Le,
+        });
+
+        let got =
+            strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", Some("tcp://127.0.0.1:43210")));
+        let mut expected: Vec<String> = vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "rawvideo", "-pix_fmt", "bgra", "-s", "1280x720", "-framerate", "30",
+            "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
+            // Input 2, from the configuration's spec.
+            "-f", "s16le", "-ar", "44100", "-ac", "1", "-i", "tcp://127.0.0.1:43210",
+            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-g", "30",
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
+            "-c:a", "aac", "-b:a", "128k",
+            // What a second audio input makes necessary, and the only two things this
+            // change adds: both audio streams are mapped explicitly (without maps ffmpeg
+            // would pick ONE of them) and each is tagged, because a two-track container
+            // whose tracks cannot be told apart is not the feature.
+            "-map", "0:v", "-map", "1:a", "-map", "2:a",
+            "-metadata:s:a:0", "title=Game Audio",
+            "-metadata:s:a:1", "title=Microphone",
+            "-f", "segment", "-segment_time", "1", "-segment_format", "mp4",
+            "-reset_timestamps", "1", "-segment_start_number", "0",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        expected.push(cfg.scratch_dir.join("seg-%06d.mp4").to_string_lossy().into_owned());
+
+        assert_eq!(got, expected, "the microphone adds its input, its mapping and its tags");
+    }
+
     #[test]
     fn a_payload_that_fits_is_queued_and_not_counted_as_dropped() {
         let (tx, rx) = mpsc::sync_channel::<u32>(1);
@@ -873,13 +1251,18 @@ mod tests {
             child,
             video_tx: None,
             audio_tx: None,
+            mic_tx: None,
             video_writer: None,
             audio_writer: None,
+            mic_writer: None,
             encoder_name: "h264_amf",
             source_size: (320, 240),
             input_fps: 30,
+            mic_port: None,
+            mic_spec: None,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
+            dropped_mic_audio: AtomicU64::new(0),
             drained_stderr: None,
         };
         encoder.child.wait().unwrap();
@@ -950,5 +1333,107 @@ mod tests {
             "ffmpeg's own words are the point, and they were only in its stderr: {err}"
         );
         assert!(err.contains("exit status"), "and so is its exit status: {err}");
+    }
+
+    /// The trap this codebase has been bitten by twice (`docs/platform-traps.md`, trap 1):
+    /// on macOS and the other BSD-derived platforms the socket `accept()` returns inherits
+    /// the **listener's** `O_NONBLOCK`, so a write that would have waited for ffmpeg to
+    /// drain the socket fails immediately with `WouldBlock` (`EAGAIN`, os error 35) the
+    /// moment the socket buffers fill. It shows up as a flake — "the pump fails only when it
+    /// happens to get ahead of ffmpeg" — so a test that hopes to hit the race proves
+    /// nothing; this one makes the state certain instead.
+    ///
+    /// [`accept_within`] forces the accepted socket back to blocking mode for exactly this
+    /// reason, and the microphone input is a **second copy of that accept path**
+    /// (`pump_audio` calls this and nothing else before writing), so it needs the same line.
+    /// The client here is a real ffmpeg on the same `s16le` transport the encoder declares,
+    /// paced to real time with `-re` and given a small receive buffer, so it cannot swallow
+    /// a megabyte whole: the writer has to *wait* for it.
+    ///
+    /// The two behaviours are told apart by the socket's own write timeout, which is the
+    /// discriminator `docs/platform-traps.md` names: a blocking socket honours it (the write
+    /// waits out the timeout and then reports `WouldBlock`), a non-blocking socket ignores it
+    /// and reports `WouldBlock` immediately. So the assertion is "the large write did not
+    /// fail at once", which is exactly "the accepted socket is blocking".
+    ///
+    /// The client is ffmpeg rather than a `TcpStream::connect`: the tree's outbound sockets
+    /// are enumerated by `crates/events/tests/no_egress.rs` and a new one belongs in that
+    /// list deliberately. ffmpeg dialling a listener we bound is the production shape anyway.
+    #[cfg(feature = "test-encoders")]
+    #[test]
+    fn a_large_block_written_to_the_microphone_input_waits_instead_of_failing_with_eagain() {
+        /// How long a write is willing to wait for the reader. The assertion is about
+        /// whether this is *honoured*, so the number only has to be comfortably larger than
+        /// the few milliseconds a non-blocking socket needs to give up.
+        const WRITE_PATIENCE: Duration = Duration::from_millis(300);
+
+        let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+        let port = listener.local_addr().expect("the listener's address").port();
+
+        let mut client = Command::new(&bin.ffmpeg)
+            .args([
+                "-hide_banner", "-loglevel", "error", "-nostdin",
+                // Real-time pacing: the reader takes the transport at the rate the PCM
+                // represents, so it cannot drain a burst faster than the socket buffers
+                // allow — which is the state that used to make `write_all` fail on macOS.
+                "-re",
+                // A small receive buffer keeps the burst decisively larger than the
+                // socket's own capacity.
+                "-recv_buffer_size", "32768",
+                "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-i", &format!("tcp://127.0.0.1:{port}"),
+                "-f", "null", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg can act as the client of a loopback listener");
+
+        // The microphone input's own accept, with the microphone's own label.
+        let mut stream = accept_within(&listener, port, AUDIO_CONNECT_TIMEOUT, MICROPHONE_LABEL)
+            .expect("ffmpeg dials the microphone listener");
+        stream
+            .set_write_timeout(Some(WRITE_PATIENCE))
+            .expect("the accepted socket takes a write timeout");
+        // Four megabytes — 22 s of 48kHz stereo s16le — written immediately after connect,
+        // like a pump that just received a burst, or that is catching up after a stall. It
+        // is several times what a real-time-paced reader absorbs before it starts pacing
+        // (measured on this host: ffmpeg takes ~1 MiB at once and then reads at the PCM's
+        // own rate), so the write has to wait rather than being swallowed whole.
+        let burst = vec![0u8; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let outcome = stream.write_all(&burst);
+        let waited = started.elapsed();
+
+        let _ = client.kill();
+        let _ = client.wait();
+
+        match outcome {
+            // A reader that swallowed a megabyte inside the write timeout would mean
+            // nothing ever had to wait, so this run would be inconclusive rather than
+            // wrong: a non-blocking socket cannot reach this arm (it fails at once), so
+            // the regression could not hide here.
+            Ok(()) => eprintln!(
+                "note: the client drained the whole {}-byte burst within {WRITE_PATIENCE:?}; \
+                 the write never had to wait",
+                burst.len()
+            ),
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "a full socket buffer is not a write failure: {e}"
+                );
+                assert!(
+                    waited >= WRITE_PATIENCE - Duration::from_millis(50),
+                    "the write gave up after {waited:?} instead of waiting out its \
+                     {WRITE_PATIENCE:?} timeout: the accepted socket is NON-BLOCKING, i.e. it \
+                     inherited O_NONBLOCK from the listener — docs/platform-traps.md, trap 1 \
+                     (this is the macOS/BSD inheritance `set_nonblocking(false)` exists for)"
+                );
+            }
+        }
     }
 }

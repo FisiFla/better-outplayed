@@ -39,6 +39,57 @@ pub enum Vendor {
     Amf,
 }
 
+/// The PCM sample encoding an audio input is declared with (`-f <name>`).
+///
+/// One variant today, and deliberately a type rather than a bare string: the audio
+/// timeline is derived from the byte count, so a format the pipeline does not actually
+/// produce is not "unsupported", it is a silently wrong timeline. Every capture backend in
+/// this workspace publishes signed 16-bit little-endian PCM
+/// (`localplay_capture::AudioFormat::default`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFormat {
+    /// `s16le` — signed 16-bit little-endian, what `localplay-capture` delivers.
+    S16Le,
+}
+
+impl SampleFormat {
+    /// The ffmpeg demuxer name for this format, as it goes into `-f`.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            SampleFormat::S16Le => "s16le",
+        }
+    }
+}
+
+/// The format of the **second, optional** audio input: the microphone.
+///
+/// Declared on [`EncodeConfig::mic_audio`], which is what turns the second input on at all.
+/// The three values are not decoration — each one is a number ffmpeg is *told*, and the
+/// microphone track is muxed onto the same timeline as the game audio and the picture:
+///
+/// * `sample_rate` — `-ar`. PCM submitted at 48kHz but declared as 44.1kHz plays back 8.8%
+///   fast and slides against the other track for the whole clip;
+/// * `channels` — `-ac`. A mono block declared as stereo is read as half its duration;
+/// * `sample_format` — `-f`. See [`SampleFormat`].
+///
+/// [`EncodeConfig::mic_audio`] being `None` is the default and the shipping configuration:
+/// the microphone is opted into explicitly, by a caller that sets it on the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MicAudioSpec {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: SampleFormat,
+}
+
+impl Default for MicAudioSpec {
+    /// What every capture backend in this workspace publishes: 48kHz stereo s16le
+    /// (`localplay_capture::AudioFormat::default`), i.e. the values the game-audio input
+    /// has always been declared with.
+    fn default() -> Self {
+        Self { sample_rate: 48_000, channels: 2, sample_format: SampleFormat::S16Le }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub codec: VideoCodec,
@@ -69,6 +120,21 @@ pub struct EncodeConfig {
     /// another clippy `too_many_arguments` warning. Default `0`: a first run on an empty
     /// scratch directory, and every test.
     pub start_number: u64,
+    /// When `Some`, a second audio input is declared and mapped as the container's
+    /// second audio track (`Microphone`); the first stays `Game Audio`.
+    /// When `None`, the argument list is BYTE-IDENTICAL to the pre-change list.
+    ///
+    /// The microphone is opt-in (`None` is the default in both constructors) and it is a
+    /// *second loopback listener* in the encoder child's argument list, not a second pass
+    /// over the existing one: the encoder binds the port, owns the pump thread and feeds
+    /// ffmpeg's input 2, exactly as it already does for the game audio on input 1. The
+    /// caller never dials anything — it hands PCM to
+    /// [`Encoder::submit_mic_audio`] and reads the port back with [`Encoder::mic_port`].
+    ///
+    /// A configured microphone that cannot be brought up (no port to bind, a child that
+    /// never dials it) **fails the start**; it never degrades to a recording that claims
+    /// two tracks and carries one.
+    pub mic_audio: Option<MicAudioSpec>,
     /// `None` means "real hardware encoder" — the only shipping configuration.
     pub(crate) software_encoder: Option<&'static str>,
 }
@@ -96,6 +162,10 @@ impl EncodeConfig {
             // A first run (and every test) writes `seg-000000.mp4`; the CLI overrides
             // this from what it finds on disk before spawning.
             start_number: 0,
+            // Off unless a caller sets it: the microphone is explicit opt-in, and a
+            // config file that says nothing about it must produce the one-track
+            // argument list this encoder has always built.
+            mic_audio: None,
             software_encoder: Some(codec.hw_encoder_name(vendor)),
         }
     }
@@ -124,6 +194,7 @@ impl EncodeConfig {
             scratch_dir,
             audio_bitrate_kbps: 128,
             start_number: 0,
+            mic_audio: None,
             software_encoder: None,
         }
     }
@@ -152,6 +223,27 @@ pub trait Encoder: Send {
     /// [`Encoder::submit_video`]: the audio block is moved into the writer queue
     /// instead of being cloned into it.
     fn submit_audio(&mut self, audio: AudioBuffer) -> anyhow::Result<()>;
+
+    /// Hand captured **microphone** PCM to the encoder — the second audio track.
+    ///
+    /// Only an encoder spawned with a microphone ([`EncodeConfig::mic_audio`]) accepts these
+    /// blocks, and the two audio inputs are **never mixed**: the block goes to the pump that
+    /// feeds ffmpeg's microphone input, exactly as [`Encoder::submit_audio`] feeds the game
+    /// audio one, so the two tracks keep their own tones and their own sample counts. The
+    /// encoder owns the listener and the pump, so a caller hands PCM over and never dials a
+    /// port itself (see [`Encoder::mic_port`]).
+    ///
+    /// The default implementation is for encoders with no second audio input, and it
+    /// **refuses** the block rather than discarding it: quietly dropping a track's worth of
+    /// audio would leave a recording that claims two tracks and carries one, which is worse
+    /// than a loud failure (same reasoning as the bind failure in `localplay_encoder::ffmpeg`).
+    fn submit_mic_audio(&mut self, _audio: AudioBuffer) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "this encoder has no microphone input (EncodeConfig::mic_audio was None); \
+             the block was refused rather than silently dropped"
+        )
+    }
+
     fn finish(&mut self) -> anyhow::Result<()>;
     /// Codec actually in use, for ffprobe assertions and the UI.
     fn active_encoder(&self) -> &'static str;
@@ -197,5 +289,24 @@ pub trait Encoder: Send {
     /// [`Encoder::dropped_frames`], which this mirrors for the other stream.
     fn dropped_audio_blocks(&self) -> u64 {
         0
+    }
+
+    /// **Microphone** audio blocks discarded because the encoder could not keep up — the
+    /// microphone's counterpart of [`Encoder::dropped_audio_blocks`]. Zero for every encoder
+    /// that has no second audio input.
+    fn dropped_mic_audio_blocks(&self) -> u64 {
+        0
+    }
+
+    /// The loopback port the microphone input is listening on, or `None` when this encoder
+    /// has no microphone input.
+    ///
+    /// The encoder owns that listener and its pump — a caller hands PCM to
+    /// [`Encoder::submit_mic_audio`] and never dials a port itself — so this accessor exists
+    /// for the two things a caller can honestly do with the port: log which one the second
+    /// input was bound to, and tell "microphone enabled" apart from "microphone requested but
+    /// not wired up".
+    fn mic_port(&self) -> Option<u16> {
+        None
     }
 }
