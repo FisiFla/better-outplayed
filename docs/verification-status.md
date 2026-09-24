@@ -474,20 +474,33 @@ $ gh run view 35904179918 --log-failed
 
 ## 7. Known limitations — do not mistake these for bugs, or for working features
 
-- **The box's own media/wall ratio has never been measured with the fix in place.** The
-  mechanism is settled and fixed on the dev host (§1: 0.660× → 0.987×, with the encoder
-  inventing no frames), and the box's two informal readings (≈0.81x, ≈1.11x) were both
-  readings of the *write position*, which is what `span_ms` is. What needs the box is one
-  soak with `RUST_LOG=debug`: the log's `span=` field against wall clock (never file
-  mtimes), which is also the only place the 33 MB-per-frame WGC readback can show whether
-  the remaining shortfall is capture rather than encode.
+- ~~**The box's own media/wall ratio has never been measured with the fix in place.**~~
+  **Measured on the box, 2026-09-25 (§13):** `media=180266ms wall=180372ms`, a drift of
+  106 ms over 180 seconds. The media clock is the wall clock to 0.06%, so `pre_seconds`
+  means real seconds. The mechanism (`-fps_mode passthrough`) was already in the tree; this
+  was the one reading that was outstanding.
 - **A VFR clip can be one frame interval per segment short of its nominal window**, its
   `span_ms` over-estimates footage on disk by the same amount, and a frame landing across a
   segment boundary can step the concatenated timeline back by ≤ ~50 ms. All three are
   measured in §1; before the fix the clip was exactly nominal and its footage was seconds
   stale.
-- **Criteria 1 and 6 fail on 4K hardware** — the pipeline cannot sustain 30 fps and costs
-  ~50.8% of a core. Open in issue #1.
+- ~~**Criteria 1 and 6 fail on 4K hardware.**~~ **Re-measured on the box, 2026-09-25 (§13),
+  and they now part company.** Criterion 1 **passes**: the pipeline sustains **`fps=56.9/60`**
+  at 3840x2160 with `h264_nvenc` and drops 8 frames of 10,525 — against ~24 fps at 30 with 45%
+  dropped when the issue was filed. Criterion 6 **still fails**, and this is now a *known cost
+  of the design* rather than an unexplained shortfall: **88.9% of one core** for the same work
+  at 2.4x the frame rate (1.49 cpu-percent per fps, against 2.1 before — better per frame,
+  higher in total). The cost is memory bandwidth, not arithmetic: 3840x2160x4 bytes at 57 fps
+  is ~2.1 GB/s moved twice (GPU to staging, staging to the pipe), which is memcpy speed. **No
+  code change fixes that except moving fewer bytes** — either encoding on the GPU (the design
+  spec's Phase 2) or capturing at the output size, which the WGC frame pool cannot do because
+  it follows the capture item's size. The criterion is left absolute, as the owner decided;
+  this line is the honest reading of it.
+- **The pacer already skips before the readback**, which both issues proposed as a fix: the
+  pump consults the pacer first and only calls `next_frame` when a frame is due. On this
+  display it has little left to win — `skipped=204` against `frames=10525` (§13) — because the
+  panel delivers ~60 fps, not the 144 Hz the issue assumed, so almost no frame is read back
+  and then thrown away.
 - **Single-monitor capture only.** `crates/capture/src/wgc.rs` captures the primary monitor
   (index 0) and rejects any other index; monitor selection is not wired to config.
 - **No macOS/Linux capture backend.** `crates/capture/src/platform.rs` selects WGC/WASAPI

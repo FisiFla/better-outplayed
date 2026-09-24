@@ -570,7 +570,7 @@ The `Trigger` enum is present but only `Trigger::Hotkey` is wired.
 | 3 | `Ctrl+F8` writes `clip-*.mp4` within 2 s of post-roll completion | Timestamp delta, printed by the run |
 | 4 | Clip duration matches `pre_seconds + post_seconds` ± 0.5 s | `ffprobe -show_format` |
 | 5 | Clip is a stream copy, not a re-encode | `ffprobe` codec/profile matches the live encoder; export completes near-instantly |
-| 6 | Steady-state CPU under 5% of one core and RSS under 400 MB | Process counters sampled during the soak |
+| 6 | Steady-state CPU under 5% of one core and RSS under 400 MB | Process counters sampled during the soak. **Known to miss on 4K hardware and left absolute deliberately**: measured 88.9% of one core at 3840x2160/60 (RSS passes at 202 MB). The cost is memory bandwidth — the frame is read back from the GPU and copied to ffmpeg's pipe — so it is a property of this design rather than a defect in it. §7 and §13 of `docs/verification-status.md` carry the numbers and what would change it. |
 | 7 | The process exits non-zero with an actionable message when no hardware encoder exists | Run on a machine/GPU without one, or force `vendor` to an absent encoder |
 | 8 | The clip contains a synchronised audio stream | `ffprobe -show_streams` reports one video and one audio stream; the audio is audible and lip-sync is correct on playback; A/V drift is logged. The logged drift is measured **in the produced clip** (per-stream duration and start-time delta) — it is *not* the live QPC-vs-WASAPI clock divergence, which is still unmeasured. |
 
