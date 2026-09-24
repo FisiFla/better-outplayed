@@ -48,6 +48,52 @@ video instead of ~2 GB/s of raw pixels, a factor of ~800. Everything downstream 
 `MemoryRingBuffer`, both `EncodeOutput` modes, `ClipSplicer`, the lossless trim — is untouched,
 because ffmpeg still writes the containers they consume.
 
+## Step 5's premise, tested before any of step 5 was written (2026-09-25)
+
+The architecture has one load-bearing assumption: that a hardware encoder MFT exists on this
+machine **and** will accept a D3D11 device manager over a device of the kind Windows Graphics
+Capture requires. If that is false, nothing else in this plan matters.
+
+So it was asked, with `cargo run --release -p localplay-encoder --example mft_probe` — a real
+binary that starts Media Foundation, enumerates, and runs the handshake. **No window, no capture
+session, no synthesised input**, which matters on a machine running an anti-cheat. The first
+answer, before the unlock below, was:
+
+```
+hardware H.264 encoder MFTs: 3
+  NVIDIA H.264 Encoder MFT                    d3d11=false async=true
+      refused: refused MFT_MESSAGE_SET_D3D_MANAGER: The caller does not appear to support
+               this transform's asynchronous capabilities. (0xC00D6D77)
+  Intel® Quick Sync Video H.264 Encoder MFT   d3d11=false async=true
+      refused: could not be activated: Unspecified error (0x80004005)
+  Intel® Quick Sync Video H.264 Encoder MFT   d3d11=false async=true
+      refused: could not be activated: Unspecified error (0x80004005)
+```
+
+Read naively that says "no hardware encoder here takes a GPU texture", which would have killed the
+design. It says nothing of the sort. `0xC00D6D77` is `MF_E_TRANSFORM_ASYNC_LOCKED`: an
+**asynchronous** MFT refuses to be configured until the caller sets `MF_TRANSFORM_ASYNC_UNLOCK` on
+its own attributes — a step every hardware encoder on this box needs, since all three report
+`MF_TRANSFORM_ASYNC`. The Intel entries are a separate, honest fact: their MFTs cannot be
+instantiated here at all (no usable Intel adapter), so Quick Sync is not a path on this machine.
+
+With the unlock in place, the same probe:
+
+```
+hardware H.264 encoder MFTs: 3
+  NVIDIA H.264 Encoder MFT                    d3d11=true  async=true
+  Intel® Quick Sync Video H.264 Encoder MFT   d3d11=false async=true   (cannot activate)
+  Intel® Quick Sync Video H.264 Encoder MFT   d3d11=false async=true   (cannot activate)
+
+of those, 1 accepted MFT_MESSAGE_SET_D3D_MANAGER over a BGRA-capable D3D11 device
+```
+
+**NVIDIA's MFT takes the handshake.** The hybrid is viable on this hardware, and that is now
+measured rather than assumed — which is what makes the remaining steps worth writing. It also
+tells step 5 two things it would otherwise have learned by debugging: the MFT must be unlocked
+before it is configured, and the encoder has to be *chosen* rather than assumed, because the
+hardware flag enumerates MFTs that cannot be instantiated on this machine at all.
+
 ## Sub-steps, each independently verifiable
 
 1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on

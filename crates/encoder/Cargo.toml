@@ -10,6 +10,21 @@ localplay-capture = { path = "../capture" }
 localplay-media = { path = "../media" }
 tracing.workspace = true
 
+# Media Foundation, for the hardware encoder MFT the Tier 2 zero-copy path hands GPU textures
+# to (`src/mft.rs`). Only `MediaFoundation` and what that module's types reach for: the device
+# manager and the D3D11 texture live in `MediaFoundation`/`Graphics::Direct3D11`, so the smaller
+# `System::WinRT` spelling the plan expected is not needed. `Graphics::Direct3D11` is here for
+# the probe's own device, which has to be the *same kind* the capture backend creates
+# (`D3D11_CREATE_DEVICE_BGRA_SUPPORT`) for the handshake to mean anything.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

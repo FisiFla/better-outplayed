@@ -4,6 +4,10 @@ use localplay_capture::{AudioBuffer, Frame};
 use std::path::PathBuf;
 
 pub mod ffmpeg;
+/// Media Foundation hardware encoders: what this machine offers, and whether they take a
+/// GPU texture. Windows only, and inert everywhere else.
+#[cfg(windows)]
+pub mod mft;
 pub mod probe;
 pub mod throughput;
 
