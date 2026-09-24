@@ -9,7 +9,7 @@
 //! installs a real `RegisterHotKey` message loop only there), so the CLI's capture loop
 //! itself cannot be driven from a test on this host. Everything the hotkey *branch* does
 //! after its post-roll wait can be, and is, driven here with the same calls the engine
-//! makes: `RingBuffer::trigger` to splice, `localplay_recorder::index_clip` to index, and
+//! makes: the in-memory ring's `trigger` to splice, `localplay_recorder::index_clip` to index, and
 //! the policy functions to evict. (Those calls are the recorder crate's rather than this
 //! library's since the pipeline moved there; what this file still pins is that the whole
 //! sequence — splice, index, plan, evict — works over real ffmpeg output.)
@@ -20,10 +20,10 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::FramePacer;
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
+use localplay_recorder::{pump_until_span_on, FramePacer};
+use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
-use localplay_replay::buffer::{BufferConfig, RingBuffer};
 use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
 use localplay_store::Store;
 use std::time::Duration;
@@ -45,30 +45,38 @@ fn now_ms() -> i64 {
 #[test]
 fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-    let scratch = tempfile::tempdir().expect("a scratch dir");
+    // The buffer keeps its footage in RAM, so a segment directory is only needed because the
+    // test encoder's constructor takes one; nothing is written into it in stream mode.
+    let segment_dir = tempfile::tempdir().expect("a segment dir");
     let clips = tempfile::tempdir().expect("a clips dir");
 
-    let encode = EncodeConfig::for_tests_software(
+    let mut encode = EncodeConfig::for_tests_software(
         VideoCodec::H264,
         WIDTH,
         HEIGHT,
         FPS,
-        scratch.path().to_path_buf(),
+        segment_dir.path().to_path_buf(),
         SEGMENT_MS,
     );
-    let cfg = BufferConfig {
-        pre_ms: PRE_MS,
-        post_ms: POST_MS,
-        scratch_cap_bytes: 1 << 30,
-        segment_ms: SEGMENT_MS,
-        clips_dir: clips.path().to_path_buf(),
-    };
+    encode.output = EncodeOutput::FragmentedStream;
 
     let mut capture = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
     let mut audio = StubAudio::new(AudioFormat::default());
     let mut encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn the encoder");
-    let mut ring =
-        RingBuffer::start(&bin, cfg, scratch.path().to_path_buf(), "libx264".into()).expect("start the ring");
+    let stream = encoder.take_output_stream().expect("the stream mode exposes its pipe");
+    let mut ring = MemoryRing::start(
+        stream,
+        RingSetup {
+            bin: bin.clone(),
+            clips_dir: clips.path().to_path_buf(),
+            ram_cap_bytes: 256 * 1024 * 1024,
+            cap_ms: PRE_MS + POST_MS + SEGMENT_MS,
+            pre_ms: PRE_MS,
+            post_ms: POST_MS,
+            encoder: "libx264".to_string(),
+        },
+    )
+    .expect("start the in-memory ring");
 
     // The pipeline runs in real time: the encoder's media timeline is the wall clock, so
     // this covers `need_ms` of footage after roughly `need_ms` of wall clock.
@@ -77,11 +85,12 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     let mut pacer = FramePacer::new(FPS);
     let trigger_ms = PRE_MS; // run-relative media time, exactly as the CLI takes it
     let need_ms = trigger_ms + POST_MS;
-    localplay_recorder::pump_until_span(
+    pump_until_span_on(
         &mut pacer,
         &mut ring,
         &mut capture,
         &mut audio,
+        None,
         &mut encoder,
         need_ms,
         Duration::from_secs(60),
@@ -98,7 +107,10 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     let store = Store::open(&db_dir.path().join("localplay.db")).expect("open the clip index");
     store.migrate().expect("migrate the clip index");
 
-    let started_at_ms = ring.ledger_origin_ms() + trigger_ms.saturating_sub(PRE_MS);
+    // The window's start on the ring's own clock. An in-memory ring starts at zero every run,
+    // so unlike the file ledger's there is no origin to add: the trigger instant and the
+    // footage are already on the same timeline.
+    let started_at_ms = trigger_ms.saturating_sub(PRE_MS);
     let id = localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
 
     let rows = store.list_clips().expect("list the indexed clips");
