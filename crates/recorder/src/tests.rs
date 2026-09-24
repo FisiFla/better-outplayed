@@ -72,6 +72,9 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             segment_time: SEGMENT_SECONDS,
             scratch_cap_bytes: 1 << 30,
             scratch_dir: String::new(),
+            // Deliberately large: these tests are about the pipeline, and a ring that evicted
+            // mid-recording would make them about eviction instead.
+            ram_cap_bytes: 1 << 30,
         },
         encode: EncodeSection {
             vendor: "auto".to_string(),
@@ -131,12 +134,27 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
 
     // 1. The status advances while nothing is asked of it: frames reach the encoder, and
     //    the ring's media timeline grows as ffmpeg finalises segments.
-    let first = wait_for(&recorder, Duration::from_secs(30), "a non-empty buffer", |s| {
-        s.frames > 0 && s.span_ms > 0
+    //
+    //    The bar is the **window**, `pre + post`, and not merely "non-empty". The assertion at
+    //    the end of this test is that a clip covers that window, and no window can be covered by
+    //    footage that does not exist yet: a trigger at 1000ms with a 2000ms pre-roll asks for
+    //    media from -1000ms, so the clip comes back one pre-roll short. That is exactly what
+    //    happened the first time this suite ran against the in-memory ring — trigger=1000ms,
+    //    window=[0ms, 2000ms), 2200ms of a 3000ms request.
+    //
+    //    Waiting for `span_ms > 0` used to be enough by accident. The file ledger's span lags a
+    //    whole segment behind, because its newest file is untrusted until a later one appears, so
+    //    "the span moved" meant two segments of footage had been written. A fragment in the
+    //    in-memory ring carries its own length, so that ring's span is exact and the same wait
+    //    returns after one segment. Asking for the window says what was meant all along, and is
+    //    correct for both rings instead of relying on one of them being slow to count.
+    let wanted_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    let first = wait_for(&recorder, Duration::from_secs(30), "the window to be buffered", |s| {
+        s.frames > 0 && s.span_ms >= wanted_ms
     });
     assert!(first.running, "the recorder must report itself as running");
     assert!(first.segments > 0, "a non-zero span implies a completed segment: {first:?}");
-    assert!(first.bytes > 0, "the segments are on disk, so they have bytes: {first:?}");
+    assert!(first.bytes > 0, "the ring holds footage, so it has bytes: {first:?}");
     assert_eq!(first.configured_fps, FPS);
     assert_eq!(first.error, None, "nothing has failed");
     eprintln!("after the buffer filled: {first:?}");
@@ -1159,4 +1177,71 @@ fn dropping_a_recorder_finalises_and_closes_its_session() {
     assert_eq!(row.size_bytes as u64, std::fs::metadata(&file).unwrap().len());
     let (dirs, _files) = sessions_on_disk(&app_data_dir);
     assert!(dirs.is_empty(), "and the temporary segments went with it: {dirs:?}");
+}
+
+/// Everything in `dir`, by name. An absent directory counts as empty, and that is the point
+/// rather than a convenience: the strongest form of "buffering wrote nothing" is that the
+/// directory `-f segment` used to write into was never created at all.
+fn entries_in(dir: &Path) -> Vec<String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .map(|e| e.expect("a directory entry").file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => panic!("reading {}: {err}", dir.display()),
+    }
+}
+
+/// Constraint 1 of the in-memory buffer, asserted where it is actually claimed: **replay-buffer
+/// mode writes nothing to disk while it is only buffering.**
+///
+/// The whole purpose of this mode is that unclipped footage never reaches the SSD. `-f segment`
+/// used to write a file per second into `<app data dir>/scratch` and the filesystem ledger used
+/// to delete the oldest one; if any of that came back, nothing else in this suite would notice.
+/// The clips would still be correct, the status would still advance, and the only symptom would
+/// be a disk doing work nobody asked it to — which is why this checks the thing directly rather
+/// than inferring it from behaviour that is supposed to be identical either way.
+///
+/// The clips directory is checked too, because "the disk is only touched when a clip is saved"
+/// has a second half: saving one must leave exactly one file behind.
+#[test]
+fn buffering_writes_nothing_to_disk_and_only_a_saved_clip_does() {
+    let (_tmp, app_data_dir) = application_data_dir("ram-buffer-no-writes");
+    let cfg = stub_config(&app_data_dir);
+    let scratch = app_data_dir.join("scratch");
+    // Where a clip lands, derived the way the recorder derives it (the directory the failed
+    // runs above wrote into).
+    let clips = app_data_dir.join("clips");
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    let wanted_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    let filled = wait_for(&recorder, Duration::from_secs(30), "the window to be buffered", |s| {
+        s.frames > 0 && s.span_ms >= wanted_ms
+    });
+    assert!(filled.running, "the recorder must report itself as running");
+
+    // Not a segment, not a partial file, not even the directory. `RingBuffer::start` created it
+    // and ffmpeg had written the first segment into it well inside this window.
+    let written = entries_in(&scratch);
+    assert!(
+        written.is_empty(),
+        "buffering wrote {written:?} into {} — unclipped footage must stay in RAM",
+        scratch.display()
+    );
+    assert!(
+        entries_in(&clips).is_empty(),
+        "no clip has been asked for yet, so the clips directory must be empty"
+    );
+
+    // The trigger is the one thing that is allowed to touch the disk.
+    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    assert!(clip.metadata.path.is_file(), "the saved clip is on disk");
+    assert!(entries_in(&scratch).is_empty(), "saving a clip left a scratch trail");
+
+    let saved = entries_in(&clips);
+    assert_eq!(
+        saved.len(),
+        1,
+        "the clips directory must hold exactly the one saved clip, found {saved:?}"
+    );
 }

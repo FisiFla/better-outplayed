@@ -824,107 +824,101 @@ mean is that nothing in this tree is currently waiting on a gate nobody has exer
 
 ---
 
-## 12. In-memory replay buffering — half landed, and one open decision (`ec85169`)
+## 12. In-memory replay buffering — landed, and what the first attempt actually got wrong
 
-**This section is a note, not a claim.** It records work in progress so that the next pass does
-not have to rediscover it, and so that nobody reads the ticked items in the task list as
-delivered behaviour. Nothing below changes what the shipping recorder does.
+A replay buffer that writes **nothing** to the SSD while it is only buffering, and touches the
+disk only when a clip is saved. `-f segment` used to write a file per second into a scratch
+directory and a filesystem ledger deleted the oldest; that write churn is gone in buffer mode.
 
-The goal: a replay buffer that writes **nothing** to the SSD while it is only buffering, and
-touches the disk only when a clip is saved. Today `-f segment` writes a file per second into a
-scratch directory and a filesystem ledger deletes the oldest. That churn is the thing being
-removed.
-
-### What has landed, and what each piece is worth
+### What landed, and what each piece is worth
 
 | Piece | Where | Evidence level |
 |---|---|---|
-| `EncodeConfig::output` with `EncodeOutput::FragmentedStream`; `.stdout(Stdio::piped())`; `Encoder::take_output_stream()` | `crates/encoder/src/ffmpeg.rs` | **Verified on the dev host** — an element-for-element args test plus 3 tests that drive a real ffmpeg |
-| The stream mode writes no files | `crates/encoder/tests/stream_output.rs` | **Verified** — `the_stream_mode_writes_nothing_to_disk` asserts it, and the fragment timestamps are monotonic, and the fragments remux into a playable clip |
-| `FragmentSplitter` — fragmented-MP4 → `Fragment { seq, start_ms, duration_ms, keyframe, bytes }` | `crates/media/src/fragments.rs` | **Verified on the dev host** — 5 tests against a real ffmpeg stream, including byte-at-a-time equivalence |
+| `EncodeConfig::output` / `EncodeOutput::FragmentedStream`; `.stdout(Stdio::piped())`; `Encoder::take_output_stream()` | `crates/encoder/src/ffmpeg.rs` | **Verified on the dev host** — the element-for-element args test still passes, and 3 tests drive a real ffmpeg |
+| The stream mode writes no files | `crates/encoder/tests/stream_output.rs` | **Verified** — `the_stream_mode_writes_nothing_to_disk`, monotonic fragment timestamps, and a remux into a playable clip |
+| `FragmentSplitter` — fragmented MP4 → `Fragment { seq, start_ms, duration_ms, keyframe, bytes }` | `crates/media/src/fragments.rs` | **Verified on the dev host** — 5 tests against a real ffmpeg stream, including byte-at-a-time equivalence |
 | `MemoryRingBuffer` — push, byte/duration eviction, window selection, `assemble` | `crates/replay/src/ram_buffer.rs` | **Verified on the dev host** — 8 tests |
-| `ClipSplicer::splice_from_memory` / `splice_stream` — `-i pipe:0 -c copy`, audio titles re-applied | `crates/replay/src/splice.rs`, `tests/ram_clip.rs` | **Verified on the dev host** — 2 tests that produce a probeable clip from a real stream and leave the scratch directory empty |
+| `ClipSplicer::splice_from_memory` / `splice_stream` — `-i pipe:0 -c copy`, audio titles re-applied | `crates/replay/src/splice.rs`, `tests/ram_clip.rs` | **Verified on the dev host** — a clip produced from a real stream, probeable, with both streams and the right names |
+| The live-stream seam: the ring is parsed on the thread that owns the pipe, while frames are fed | `crates/replay/tests/ram_clip.rs` | **Verified** — `a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline` |
+| The window contract: footage covering `[T - pre, T + post)` is selected whole | `crates/replay/tests/ram_clip.rs` | **Verified** — `a_window_inside_the_held_footage_covers_the_whole_request`, positive and negative |
+| `Ledger::Memory` — buffer mode uses the in-memory ring; encoder built first because the ring is fed by its stdout | `crates/recorder/src/lib.rs`, `src/memory_ring.rs` | **Verified on the dev host** — the recorder suite runs buffer mode end to end |
+| **Constraint 1**: buffering writes nothing, and a saved clip is the only thing that is written | `crates/recorder/src/tests.rs` | **Verified** — `buffering_writes_nothing_to_disk_and_only_a_saved_clip_does` |
+| `buffer.ram_cap_bytes`, defaulting to 256 MiB, and the RAM budget that replaced the scratch cap as the engine's check | `crates/recorder/src/config.rs`, `config.example.toml` | **Verified on the dev host** — the default, the example, and a pre-existing config without the key |
 
-### What has **not** landed: the recorder wiring, and it is the whole point
+Full workspace suite: **537 passed, 0 failed, 1 ignored**. The desktop shell's separate crate
+graph: **112 passed, 0 failed**. Clippy on the touched crates adds no warning that was not
+already there.
 
-`crates/recorder` still runs `Ledger::Buffer(RingBuffer)` — the file ledger — in replay-buffer
-mode. So **constraint 1 of this task is not satisfied by the shipping binary**: unclipped
-footage still goes to disk. The pieces above are used by tests, not by the recorder.
+### The thing the first attempt got wrong, because it is the useful part
 
-The wiring was written, type-checked, and **reverted unlanded**, because in a buffer-mode
-recording in the recorder's own suite a 3000ms clip request came back as **2000ms** — exactly
-the pre-roll, with the post-roll missing.
+The first attempt wired the recorder, saw a **3000ms clip request come back as 2000ms**, and was
+reverted on the belief that the reader thread was stalling. Two things were wrong with that, and
+both are worth keeping:
 
-**An earlier reading of that evidence blamed a stalled reader thread. That was wrong**, and is
-recorded here so the next pass does not chase it. The status line at the moment in question was:
+1. **There was no stall.** The status line read `fps: 9.99, configured_fps: 10,
+   effective_fps: 10`, and `fps` is *measured from frames actually submitted* — positive evidence
+   the pipeline ran at its configured rate. The two `frames` readings that looked like a freeze
+   were ~200ms apart, not the two seconds the surrounding test wording suggested. A stall is a
+   number you can read off the pacer, and this one was not there. The claim sat in this ledger as
+   fact until the next pass re-read the evidence instead of its own summary of it.
 
-```
-after the buffer filled: frames: 21, segments: 1, bytes: 8372, span_ms: 900,
-                         fps: 9.99, configured_fps: 10, effective_fps: 10
-two seconds later:       frames: 21 -> 23, span 900ms -> 1000ms
-```
+2. **The short clip was a test defect, and the test was passing for the wrong reason.** The wait
+   before the trigger was `s.frames > 0 && s.span_ms > 0` — "the buffer is non-empty" — while the
+   assertion later in the same test needs `pre + post` = 3000ms of footage to exist. The file
+   ledger's span **lags a whole segment behind** (its newest file is untrusted until a later one
+   appears), so "the span has moved" meant two segments had been written: enough for the window by
+   accident. A fragment in the in-memory ring carries its own length, so that ring's span is
+   *exact*, the same wait returned after one segment, and the window resolved to
+   `[0ms, 2000ms)` for a trigger at 1000ms with a 2000ms pre-roll. The clip was correct for the
+   footage that existed; the footage did not exist yet.
 
-`fps` is *measured from frames actually submitted*, so 9.99 against a requested 10 is positive
-evidence that the pump was running at its configured rate and nothing was throttled. The two
-`frames` readings were therefore about 200ms apart, not the two seconds the surrounding test
-wording suggests — and `span 900 -> 1000` is one fragment boundary, not a frozen ring. A reader
-that had died would have shown a measured `fps` near 1, and would have shown it in the pacer's
-own number.
+   The fix was to the **wait**, not the assertion: ask for the window, which is what was meant and
+   is right for both rings instead of relying on one of them being slow to count. The instrument
+   that made this legible was four numbers logged at the splice — `trigger`, the window, the
+   selected span and the ring's held range:
 
-That reading is now backed by a test rather than an argument:
-`a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline`
-(`crates/replay/tests/ram_clip.rs`) drives the recorder's actual shape — a reader thread that
-parses into the ring *while* frames are fed — and asserts both halves, that the capture side
-keeps its pace and that the ring holds the footage wall time says it should. **It passes.** It
-is a regression test for the seam no other test covered: `ring_of_stub_capture` collects the
-stream first and parses it afterwards, which is easier to write and is not what the recorder
-does.
+   ```
+   clip from RAM: trigger=1000ms window=[0ms, 2000ms) selected=2000ms held=2000ms footage=[0ms, 2000ms]
+   ```
 
-**So the defect to chase is clip length, not throughput.** A 3000ms request resolving to
-2000ms means the window `[trigger - pre, trigger + post)` was not fully covered — either the
-post-roll wait's target was reached at a lower span than the window's end, or the window's end
-was clamped. The ring's `span_ms`, the trigger's time base and `pump_until_span`'s `need_ms` all
-have to be shown to be the same clock, which is the measurement to make next: log
-`trigger_ms`, `pre_ms`, `post_ms`, the ring's oldest and newest fragment bounds, and the
-post-roll wait's exit span, and check that the selected window is the one the request asked
-for.
+   A pass had already been spent inferring this from surrounding test output. It is cheap to
+   just say it.
 
 ### Two parse bugs found by measurement, not by reading
 
-Both were in `sample_span_ticks`, which reads a fragment's own sample durations out of its
-`moof` so the ring can know its length on arrival instead of borrowing the next fragment's
-start. Both were caught by a number disagreeing with reality:
+Both were in `sample_span_ticks`, which reads a fragment's own sample durations out of its `moof`
+so the ring knows its length on arrival instead of borrowing the next fragment's start — the
+borrowed rule cost a whole fragment of span, and a clip's window is resolved against that span.
 
-* `tfhd`'s conditional fields are positional, so `default_sample_duration` sits at an offset
-  that depends on which of `base_data_offset` and `sample_description_index` are present.
-* `trun`'s per-sample entries are **4 to 16 bytes wide, not 4** — a duration may be followed by
-  a size, flags and a composition offset. A fixed 4-byte stride sums those into the total, which
-  is how a one-second fragment measured **3576ms** and a 3000ms clip request came back as
-  2000ms.
+* `tfhd`'s conditional fields are positional, so `default_sample_duration` sits at an offset that
+  depends on which of `base_data_offset` and `sample_description_index` are present.
+* `trun`'s per-sample entries are **4 to 16 bytes wide, not 4** — a duration may be followed by a
+  size, flags and a composition offset. A fixed 4-byte stride sums those into the total, which is
+  how a one-second fragment measured **3576ms**.
 
-The rule the ring inherited from the file ledger — *a segment's end is proved by the next
-segment's start* — is kept as the fallback for a sample table this build cannot read. On disk it
-is free; in a stream it costs a whole fragment of span, and a clip's window is resolved against
-that span.
+The file ledger's rule — *a segment's end is proved by the next segment's start* — is kept as the
+fallback for a sample table this build cannot read, so the failure mode is the previous behaviour
+rather than a guessed length.
 
 ### The open decision: what happens to the file ledger
 
-Buffer mode goes to RAM **unconditionally**, which is what "no SSD writes while buffering"
-means. That leaves `RingBuffer` — the file ledger in `crates/replay/src/buffer.rs`, and its
-`scanner`/`SegmentLedger`/`window` helpers — **unreachable from the recorder**, while roughly
-thirty tests still exercise it directly by constructing it.
+Buffer mode goes to RAM **unconditionally**, which is what "no SSD writes while buffering" means.
+That leaves `RingBuffer` — the file ledger in `crates/replay/src/buffer.rs`, with its
+`scanner`/`SegmentLedger`/`window` helpers — **unreachable from the recorder**. It is not dead
+code: `apps/localplay-cli/tests/post_roll.rs` and `crates/replay/tests/end_to_end_clip.rs` still
+exercise it directly, and `SessionRing` shares its ledger helpers.
 
 Two honest options, and this is a call for the owner, not for the next pass to make silently:
 
-1. **Delete it**, and let `SessionRing` keep the ledger helpers it still uses. The crash
-   survivability it provided is already session mode's job, and a type nothing calls is a type
-   that will rot.
+1. **Delete it**, keeping whatever `SessionRing` still uses. The crash survivability it provided
+   is already session mode's job, and a type nothing in the application calls is a type that will
+   rot — its tests will keep passing while no user path reaches it.
 2. **Keep it**, as the documented way to get a crash-survivable *replay buffer* rather than a
-   crash-survivable *session* — which is a real difference: a session records everything, a
-   buffer keeps the last N seconds. If this is wanted, it needs a config key to reach it,
-   because a mode nothing can select is not really kept.
+   crash-survivable *session* — a real difference, since a session records everything and a buffer
+   keeps the last N seconds. If this is wanted it needs a config key to reach it, because a mode
+   nothing can select is not really kept.
 
-Option 1 is smaller and matches the constraint as written. Option 2 preserves a capability that
-the task's own wording does not ask for and does not forbid. **No decision has been made**, and
-nothing has been deleted.
-
+Option 1 is smaller and matches the constraint as written. Option 2 preserves a capability the
+task neither asked for nor forbade. **No decision has been made, and nothing has been deleted** —
+but the case for deciding is now stronger than when this section was first written, because the
+recorder no longer calls the type at all.

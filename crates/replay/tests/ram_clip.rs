@@ -288,3 +288,58 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
          behind and the pipeline paid for it"
     );
 }
+
+/// The window contract a trigger depends on: **given footage covering `[T - pre, T + post)`,
+/// the ring selects all of it.**
+///
+/// This is the arithmetic that came back wrong when the recorder was first wired to this ring,
+/// and it is worth a test of its own because the failure is silent rather than loud. `span_ms`
+/// is the newest fragment's *end*, so if a trigger resolved its window against `span_ms` at the
+/// instant it fired, the post-roll half of the window would reach past the footage the ring
+/// holds and the clip would come back short by exactly the post-roll — a 3000ms request
+/// producing 2000ms, which is what was observed.
+///
+/// What stops that is the recorder's post-roll wait: it keeps pumping until the span has passed
+/// `T + post` *before* splicing, so by the time the window is resolved the footage exists. The
+/// `t` below is therefore `span - post`, which is where that wait leaves the timeline, and the
+/// assertion is that the ring then covers the whole request. The recorder's half of the
+/// invariant — that it really waits — is the recorder's own test's business.
+#[test]
+fn a_window_inside_the_held_footage_covers_the_whole_request() {
+    const PRE: u64 = 2_000;
+    const POST: u64 = 1_000;
+    let (ring, _dir) = ring_of_stub_capture(6);
+
+    // As the post-roll wait leaves it: the ring holds footage up to `span`, and the trigger
+    // instant sits `post` behind that.
+    let t = ring.span_ms() - POST;
+    assert!(t > PRE, "the fixture must hold more than one window, got span {}", ring.span_ms());
+
+    let window = ring
+        .window(t - PRE, t + POST)
+        .expect("the ring can serve a window inside its own footage");
+
+    assert!(
+        !window.truncated_front,
+        "the pre-roll is inside the held footage, so nothing should be reported as truncated"
+    );
+    // One frame of slack: the fragments carry whole frames, and at 30fps a selection can end a
+    // frame short of the request without omitting any footage the ring held.
+    assert!(
+        window.duration_ms() + 40 >= PRE + POST,
+        "a {}ms window resolved to {}ms of footage",
+        PRE + POST,
+        window.duration_ms()
+    );
+
+    // And the negative half of the contract, which is what the post-roll wait exists to avoid:
+    // a window reaching past the held footage really does come back short. Stating it here keeps
+    // the reason for the wait visible to anyone who changes either side.
+    let past_the_end = ring
+        .window(t, t + 10_000)
+        .expect("a window at the end of the footage still selects something");
+    assert!(
+        past_the_end.duration_ms() < 10_000,
+        "a window past the held footage must report less than it asked for, not claim the rest"
+    );
+}

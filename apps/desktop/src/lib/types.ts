@@ -140,7 +140,11 @@ export interface RecordingStatus {
   frames: number;
   /** Completed segments in the scratch ring. */
   segments: number;
-  /** Bytes the ring holds on disk. */
+  /**
+   * Bytes the ring is holding: **RAM** for a replay buffer (which writes nothing while it is
+   * only buffering), **disk** for a full session. Which one follows from `mode`, so a caller
+   * showing this to a user should show the mode beside it.
+   */
   bytes: number;
   /** Media time on disk, in ms: how much footage a clip can be cut from. */
   span_ms: number;

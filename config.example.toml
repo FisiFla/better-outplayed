@@ -38,9 +38,23 @@ post_seconds = 5
 segment_time = 1
 # Hard ceiling on the scratch directory, in bytes. Oldest segments are evicted
 # first once this is exceeded. Default: 2 GiB.
+#
+# Only full-session recordings use a scratch directory now. A replay buffer keeps the
+# last few minutes of unclipped footage in memory instead, so that buffering does not
+# write to the disk at all: nothing is written until a clip is saved. This key
+# therefore bounds a directory that session mode writes into and nothing else.
 scratch_cap_bytes = 2147483648
 # Empty = %LOCALAPPDATA%\localplay\scratch
 scratch_dir = ""
+# How much memory a replay buffer may use for the footage it has not been asked to keep,
+# in bytes. Default: 256 MiB.
+#
+# Which footage is held is set by `pre_seconds`: this is the ceiling that keeps the
+# application from being killed by the operating system when the encoder is producing
+# more than that budget can hold. The oldest footage is dropped first, so a buffer that
+# hits this ceiling keeps serving clips - just shorter ones, and it says so in the log
+# rather than quietly returning less than was asked for.
+ram_cap_bytes = 268435456
 
 [encode]
 # auto | nvenc | qsv | amf

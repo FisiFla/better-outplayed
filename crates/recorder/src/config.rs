@@ -137,9 +137,30 @@ pub struct BufferSection {
     pub segment_time: u64,
     /// Total bytes the scratch ring may occupy. Enforced on every scan, and a violation
     /// is fatal: a ring that overruns its cap is a disk that fills up (spec §8.1).
+    ///
+    /// Only session mode has a scratch directory now: a replay buffer holds its footage in RAM,
+    /// so this cap bounds a directory that session mode writes into and nothing else.
     pub scratch_cap_bytes: u64,
     /// Empty means `<app data dir>/scratch`.
     pub scratch_dir: String,
+    /// Bytes of **RAM** the in-memory replay ring may occupy. Default 256 MiB.
+    ///
+    /// This is the cap that matters for a replay buffer: unclipped footage lives in RAM rather
+    /// than on the SSD (see `localplay_replay::MemoryRingBuffer`), so this number is what keeps
+    /// the application from being killed by the operating system. Sized as a fraction of a
+    /// typical machine rather than all of it — the encoder, the capture backends and the
+    /// application all need room, and a ring that has evicted something is still a ring.
+    ///
+    /// Defaulted rather than required, so a `config.toml` written before this key existed still
+    /// parses: a config file belongs to its user, and a key this build added is not their error
+    /// (the same reasoning as `[mic]` and `[games]`).
+    #[serde(default = "default_ram_cap_bytes")]
+    pub ram_cap_bytes: u64,
+}
+
+/// 256 MiB. See [`BufferSection::ram_cap_bytes`] for why it is not larger.
+fn default_ram_cap_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 /// `[encode]` — what the encoder is asked for.
@@ -222,6 +243,30 @@ output_size = \"\"
     fn the_example_config_asks_for_adaptation() {
         let section = encode_section(include_str!("../../../config.example.toml"));
         assert!(section.adapt_fps, "config.example.toml must enable adaptation");
+    }
+
+    /// A `[buffer]` section written before `ram_cap_bytes` existed must still parse.
+    ///
+    /// The key is `#[serde(default)]` for exactly this reason — a config file belongs to its user,
+    /// and a key a later build added is not their error — and a default no test ever takes is a
+    /// claim rather than a behaviour. Every other key in the section is required, so `ram_cap_bytes`
+    /// is the one this section cannot be missing.
+    #[test]
+    fn a_config_without_the_ram_cap_parses_and_gets_the_default() {
+        #[derive(Debug, Deserialize)]
+        struct File {
+            buffer: BufferSection,
+        }
+        let text = format!(
+            "{MINIMAL}\n[buffer]\npre_seconds = 30\npost_seconds = 5\nsegment_time = 1\n\
+             scratch_cap_bytes = 2147483648\nscratch_dir = \"\"\n"
+        );
+        let file = toml::from_str::<File>(&text).expect("a config from before this key parses");
+        assert_eq!(
+            file.buffer.ram_cap_bytes,
+            256 * 1024 * 1024,
+            "an absent key must default, not fail and not be zero"
+        );
     }
 
     /// A `config.toml` written before this key existed gets adaptation, not silence: the

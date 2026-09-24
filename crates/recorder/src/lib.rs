@@ -112,6 +112,7 @@
 pub mod config;
 pub mod fps;
 pub mod index;
+pub mod memory_ring;
 pub mod pump;
 pub mod session;
 
@@ -145,9 +146,10 @@ use localplay_encoder::{
 use localplay_events::process::{GamesSection, PresenceChange, WatchHandle};
 use localplay_events::{CaptureClock, GameEvent};
 use localplay_media::FfmpegBinaries;
-use localplay_replay::buffer::{BufferConfig, BufferStats, RingBuffer};
+use localplay_replay::buffer::{BufferConfig, BufferStats};
 use localplay_replay::splice::ClipMetadata;
 use localplay_store::Store;
+use memory_ring::MemoryRing;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -317,10 +319,15 @@ pub struct RecorderStatus {
     pub frames: u64,
     /// Completed segments in the ring.
     pub segments: u64,
-    /// Bytes the ring holds on disk.
+    /// Bytes the ring is holding.
+    ///
+    /// **In RAM** for a replay buffer, which writes nothing while it is only buffering, and on
+    /// **disk** for a full session. Which one follows from `mode` in the same status and is not
+    /// distinguishable from the number alone, so a caller that shows this to a user should show
+    /// the mode beside it.
     pub bytes: u64,
-    /// Media time the ring can prove is on disk, in ms — the position the trigger is
-    /// taken from.
+    /// Media time the ring can prove it holds, in ms — the position the trigger is taken from,
+    /// and the clock the post-roll wait advances against.
     pub span_ms: u64,
     /// Encoder video frames dropped because its queue was full.
     pub dropped: u64,
@@ -1132,37 +1139,77 @@ impl Prepared {
         encode_cfg.fps = decision.effective();
         log_rate_decision(&decision, encode_cfg.encoder_name(), native);
 
-        // The ledger is built and adopted *before* the encoder is spawned because the
-        // segment number the encoder must continue from is decided from what is already
-        // on disk, and that number is one of ffmpeg's arguments.
-        let mut ledger = match mode {
-            RecordingMode::ReplayBuffer => Ledger::Buffer(RingBuffer::start(
-                &cfg.bin,
-                buffer_cfg.clone(),
-                self.scratch_dir.clone(),
-                encode_cfg.encoder_name().to_string(),
-            )?),
-            RecordingMode::FullSession => Ledger::Session(session::SessionRing::open(
-                &cfg.bin,
-                &segment_dir,
-                &buffer_cfg,
-                microphone,
-                encode_cfg.encoder_name().to_string(),
-            )?),
-        };
-        let adopted = ledger.adopt_existing()?;
-        if adopted > 0 {
-            tracing::info!("adopted {adopted} segments from a previous run");
+        // The two modes build their ledger and their encoder in the opposite order, and each
+        // order is forced:
+        //
+        // * a **session**'s ring indexes files the encoder is about to write, so it has to exist
+        //   first — the segment number the encoder continues from is one of ffmpeg's arguments;
+        // * a **replay buffer**'s ring is fed by the encoder's own stdout, so the encoder has to
+        //   exist first and the ring is built around the pipe it hands over.
+        //
+        // The adoption and numbering steps therefore live inside the session arm rather than
+        // after both: for an in-memory ring they have no meaning at all, and running them
+        // unconditionally would pretend the two are more alike than they are.
+        let mut ledger;
+        let encoder;
+        let encoder_name;
+        match mode {
+            RecordingMode::ReplayBuffer => {
+                // Fragmented MP4 on the child's stdout: **no file is written while buffering**,
+                // which is the whole point of this mode. `scratch_dir` is deliberately left in
+                // the config unconsumed — see the note on `BufferSection::scratch_cap_bytes`.
+                encode_cfg.output = localplay_encoder::EncodeOutput::FragmentedStream;
+                let (mut enc, name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
+                let stream = enc.take_output_stream().context(
+                    "a fragmented-stream encoder must expose its output pipe, or the ring \
+                     cannot be fed — the encoder and the ring have to agree about the output",
+                )?;
+                ledger = Ledger::Memory(MemoryRing::start(
+                    stream,
+                    memory_ring::RingSetup {
+                        bin: cfg.bin.clone(),
+                        clips_dir: buffer_cfg.clips_dir.clone(),
+                        // The RAM safety net: the number that keeps this process from being
+                        // killed by the operating system.
+                        ram_cap_bytes: cfg.buffer.ram_cap_bytes,
+                        // The duration cap is what a trigger can actually ask for — the window,
+                        // plus one segment so a fragment boundary landing unluckily cannot
+                        // truncate a clip. Deliberately not larger: nothing can ask for more
+                        // footage than `pre + post`, and the buffer's *length* is the user's
+                        // `pre_seconds`. A longer buffer is that key, not a second knob here.
+                        cap_ms: buffer_cfg.pre_ms + buffer_cfg.post_ms + buffer_cfg.segment_ms,
+                        pre_ms: buffer_cfg.pre_ms,
+                        post_ms: buffer_cfg.post_ms,
+                        encoder: encode_cfg.encoder_name().to_string(),
+                    },
+                )?);
+                encoder = enc;
+                encoder_name = name;
+            }
+            RecordingMode::FullSession => {
+                ledger = Ledger::Session(session::SessionRing::open(
+                    &cfg.bin,
+                    &segment_dir,
+                    &buffer_cfg,
+                    microphone,
+                    encode_cfg.encoder_name().to_string(),
+                )?);
+                let adopted = ledger.adopt_existing()?;
+                if adopted > 0 {
+                    tracing::info!("adopted {adopted} segments from a previous run");
+                }
+                encode_cfg.start_number = ledger.reserve_number()?;
+                if encode_cfg.start_number > 0 {
+                    tracing::info!(
+                        "segment numbering continues at {} (previous material is on disk)",
+                        encode_cfg.start_number
+                    );
+                }
+                let (enc, name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
+                encoder = enc;
+                encoder_name = name;
+            }
         }
-        encode_cfg.start_number = ledger.reserve_number()?;
-        if encode_cfg.start_number > 0 {
-            tracing::info!(
-                "segment numbering continues at {} (previous material is on disk)",
-                encode_cfg.start_number
-            );
-        }
-
-        let (encoder, encoder_name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
         tracing::info!("encoding with {encoder_name}");
         // The pacer's rate is read back out of the encoder object — i.e. out of the
         // configuration ffmpeg was actually spawned with — instead of being taken from
@@ -1203,7 +1250,7 @@ impl Prepared {
         // timeline is media minus media, and the age is wall. Passing the wall clock as the
         // epoch — or nothing at all, as this used to — is what put the events of a session
         // that adopted segments from a previous run in the wrong place on the scrubber.
-        let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()) as i64;
+        let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()?) as i64;
         let session = match store.start_session(
             game.as_deref(),
             mode.store_mode(),
@@ -1260,7 +1307,10 @@ impl Prepared {
         let engine = Engine {
             pre_ms: buffer_cfg.pre_ms,
             post_ms: buffer_cfg.post_ms,
-            scratch_cap_bytes: buffer_cfg.scratch_cap_bytes,
+            // Only the RAM budget is carried. The scratch cap bounded a directory a replay
+            // buffer no longer has (it is session mode's, and session mode deletes nothing), so
+            // the cap the engine checks a run against is the in-memory one.
+            ram_cap_bytes: cfg.buffer.ram_cap_bytes,
             storage: cfg.storage.clone(),
             cleanup: CleanupReport::default(),
             // The pacer paces to the rate the encoder child was told — read back from the
@@ -1499,7 +1549,9 @@ fn log_recovery(recovery: &session::Recovery) {
 struct Engine {
     pre_ms: u64,
     post_ms: u64,
-    scratch_cap_bytes: u64,
+    /// The in-memory ring's byte budget, carried so the ring can be checked against the number it
+    /// was configured with rather than re-reading a config the engine has already been built from.
+    ram_cap_bytes: u64,
     storage: StorageSection,
     cleanup: CleanupReport,
     pacer: FramePacer,
@@ -1581,53 +1633,89 @@ struct Engine {
 /// evicts — a whole session is footage that was asked for, so the cap does not apply to it
 /// at all ([`crate::session`] explains why that is structural rather than a large cap).
 enum Ledger {
-    /// The rolling replay buffer.
-    Buffer(RingBuffer),
+    /// The rolling replay buffer, held **in RAM**.
+    ///
+    /// Buffer mode is in memory so that an idle buffer writes nothing to the SSD. The footage
+    /// exists to be thrown away unless a trigger saves it, so a file per second for material
+    /// nobody keeps is pure churn — the thing this mode exists to remove. The cost is that a
+    /// crash loses the buffer, which is the deal; session mode ([`Ledger::Session`]) keeps its
+    /// files precisely because a whole recording is worth surviving a crash for.
+    Memory(MemoryRing),
     /// A full session's segment directory.
     Session(crate::session::SessionRing),
 }
 
 impl Ledger {
-    /// Find newly written segments (the buffer's scan evicts; the session's never does).
+    /// Find newly written segments — a no-op for the memory ring, which is fed by its own reader
+    /// thread rather than by scanning a directory, and which therefore never has a file that is
+    /// still being appended to.
     fn scan(&mut self) -> Result<()> {
         match self {
-            Ledger::Buffer(ring) => ring.scan_once(),
+            Ledger::Memory(_) => Ok(()),
             Ledger::Session(session) => session.scan(),
         }
     }
 
-    /// Index every segment in the directory, the newest file included. Called at shutdown,
-    /// after the encoder has been flushed and its child has exited, so the last file is
-    /// complete and must not be dropped (the ring's live scan deliberately does not trust
-    /// the newest file while ffmpeg is still appending to it).
+    /// Index every segment, the newest included. Called at shutdown, after the encoder has been
+    /// flushed and its child has exited, so the last file is complete and must not be dropped
+    /// (the live scan deliberately does not trust the newest file while ffmpeg is appending to
+    /// it). Meaningless for the memory ring, whose reader has already ingested everything the
+    /// encoder wrote — waiting for the stream to end is what proves the newest fragment.
     fn scan_all(&mut self) -> Result<()> {
         match self {
-            Ledger::Buffer(ring) => ring.scan_once(),
+            Ledger::Memory(_) => Ok(()),
             Ledger::Session(session) => session.scan_all(),
         }
     }
 
-    /// What is on disk, in the shape the status line and the scratch cap use.
-    fn stats(&self) -> BufferStats {
-        match self {
-            Ledger::Buffer(ring) => ring.stats(),
+    /// What this ring holds, in the shape the status line uses.
+    ///
+    /// `bytes_on_disk` is deliberately left 0 for the memory ring: the number that matters there
+    /// is RAM, and it is reported by [`Ledger::buffered_bytes`]. Keeping them separate is what
+    /// stops the sessions row's `size_bytes` — a claim about disk — from silently becoming a
+    /// claim about memory.
+    ///
+    /// Fallible because the memory ring's numbers come from a lock its reader thread holds, and
+    /// a ring that cannot be read must not report zero footage as if it were empty.
+    fn stats(&self) -> Result<BufferStats> {
+        Ok(match self {
+            Ledger::Memory(ring) => BufferStats {
+                segments: ring.stats()?.segments,
+                bytes_on_disk: 0,
+                span_ms: ring.span_ms()?,
+            },
             Ledger::Session(session) => BufferStats {
                 segments: session.segment_count(),
                 bytes_on_disk: session.bytes_on_disk(),
                 span_ms: session.span_ms(),
             },
+        })
+    }
+
+    /// Bytes the ring is holding, **wherever** it is holding them: on disk for a session, in RAM
+    /// for a replay buffer.
+    ///
+    /// One accessor rather than two because the status line has one `bytes=` field and it must
+    /// mean "how much footage is buffered". Which medium that is follows from the mode, and the
+    /// mode is in the same status.
+    fn buffered_bytes(&self) -> Result<u64> {
+        match self {
+            Ledger::Memory(ring) => ring.bytes(),
+            Ledger::Session(session) => Ok(session.bytes_on_disk()),
         }
     }
 
-    /// Run-relative media time on disk, in ms.
-    fn span_ms(&self) -> u64 {
-        self.stats().span_ms
+    /// Run-relative media time the ring holds, in ms.
+    fn span_ms(&self) -> Result<u64> {
+        Ok(self.stats()?.span_ms)
     }
 
     /// The ledger's own position of this run's zero.
     fn origin_ms(&self) -> u64 {
         match self {
-            Ledger::Buffer(ring) => ring.ledger_origin_ms(),
+            // A memory ring starts at zero every run: nothing is adopted, because nothing was
+            // ever written.
+            Ledger::Memory(ring) => ring.origin_ms(),
             Ledger::Session(session) => session.origin_ms(),
         }
     }
@@ -1635,38 +1723,35 @@ impl Ledger {
     /// The pump's view of this ledger, for the post-roll wait.
     fn as_ring(&mut self) -> &mut dyn MediaRing {
         match self {
-            Ledger::Buffer(ring) => ring,
+            Ledger::Memory(ring) => ring,
             Ledger::Session(session) => session,
         }
     }
 
-    /// Index what is already on disk, before the encoder is spawned (the segment number it
-    /// is told depends on this).
+    /// Index what is already on disk, before the encoder is spawned.
+    ///
+    /// A memory ring adopts nothing: it starts empty every run by construction, which is also
+    /// why there is no segment number to continue.
     fn adopt_existing(&mut self) -> Result<usize> {
         match self {
-            Ledger::Buffer(ring) => ring.adopt_existing(),
+            Ledger::Memory(_) => Ok(0),
             Ledger::Session(session) => session.adopt_existing(),
         }
     }
 
-    /// Reserve the sequence number the encoder must start writing at.
+    /// Reserve the sequence number the encoder must start writing at. Zero for the memory ring:
+    /// it writes no files, so there is no numbering to continue.
     fn reserve_number(&mut self) -> Result<u64> {
         match self {
-            Ledger::Buffer(ring) => ring.reserve_segment_number(),
+            Ledger::Memory(_) => Ok(0),
             Ledger::Session(session) => session.reserve_number(),
         }
-    }
-
-    /// Whether this ledger's scan enforces the scratch cap (the buffer) or never deletes
-    /// anything (a session).
-    fn evicts_to_cap(&self) -> bool {
-        matches!(self, Ledger::Buffer(_))
     }
 
     /// Splice a clip around `trigger_ms` out of this ledger's footage.
     fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
         match self {
-            Ledger::Buffer(ring) => ring.trigger(trigger_ms, stem).map_err(Into::into),
+            Ledger::Memory(ring) => ring.trigger(trigger_ms, stem),
             Ledger::Session(session) => session.trigger(trigger_ms, stem),
         }
     }
@@ -1746,14 +1831,19 @@ impl Engine {
     /// encoder, and apply the storage policy on its own interval.
     fn tick(&mut self, last_cleanup: &mut Instant) -> Result<()> {
         self.ledger.scan().context("scanning for new segments")?;
-        if let Ledger::Buffer(ring) = &self.ledger {
-            ring.save_ledger()?;
-        }
+        // No ledger file is saved any more. It existed to remember which segment files a previous
+        // run had written and could adopt, and neither ring keeps files to remember: a session's
+        // segments *are* its record (the directory listing), and the in-memory ring has nothing
+        // on disk at all.
 
-        let stats = self.ledger.stats();
+        let stats = self.ledger.stats()?;
         self.status.publish_ring(
             stats.segments as u64,
-            stats.bytes_on_disk,
+            // The bytes the ring is holding, wherever it is holding them: RAM for a replay
+            // buffer, disk for a session. `stats.bytes_on_disk` is deliberately NOT used here —
+            // it is 0 for the memory ring, and a status line reporting `bytes=0` for a ring full
+            // of footage would be a lie about the one number the panel exists to show.
+            self.ledger.buffered_bytes()?,
             stats.span_ms,
         );
         // The `sessions` row's size, on the tick that already measured it: a multi-hour
@@ -1793,16 +1883,24 @@ impl Engine {
             self.effective_fps,
             self.configured_fps
         );
-        // The scratch cap is the **ring's** rule (spec §8.1): a bounded window that overruns
-        // its budget is a disk that fills up. A full session is not a window — its segments
-        // are the recording the user asked for — so the check does not apply to it, and that
-        // is structural (`evicts_to_cap`), not a cap set high enough to be missed.
-        if self.ledger.evicts_to_cap() && stats.bytes_on_disk > self.scratch_cap_bytes {
-            bail!(
-                "scratch cap violated: {} bytes on disk exceeds {}",
-                stats.bytes_on_disk,
-                self.scratch_cap_bytes
-            );
+        // The cap the ring is held to is **RAM**, not scratch (spec §8.1): a rolling buffer
+        // holds unclipped footage in memory, so a bounded window that overruns its budget is the
+        // process being killed by the operating system, not a disk filling up. The ring evicts
+        // to stay inside it on every push, so this is a check on that eviction rather than a
+        // threshold a run can approach — it fires only if eviction has stopped working, which is
+        // worth failing loudly over because the alternative is an OOM kill with no explanation.
+        //
+        // A full session is not a window — its segments are the recording the user asked for —
+        // so no cap applies to it, and that is structural, not a cap set high enough to be
+        // missed.
+        if let Ledger::Memory(ring) = &self.ledger {
+            let held = ring.bytes()?;
+            if held > self.ram_cap_bytes {
+                bail!(
+                    "the in-memory ring is over its RAM budget: {held} bytes held against {},                      which means its eviction has stopped working",
+                    self.ram_cap_bytes
+                );
+            }
         }
 
         // A rising `dropped=` means the encoder's queue is overflowing while the pacer
@@ -1882,7 +1980,7 @@ impl Engine {
         // earlier divergence, media at 0.81x, is what the ledger records as fixed. If the
         // buffer holds less than `pre_ms` of media at the trigger, `RingBuffer::trigger`
         // already warns and splices the truncated front — that path is unchanged.
-        let trigger_ms = self.ledger.span_ms();
+        let trigger_ms = self.ledger.span_ms()?;
         // Wall-clock value, kept for telemetry only: nothing below reads it, because mixing
         // the two clocks is what made the post-roll unreachable. Logged next to the media
         // value so the two can be compared in a soak: `drift` is wall minus media and should
@@ -1965,7 +2063,7 @@ impl Engine {
 
     /// Record an event that did not ask for a clip (see [`Recorder::note_event`]).
     fn note_event(&mut self, event: &GameEvent) -> Result<i64> {
-        let at_ms = self.ledger.origin_ms() + self.ledger.span_ms();
+        let at_ms = self.ledger.origin_ms() + self.ledger.span_ms()?;
         index_event(&self.store, event, at_ms, None, Some(self.session))
     }
 
@@ -2021,7 +2119,11 @@ impl Engine {
 
     /// Wall clock minus media time, in ms.
     fn drift_ms(&self) -> i64 {
-        self.clock.ms_at(Instant::now()) as i64 - self.ledger.span_ms() as i64
+        // Telemetry only, so a ring that cannot be read contributes no media position and the
+        // difference comes out as the wall clock alone. That is obviously wrong rather than
+        // quietly plausible, which is the point: the reader's own error is logged once, and a
+        // `drift` that has jumped to the age of the process is a second, unmissable sign.
+        self.clock.ms_at(Instant::now()) as i64 - self.ledger.span_ms().unwrap_or(0) as i64
     }
 
     /// Flush the encoder, close the sources, and close the session.
@@ -2037,8 +2139,13 @@ impl Engine {
         } else {
             Ok(())
         };
-        let ledger = match &self.ledger {
-            Ledger::Buffer(ring) => ring.save_ledger().context("saving the ledger at shutdown"),
+        let ledger = match &mut self.ledger {
+            // Nothing on disk to save: the replay buffer lives in RAM, so when the process stops
+            // the footage stops existing — which is what "unclipped footage is never written"
+            // means. The reader thread is joined here because the encoder has been flushed and
+            // its child has exited by now, so the stream has ended and the join returns; a reader
+            // that stopped early is reported rather than passed over.
+            Ledger::Memory(ring) => ring.join(),
             // A session writes no ledger file: its segments are the directory listing, which
             // is exactly what makes them recoverable after a crash (see `crate::session`).
             Ledger::Session(_) => Ok(()),
@@ -2081,16 +2188,20 @@ impl Engine {
     fn finish_session(&mut self) -> Result<()> {
         match self.mode {
             RecordingMode::ReplayBuffer => {
-                let stats = self.ledger.stats();
+                let stats = self.ledger.stats()?;
+                // `size_bytes` stays 0 because it is a claim about **disk**, and a RAM buffer
+                // occupies none — the footage is dropped when the process stops. The bytes that
+                // were held go to the log, where they are a fact about RAM and cannot be mistaken
+                // for a file's size.
                 self.store
-                    .end_session(self.session, now_ms(), None, stats.bytes_on_disk as i64, 0)
+                    .end_session(self.session, now_ms(), None, 0, 0)
                     .with_context(|| format!("closing session #{}", self.session))?;
                 tracing::info!(
-                    "buffer session #{} closed: {} segment(s), {} bytes in the scratch ring, \
-                     no session file",
+                    "buffer session #{} closed: {} segment(s), {} bytes held in RAM, \
+                     no session file and nothing written while buffering",
                     self.session,
                     stats.segments,
-                    stats.bytes_on_disk
+                    self.ledger.buffered_bytes()?
                 );
                 Ok(())
             }
@@ -2105,7 +2216,7 @@ impl Engine {
                         session.dir().to_path_buf(),
                         session.bin().clone(),
                     ),
-                    Ledger::Buffer(_) => bail!(
+                    Ledger::Memory(_) => bail!(
                         "a full-session recording has no session segment store: this is a \
                          bug in the recorder (mode and ledger disagree)"
                     ),
