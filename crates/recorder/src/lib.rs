@@ -1836,13 +1836,18 @@ impl Engine {
         // on disk at all.
 
         let stats = self.ledger.stats()?;
+        // Read once and used twice. `stats.bytes_on_disk` is deliberately not the number: it is
+        // 0 for a replay buffer, which holds its footage in RAM, and a line reporting `bytes=0`
+        // for a ring full of footage is a lie about the one number a soak watches to see the
+        // buffer settle. Measured on the box: `bytes=0` against 84,335,007 bytes actually held.
+        let buffered = self.ledger.buffered_bytes()?;
         self.status.publish_ring(
             stats.segments as u64,
             // The bytes the ring is holding, wherever it is holding them: RAM for a replay
             // buffer, disk for a session. `stats.bytes_on_disk` is deliberately NOT used here —
             // it is 0 for the memory ring, and a status line reporting `bytes=0` for a ring full
             // of footage would be a lie about the one number the panel exists to show.
-            self.ledger.buffered_bytes()?,
+            buffered,
             stats.span_ms,
         );
         // The `sessions` row's size, on the tick that already measured it: a multi-hour
@@ -1872,7 +1877,10 @@ impl Engine {
              dropped_mic={} skipped={} fps={:.1}/{} configured={}",
             self.frames,
             stats.segments,
-            stats.bytes_on_disk,
+            // The bytes the ring is holding, wherever it holds them — RAM for a replay buffer,
+            // disk for a session. The same number the status publishes, read once, so the line
+            // and the panel cannot disagree about a buffer that is not on disk at all.
+            buffered,
             stats.span_ms,
             dropped,
             self.encoder.dropped_audio_blocks(),

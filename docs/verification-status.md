@@ -993,3 +993,80 @@ enforcing it would visibly gut the session. With no cap to ignore, the property 
 for is stated directly and the test is now
 `..._and_keeps_every_segment`, asserting that four seconds of 1s segments are all still there. That
 is the real difference between a session and a rolling buffer, and it is better said than implied.
+
+---
+
+## 13. The 4K soak on the box (2026-09-25) — the measurement issues #1 and #2 were waiting for
+
+Issue #2's own closing comment says the one thing that would close it is "the box's own ratio, taken
+with the fix in place" and that no number from the box had been taken. Issue #1 says the same about
+`dropped=` / `fps=` / `configured=`. Both were taken in a single run.
+
+### How it was run, so it can be repeated
+
+`schtasks /create … /it` so the CLI ran in **session 1** (`Logon Mode: Interactive only`, with
+`explorer` running), from the **release** build of the current tree, against
+`%LOCALAPPDATA%\localplay\config.toml` — a copy of the shipped `config.example.toml`, so the fps,
+output size and window are what a fresh install would use. `RUST_LOG=debug`, 180 s of capture, and
+the CLI's own `--self-test-clip-after 180` to end it. A running League client or game aborts the run
+before it starts: this captures the screen, which is not done while a protected game is up. Measured
+**3840x2160** throughout, `h264_nvenc`, `WASAPI` loopback for audio.
+
+### The numbers
+
+| Reading | Issue #1/#2's measurement | This run |
+|---|---|---|
+| Sustained rate | ~24 fps against 30 configured | **`fps=56.9/60`** — 95% of a rate that is 2x higher |
+| Dropped frames | 1183, ~45% | **8 of 10,525** — 0.076% |
+| `media=` vs `wall=` at the trigger | divergence of unknown direction | **`media=180266ms wall=180372ms (drift 106ms)`** — 0.06% over 180 s |
+| Post-roll reached | every press timed out before the trigger fix | **`span=185416ms covers 185266ms`**, 5133 ms after the press |
+| Clip | — | **36165 ms, 84,897,902 bytes**, video+audio, splice drift **49 ms**, indexed |
+| The probe's accuracy at 4K with NVENC | "**unverified**" | **`82.2fps sustainable at 3840x2160 with h264_nvenc`** |
+| CPU | 50.8% of one core at ~24 fps | **88.9% of one core at ~57 fps** |
+| RSS | 235 MB peak 267 MB | **202 MB peak 271 MB** |
+
+### What this closes, and what it does not
+
+**Closed: the timeline half of issue #2.** The media clock is the wall clock to 0.06% over three
+minutes, so `pre_seconds` now means real seconds. That was the outstanding question; the mechanism
+(`-fps_mode passthrough`) was already in the tree and is not what this run tests.
+
+**Closed: issue #1's headline and its drop counter.** "4K capture cannot sustain 30 fps" is no
+longer true — it sustains **57 of a declared 60** at 3840x2160, and drops 0.076% rather than 45%.
+The issue's suggested fix for the wasted readback is also **already implemented**: `pump_once`
+consults the pacer *first* and only calls `next_frame` when a frame is due, calling
+`discard_pending` otherwise. This run shows why that change has little left to win here —
+`skipped=204` against `frames=10525`, because this display delivers ~60 fps and not the 144 Hz the
+issue assumed, so there are almost no frames being read back and thrown away.
+
+**Not closed: criterion 6** (< 5% of one core). It is *worse* in absolute terms than the issue's
+figure — 88.9% against 50.8% — because the run is doing 2.4x the frames per second. Per frame it is
+better (1.49 against 2.1 cpu-percent per fps), which is what the timeline fix should look like: the
+same work, more of it, and no longer thrown away. The cost is memory bandwidth, not CPU arithmetic:
+3840x2160x4 bytes at 57 fps is ~2.1 GB/s moved twice (GPU to staging, staging to the pipe), which is
+memcpy speed. **No code change fixes that except not moving the frame**, and there are only two ways
+to do that: encode on the GPU (the design spec's Phase 2) or capture fewer pixels. The second is
+cheap and was not exercised here: capturing at the *output* size would cut the traffic 4x for a
+1080p clip, and the WGC frame pool is created at the capture item's size, so it is not reachable
+from configuration — it is a change to the capture backend, and it needs its own measurements.
+
+**Not measured: 1080p**, and the reason is worth recording rather than glossing. Issue #1 asks for it
+"to separate '4K is hard' from 'the pipeline is slow'", and on this box it cannot be had by
+configuration: only the primary monitor is captured, that monitor is 4K, and the pool size follows
+it. Taken from session 0 the display list reports a 1024x768 virtual device, so the real geometry is
+only visible inside the interactive session. A 1080p measurement needs either the display resolution
+changed (invasive) or the scaled capture above (a change).
+
+### And an independent confirmation, for free
+
+The same run exercised the in-memory ring on real Windows hardware for the first time — §12 listed
+that as unperformed. The run's own closing line:
+
+```
+buffer session #2 closed: 34 segment(s), 84335007 bytes held in RAM, no session file and nothing written while buffering
+```
+
+84 MB held in RAM, and the only file written in 180 seconds is the clip that was asked for. The log
+line that reports the held bytes had been printing `bytes=0` for exactly this case, because it read
+the *disk* figure from `Ledger::stats`; the status field and the log now read the same
+`buffered_bytes` value once, so they cannot disagree.
