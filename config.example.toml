@@ -6,6 +6,27 @@
 #
 # localplay never reads configuration from environment variables.
 
+[recorder]
+# What a recording is:
+#
+#   "buffer"  — the rolling replay buffer. A bounded scratch ring holds the last
+#               seconds of play, and the hotkey (or a game event) splices a clip out
+#               of it. Default, and what every build before Phase 5 did.
+#
+#   "session" — record the whole session. Segments are written into their own
+#               directory under `sessions/` as you play, `buffer.scratch_cap_bytes`
+#               does NOT apply to them (a full session is not a ring: evicting its
+#               oldest segment would delete footage you asked for), and when the
+#               recording stops they are concatenated losslessly into one
+#               `session-<timestamp>.mp4` — never re-encoded — after which the
+#               temporary segments are removed.
+#
+# Either way a `sessions` row is opened when recording starts and closed when it
+# stops, and the hotkey still takes an instant clip from the same footage.
+#
+# The CLI can override this per run with `--mode session` (or `--mode buffer`).
+mode = "buffer"
+
 [buffer]
 # How much footage before the trigger instant is written into the clip.
 pre_seconds = 30
@@ -77,6 +98,71 @@ clips_dir = ""
 max_total_bytes = 53687091200
 # Favourited clips are exempt from this limit.
 max_age_days = 7
+
+# --- The session store (Phase 5) -----------------------------------------------
+# Full-session recordings, and the session rows of buffer runs, are managed by the
+# *same* two rules with their own numbers: clips and sessions are evicted
+# independently, so a large session library can never push your clips out (or the
+# other way round). Favourited sessions are exempt from both rules, exactly as
+# favourited clips are — and so is a session that is still recording: its scratch
+# directory is footage that exists nowhere else yet, so the cap counts its bytes but
+# never evicts it. A live recording that alone exceeds the cap is reported as an
+# unsatisfiable cap rather than paid for out of the finished sessions beside it.
+#
+# Defaults: 200 GiB and 7 days. A 4K session is roughly 9 GB an hour at the example
+# bitrate, so raise the cap if you record long sessions at 4K.
+[storage.sessions]
+# Empty = %LOCALAPPDATA%\localplay\sessions
+sessions_dir = ""
+max_total_bytes = 214748364800
+max_age_days = 7
+
+# --- The microphone (Phase 5) ---------------------------------------------------
+# Record a voice track alongside the game audio. **Off by default**, and deliberately
+# so: a microphone is not the game's own audio, the machine may have no capture
+# endpoint at all, and a recording that silently gained a track nobody asked for is a
+# surprise. With this off, the encoder is invoked exactly as it was before the feature
+# existed (one audio input, no second track).
+#
+# With it on, every clip and every session file carries TWO audio tracks — the game
+# audio first, the microphone second — and the microphone is the default
+# *communications* capture endpoint (the device Windows assigns to voice chat), which
+# is not configurable. On Windows this needs a capture device; if it cannot be
+# started, the recording fails at start rather than producing a video with a silent
+# voice track.
+[mic]
+enabled = false
+
+# --- Game presence, and recording that follows it (Phase 5) ---------------------
+# When `auto_record = true`, localplay watches for the titles below and records one
+# session per game: recording starts when the game starts and stops (and is
+# finalised, and the storage policy is applied) when it stops.
+#
+# **Off by default, and that is the whole safety posture of the feature**: with it
+# off, nothing is polled, no process list is enumerated and no request is made — no
+# watcher thread exists at all. League of Legends is detected through Riot's own
+# Live Client Data API (a read-only GET to 127.0.0.1:2999, which only answers during
+# a real match); every other title by comparing process names in a snapshot — the
+# same enumeration Task Manager does, with nothing opened, read or injected, and no
+# handle held between polls. Nothing is ever sent anywhere but loopback.
+#
+# `poll_ms` is how often to look; it is clamped to 250..30000. A change is believed
+# after two consecutive polls, so one flickering snapshot cannot start or end a
+# session.
+#
+# The titles watched when no `[[games.watch]]` list is given: League of Legends
+# (Live Client Data API), Counter-Strike 2 (`cs2.exe`), Dota 2 (`dota2.exe`),
+# Rainbow Six Siege (`RainbowSix.exe`), Valorant (`VALORANT-Win64-Shipping.exe`) and
+# Overwatch 2 (`Overwatch.exe`) — always the *game* process, never the launcher's.
+#
+# Name your own list like this (it replaces the default one):
+#   [[games.watch]]
+#   name = "Dota 2"
+#   exe = "dota2.exe"
+#   signal = "process"            # or "live_client_api"
+[games]
+auto_record = false
+poll_ms = 2500
 
 [hotkeys]
 clip = "Ctrl+F8"

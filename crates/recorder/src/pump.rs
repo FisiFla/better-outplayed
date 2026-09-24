@@ -15,6 +15,34 @@ use localplay_encoder::Encoder;
 use localplay_replay::buffer::RingBuffer;
 use std::time::{Duration, Instant};
 
+/// A media timeline the pump can wait on: something that finds newly written segments and
+/// reports how much footage is on disk.
+///
+/// Introduced for the full-session mode (Phase 5): [`crate::session::SessionRing`] is the
+/// ring's cap-free twin, and the post-roll wait below has to work on either without knowing
+/// which it was given. The two methods are the whole of what the wait needs — a scan and a
+/// span — so the trait is two methods wide and deliberately not the ring's interface.
+///
+/// `RingBuffer` implements it here (the trait is this crate's, the type is
+/// `localplay-replay`'s, which is what makes the impl legal); its `scan` is
+/// `scan_once`, eviction included, exactly as before.
+pub trait MediaRing {
+    /// Find newly written segments and index them.
+    fn scan(&mut self) -> Result<()>;
+    /// Media time the ring can prove is on disk, in ms, run-relative.
+    fn span_ms(&self) -> u64;
+}
+
+impl MediaRing for RingBuffer {
+    fn scan(&mut self) -> Result<()> {
+        self.scan_once()
+    }
+
+    fn span_ms(&self) -> u64 {
+        self.stats().span_ms
+    }
+}
+
 /// Longest a single `next_frame` call waits for a frame to become due.
 ///
 /// The capture backends are real-time paced and return `None` when nothing is due
@@ -235,7 +263,6 @@ pub fn pump_once(
     pump_once_counted(pacer, capture, audio, encoder)?;
     Ok(())
 }
-
 /// [`pump_once`], reporting what became of the frames the backend offered.
 ///
 /// Both the steady-state loop and the post-roll wait pump through here, so the rule
@@ -288,6 +315,29 @@ pub fn pump_once_counted(
     audio: &mut dyn AudioBackend,
     encoder: &mut dyn Encoder,
 ) -> Result<PumpCounts> {
+    pump_once_counted_with_mic(pacer, capture, audio, None, encoder)
+}
+
+/// [`pump_once_counted`], with the microphone input drained too.
+///
+/// The microphone is a **second input with its own writer thread inside the encoder**, fed
+/// from this same loop iteration: the game audio goes to `submit_audio` and the microphone
+/// to `submit_mic_audio`, both of which hand a block to a queue that a thread of their own
+/// drains into its own loopback socket. One pump thread submitting to two queues is the
+/// shape the encoder's own docs require — a synchronous write of both inputs from one
+/// thread is the deadlock this pipeline already fixed once — and it is why the microphone
+/// adds no thread of its own here.
+///
+/// `mic` is `None` whenever this recording has no microphone track (`[mic] enabled = false`,
+/// the default): the function is then exactly the pre-Phase-5 pump, one `submit_audio` loop
+/// and nothing else.
+pub fn pump_once_counted_with_mic(
+    pacer: &mut FramePacer,
+    capture: &mut dyn CaptureBackend,
+    audio: &mut dyn AudioBackend,
+    mic: Option<&mut (dyn AudioBackend + '_)>,
+    encoder: &mut dyn Encoder,
+) -> Result<PumpCounts> {
     let mut counts = PumpCounts::default();
     if pacer.is_due(Instant::now()) {
         if let Some(frame) = capture.next_frame(FRAME_POLL)? {
@@ -310,6 +360,14 @@ pub fn pump_once_counted(
     }
     while let Some(block) = audio.next_buffer(Duration::ZERO)? {
         encoder.submit_audio(block)?;
+    }
+    // The microphone's blocks are drained the same way, for the same reason: its timeline
+    // is the exact sample count, and a block left in the backend is a hole in the voice
+    // track rather than a frame that is merely late.
+    if let Some(mic) = mic {
+        while let Some(block) = mic.next_buffer(Duration::ZERO)? {
+            encoder.submit_mic_audio(block)?;
+        }
     }
     Ok(counts)
 }
@@ -383,20 +441,55 @@ pub fn pump_until_span(
     need_ms: u64,
     budget: Duration,
 ) -> Result<PumpCounts> {
+    pump_until_span_on(pacer, ring, capture, audio, None, encoder, need_ms, budget)
+}
+
+/// [`pump_until_span`] over any [`MediaRing`], with an optional microphone input.
+///
+/// Two things vary between the callers and nothing else does: which ledger the span comes
+/// from (the replay ring, or a full session's own segments — see
+/// [`crate::session::SessionRing`]) and whether a microphone is drained alongside the game
+/// audio. Both are parameters rather than a second wait loop, because this loop is the one
+/// place that must keep the encoder fed while it waits, and a second copy of it is a second
+/// chance to get that wrong.
+// Seven parameters plus the ring: the wait loop's handles are what it needs to keep feeding
+// one encoder while it waits, and bundling them into a struct would only move the list. The
+// pre-Phase-5 loop took seven for the same reason; the microphone is the eighth.
+#[allow(clippy::too_many_arguments)]
+pub fn pump_until_span_on(
+    pacer: &mut FramePacer,
+    ring: &mut (dyn MediaRing + '_),
+    capture: &mut dyn CaptureBackend,
+    audio: &mut dyn AudioBackend,
+    mic: Option<&mut (dyn AudioBackend + '_)>,
+    encoder: &mut dyn Encoder,
+    need_ms: u64,
+    budget: Duration,
+) -> Result<PumpCounts> {
     let started = Instant::now();
     let deadline = started + budget;
     let mut counts = PumpCounts::default();
     // Scan on the first pass, then on the interval: the span can only move when
     // ffmpeg finalises a segment, which is a per-segment event, not a per-frame one.
     let mut next_scan = started;
+    // The microphone is borrowed for the whole wait: re-borrowing it inside the loop would
+    // mean a second `Option<&mut dyn AudioBackend>` per iteration, which the borrow checker
+    // rightly refuses.
+    let mut mic = mic;
 
     loop {
-        counts = counts.plus(pump_once_counted(pacer, capture, audio, encoder)?);
+        counts = counts.plus(pump_once_counted_with_mic(
+            pacer,
+            capture,
+            audio,
+            mic.as_deref_mut(),
+            encoder,
+        )?);
 
         if Instant::now() >= next_scan {
-            ring.scan_once().context("scanning scratch for the post-roll")?;
+            ring.scan().context("scanning for the post-roll")?;
             next_scan = Instant::now() + POST_ROLL_SCAN_INTERVAL;
-            let span = ring.stats().span_ms;
+            let span = ring.span_ms();
             if span >= need_ms {
                 tracing::debug!(
                     "post-roll on disk: span={span}ms covers {need_ms}ms after {}ms \
@@ -413,7 +506,7 @@ pub fn pump_until_span(
                 "timed out after {}ms waiting for post-roll (span={}ms need={}ms): the \
                  encoder produced no segment covering the trigger",
                 started.elapsed().as_millis(),
-                ring.stats().span_ms,
+                ring.span_ms(),
                 need_ms
             );
         }

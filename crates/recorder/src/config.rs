@@ -13,6 +13,118 @@
 
 use serde::Deserialize;
 
+/// `[recorder]` — which recording this run is (spec §6, Phase 5).
+///
+/// Its own section rather than a key on `[buffer]` or `[storage]`: the mode is not a
+/// property of the ring or of the storage policy, it is what the engine is asked to do,
+/// and the two modes read every other setting differently (the scratch cap applies to one
+/// and not the other, and only one of them produces a session file).
+///
+/// ```toml
+/// [recorder]
+/// mode = "buffer"   # or "session"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct RecorderSection {
+    /// [`RecordingMode::ReplayBuffer`] (the default) or [`RecordingMode::FullSession`].
+    pub mode: RecordingMode,
+}
+
+/// What the engine records.
+///
+/// * [`RecordingMode::ReplayBuffer`] — the Phase 1 behaviour: a bounded scratch ring, a
+///   hotkey (or a game event) splices a clip out of it, and everything older than
+///   `buffer.scratch_cap_bytes` is evicted. Nothing else survives the run.
+/// * [`RecordingMode::FullSession`] — the whole session is written to disk: segments go
+///   into a per-session directory under the sessions area, **the scratch cap is not
+///   applied to them** (a full session is not a ring: evicting the oldest segment of a
+///   four-hour recording would delete footage the user asked for), and stopping the
+///   recording losslessly concatenates them into one `session-<timestamp>.mp4`.
+///
+/// The strings are the ones `sessions.mode` stores ([`RecordingMode::store_mode`]), and
+/// a test pins the two spellings together so a rename cannot silently split them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum RecordingMode {
+    /// The rolling replay buffer. The default, and the only mode before Phase 5.
+    #[default]
+    #[serde(rename = "buffer", alias = "replay_buffer", alias = "replaybuffer")]
+    ReplayBuffer,
+    /// Record the whole session and concatenate it at stop.
+    #[serde(rename = "session", alias = "full_session", alias = "fullsession")]
+    FullSession,
+}
+
+impl RecordingMode {
+    /// The `config.toml` spelling (`[recorder] mode`), which is also the string
+    /// [`RecordingMode::store_mode`] maps onto.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordingMode::ReplayBuffer => "buffer",
+            RecordingMode::FullSession => "session",
+        }
+    }
+
+    /// The `sessions.mode` value this mode opens its row with (spec §5.5). The store owns
+    /// the vocabulary; this is the mapping, in one place.
+    pub fn store_mode(self) -> &'static str {
+        match self {
+            RecordingMode::ReplayBuffer => localplay_store::SESSION_MODE_BUFFER,
+            RecordingMode::FullSession => localplay_store::SESSION_MODE_SESSION,
+        }
+    }
+
+    /// Whether this mode writes a session file and keeps its segments free of the scratch
+    /// cap. Named rather than compared, so the intent is readable at the call sites.
+    pub fn is_full_session(self) -> bool {
+        matches!(self, RecordingMode::FullSession)
+    }
+}
+
+impl std::fmt::Display for RecordingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RecordingMode {
+    type Err = anyhow::Error;
+
+    /// The CLI's `--mode` parsing, and the one place the accepted spellings are listed.
+    fn from_str(spec: &str) -> anyhow::Result<Self> {
+        match spec.trim().to_ascii_lowercase().as_str() {
+            "buffer" | "replay" | "replay_buffer" => Ok(RecordingMode::ReplayBuffer),
+            "session" | "full" | "full_session" => Ok(RecordingMode::FullSession),
+            other => anyhow::bail!(
+                "unknown recording mode {other:?}: expected \"buffer\" (rolling replay \
+                 buffer) or \"session\" (record the whole session)"
+            ),
+        }
+    }
+}
+
+/// `[mic]` — the optional microphone track (spec §5.1, Phase 5).
+///
+/// **Off by default, and that is the whole posture of the feature.** A microphone is not
+/// part of the game's own audio, a machine may have no capture endpoint at all, and a
+/// recording that silently gained a track nobody asked for is a surprise with a legal
+/// flavour on a voice-chat-enabled box. The user opts in by writing `enabled = true`.
+///
+/// When it *is* on, the engine sets `mic_audio` on the encode configuration (so ffmpeg
+/// gets a second audio input and the output carries two audio tracks) and feeds that input
+/// from the microphone backend. When it cannot — no capture endpoint, or a platform with
+/// no microphone backend — the recording **fails at start** rather than producing video
+/// with a silent microphone track (see `Recorder::start`).
+///
+/// Device choice is deliberately not configurable: the Windows backend opens the default
+/// **communications** capture endpoint, which is the device the user actually talks into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct MicSection {
+    /// Record a microphone track alongside the game audio. Default `false`.
+    pub enabled: bool,
+}
+
 /// `[buffer]` — the ring's window, its segment length and its scratch budget.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BufferSection {
@@ -85,6 +197,13 @@ mod tests {
         encode: EncodeSection,
     }
 
+    /// The same for `[recorder]`, with the section optional so "absent" can be tested.
+    #[derive(Debug, Deserialize)]
+    struct RecorderFile {
+        #[serde(default)]
+        recorder: RecorderSection,
+    }
+
     fn encode_section(text: &str) -> EncodeSection {
         toml::from_str::<File>(text).expect("the section parses").encode
     }
@@ -132,9 +251,96 @@ output_size = \"\"
             "the error names the key that is wrong: {err}"
         );
     }
+
+    /// The mode is a setting of the engine, so it parses from `[recorder]` — and absent, it
+    /// is the replay buffer, i.e. the behaviour every existing configuration already has.
+    #[test]
+    fn the_recording_mode_parses_and_defaults_to_the_replay_buffer() {
+        let absent: RecorderFile = toml::from_str("buffer_thing = 1\n").expect("no [recorder]");
+        assert_eq!(absent.recorder.mode, RecordingMode::ReplayBuffer);
+
+        let section: RecorderFile =
+            toml::from_str("[recorder]\nmode = \"buffer\"\n").expect("the buffer spelling");
+        assert_eq!(section.recorder.mode, RecordingMode::ReplayBuffer);
+
+        let session: RecorderFile =
+            toml::from_str("[recorder]\nmode = \"session\"\n").expect("the session spelling");
+        assert_eq!(session.recorder.mode, RecordingMode::FullSession);
+        assert!(session.recorder.mode.is_full_session());
+    }
+
+    /// A mode this build does not know is a parse error naming the key — the alternative is
+    /// recording the *other* mode while the file says otherwise.
+    #[test]
+    fn an_unknown_mode_is_refused() {
+        let err = toml::from_str::<RecorderFile>("[recorder]\nmode = \"everything\"\n")
+            .expect_err("only the two known modes are accepted");
+        assert!(err.to_string().contains("mode"), "the error names the key: {err}");
+    }
+
+    /// The spelling `config.toml` uses and the value `sessions.mode` stores are one fact:
+    /// the config's `"session"` must be the store's `SESSION_MODE_SESSION`, or a row would
+    /// say one thing and the config another.
+    #[test]
+    fn the_mode_spellings_match_the_stores_vocabulary() {
+        for mode in [RecordingMode::ReplayBuffer, RecordingMode::FullSession] {
+            assert_eq!(mode.as_str(), mode.store_mode(), "{mode:?}");
+            assert_eq!(mode.to_string(), mode.store_mode());
+            assert_eq!(mode.as_str().parse::<RecordingMode>().unwrap(), mode);
+        }
+        assert_eq!(RecordingMode::FullSession.store_mode(), localplay_store::SESSION_MODE_SESSION);
+        assert_eq!(RecordingMode::ReplayBuffer.store_mode(), localplay_store::SESSION_MODE_BUFFER);
+    }
+
+    /// The microphone is opt-in, and the section's absence is the same answer as `false`.
+    #[test]
+    fn the_microphone_is_off_unless_the_file_turns_it_on() {
+        #[derive(Debug, Deserialize)]
+        struct File {
+            #[serde(default)]
+            mic: MicSection,
+        }
+        let absent: File = toml::from_str("nothing = 1\n").expect("no [mic]");
+        assert!(!absent.mic.enabled, "the microphone is off by default");
+        let empty: File = toml::from_str("[mic]\n").expect("[mic] with nothing in it");
+        assert!(!empty.mic.enabled);
+        let on: File = toml::from_str("[mic]\nenabled = true\n").expect("the opt-in");
+        assert!(on.mic.enabled);
+    }
+
+    /// The session rules are additive: a `[storage]` table written before Phase 5 parses,
+    /// keeps its own values, and gets the documented default for the session store.
+    #[test]
+    fn the_session_storage_rules_are_optional_and_separate() {
+        #[derive(Debug, Deserialize)]
+        struct File {
+            storage: StorageSection,
+        }
+        let old: File = toml::from_str(
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 1000\nmax_age_days = 3\n",
+        )
+        .expect("a pre-Phase-5 [storage] table must keep parsing");
+        assert_eq!(old.storage.max_total_bytes, 1_000);
+        assert_eq!(old.storage.max_age_days, 3);
+        assert_eq!(old.storage.sessions, SessionStorageRules::default(), "the default rules");
+        assert!(old.storage.sessions.max_total_bytes > old.storage.max_total_bytes);
+
+        let extended: File = toml::from_str(
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 1000\nmax_age_days = 3\n\n\
+             [storage.sessions]\nmax_total_bytes = 500\nmax_age_days = 1\n",
+        )
+        .expect("the session table");
+        assert_eq!(extended.storage.sessions.max_total_bytes, 500);
+        assert_eq!(extended.storage.sessions.max_age_days, 1);
+        assert_eq!(extended.storage.sessions.sessions_dir, "", "empty means the default");
+        assert_eq!(extended.storage.max_total_bytes, 1_000, "the clips rule is untouched");
+    }
 }
 
 /// `[storage]` — the clips directory and the policy applied to it (spec §8.1).
+///
+/// Phase 5 added [`StorageSection::sessions`], additively: a file written before it existed
+/// still parses, and every field above means exactly what it always did.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StorageSection {
     /// Empty means `<app data dir>/clips`.
@@ -144,4 +350,39 @@ pub struct StorageSection {
     pub max_total_bytes: u64,
     /// A non-favourited clip older than this many days is deleted.
     pub max_age_days: u64,
+    /// `[storage.sessions]` — the same two rules, for the session store (Phase 5).
+    /// Optional: a configuration that does not mention it gets
+    /// [`SessionStorageRules::default`].
+    #[serde(default)]
+    pub sessions: SessionStorageRules,
+}
+
+/// `[storage.sessions]` — the session store's own rules (spec §8.1).
+///
+/// The field names are the clips rules' field names on purpose: sessions and clips are
+/// evicted independently, by the *same* two rules with their own numbers, and a reader who
+/// knows one table knows the other ([`crate::index::cleanup_pass`] applies both).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SessionStorageRules {
+    /// Empty means `<app data dir>/sessions`.
+    pub sessions_dir: String,
+    /// Total bytes the session store may occupy, favourites and *running* sessions
+    /// included. A session that is still recording is never an eviction candidate — its
+    /// bytes are counted, and a live recording that alone exceeds the cap is reported as
+    /// an unsatisfiable cap rather than paid for out of the finished sessions beside it.
+    pub max_total_bytes: u64,
+    /// A non-favourited session that *started* longer ago than this many days is deleted.
+    pub max_age_days: u64,
+}
+
+impl Default for SessionStorageRules {
+    /// 200 GiB and a week. The cap is generous because a session is one file the user
+    /// deliberately recorded end to end (a 4K session is ~9 GB an hour at the example
+    /// bitrate), and the age limit is the clips limit: a session is not more precious than
+    /// a clip. Both are meant to be raised by a user who records a lot, not to be the
+    /// thing that decides how much they can keep.
+    fn default() -> Self {
+        Self { sessions_dir: String::new(), max_total_bytes: 214_748_364_800, max_age_days: 7 }
+    }
 }

@@ -64,11 +64,17 @@ pub mod config;
 
 use anyhow::{bail, Context, Result};
 use config::{Config, EventsSection};
+#[cfg(feature = "test-encoders")]
+use localplay_capture::stub::StubConfig;
 use localplay_events::gsi::{self, GsiConfig, GsiListener};
 use localplay_events::lol::{self, LolConfig, LolHandle};
 use localplay_events::{hotkey, GameEvent};
 use localplay_media::FfmpegBinaries;
-use localplay_recorder::{ClipReason, Recorder, RecorderConfig, Sources};
+use localplay_recorder::{
+    ClipReason, Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources,
+};
+#[cfg(feature = "test-encoders")]
+use localplay_recorder::STUB_CAPTURE_SIZE;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -96,6 +102,13 @@ usage:
   localplay-cli buffer [OPTIONS]
 
 options:
+  --mode <buffer|session>
+        Which recording to make, overriding the file's `[recorder] mode`.
+          buffer  — the rolling replay buffer: a bounded scratch ring, a clip per
+                    hotkey press. The default, and what every earlier build did.
+          session — record the whole session, then concatenate it losslessly into
+                    one `session-<timestamp>.mp4` under the sessions area when the
+                    recording stops. The scratch cap does not apply to a session.
   --self-test-clip-after <SECONDS>
         Verification aid, not an end-user feature. Once the ring holds SECONDS of
         media — and never before it holds a full pre-roll plus post-roll — take
@@ -111,6 +124,12 @@ options:
         Only in builds carrying the `test-encoders` feature (never a release
         build): use libx264 instead of a GPU hardware encoder, for pipeline
         smoke tests on a host with no GPU encoder.
+  --dev-stub-sources
+        Only in builds carrying the `test-encoders` feature (never a release
+        build): capture from the synthetic sources instead of the display, the
+        speakers and a microphone. **Nothing real is captured.** It exists so the
+        whole pipeline — including the microphone path, which has no non-Windows
+        backend — can be driven end to end on a development host.
 
 configuration:
   %LOCALAPPDATA%\\localplay\\config.toml on Windows (the directory
@@ -137,6 +156,23 @@ pub struct BufferOptions {
     pub self_test_clip_after: Option<u64>,
     /// `--dev-software-encoder`.
     pub dev_software_encoder: bool,
+    /// `--mode <buffer|session>`: an override of `[recorder] mode` from the file. `None`
+    /// means "whatever the file says".
+    pub mode: Option<RecordingMode>,
+    /// `--dev-stub-sources`: the synthetic capture/audio/microphone sources, for a host
+    /// that is not the platform this application records on. Feature-gated like
+    /// `--dev-software-encoder`, because a build that captured nothing while looking like a
+    /// recording would be worse than a build that cannot be demonstrated.
+    pub stub_sources: bool,
+}
+
+/// The flags the `buffer` subcommand accepted, before the config file is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferArgs {
+    pub self_test_clip_after: Option<u64>,
+    pub dev_software_encoder: bool,
+    pub mode: Option<RecordingMode>,
+    pub stub_sources: bool,
 }
 
 /// Parse the flags the `buffer` subcommand accepts (everything after `buffer`).
@@ -144,9 +180,13 @@ pub struct BufferOptions {
 /// Strict on purpose: an unrecognised argument is an error rather than something quietly
 /// ignored, because the one thing this parser exists for is a verification flag that must
 /// provably have been understood.
-pub fn parse_buffer_args(args: &[String]) -> Result<(Option<u64>, bool)> {
-    let mut self_test_clip_after = None;
-    let mut dev_software_encoder = false;
+pub fn parse_buffer_args(args: &[String]) -> Result<BufferArgs> {
+    let mut parsed = BufferArgs {
+        self_test_clip_after: None,
+        dev_software_encoder: false,
+        mode: None,
+        stub_sources: false,
+    };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let value_of = |it: &mut std::slice::Iter<'_, String>, flag: &str| -> Result<String> {
@@ -157,16 +197,24 @@ pub fn parse_buffer_args(args: &[String]) -> Result<(Option<u64>, bool)> {
         match arg.as_str() {
             "--self-test-clip-after" => {
                 let value = value_of(&mut it, "--self-test-clip-after")?;
-                self_test_clip_after = Some(parse_self_test_seconds(&value)?);
+                parsed.self_test_clip_after = Some(parse_self_test_seconds(&value)?);
             }
-            "--dev-software-encoder" => dev_software_encoder = true,
+            "--mode" => {
+                let value = value_of(&mut it, "--mode")?;
+                parsed.mode = Some(value.parse::<RecordingMode>().context("--mode")?);
+            }
+            "--dev-software-encoder" => parsed.dev_software_encoder = true,
+            "--dev-stub-sources" => parsed.stub_sources = true,
             other => match other.strip_prefix("--self-test-clip-after=") {
-                Some(value) => self_test_clip_after = Some(parse_self_test_seconds(value)?),
-                None => bail!("unexpected argument {other:?}\n\n{}", help()),
+                Some(value) => parsed.self_test_clip_after = Some(parse_self_test_seconds(value)?),
+                None => match other.strip_prefix("--mode=") {
+                    Some(value) => parsed.mode = Some(value.parse::<RecordingMode>().context("--mode")?),
+                    None => bail!("unexpected argument {other:?}\n\n{}", help()),
+                },
             },
         }
     }
-    Ok((self_test_clip_after, dev_software_encoder))
+    Ok(parsed)
 }
 
 fn parse_self_test_seconds(value: &str) -> Result<u64> {
@@ -192,11 +240,13 @@ pub fn self_test_need_ms(after_seconds: u64, pre_seconds: u64, post_seconds: u64
 /// The `buffer` subcommand, as `main.rs` calls it: flags from the process's own arguments.
 pub fn run_buffer() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
-    let (self_test_clip_after, dev_software_encoder) = parse_buffer_args(&args)?;
+    let parsed = parse_buffer_args(&args)?;
     run_buffer_with(BufferOptions {
         app_dir: app_data_dir(),
-        self_test_clip_after,
-        dev_software_encoder,
+        self_test_clip_after: parsed.self_test_clip_after,
+        dev_software_encoder: parsed.dev_software_encoder,
+        mode: parsed.mode,
+        stub_sources: parsed.stub_sources,
     })
 }
 
@@ -213,12 +263,16 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     } else {
         Config::from_toml(include_str!("../../../config.example.toml"))?
     };
-    let Config { buffer, encode, storage, hotkeys, events, .. } = cfg;
+    let Config { recorder, buffer, encode, storage, mic, hotkeys, events, games, .. } = cfg;
     // Read before the move: these are the CLI's own line (it is logged after the engine is
     // already capturing). The rate the line prints comes from the engine rather than from
     // `encode.fps`, because the engine may have measured that this machine cannot hold the
     // configured rate and is pacing to a lower one — see `RecorderStatus::effective_fps`.
     let (pre_seconds, post_seconds) = (buffer.pre_seconds, buffer.post_seconds);
+    // `--mode` overrides the file (Phase 5), and the resolved value is what the CLI logs and
+    // what the engine is told: one number, decided here, never re-derived below.
+    let mode = opts.mode.unwrap_or(recorder.mode);
+    let encode_fps = encode.fps;
 
     let bin = FfmpegBinaries::discover(None)?;
     let hotkey = localplay_events::hotkey::Hotkey::parse(&hotkeys.clip)?;
@@ -230,35 +284,52 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // selects libx264, needs no GPU vendor at all, and is never reachable from the config
     // file. The engine applies the gate (see `localplay_recorder::resolve_encoder`).
     let dev_software = opts.dev_software_encoder;
+    let stub_sources = opts.stub_sources;
 
-    let recorder = Recorder::start(RecorderConfig {
-        bin,
-        app_data_dir: app_dir,
-        buffer,
-        encode,
-        storage,
-        // WGC + WASAPI on Windows, the synthetic stubs everywhere else
-        // (`localplay_capture::platform` decides, and on Windows it refuses to fall back
-        // to a stub).
-        sources: Sources::Platform,
-        dev_software_encoder: dev_software,
-    })?;
+    let recorder = Recorder::start_with_options(
+        RecorderConfig {
+            bin,
+            app_data_dir: app_dir,
+            buffer,
+            encode,
+            storage,
+            // WGC + WASAPI on Windows, the synthetic stubs everywhere else
+            // (`localplay_capture::platform` decides, and on Windows it refuses to fall back
+            // to a stub). `--dev-stub-sources` selects the synthetic pair *explicitly* —
+            // including the microphone, which has no non-Windows backend — and is gated the
+            // same way `--dev-software-encoder` is.
+            sources: choose_sources(stub_sources, encode_fps)?,
+            dev_software_encoder: dev_software,
+        },
+        RecorderOptions { mode, mic, games, game: None },
+    )?;
 
-    // From here the engine is capturing: the encoder is spawned, the ring is built and
-    // adopted, and the capture session is open. This line is the CLI's own — the hotkey is
-    // what only it knows about — and it is emitted at the same point in the sequence it
-    // always was. The chord printed is the *parsed* one (its `Display`), so a config that
-    // says `ctrl+f8` reads back as `Ctrl+F8` and matches what the desktop shell shows for
-    // the same file. The rate is the one the pipeline is running at: when it is below the
-    // configured `encode.fps`, the engine has already logged a warning saying what it
-    // measured and why (see `log_rate_decision` in `localplay-recorder`).
-    tracing::info!(
-        "buffering {}s pre / {}s post at {}fps; press {} to clip",
-        pre_seconds,
-        post_seconds,
-        recorder.status().effective_fps,
-        hotkey
-    );
+    // From here the engine is capturing — or, with `[games] auto_record` on, armed and
+    // waiting for a game. This line is the CLI's own — the hotkey is what only it knows
+    // about — and it is emitted at the same point in the sequence it always was. The chord
+    // printed is the *parsed* one (its `Display`), so a config that says `ctrl+f8` reads back
+    // as `Ctrl+F8` and matches what the desktop shell shows for the same file. The rate is
+    // the one the pipeline is running at: when it is below the configured `encode.fps`, the
+    // engine has already logged a warning saying what it measured and why (see
+    // `log_rate_decision` in `localplay-recorder`).
+    let status = recorder.status();
+    if status.watching_games {
+        tracing::info!(
+            "armed in {} mode at up to {}fps: nothing is captured until a watched game \
+             starts (games.auto_record = true), and each game is recorded as its own \
+             session; press {} to clip during one",
+            mode,
+            status.configured_fps,
+            hotkey
+        );
+    } else {
+        tracing::info!(
+            "{} {pre_seconds}s pre / {post_seconds}s post at {}fps; press {} to clip",
+            if mode.is_full_session() { "recording the whole session," } else { "buffering" },
+            status.effective_fps,
+            hotkey
+        );
+    }
 
     // The game-event sources. Started after the recorder (a source cannot ask for a clip
     // before there is anything to clip) and before the hotkey, so that an event arriving in
@@ -292,19 +363,35 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // The verification-only trigger (`--self-test-clip-after`). It never synthesises input:
     // it is an in-process call to the same media-time trigger the hotkey drives.
     if let Some(after_seconds) = opts.self_test_clip_after {
+        if recorder.status().watching_games {
+            tracing::warn!(
+                "self-test: games.auto_record is on, so the recording this run clips from \
+                 does not exist yet — the self-test waits for a watched game to start"
+            );
+        }
         return self_test_clip(&recorder, after_seconds, pre_seconds, post_seconds);
     }
 
     // The driver loop. Everything below either waits for a press, hands the trigger to the
     // engine, or leaves — and every path out of it stops the recorder, which flushes the
-    // encoder and closes the capture session.
+    // encoder and closes the capture session (and, in session mode, writes the session
+    // file).
     loop {
         if hotkey::wait_for_press(&hotkeys, HOTKEY_POLL) {
             if let Err(err) = recorder.clip_now() {
-                // The engine logs what went wrong; stopping first means the encoder is
-                // flushed and the capture session closed before the process gives up.
-                let _ = recorder.stop();
-                return Err(err.context("taking a clip"));
+                // A recorder armed for game detection has nothing to clip until a game
+                // starts; that is a state, not a failure, and the loop keeps waiting.
+                if recorder.is_armed() && !recorder.is_running() {
+                    tracing::info!(
+                        "nothing is being recorded yet ({err:#}); the hotkey takes a clip \
+                         once a watched game starts"
+                    );
+                } else {
+                    // The engine logs what went wrong; stopping first means the encoder is
+                    // flushed and the capture session closed before the process gives up.
+                    let _ = recorder.stop();
+                    return Err(err.context("taking a clip"));
+                }
             }
         } else {
             std::thread::sleep(HOTKEY_POLL);
@@ -315,12 +402,19 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         // `try_recv` rather than `recv`, so a quiet game cannot make the hotkey wait.
         while let Ok(event) = sources.events.try_recv() {
             if let Err(err) = act_on_event(&recorder, event) {
+                // The same state as above: no recording exists to clip or to mark, and a
+                // game event that arrived while nothing is being recorded is not a reason
+                // to stop watching for a game.
+                if recorder.is_armed() && !recorder.is_running() {
+                    tracing::info!("the event is not recorded: {err:#}");
+                    continue;
+                }
                 let _ = recorder.stop();
                 return Err(err);
             }
         }
 
-        if !recorder.is_running() {
+        if !recorder.is_running() && !recorder.is_armed() {
             // The engine stopped on its own — a failed capture, a scratch cap violation —
             // and it kept the reason in its status. `stop()` reports it.
             recorder.stop()?;
@@ -510,6 +604,47 @@ fn app_data_dir() -> PathBuf {
     base.join("localplay")
 }
 
+/// The capture, audio and microphone sources this run uses.
+///
+/// `Sources::Platform` is the shipping choice and what a build without the `test-encoders`
+/// feature can only ever have: WGC + WASAPI on Windows, and the synthetic pair elsewhere
+/// (`localplay_capture::platform` refuses to substitute a stub on Windows, which is why the
+/// stub is never selected implicitly there).
+///
+/// `--dev-stub-sources` selects the synthetic sources **explicitly**, microphone included —
+/// the microphone backend has no non-Windows implementation at all, so this is the only way
+/// the microphone path can be driven end to end on a development host. Gated exactly like
+/// `--dev-software-encoder`: a release build cannot capture nothing while looking like a
+/// recording.
+fn choose_sources(stub_sources: bool, fps: u32) -> Result<Sources> {
+    if !stub_sources {
+        return Ok(Sources::Platform);
+    }
+    #[cfg(feature = "test-encoders")]
+    {
+        tracing::warn!(
+            "--dev-stub-sources: the synthetic capture, audio and microphone sources are in \
+             use. NOTHING REAL IS CAPTURED — this is for pipeline smoke tests only, and the \
+             recording it produces will show a test pattern, two synthetic tones and silence \
+             from the display."
+        );
+        Ok(Sources::Stub(StubConfig {
+            width: STUB_CAPTURE_SIZE.0,
+            height: STUB_CAPTURE_SIZE.1,
+            fps,
+        }))
+    }
+    #[cfg(not(feature = "test-encoders"))]
+    {
+        let _ = fps;
+        bail!(
+            "--dev-stub-sources requires building with `--features test-encoders` (the same \
+             gate --dev-software-encoder has): a build that captures nothing while looking \
+             like a recording is not something to ship"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,35 +655,72 @@ mod tests {
 
     #[test]
     fn the_buffer_flags_default_to_the_shipping_behaviour() {
-        // No flags: nothing about the hotkey path changes, and the self-test trigger is
-        // not armed. This is the case a user runs.
-        let (self_test, dev) = parse_buffer_args(&[]).expect("no flags is a valid command line");
-        assert_eq!(self_test, None);
-        assert!(!dev);
+        // No flags: nothing about the hotkey path changes, the self-test trigger is not
+        // armed, the mode comes from the file, and the real sources are used. This is the
+        // case a user runs.
+        let parsed = parse_buffer_args(&[]).expect("no flags is a valid command line");
+        assert_eq!(parsed.self_test_clip_after, None);
+        assert!(!parsed.dev_software_encoder);
+        assert_eq!(parsed.mode, None, "the file's [recorder] mode decides");
+        assert!(!parsed.stub_sources, "the synthetic sources are never implicit");
     }
 
     #[test]
     fn the_self_test_flag_parses_seconds_in_either_form() {
         assert_eq!(
-            parse_buffer_args(&args(&["--self-test-clip-after", "45"])).expect("spaced form").0,
+            parse_buffer_args(&args(&["--self-test-clip-after", "45"])).expect("spaced form").self_test_clip_after,
             Some(45)
         );
         assert_eq!(
-            parse_buffer_args(&args(&["--self-test-clip-after=45"])).expect("= form").0,
+            parse_buffer_args(&args(&["--self-test-clip-after=45"])).expect("= form").self_test_clip_after,
             Some(45)
         );
         // The two forms are one setting, not two: the last one wins, and an unrelated flag
         // is unaffected.
+        let parsed = parse_buffer_args(&args(&[
+            "--self-test-clip-after=10",
+            "--dev-software-encoder",
+            "--self-test-clip-after",
+            "20",
+        ]))
+        .expect("last one wins");
+        assert_eq!(parsed.self_test_clip_after, Some(20));
+        assert!(parsed.dev_software_encoder);
+    }
+
+    /// The mode is settable from the command line in either form, and it is an *override*:
+    /// with no flag the file decides (`None`).
+    #[test]
+    fn the_mode_flag_parses_and_overrides_the_file() {
         assert_eq!(
-            parse_buffer_args(&args(&[
-                "--self-test-clip-after=10",
-                "--dev-software-encoder",
-                "--self-test-clip-after",
-                "20",
-            ]))
-            .expect("last one wins"),
-            (Some(20), true)
+            parse_buffer_args(&args(&["--mode", "session"])).expect("the spaced form").mode,
+            Some(RecordingMode::FullSession)
         );
+        assert_eq!(
+            parse_buffer_args(&args(&["--mode=buffer"])).expect("the = form").mode,
+            Some(RecordingMode::ReplayBuffer)
+        );
+        let err = parse_buffer_args(&args(&["--mode", "everything"]))
+            .expect_err("an unknown mode must be refused")
+            .to_string();
+        assert!(err.contains("mode"), "the error names the flag and the setting: {err}");
+    }
+
+    /// The stub-sources flag exists only in a build that carries the software-encoder
+    /// feature — the same gate `--dev-software-encoder` has, for the same reason: a release
+    /// build must not be able to capture nothing while looking like a recording.
+    #[test]
+    fn the_stub_sources_flag_is_gated_behind_the_test_encoders_feature() {
+        if cfg!(feature = "test-encoders") {
+            let sources = choose_sources(true, 60).expect("with the feature it is selectable");
+            assert!(matches!(sources, Sources::Stub(_)));
+            assert!(matches!(choose_sources(false, 60).unwrap(), Sources::Platform));
+        } else {
+            let err = choose_sources(true, 60)
+                .expect_err("without the feature the flag must be refused")
+                .to_string();
+            assert!(err.contains("test-encoders"), "the error names the gate: {err}");
+        }
     }
 
     #[test]
@@ -588,6 +760,10 @@ mod tests {
         assert!(help.contains("--self-test-clip-after"));
         assert!(help.contains("no keyboard or mouse input"));
         assert!(help.contains("not enumerate windows"));
+        // And the Phase 5 flags are documented where a user looks for them.
+        assert!(help.contains("--mode <buffer|session>"));
+        assert!(help.contains("--dev-stub-sources"));
+        assert!(help.contains("Nothing real is captured"), "the stub flag says what it costs");
     }
 
     #[test]

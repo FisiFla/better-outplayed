@@ -11,9 +11,11 @@ use crate::config::StorageSection;
 use anyhow::{Context, Result};
 use localplay_events::GameEvent;
 use localplay_replay::splice::ClipMetadata;
-use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
+use localplay_store::retention::{
+    execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
+};
 use localplay_store::{NewClip, NewEvent, Store};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Wall-clock now, in ms since the Unix epoch — the clock `clips.created_at` is on, and
 /// so the clock the storage policy's age rule is evaluated against.
@@ -149,78 +151,168 @@ pub fn index_event(store: &Store, event: &GameEvent, at_ms: u64, clip_id: Option
 
 /// Bookkeeping across storage-policy passes, so a condition that lasts the whole session
 /// is stated when it appears (or when its size changes) rather than once per pass.
+///
+/// One field per cap: clips and sessions are planned independently (spec §8.1), so each can
+/// be unsatisfiable on its own, and a single field would let one class's recovery hide the
+/// other's shortfall. Both are public because they are the observable "why did nothing get
+/// deleted" of a pass, and a test asserts on them.
 #[derive(Default, Debug)]
 pub struct CleanupReport {
-    /// The shortfall reported by the last pass that could not meet the cap; `None` while
-    /// the cap is met, so a recurrence warns again.
-    last_shortfall: Option<u64>,
+    /// The shortfall reported by the last pass whose clips cap could not be met; `None`
+    /// while that cap is met, so a recurrence warns again.
+    pub last_clips_shortfall: Option<u64>,
+    /// The same for the sessions cap.
+    pub last_sessions_shortfall: Option<u64>,
 }
 
-/// Apply the storage policy once (spec §8.1): plan against the index, execute the plan,
-/// and report what happened.
+/// Apply the storage policy once (spec §8.1): plan against the index, execute the plan, and
+/// report what happened.
 ///
-/// The decision is [`plan_cleanup`]'s and the deletion ordering is
-/// [`execute_cleanup`]'s; this function only supplies the policy from the config and the
-/// clock, and decides what is worth a log line. It is silent when there is nothing to do,
-/// because it runs at startup and then every [`crate::CLEANUP_INTERVAL`], and an idle pass
-/// is not news.
-pub fn cleanup_pass(store: &Store, storage: &StorageSection, report: &mut CleanupReport) {
-    let policy = CleanupPolicy {
-        max_total_bytes: storage.max_total_bytes,
-        max_age_days: storage.max_age_days,
+/// The decision is [`plan_retention`]'s — one plan over **both** libraries, clips and
+/// sessions, each with its own cap and age limit — and the deletion ordering is
+/// [`execute_retention`]'s; this function supplies the policy from the config and the clock,
+/// and decides what is worth a log line. It is silent when there is nothing to do, because it
+/// runs at startup and then every [`crate::CLEANUP_INTERVAL`], and an idle pass is not news.
+///
+/// The returned [`RetentionOutcome`] is what the pass measured after executing the plan
+/// (bytes reclaimed file by file, per class): returned rather than only logged so a caller
+/// — and a test — can see the numbers instead of reconstructing them from log lines.
+pub fn cleanup_pass(
+    store: &Store,
+    storage: &StorageSection,
+    report: &mut CleanupReport,
+) -> RetentionOutcome {
+    let policy = RetentionPolicy {
+        clips: RetentionRules {
+            max_total_bytes: storage.max_total_bytes,
+            // The retention rules count days as `u32`; the config keeps them as `u64` (it
+            // always has). A day count above `u32::MAX` is not a policy, it is "never",
+            // and clamping says so rather than wrapping to a small number.
+            max_age_days: storage.max_age_days.min(u64::from(u32::MAX)) as u32,
+        },
+        sessions: RetentionRules {
+            max_total_bytes: storage.sessions.max_total_bytes,
+            max_age_days: storage.sessions.max_age_days.min(u64::from(u32::MAX)) as u32,
+        },
     };
+
     let clips = match store.list_clips() {
         Ok(clips) => clips,
         Err(err) => {
             tracing::warn!("storage policy: cannot read the clip index: {err:#}");
-            return;
+            return RetentionOutcome::default();
         }
     };
-    let plan = plan_cleanup(&clips, &policy, now_ms());
-    let outcome = match execute_cleanup(store, &plan) {
+    let sessions = match store.list_sessions() {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::warn!("storage policy: cannot read the session store: {err:#}");
+            return RetentionOutcome::default();
+        }
+    };
+
+    let plan = plan_retention(&clips, &sessions, &policy, now_ms());
+    let outcome = match execute_retention(store, &plan) {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::warn!("storage policy: the pass could not be completed: {err:#}");
-            return;
+            return RetentionOutcome::default();
         }
     };
 
-    if outcome.deleted > 0 {
+    if outcome.deleted() > 0 {
         tracing::info!(
-            "storage policy: deleted {} clip(s), reclaimed {} bytes; the clips directory \
-             now holds {} bytes against a {} byte cap",
-            outcome.deleted,
-            outcome.bytes_reclaimed,
-            outcome.bytes_after,
-            policy.max_total_bytes
+            "storage policy: deleted {} clip(s) and {} session(s), reclaimed {} bytes; the \
+             clips directory now holds {} bytes against its {} byte cap, and the session \
+             store {} bytes against its {} byte cap",
+            outcome.clips.deleted,
+            outcome.sessions.deleted,
+            outcome.bytes_reclaimed(),
+            outcome.clips.bytes_after,
+            policy.clips.max_total_bytes,
+            outcome.sessions.bytes_after,
+            policy.sessions.max_total_bytes
         );
     }
-    if outcome.failed > 0 {
+    let failed = outcome.clips.failed + outcome.sessions.failed;
+    if failed > 0 {
         tracing::warn!(
-            "storage policy: {} planned deletion(s) could not be applied; the clips \
-             directory is larger than the policy asked for",
-            outcome.failed
+            "storage policy: {failed} planned deletion(s) could not be applied; the affected \
+             library is larger than the policy asked for"
+        );
+    }
+    let leftovers: Vec<&PathBuf> = outcome.leftovers().collect();
+    if !leftovers.is_empty() {
+        // The row is gone (the delete committed) and the path is still there. Every entry is
+        // one of: a removal that failed, a path deliberately refused (a symlinked or
+        // suspicious session directory), or a file that was already missing. Named, because
+        // "the library is within its cap" would otherwise be a statement about rows only.
+        tracing::warn!(
+            "storage policy: {} path(s) named by deleted rows are still on disk: {}",
+            leftovers.len(),
+            leftovers
+                .iter()
+                .take(5)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
-    // A cap that the favourites alone exceed is not merely "not met this pass" — no pass
-    // can meet it, and the spec forbids deleting anything else to try (spec §8.1). The
-    // shortfall is what the user has to act on, so it is worth a warning, but only when
-    // it appears or changes: the condition is permanent, and repeating it verbatim every
-    // pass would bury everything else in the log.
-    if outcome.cap_met {
-        report.last_shortfall = None;
-    } else if report.last_shortfall != Some(plan.over_cap_by_bytes) {
+    // A cap that the immune members alone exceed is not merely "not met this pass" — no
+    // pass can meet it: favourites and a *running* session are exempt (spec §8.1), so the
+    // shortfall is what the user has to act on. Worth a warning, but only when it appears or
+    // changes: the condition is permanent, and repeating it verbatim every pass would bury
+    // everything else in the log.
+    report_clips_shortfall(report, policy.clips.max_total_bytes, &plan, &outcome);
+    report_sessions_shortfall(report, policy.sessions.max_total_bytes, &plan, &outcome);
+    outcome
+}
+
+/// The clips cap's unsatisfiable case (see [`cleanup_pass`]).
+fn report_clips_shortfall(
+    report: &mut CleanupReport,
+    cap: u64,
+    plan: &localplay_store::retention::RetentionPlan,
+    outcome: &RetentionOutcome,
+) {
+    if outcome.clips.cap_met {
+        report.last_clips_shortfall = None;
+    } else if report.last_clips_shortfall != Some(plan.clips.over_cap_by_bytes) {
         tracing::warn!(
-            "storage policy: storage.max_total_bytes ({}) cannot be satisfied — the \
+            "storage policy: storage.max_total_bytes ({cap}) cannot be satisfied — the \
              favourited clips alone exceed it by {} bytes, and favourites are exempt from \
              both rules, so nothing is deleted for it. The clips directory holds {} bytes. \
              Raise storage.max_total_bytes or un-favourite some clips.",
-            policy.max_total_bytes,
-            plan.over_cap_by_bytes,
-            outcome.bytes_after
+            plan.clips.over_cap_by_bytes,
+            outcome.clips.bytes_after
         );
-        report.last_shortfall = Some(plan.over_cap_by_bytes);
+        report.last_clips_shortfall = Some(plan.clips.over_cap_by_bytes);
+    }
+}
+
+/// The sessions cap's unsatisfiable case — the same condition, but its two causes are both
+/// "nothing here may be deleted": a favourited session, and a session that is still
+/// recording (its scratch directory is footage that exists nowhere else).
+fn report_sessions_shortfall(
+    report: &mut CleanupReport,
+    cap: u64,
+    plan: &localplay_store::retention::RetentionPlan,
+    outcome: &RetentionOutcome,
+) {
+    if outcome.sessions.cap_met {
+        report.last_sessions_shortfall = None;
+    } else if report.last_sessions_shortfall != Some(plan.sessions.over_cap_by_bytes) {
+        tracing::warn!(
+            "storage policy: storage.sessions.max_total_bytes ({cap}) cannot be satisfied — \
+             the sessions nothing may delete (favourited ones, and one that is still \
+             recording) exceed it by {} bytes. The session store holds {} bytes. Raise \
+             storage.sessions.max_total_bytes, un-favourite a session, or finish the \
+             recording that is running.",
+            plan.sessions.over_cap_by_bytes,
+            outcome.sessions.bytes_after
+        );
+        report.last_sessions_shortfall = Some(plan.sessions.over_cap_by_bytes);
     }
 }
 
@@ -241,12 +333,32 @@ mod tests {
         (dir, store)
     }
 
+    /// The schema version this build's store writes, **read from the store itself**.
+    ///
+    /// `localplay-store` keeps its `SCHEMA_VERSION` private, so there is no exported
+    /// constant to assert against — and a bare `2` here is exactly what broke when the
+    /// store bumped 1 → 2: this crate's assertion failed on a store that was working
+    /// perfectly. A fresh in-memory database is migrated by the same code path a file
+    /// database is, so its `user_version` *is* the store's constant. A future bump
+    /// therefore cannot break these assertions, while a database that failed to migrate
+    /// still can.
+    fn store_schema_version() -> i32 {
+        let fresh = Store::open_in_memory().expect("an in-memory store");
+        fresh.migrate().expect("migrating a fresh store");
+        fresh.schema_version().expect("reading its version")
+    }
+
     #[test]
     fn the_clip_index_is_created_migrated_and_reopened_in_place() {
         let (dir, store) = index_dir();
         let db = dir.path().join("localplay.db");
         assert!(db.is_file(), "opening the index creates the database file");
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            store_schema_version(),
+            "opening the index migrates it to the store's own current schema version \
+             (`localplay-store` keeps that number private; see `store_schema_version`)"
+        );
 
         let path = dir.path().join("clip-1.mp4");
         std::fs::write(&path, vec![7u8; 500]).unwrap();
@@ -256,8 +368,17 @@ mod tests {
         // A second start must adopt the same index — migration is forward-only and
         // idempotent — rather than start a fresh one over the top of it.
         let reopened = open_clip_index(&db).expect("reopen the index");
-        assert_eq!(reopened.schema_version().unwrap(), 1);
+        assert_eq!(reopened.schema_version().unwrap(), store_schema_version());
         assert_eq!(reopened.list_clips().unwrap().len(), 1, "the clip survived the restart");
+
+        // The capability the version gate exists for, asserted rather than assumed: the
+        // session columns a Phase 5 engine writes into are present, so a session row can be
+        // opened and closed on this index.
+        let session = reopened
+            .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch")
+            .expect("the index carries the session columns");
+        reopened.end_session(session, 2_000, None, 0).expect("and can close a session");
+        assert_eq!(reopened.list_sessions().unwrap().len(), 1);
     }
 
     #[test]
@@ -364,6 +485,20 @@ mod tests {
         assert!(store.list_events().unwrap().is_empty());
     }
 
+    /// The storage policy, in the shape the config file gives it.
+    fn storage(clips_dir: &Path, clips_cap: u64, sessions_dir: &Path, sessions_cap: u64) -> StorageSection {
+        StorageSection {
+            clips_dir: clips_dir.display().to_string(),
+            max_total_bytes: clips_cap,
+            max_age_days: 3_650,
+            sessions: crate::config::SessionStorageRules {
+                sessions_dir: sessions_dir.display().to_string(),
+                max_total_bytes: sessions_cap,
+                max_age_days: 3_650,
+            },
+        }
+    }
+
     #[test]
     fn a_cleanup_pass_applies_the_configured_policy_through_the_index() {
         let (dir, store) = index_dir();
@@ -379,13 +514,10 @@ mod tests {
             paths.push(path);
         }
 
-        let storage = StorageSection {
-            clips_dir: clips_dir.display().to_string(),
-            max_total_bytes: 1_000, // room for one of the two clips
-            max_age_days: 3_650,
-        };
+        // Room for one of the two clips, and a session store with nothing in it.
+        let storage = storage(&clips_dir, 1_000, &dir.path().join("sessions"), 1 << 30);
         let mut report = CleanupReport::default();
-        cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &mut report);
 
         let rows = store.list_clips().unwrap();
         assert_eq!(rows.len(), 1, "the cap allows one of the two clips");
@@ -394,12 +526,143 @@ mod tests {
         let evicted = paths.into_iter().find(|p| *p != survivor).expect("one was evicted");
         assert!(!evicted.exists(), "the evicted clip's row and its file are both gone");
         assert_eq!(store.total_bytes().unwrap(), 1_000);
+        assert_eq!(outcome.clips.deleted, 1);
+        assert_eq!(outcome.clips.bytes_reclaimed, 1_000, "measured from the files, not the rows");
+        assert!(outcome.sessions.deleted == 0 && outcome.sessions.bytes_reclaimed == 0);
+        assert!(outcome.clips.cap_met, "the clips cap is met after the pass");
 
         // A second pass has nothing to do, and must leave the survivor alone: this is the
         // pass that runs every `CLEANUP_INTERVAL` in the capture loop, so it has to be a
         // no-op once the library fits.
-        cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &mut report);
         assert_eq!(store.list_clips().unwrap().len(), 1);
         assert!(survivor.is_file(), "an idle pass deletes nothing");
+        assert_eq!(outcome.deleted(), 0);
+    }
+
+    /// The two libraries are evicted **independently** — a full session store must not
+    /// push clips out, and vice versa — and a favourite survives in each of them.
+    #[test]
+    fn retention_evicts_clips_and_sessions_independently_with_favourites_immune() {
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+
+        // Two clips, the newer one favourited.
+        let mut clip_paths = Vec::new();
+        for i in 1..=2u64 {
+            let path = clips_dir.join(format!("clip-{i}.mp4"));
+            std::fs::write(&path, vec![0u8; 1_000]).unwrap();
+            let id = index_clip(&store, &metadata(path.clone(), 1_000), i * 1_000).unwrap();
+            if i == 2 {
+                store.set_favourite(id, true).unwrap();
+            }
+            clip_paths.push(path);
+        }
+
+        // Two finished sessions with their own directories and files, the newer favourited.
+        let mut session_paths = Vec::new();
+        for i in 1..=2i64 {
+            let scratch = sessions_dir.join(format!("session-{i}"));
+            std::fs::create_dir_all(&scratch).unwrap();
+            std::fs::write(scratch.join("seg-000000.mp4"), vec![0u8; 400]).unwrap();
+            let final_path = sessions_dir.join(format!("session-{i}.mp4"));
+            std::fs::write(&final_path, vec![0u8; 600]).unwrap();
+            let id = store
+                .start_session(Some("Dota 2"), localplay_store::SESSION_MODE_SESSION, i * 1_000, &scratch.display().to_string())
+                .unwrap();
+            store.end_session(id, i * 1_000 + 5, Some(&final_path.display().to_string()), 1_000).unwrap();
+            if i == 2 {
+                store.set_session_favourite(id, true).unwrap();
+            }
+            session_paths.push((final_path, scratch));
+        }
+
+        // Each cap allows exactly one (the favourite) and nothing more.
+        let storage = storage(&clips_dir, 1_000, &sessions_dir, 1_000);
+        let mut report = CleanupReport::default();
+        let outcome = cleanup_pass(&store, &storage, &mut report);
+
+        assert_eq!(store.list_clips().unwrap().len(), 1, "one clip survives");
+        assert!(store.list_clips().unwrap()[0].favourite, "and it is the favourite");
+        assert!(clip_paths[1].is_file(), "the favourite's file is untouched");
+        assert!(!clip_paths[0].exists(), "the non-favourite clip is gone");
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "one session survives");
+        assert!(sessions[0].favourite, "and it is the favourite");
+        assert!(session_paths[1].0.is_file(), "the favourite session's file is untouched");
+        assert!(session_paths[1].1.is_dir(), "and so is its scratch directory");
+        assert!(!session_paths[0].0.exists(), "the evicted session's file is gone");
+        assert!(!session_paths[0].1.exists(), "and so is the directory its segments lived in");
+        assert_eq!(store.total_session_bytes().unwrap(), 1_000);
+
+        assert_eq!(outcome.clips.deleted, 1);
+        assert_eq!(outcome.sessions.deleted, 1, "the pass reports both classes");
+        assert_eq!(outcome.clips.bytes_reclaimed, 1_000);
+        assert_eq!(outcome.sessions.bytes_reclaimed, 1_000);
+        assert!(outcome.cap_met(), "both caps are met after the pass");
+    }
+
+    /// A cap that nothing may satisfy is reported, per class, and nothing is deleted to try.
+    ///
+    /// Both causes are real: a favourited session (immune by choice) and a session that is
+    /// **still recording** (immune because its scratch directory is footage that exists
+    /// nowhere else yet).
+    #[test]
+    fn an_unsatisfiable_cap_is_reported_for_each_class() {
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // One favourited clip of 1_000 bytes against a 100-byte cap.
+        let clip_path = clips_dir.join("clip-1.mp4");
+        std::fs::write(&clip_path, vec![0u8; 1_000]).unwrap();
+        let clip_id = index_clip(&store, &metadata(clip_path.clone(), 1_000), 1_000).unwrap();
+        store.set_favourite(clip_id, true).unwrap();
+
+        // A running session of 2_000 bytes against a 100-byte cap.
+        let scratch = sessions_dir.join("session-1");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("seg-000000.mp4"), vec![0u8; 2_000]).unwrap();
+        let running = store
+            .start_session(None, localplay_store::SESSION_MODE_SESSION, 1_000, &scratch.display().to_string())
+            .unwrap();
+        store.set_session_size(running, 2_000).unwrap();
+
+        let storage = storage(&clips_dir, 100, &sessions_dir, 100);
+        let mut report = CleanupReport::default();
+        let outcome = cleanup_pass(&store, &storage, &mut report);
+
+        assert_eq!(outcome.deleted(), 0, "nothing may be deleted to satisfy these caps");
+        assert!(!outcome.clips.cap_met && !outcome.sessions.cap_met);
+        assert_eq!(report.last_clips_shortfall, Some(900), "the favourite's excess is reported");
+        assert_eq!(report.last_sessions_shortfall, Some(1_900), "the live session's is too");
+        assert!(clip_path.is_file(), "the favourite is untouched");
+        assert!(scratch.is_dir(), "and the live session's footage is not touched");
+        assert!(store.get_session(running).unwrap().unwrap().ended_at_ms.is_none());
+
+        // The report is remembered: a second identical pass does not change it (it is the
+        // same shortfall), and once the immunity is gone the next pass evicts both classes.
+        let outcome = cleanup_pass(&store, &storage, &mut report);
+        assert_eq!(outcome.deleted(), 0, "still nothing to do: {outcome:?}");
+        assert_eq!(report.last_sessions_shortfall, Some(1_900));
+
+        // The recording ends (with the bytes its directory holds) and the clip is
+        // un-favourited: now the same policy has something it may delete.
+        store.end_session(running, 9_000, None, 2_000).unwrap();
+        store.set_favourite(clip_id, false).unwrap();
+        let outcome = cleanup_pass(&store, &storage, &mut report);
+        assert_eq!(outcome.deleted(), 2, "once nothing is immune, both classes shrink: {outcome:?}");
+        assert_eq!(outcome.clips.bytes_reclaimed, 1_000);
+        assert_eq!(outcome.sessions.bytes_reclaimed, 2_000);
+        assert!(outcome.cap_met(), "both caps are met after the pass: {outcome:?}");
+        assert_eq!(report.last_clips_shortfall, None, "the unsatisfiable condition is gone");
+        assert_eq!(report.last_sessions_shortfall, None);
+        assert!(!clip_path.exists(), "the clip's file went with its row");
+        assert!(!scratch.exists(), "and the session's scratch directory with its row");
     }
 }

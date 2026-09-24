@@ -6,18 +6,30 @@
 //! and the (Phase 4) game-event sources.
 
 use anyhow::{bail, Context, Result};
-use localplay_recorder::config::{BufferSection, EncodeSection, StorageSection};
+use localplay_events::process::GamesSection;
+use localplay_recorder::config::{
+    BufferSection, EncodeSection, MicSection, RecorderSection, StorageSection,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub recorder: RecorderSection,
     pub buffer: BufferSection,
     pub encode: EncodeSection,
     pub audio: AudioSection,
     pub storage: StorageSection,
+    #[serde(default)]
+    pub mic: MicSection,
     pub hotkeys: HotkeySection,
     pub events: EventsSection,
+    /// `[games]` — the game watcher (Phase 5, spec §7). Defaulted, so a file that does not
+    /// mention it means "watch nothing": `auto_record` is `false` in `GamesSection::default`,
+    /// and with it off the recorder starts no watcher at all.
+    #[serde(default)]
+    pub games: GamesSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +123,85 @@ mod tests {
         assert_eq!(cfg.buffer.post_seconds, 5);
         assert!(cfg.audio.enabled);
         assert_eq!(cfg.hotkeys.clip, "Ctrl+F8");
+        // The Phase 5 sections, in the file a fresh install runs: the replay buffer (the
+        // mode every existing configuration already had), no microphone, and nothing
+        // watched — which is the safety posture, not a placeholder.
+        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::ReplayBuffer);
+        assert!(!cfg.mic.enabled, "the example must not turn the microphone on");
+        assert!(!cfg.games.auto_record, "the example must not auto-record");
+        assert!(cfg.storage.sessions.max_total_bytes > 0, "the session rules have defaults");
+    }
+
+    /// A `config.toml` written before Phase 5 parses — the new sections are all optional —
+    /// and means exactly what it did: buffer mode, no microphone, nothing watched.
+    #[test]
+    fn a_pre_phase_5_config_still_parses_and_means_what_it_did() {
+        // The pre-Phase-5 surface, verbatim: the three recording sections, the CLI's own
+        // `[hotkeys]` and `[events]`, and nothing else.
+        let text = "\
+[buffer]
+pre_seconds = 30
+post_seconds = 5
+segment_time = 1
+scratch_cap_bytes = 2147483648
+scratch_dir = \"\"
+
+[encode]
+vendor = \"auto\"
+codec = \"h264\"
+bitrate_kbps = 20000
+fps = 60
+adapt_fps = true
+output_size = \"\"
+
+[audio]
+enabled = true
+source = \"loopback\"
+codec = \"aac\"
+bitrate_kbps = 192
+
+[storage]
+clips_dir = \"\"
+max_total_bytes = 53687091200
+max_age_days = 7
+
+[hotkeys]
+clip = \"Ctrl+F8\"
+
+[events]
+lol_poll_enabled = true
+gsi_port = 45671
+";
+        let cfg = Config::from_toml(text).expect("a pre-Phase-5 file must keep parsing");
+        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::ReplayBuffer);
+        assert!(!cfg.mic.enabled, "no [mic] means no microphone");
+        assert!(!cfg.games.auto_record, "no [games] means nothing is watched");
+        assert_eq!(cfg.games.watch, localplay_events::process::default_watch(), "with the default watch list, unused while auto_record is off");
+        assert_eq!(
+            cfg.storage.sessions,
+            localplay_recorder::config::SessionStorageRules::default(),
+            "and the session rules are the documented default"
+        );
+    }
+
+    /// The mode is settable from the file — that is what makes the CLI's `--mode` an
+    /// *override* rather than the only way in.
+    #[test]
+    fn the_mode_can_be_set_from_the_file() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("mode = \"buffer\"", "mode = \"session\"");
+        let cfg = Config::from_toml(&text).expect("the session mode parses");
+        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::FullSession);
+    }
+
+    /// The microphone is opt-in, and `[mic] enabled = true` is the whole opt-in.
+    #[test]
+    fn the_microphone_is_opt_in_through_the_file() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("[mic]\nenabled = false", "[mic]\nenabled = true");
+        assert!(text.contains("[mic]\nenabled = true"), "the substitution must apply");
+        let cfg = Config::from_toml(&text).expect("mic.enabled = true parses");
+        assert!(cfg.mic.enabled);
     }
 
     #[test]
@@ -193,5 +284,6 @@ mod tests {
         assert_eq!(buffer.segment_time, 1);
         assert_eq!(encode.codec, "h264");
         assert_eq!(storage.max_age_days, 7);
+        assert!(storage.sessions.max_age_days > 0, "the sessions rules are part of the same section");
     }
 }

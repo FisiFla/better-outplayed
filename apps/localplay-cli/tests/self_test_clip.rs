@@ -79,6 +79,10 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         app_dir: app_dir.path().to_path_buf(),
         self_test_clip_after: Some(SELF_TEST_AFTER_S),
         dev_software_encoder: true,
+        // The file decides the mode (its `[recorder] mode`), and the real sources are used:
+        // this test is about the shipping path.
+        mode: None,
+        stub_sources: false,
     });
     result.expect("the self-test run must succeed");
 

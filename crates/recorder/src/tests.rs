@@ -42,7 +42,14 @@ fn application_data_dir(what: &str) -> (Option<tempfile::TempDir>, PathBuf) {
         // scratch directory.
         Some(dir) => (None, PathBuf::from(dir).join(what)),
         None => {
-            let dir = tempfile::tempdir().expect("a temp dir for the recording");
+            // Under `target/`, not the system temp: a test run leaves everything it wrote
+            // inside the build directory (and removes it, unless it is killed).
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-tests");
+            std::fs::create_dir_all(&base).expect("creating the test scratch root under target/");
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("{what}-"))
+                .tempdir_in(&base)
+                .expect("a temp dir under target/");
             let path = dir.path().to_path_buf();
             (Some(dir), path)
         }
@@ -81,6 +88,11 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             clips_dir: String::new(),
             max_total_bytes: 1 << 30,
             max_age_days: 365,
+            sessions: crate::config::SessionStorageRules {
+                sessions_dir: String::new(),
+                max_total_bytes: 1 << 30,
+                max_age_days: 365,
+            },
         },
         sources: Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS }),
         dev_software_encoder: true,
@@ -541,4 +553,546 @@ fn a_recorder_reports_itself_as_not_running_before_it_is_started() {
     assert_eq!(idle.configured_fps, 0);
     assert_eq!(idle.frames, 0);
     assert_eq!(idle.error, None);
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 5: the mode, the session lifecycle, the microphone and the game watcher
+// ---------------------------------------------------------------------------------------
+
+use crate::session::layout_test_segments;
+use localplay_events::process::{PresenceChange, WatchedGame};
+use localplay_store::SESSION_MODE_SESSION;
+
+/// The options this crate's tests build, so each test states only what it changes.
+fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
+    RecorderOptions {
+        mode,
+        mic: MicSection { enabled: mic },
+        games: GamesSection::default(),
+        game: None,
+    }
+}
+
+/// The `(video, audio)` stream counts of a file, counted by ffprobe directly: `MediaInfo`
+/// reports the *first* stream of each kind, which cannot tell one audio track from two.
+fn stream_counts(path: &Path, bin: &FfmpegBinaries) -> (usize, usize) {
+    let output = std::process::Command::new(&bin.ffprobe)
+        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("running ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe failed on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let video = text.lines().filter(|line| line.trim() == "video").count();
+    let audio = text.lines().filter(|line| line.trim() == "audio").count();
+    (video, audio)
+}
+
+/// The session directories and the session files in an application data directory.
+fn sessions_on_disk(app_data_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let sessions = app_data_dir.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "mp4") {
+                files.push(path);
+            }
+        }
+    }
+    (dirs, files)
+}
+
+/// Wait for the session store to hold exactly one finished session, and return its row.
+///
+/// The engine writes the row from its own connection while the test reads through a second
+/// one, so the read is a poll rather than a single query.
+fn wait_for_finished_session(bin: &FfmpegBinaries, db: &Path) -> localplay_store::Session {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let store = open_clip_index(db).expect("the index opens");
+        let sessions = store.list_sessions().expect("listing sessions");
+        if let Some(row) = sessions.iter().find(|row| row.ended_at_ms.is_some()) {
+            return row.clone();
+        }
+        assert!(Instant::now() < deadline, "no finished session appeared: {sessions:?}");
+        let _ = bin;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_full_session_records_into_its_own_directory_and_ignores_the_scratch_cap() {
+    // The cap is 1 KiB and the session is several seconds of 64x48 video: if this mode
+    // enforced `buffer.scratch_cap_bytes`, the oldest segments would vanish and the session
+    // would be a fragment — or the tick would fail with a "scratch cap violated" error.
+    let (_tmp, app_data_dir) = application_data_dir("full-session");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.scratch_cap_bytes = 1_024;
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
+        .expect("the session recorder starts");
+
+    let grown = wait_for(&recorder, Duration::from_secs(40), "four seconds of session", |s| {
+        s.span_ms >= 4_000
+    });
+    assert_eq!(grown.mode, RecordingMode::FullSession);
+    assert!(
+        grown.bytes > 4 * 1_024,
+        "the session is past the 1 KiB scratch cap and still on disk: {grown:?}"
+    );
+    assert_eq!(grown.error, None, "no scratch-cap violation happened");
+
+    // The segments are in a per-session directory under the sessions area, not in scratch/.
+    let (dirs, files) = sessions_on_disk(&app_data_dir);
+    assert_eq!(dirs.len(), 1, "one session directory: {dirs:?}");
+    assert!(files.is_empty(), "no session file exists until the recording stops: {files:?}");
+    assert!(
+        dirs[0].file_name().unwrap().to_string_lossy().starts_with("session-"),
+        "named from the wall clock: {:?}",
+        dirs[0]
+    );
+    let segments_in_dir = std::fs::read_dir(&dirs[0]).unwrap().filter_map(|e| e.ok()).count();
+    assert!(segments_in_dir >= 4, "the segments are there: {segments_in_dir}");
+
+    recorder.stop().expect("stop must succeed");
+
+    // One finished session, one file, both streams, and the temporary segments gone.
+    let row = wait_for_finished_session(&bin, &db_path);
+    assert_eq!(row.mode, SESSION_MODE_SESSION);
+    assert_eq!(row.game, None, "a manually started recording carries no game name");
+    let final_path = row.final_path.clone().expect("the row names the session file");
+    let final_path = PathBuf::from(&final_path);
+    assert!(final_path.is_file(), "{final_path:?} exists");
+    assert_eq!(stream_counts(&final_path, &bin), (1, 1), "one video, one audio track");
+    assert_eq!(row.size_bytes as u64, std::fs::metadata(&final_path).unwrap().len());
+    assert!(row.size_bytes > 4 * 1_024, "the session file is bigger than the cap: {row:?}");
+    let info = localplay_media::probe::MediaInfo::probe(&bin, &final_path).expect("probing it");
+    assert!(
+        info.duration_ms >= 4_000,
+        "the session file covers the whole session: {}ms",
+        info.duration_ms
+    );
+    let (dirs, files) = sessions_on_disk(&app_data_dir);
+    assert!(dirs.is_empty(), "the temporary segments are removed: {dirs:?}");
+    assert_eq!(files, vec![final_path], "and the session file is the only thing left");
+}
+
+#[test]
+fn a_full_session_with_a_microphone_concatenates_both_audio_tracks() {
+    let (_tmp, app_data_dir) = application_data_dir("session-mic");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    // `Sources::Stub` is what `stub_config` uses, so the microphone comes from
+    // `StubMicrophone` — the only way this path can be covered on a machine with no WASAPI.
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, true))
+        .expect("the session recorder starts with a microphone");
+
+    let status = recorder.status();
+    assert!(status.mic, "the recording carries a microphone track");
+    assert!(
+        status.mic_port.is_some(),
+        "and the encoder declared a second audio input: {status:?}"
+    );
+    assert_eq!(status.dropped_mic_audio, 0, "nothing has been dropped: {status:?}");
+
+    let grown = wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| {
+        s.span_ms >= 3_000
+    });
+    assert_eq!(grown.dropped_mic_audio, 0, "the voice track is being fed: {grown:?}");
+    assert_eq!(grown.error, None);
+
+    // A clip taken during the session carries both tracks too: a session's own trigger knows
+    // it has a microphone and splices with `-map 0` (which is also why the clip exists as a
+    // separate check — the ring mode has no way to do this, and says so out loud at start).
+    wait_for(&recorder, Duration::from_secs(40), "enough media for a clip", |s| {
+        s.span_ms >= (PRE_SECONDS + POST_SECONDS) * 1000
+    });
+    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    assert_eq!(
+        stream_counts(&clip.metadata.path, &bin),
+        (1, 2),
+        "a clip out of a session with a microphone: {:?}",
+        clip.metadata.path
+    );
+
+    recorder.stop().expect("stop must succeed");
+
+    let row = wait_for_finished_session(&bin, &db_path);
+    let final_path = PathBuf::from(row.final_path.expect("the session file"));
+    // The point of the test: `-c copy` through a concat list is only lossless if the second
+    // audio track survives it (`session::finalise`'s `-map 0`).
+    assert_eq!(
+        stream_counts(&final_path, &bin),
+        (1, 2),
+        "one video and **two** audio tracks in {final_path:?}"
+    );
+}
+
+#[test]
+fn a_clip_taken_during_a_full_session_is_the_same_instant_splice() {
+    let (_tmp, app_data_dir) = application_data_dir("session-clip");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
+        .expect("the session recorder starts");
+    let ready_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    wait_for(&recorder, Duration::from_secs(40), "enough media for a clip", |s| {
+        s.span_ms >= ready_ms
+    });
+
+    // The hotkey's path, unchanged, in session mode: an instant clip out of the same
+    // footage the session is being written into.
+    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    assert!(clip.metadata.path.is_file());
+    assert_eq!(stream_counts(&clip.metadata.path, &bin), (1, 1));
+    assert_eq!(clip.metadata.encoder, "libx264");
+    assert!(clip.id.is_some(), "the clip is indexed");
+    assert!(
+        clip.metadata.path.starts_with(app_data_dir.join("clips")),
+        "and it went to the clips directory, not the session's: {:?}",
+        clip.metadata.path
+    );
+
+    recorder.stop().expect("stop must succeed");
+
+    // Both artefacts survive: the clip and the session file.
+    let row = wait_for_finished_session(&bin, &db_path);
+    let session_file = PathBuf::from(row.final_path.expect("the session file"));
+    assert!(session_file.is_file());
+    assert!(clip.metadata.path.is_file());
+    let store = open_clip_index(&db_path).expect("the index opens");
+    assert_eq!(store.list_clips().unwrap().len(), 1, "one clip row");
+    assert_eq!(store.list_sessions().unwrap().len(), 1, "one session row");
+}
+
+#[test]
+fn the_session_row_is_opened_before_capture_and_kept_current_while_it_records() {
+    let (_tmp, app_data_dir) = application_data_dir("session-row");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
+        .expect("the session recorder starts");
+    wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| s.span_ms >= 3_000);
+
+    // Read the row through a second connection, exactly as the desktop shell's session list
+    // would: opened, still running, with the bytes the tick has been reporting.
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let rows = store.list_sessions().expect("listing sessions");
+    assert_eq!(rows.len(), 1, "one session row: {rows:?}");
+    let running = &rows[0];
+    assert!(running.ended_at_ms.is_none(), "it is still recording");
+    assert_eq!(running.mode, SESSION_MODE_SESSION);
+    assert!(
+        running.size_bytes > 0,
+        "a multi-hour recording has to be visible to the retention cap before it stops: {running:?}"
+    );
+    assert!(
+        Path::new(&running.scratch_dir).is_dir(),
+        "the row names the directory the segments are in: {}",
+        running.scratch_dir
+    );
+    let id = running.id;
+    drop(store);
+
+    recorder.stop().expect("stop must succeed");
+    recorder.stop().expect("a second stop is a no-op, not an error");
+
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let rows = store.list_sessions().unwrap();
+    assert_eq!(rows.len(), 1, "a second stop does not open a second session");
+    let finished = &rows[0];
+    assert_eq!(finished.id, id);
+    assert!(finished.ended_at_ms.is_some(), "the row is closed: {finished:?}");
+    let path = PathBuf::from(finished.final_path.clone().expect("the session file"));
+    assert!(path.is_file());
+    assert_eq!(
+        finished.size_bytes as u64,
+        std::fs::metadata(&path).unwrap().len(),
+        "and the size is the concatenated file's own"
+    );
+}
+
+#[test]
+fn the_microphone_is_off_by_default_and_leaves_the_encoder_invocation_unchanged() {
+    let (_tmp, app_data_dir) = application_data_dir("mic-off");
+    let cfg = stub_config(&app_data_dir);
+
+    // The encoder's configuration is what its argument list is built from, and with the
+    // microphone off it is exactly the pre-Phase-5 configuration: `mic_audio: None`, the
+    // state whose argument list `localplay-encoder` pins byte for byte
+    // (`the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list`).
+    let encode_cfg = build_encode_config(
+        &cfg,
+        &cfg.scratch_dir(),
+        localplay_encoder::VideoCodec::H264,
+        None,
+        (WIDTH, HEIGHT),
+    )
+    .expect("the encoder configuration");
+    assert!(
+        encode_cfg.mic_audio.is_none(),
+        "no microphone means no second audio input (and no microphone URL in the args)"
+    );
+
+    // And the engine's own default is the microphone off — `Recorder::start` takes it.
+    let options = RecorderOptions::default();
+    assert!(!options.mic.enabled, "the microphone is opt-in");
+    assert_eq!(options.mode, RecordingMode::ReplayBuffer, "and so is full-session mode");
+    assert!(!options.games.auto_record, "and so is game-driven recording");
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    let status = recorder.status();
+    assert!(!status.mic);
+    assert!(status.mic_port.is_none(), "the encoder opened no microphone input: {status:?}");
+    assert_eq!(status.dropped_mic_audio, 0);
+    wait_for(&recorder, Duration::from_secs(30), "the buffer to start", |s| s.span_ms > 0);
+    assert_eq!(recorder.status().dropped_mic_audio, 0, "and stays 0 while recording");
+    recorder.stop().expect("stop must succeed");
+}
+
+/// A microphone that is on but cannot start fails the recording **loudly**, before anything
+/// is captured — never a video with a silent voice track.
+///
+/// Off Windows `Sources::Platform` has no microphone backend at all (the same rule
+/// `localplay_capture::platform` applies to the video and audio backends), which is the
+/// machine this runs on; on Windows the same code path reports a machine with no capture
+/// endpoint, and the assertion about the display would have to be made there.
+#[cfg(not(windows))]
+#[test]
+fn a_microphone_that_cannot_start_fails_the_recording_before_any_capture() {
+    let (_tmp, app_data_dir) = application_data_dir("mic-unavailable");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.sources = Sources::Platform;
+    let db_path = cfg.db_path();
+
+    let err = Recorder::start_with_options(cfg, options(RecordingMode::ReplayBuffer, true))
+        .map(|_| ())
+        .expect_err("enabling the microphone on a platform without one must fail");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("microphone"),
+        "the error must name the microphone: {message}"
+    );
+    assert!(
+        !app_data_dir.join("scratch").exists(),
+        "nothing was captured: the capture backend is created after the microphone"
+    );
+    // The index was opened (it is the first step) but no session was opened for a recording
+    // that never started.
+    let store = open_clip_index(&db_path).expect("the index opens");
+    assert!(store.list_sessions().expect("listing sessions").is_empty());
+}
+
+#[test]
+fn auto_record_off_starts_no_watcher_and_records_immediately() {
+    // The events crate's own contract, at the seam this crate uses: with `auto_record` false
+    // `GamesSection::start` returns `None` — it starts nothing, not even a thread to gate.
+    let (sink, _changes) = mpsc::channel();
+    assert!(
+        GamesSection::default().start(sink.clone()).expect("starting nothing cannot fail").is_none(),
+        "auto_record = false must start nothing"
+    );
+    let off = GamesSection { watch: vec![WatchedGame::by_process("Dota 2", "dota2.exe")], ..GamesSection::default() };
+    assert!(off.start(sink).expect("still nothing").is_none(), "nor with a watch list");
+
+    // And the recorder: with the default options it is *recording*, not armed, which is only
+    // possible because the watcher branch was not taken (`auto_record` is false, so no
+    // channel, no receiver and no supervisor thread exist).
+    let (_tmp, app_data_dir) = application_data_dir("games-off");
+    let recorder = Recorder::start(stub_config(&app_data_dir)).expect("the recorder starts");
+    let status = recorder.status();
+    assert!(status.running, "a recorder with nothing watched records now: {status:?}");
+    assert!(!status.watching_games, "and has no watcher: {status:?}");
+    assert!(!recorder.is_armed());
+    assert_eq!(status.game, None);
+    recorder.stop().expect("stop must succeed");
+}
+
+#[test]
+fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_pass() {
+    let (_tmp, app_data_dir) = application_data_dir("games-on");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.encode.fps = 10;
+    // A session-start rule of one day, and an old finished session that the retention pass
+    // must therefore evict — while the session the game just wrote survives it.
+    cfg.storage.sessions.max_age_days = 1;
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+    let sessions_dir = cfg.sessions_dir();
+    let _ = &bin;
+    std::fs::create_dir_all(&sessions_dir).expect("the sessions area");
+
+    // The old session, with files on disk exactly as a real one leaves them.
+    let old_dir = sessions_dir.join("session-old");
+    std::fs::create_dir_all(&old_dir).expect("the old session directory");
+    std::fs::write(old_dir.join("seg-000000.mp4"), vec![0u8; 512]).expect("an old segment");
+    let old_file = sessions_dir.join("session-old.mp4");
+    std::fs::write(&old_file, vec![0u8; 512]).expect("an old session file");
+    let two_days_ms = 2 * 24 * 60 * 60 * 1_000i64;
+    {
+        let store = open_clip_index(&db_path).expect("the index opens");
+        let id = store
+            .start_session(Some("Dota 2"), SESSION_MODE_SESSION, now_ms() - two_days_ms, &old_dir.display().to_string())
+            .expect("opening the old session");
+        store
+            .end_session(id, now_ms() - two_days_ms + 1_000, Some(&old_file.display().to_string()), 512)
+            .expect("ending the old session");
+    }
+
+    // The recorder is armed: nothing is captured until a game starts, and the injected
+    // presence channel is the only way in (production's is `GamesSection::start`'s).
+    let (presence, changes) = mpsc::channel();
+    let game = WatchedGame::by_process("Dota 2", "dota2.exe");
+    let recorder = Recorder::start_inner(
+        cfg,
+        options(RecordingMode::FullSession, false),
+        // The supervisor builds the shipping probe itself; a recording it starts must not
+        // call a caller's closure (which is what this panicking one proves).
+        &|_cfg: &EncodeConfig| panic!("the injected measurement belongs to a recording `start` begins itself"),
+        Some((changes, None)),
+    )
+    .expect("the armed recorder starts");
+
+    let armed = recorder.status();
+    assert!(!armed.running, "nothing is recorded before a game starts: {armed:?}");
+    assert!(armed.watching_games && recorder.is_armed(), "but a watcher is running");
+    assert_eq!(armed.game, None);
+    assert_eq!(armed.error, None, "being armed is not an error");
+
+    // The game starts: the recording begins, with the game's name in the session row.
+    presence.send(PresenceChange::Started(game.clone())).expect("telling the recorder");
+    let recording = wait_for(&recorder, Duration::from_secs(40), "the game's recording to start", |s| {
+        s.running && s.span_ms >= 3_000
+    });
+    assert_eq!(recording.game.as_deref(), Some("Dota 2"), "{recording:?}");
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let running: Vec<_> = store
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.ended_at_ms.is_none())
+        .collect();
+    assert_eq!(running.len(), 1, "one running session: {running:?}");
+    assert_eq!(running[0].game.as_deref(), Some("Dota 2"), "carrying the detected title");
+    drop(store);
+
+    // The game stops: the recording is closed, the session file written, and the retention
+    // pass runs — which is what removes the two-day-old session and nothing else.
+    presence.send(PresenceChange::Stopped(game.clone())).expect("telling the recorder");
+    wait_for(&recorder, Duration::from_secs(40), "the recording to stop", |s| !s.running);
+    let stopped = recorder.status();
+    assert_eq!(stopped.game, None, "no game is being recorded any more: {stopped:?}");
+    assert!(stopped.watching_games, "but the watcher is still armed");
+
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let sessions = store.list_sessions().expect("listing sessions");
+    assert_eq!(sessions.len(), 1, "the old session was evicted, the new one kept: {sessions:?}");
+    let session = &sessions[0];
+    assert_eq!(session.game.as_deref(), Some("Dota 2"));
+    let file = PathBuf::from(session.final_path.clone().expect("the new session file"));
+    assert!(file.is_file(), "the session the game produced is on disk: {file:?}");
+    assert_eq!(stream_counts(&file, &bin), (1, 1));
+    assert!(!old_file.exists(), "the retention pass removed the old session's file");
+    assert!(!old_dir.exists(), "and its scratch directory");
+    drop(store);
+
+    // A second game starts, and this time the *application* shuts down mid-session: the
+    // supervisor stops the recording it is running, which closes that session exactly as the
+    // game stopping did (flush, session file, row ended).
+    presence.send(PresenceChange::Started(game.clone())).expect("telling the recorder");
+    wait_for(&recorder, Duration::from_secs(40), "the second game's recording", |s| {
+        s.running && s.span_ms >= 3_000
+    });
+    recorder.stop().expect("stopping the recorder stops the watcher and its recording too");
+    assert!(!recorder.is_armed(), "and leaves nothing armed");
+    assert!(!recorder.is_running());
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let sessions = store.list_sessions().expect("listing sessions");
+    let other = sessions
+        .iter()
+        .find(|row| row.id != session.id)
+        .expect("the second game's session row: {sessions:?}");
+    assert!(other.ended_at_ms.is_some(), "stopping the application closed it: {other:?}");
+    let file = PathBuf::from(other.final_path.clone().expect("with its session file"));
+    assert!(file.is_file(), "{file:?} exists");
+    assert_eq!(stream_counts(&file, &bin), (1, 1));
+}
+
+#[test]
+fn a_crashed_session_is_recovered_when_the_next_run_starts() {
+    // A crash — a killed process — leaves a running `sessions` row and a directory of
+    // segments with no session file. The next start must finish it, not orphan it.
+    let (_tmp, app_data_dir) = application_data_dir("crash-recovery");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+    let sessions_dir = cfg.sessions_dir();
+    std::fs::create_dir_all(&sessions_dir).expect("the sessions area");
+    let session_dir = sessions_dir.join("session-1700000000");
+    let segments = layout_test_segments(&session_dir, 1).expect("the crashed session's segments");
+    let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
+    let id = {
+        let store = open_clip_index(&db_path).expect("the index opens");
+        let id = store
+            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_700_000_000_000, &session_dir.display().to_string())
+            .expect("the row the crash left behind");
+        store.set_session_size(id, bytes as i64).expect("its last known size");
+        id
+    };
+
+    // The next run — an ordinary buffer-mode recording, because recovery is not a session
+    // mode feature: any start recovers what a previous one left.
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    recorder.stop().expect("stop must succeed");
+
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let row = store.get_session(id).expect("reading the row").expect("the row exists");
+    assert!(row.ended_at_ms.is_some(), "the crashed session was closed: {row:?}");
+    let file = PathBuf::from(row.final_path.expect("and it names the recovered file"));
+    assert!(file.is_file(), "{file:?} exists");
+    assert_eq!(stream_counts(&file, &bin), (1, 1), "with the streams its segments carried");
+    assert_eq!(row.size_bytes as u64, std::fs::metadata(&file).unwrap().len());
+    assert!(!session_dir.exists(), "and the temporary segments are gone");
+}
+
+#[test]
+fn dropping_a_recorder_finalises_and_closes_its_session() {
+    // The `Drop` path is a `stop()` — a front-end that forgets to stop, or panics on the way
+    // out, must not leave a session row running forever or a directory of segments nobody
+    // names. Dropping is the only shutdown this test performs.
+    let (_tmp, app_data_dir) = application_data_dir("drop-session");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
+        .expect("the session recorder starts");
+    wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| s.span_ms >= 3_000);
+    drop(recorder);
+
+    let row = wait_for_finished_session(&bin, &db_path);
+    assert!(row.ended_at_ms.is_some(), "the drop closed the session: {row:?}");
+    let file = PathBuf::from(row.final_path.clone().expect("the session file"));
+    assert!(file.is_file(), "{file:?} exists");
+    assert_eq!(stream_counts(&file, &bin), (1, 1));
+    assert_eq!(row.size_bytes as u64, std::fs::metadata(&file).unwrap().len());
+    let (dirs, _files) = sessions_on_disk(&app_data_dir);
+    assert!(dirs.is_empty(), "and the temporary segments went with it: {dirs:?}");
 }
