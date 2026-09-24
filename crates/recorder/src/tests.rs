@@ -450,16 +450,37 @@ fn the_pacer_and_the_encoder_are_told_the_same_rate() {
          {second:?}"
     );
 
-    // The property the whole change is for: media time tracks the wall clock. Each segment is
-    // one second of media, so a second of wall clock must produce about a second of span.
-    let span_first = second.span_ms;
+    // The property the whole change is for: media time tracks the wall clock, so it must not
+    // drift from it. (Issue #2's failure was `-f segment` resampling onto a declared grid,
+    // which ran media at 0.66x wall.)
+    //
+    // `span_ms` is the newest segment's end offset, and a segment covers `SEGMENT_SECONDS`
+    // of media, so span is a *staircase*, not a clock: it moves in whole-second steps. Waiting
+    // a fixed wall-clock window and dividing therefore divides a staircase by a length, and
+    // where the window lands on the staircase changes the answer. That is what made this fail
+    // in CI (1000ms of media over 2096ms of wall) while passing locally: the window began
+    // before ffmpeg had written its first segment, so the encoder's startup transient sat
+    // inside the measurement and the quantised span moved exactly one step.
+    //
+    // So wait for conditions, not for durations: first for steady state (the first segment on
+    // disk), then for a *defined amount of media*, and measure how long that took. Quantisation
+    // is then absent from the ratio, because both sides are measured between the same two
+    // media positions. A genuinely warped clock still fails: at 0.66x, producing
+    // MEDIA_WINDOW_MS of media takes half again as long, putting the ratio near 0.66.
+    const MEDIA_WINDOW_MS: u64 = 3_000;
+    let steady =
+        wait_for(&recorder, Duration::from_secs(15), "the first segment on disk", |s| s.span_ms > 0);
+    let span_first = steady.span_ms;
     let t1 = Instant::now();
-    let third = wait_for(&recorder, Duration::from_secs(10), "three seconds of media", |_| {
-        Instant::now().duration_since(t1) >= Duration::from_millis(2000)
+    let third = wait_for(&recorder, Duration::from_secs(30), "three more seconds of media", |s| {
+        s.span_ms.saturating_sub(span_first) >= MEDIA_WINDOW_MS
     });
     let media = (third.span_ms.saturating_sub(span_first)) as f64;
     let wall = Instant::now().duration_since(t1).as_secs_f64() * 1000.0;
-    eprintln!("media time advanced {media:.0}ms over {wall:.0}ms of wall clock");
+    eprintln!(
+        "media time advanced {media:.0}ms over {wall:.0}ms of wall clock (from span \
+         {span_first}ms)"
+    );
     assert!(
         (0.75..=1.25).contains(&(media / wall)),
         "media time must track the wall clock (issue #2): {media}ms of media over {wall}ms of \
