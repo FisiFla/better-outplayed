@@ -33,6 +33,11 @@ tempfile.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # `CreateToolhelp32Snapshot` + `Process32FirstW`/`Process32NextW`: the process-name
+    # snapshot `process::ProcessWatcher` compares against the configured watch list. The
+    # feature grants the *enumeration* only — there is no `OpenProcess`, no
+    # `ReadProcessMemory` and no module or window call anywhere in this crate, on purpose.
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

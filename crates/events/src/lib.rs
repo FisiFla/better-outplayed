@@ -7,6 +7,9 @@
 //! * [`hotkey`] — the global `RegisterHotKey` listener (spec §7.4), which needs no game.
 //! * [`lol`] — the League of Legends Live Client Data poller (spec §7.1).
 //! * [`gsi`] — the CS2 / Dota 2 Game State Integration listener (spec §7.2).
+//! * [`process`] — is a watched game running? A process-list snapshot for the titles that
+//!   publish nothing, Riot's own Live Client Data API for the one that does. Off by
+//!   default (`games.auto_record = false`).
 //! * [`wire`] — the HTTP/1.1 framing the two integrations share.
 //!
 //! # Both integrations are loopback-only, by construction
@@ -36,6 +39,7 @@ use std::time::{Duration, Instant};
 pub mod gsi;
 pub mod hotkey;
 pub mod lol;
+pub mod process;
 pub mod wire;
 
 /// A request to clip. Both manual and automatic paths funnel through this, so the
