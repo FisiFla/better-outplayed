@@ -45,13 +45,21 @@ impl ClipSplicer {
         let files: Vec<PathBuf> = window.segments.iter().map(|s| s.file.clone()).collect();
 
         // Before anything is written: every segment must share one stream layout, or the
-        // concatenation drops or truncates a track without ffmpeg reporting it.
-        edit::check_concat_layout(bin, &files)?;
+        // concatenation drops or truncates a track without ffmpeg reporting it. The layout it
+        // returns is also what the concat needs to re-name the audio tracks: a `-c copy` does
+        // not carry per-stream metadata, so the names the encoder set are gone by this point.
+        let layout = edit::check_concat_layout(bin, &files)?;
 
         let list = out.with_extension("concat.txt");
         let total_bytes = edit::write_concat_list(&files, &list)?;
         // The list is removed whether the copy succeeded or not.
-        let concat = edit::concat_lossless_sized(bin, &list, out, total_bytes);
+        let concat = edit::concat_lossless_sized(
+            bin,
+            &list,
+            out,
+            total_bytes,
+            layout.audio_count(),
+        );
         let _ = std::fs::remove_file(&list);
         concat?;
 

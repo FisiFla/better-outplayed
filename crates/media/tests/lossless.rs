@@ -65,3 +65,99 @@ fn trim_keeps_both_streams_and_shortens() {
         after.duration_ms
     );
 }
+
+/// 2s of video and **two** audio tracks, tagged exactly as the encoder tags a recording that
+/// has a microphone: `-map 0:v -map 1:a -map 2:a` plus the two titles.
+///
+/// The titles come from [`edit::audio_titles`] rather than being written out again, so this
+/// fixture cannot drift from the pipeline it stands in for — which is the whole point, since a
+/// drifted literal is how the defect below stayed invisible.
+fn two_track_fixture(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let out = dir.join(format!("two-track-{tag}.mp4"));
+    let bin = ffmpeg();
+    let mut cmd = Command::new(&bin.ffmpeg);
+    cmd.args([
+        "-v", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+        "-f", "lavfi", "-i", "sine=frequency=200:sample_rate=48000",
+        "-f", "lavfi", "-i", "sine=frequency=6000:sample_rate=48000",
+        "-t", "2",
+        "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
+        "-c:a", "aac", "-ac", "2",
+    ]);
+    for (index, title) in edit::audio_titles(2).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+    }
+    let status = cmd.arg(&out).status().expect("spawn ffmpeg");
+    assert!(status.success(), "the two-track fixture could not be encoded");
+    out
+}
+
+/// The `name` tag of each audio stream, in order; `None` for a track with no name.
+///
+/// `name`, not `title`: ffmpeg's MP4 muxer stores `-metadata:s:a:N title=…` in the track's
+/// **`name`** atom, and ffprobe reports it as `tags.name`.
+fn audio_names(bin: &FfmpegBinaries, path: &std::path::Path) -> Vec<Option<String>> {
+    let out = Command::new(&bin.ffprobe)
+        .args(["-v", "error", "-print_format", "json", "-show_streams"])
+        .arg(path)
+        .output()
+        .expect("spawn ffprobe");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ffprobe json");
+    json["streams"]
+        .as_array()
+        .expect("ffprobe must report a streams array")
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .map(|s| s["tags"]["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The concatenation keeps the audio tracks **named**.
+///
+/// **A `-c copy` through the concat demuxer does not carry per-stream metadata.** Measured: the
+/// encoder's own segments are tagged — `tags: { "name": "Game Audio" }`, because ffmpeg's MP4
+/// muxer stores `title=` in the `name` atom — and after `-map 0 -c copy` neither name survives,
+/// with or without `-map_metadata 0`. So every clip and every session file made from segments
+/// came out with **anonymous** audio tracks: a player showed two tracks both called "Audio",
+/// with nothing to say which was the game and which the microphone.
+///
+/// Found by probing a real clip a Windows capture produced (`docs/verification-status.md`
+/// §10.2), where three streams came back as `video, audio, audio` and `stream_tags=name` was
+/// empty. This is the regression test for the fix: the concat re-applies the names.
+#[test]
+fn concat_keeps_the_audio_track_names_the_encoder_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let a = two_track_fixture(dir.path(), "a");
+    let b = two_track_fixture(dir.path(), "b");
+
+    let expected: Vec<Option<String>> = edit::audio_titles(2)
+        .iter()
+        .map(|t| Some((*t).to_string()))
+        .collect();
+    assert_eq!(
+        audio_names(&bin, &a),
+        expected,
+        "the fixture itself must be tagged the way the encoder tags a recording"
+    );
+
+    let list = dir.path().join("concat.txt");
+    let total = edit::write_concat_list(&[a, b], &list).expect("the concat list");
+    let dst = dir.path().join("clip.mp4");
+    edit::concat_lossless_sized(&bin, &list, &dst, total, 2).expect("the concat");
+
+    assert_eq!(
+        audio_names(&bin, &dst),
+        expected,
+        "the clip's audio tracks must be named, not two anonymous 'Audio' streams"
+    );
+    // The naming must not have cost a track: the sample counts above only prove the tags, and
+    // the defect this guards was a *missing* stream before it was a missing name.
+    assert_eq!(audio_names(&bin, &dst).len(), 2, "both audio tracks are still there");
+    assert!(
+        MediaInfo::probe(&bin, &dst).unwrap().video.is_some(),
+        "and so is the video"
+    );
+}

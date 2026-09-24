@@ -377,13 +377,15 @@ pub fn finalise(
     let files: Vec<PathBuf> = segments.iter().map(|s| s.file.clone()).collect();
 
     // Refused before anything is written: a segment whose layout differs from the first
-    // would make `-map 0` silently drop or truncate a track.
-    edit::check_concat_layout(bin, &files)?;
+    // would make `-map 0` silently drop or truncate a track. The layout is also what tells the
+    // concat how many audio tracks to re-name: a `-c copy` carries no per-stream metadata, so
+    // the names the encoder wrote are gone by this point.
+    let layout = edit::check_concat_layout(bin, &files)?;
 
     let list = out.with_extension("concat.txt");
     let total_bytes = edit::write_concat_list(&files, &list)?;
     // The list is scratch whether the copy works out or not.
-    let concat = edit::concat_lossless_sized(bin, &list, out, total_bytes);
+    let concat = edit::concat_lossless_sized(bin, &list, out, total_bytes, layout.audio_count());
     let _ = std::fs::remove_file(&list);
     if let Err(e) = concat {
         // The partial file is worse than useless: it occupies the space the retry needs and

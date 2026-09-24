@@ -388,15 +388,16 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // `Encoder::submit_audio` feeds, and 2 the microphone, which `Encoder::submit_mic_audio`
     // feeds.
     if mic_url.is_some() {
-        args.extend(
-            [
-                "-map", "0:v", "-map", "1:a", "-map", "2:a",
-                "-metadata:s:a:0", "title=Game Audio",
-                "-metadata:s:a:1", "title=Microphone",
-            ]
-            .iter()
-            .map(OsString::from),
-        );
+        args.extend(["-map", "0:v", "-map", "1:a", "-map", "2:a"].iter().map(OsString::from));
+        // The two tag strings come from `localplay-media`, which has to apply the same names
+        // again when it concatenates segments into a clip or a session file: a `-c copy` does
+        // not carry per-stream metadata, so these names are written twice in a recording's
+        // life, and two literals free to drift is exactly how a track ends up anonymous in the
+        // file the user opens.
+        for (index, title) in localplay_media::edit::audio_titles(2).iter().enumerate() {
+            args.push(format!("-metadata:s:a:{index}").into());
+            args.push(format!("title={title}").into());
+        }
     }
 
     args.extend(["-f", "segment"].iter().map(OsString::from));

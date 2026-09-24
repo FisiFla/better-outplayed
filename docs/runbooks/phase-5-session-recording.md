@@ -118,22 +118,17 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
 1. **Buffer-mode session rows share one scratch directory.** Their `size_bytes` is "the bytes
    the ring holds", so two buffer sessions can count the same segments. Full-session rows are
    exact (their own directory).
-2. **A session's audio tracks are unnamed.** The tracks are there — `-metadata:s:a:0
-   title=Game Audio` / `title=Microphone` — but an MP4 stores those in the track's `name`
-   atom, and a clip probed on Windows came back with no `stream_tags=name` at all, so a player
-   shows two anonymous "Audio" tracks. Measured on the box (see `docs/verification-status.md`
-   §10.2); not yet explained.
-3. **The 4K sustained-rate issue is unchanged** (a separate open issue). A full session
+2. **The 4K sustained-rate issue is unchanged** (a separate open issue). A full session
    records at whatever rate the machine sustains; the media timeline is the frames' arrival
    timestamps, so a `pre_seconds` window is still that many real seconds, but at 4K the
    picture can hold frames that were dropped. It does not make full-session recording
    *unsafe* — it makes the file's smoothness a property of the machine, and the status line's
    `dropped=` is where that shows.
 
-### Two limitations this runbook used to carry, now fixed
+### Three limitations this runbook used to carry, now fixed
 
 Recorded rather than deleted, because a reader who remembers them should find out here that
-they are gone — and because both were fixed by the same change, and the reason matters.
+they are gone — and because the first two were fixed by one change, and the reason matters.
 
 * **Clips taken with the microphone on, in buffer mode, carried only the game audio.** The
   ring's trigger splices clips with `ClipSplicer::splice`, whose concat had no `-map`, so the
@@ -141,6 +136,14 @@ they are gone — and because both were fixed by the same change, and the reason
   `localplay_media::edit::concat_lossless`, which the splicer calls, so a buffer-mode clip
   keeps both tracks — confirmed on real Windows hardware, where the clip came back with three
   streams (`video, audio, audio`). The warning is gone because the thing it warned about is.
+* **A session's audio tracks were unnamed.** `-map 0` kept the tracks, and the encoder *did*
+  tag them (`-metadata:s:a:0 title=Game Audio`, which an MP4 stores in the track's `name`
+  atom), but **a `-c copy` through the concat demuxer does not carry per-stream metadata** —
+  measured with and without `-map_metadata 0`. So every clip and every session file came out
+  with anonymous audio tracks: a player showed two tracks both called "Audio". Found by
+  probing a real Windows clip (`docs/verification-status.md` §10.2); the concat now re-applies
+  the names from `edit::audio_titles`, which is also where the encoder reads them from, so the
+  two cannot drift.
 * **The session timeline was not populated by the engine.** `sessions.started_at` is the wall
   clock (the retention rules age by it) while `events.at` is the media clock, so `offset_ms`
   was derived as the difference of two unrelated clocks and `events.session_id` stayed NULL.

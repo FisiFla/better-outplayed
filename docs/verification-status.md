@@ -710,14 +710,18 @@ session.
 
 Two caveats, stated rather than glossed:
 
-* **The clip's audio tracks are unnamed.** `-metadata:s:a:0 title=Game Audio` /
-  `title=Microphone` are set by the encoder, and the clip's `stream_tags=name` came back
-  **empty** — so a player shows two anonymous "Audio" tracks. Worth a small fix; recorded here
-  so it is not mistaken for working.
+* **The clip's audio tracks were unnamed** — three streams came back as `video, audio, audio`
+  with `stream_tags=name` **empty**, so a player showed two anonymous "Audio" tracks with
+  nothing to say which was the game and which the microphone. **Fixed**: the cause was that a
+  `-c copy` through the concat demuxer does not carry per-stream metadata, measured with and
+  without `-map_metadata 0`, so the concat now re-applies the names it knows
+  (`localplay_media::edit::audio_titles`, which the encoder also reads them from). The
+  regression test is `crates/media/tests/lossless.rs::concat_keeps_the_audio_track_names_the_encoder_wrote`,
+  and removing the fix makes it fail with `[None, None]`.
 * **The pipeline could not hold 30fps at 4K** and said so itself:
   `only 28.0 frames per second are reaching it, and its queue is dropping the rest (2 in total)`
   — the engine's own warning, doing exactly what it is written to do. It is the issue #1
-  finding reproduced on a *current* build, at 30fps rather than 60.
+  finding reproduced on a *current* build, at 30fps rather than 60. **Still open.**
 
 ### 10.3 Three test defects, found and fixed
 

@@ -90,7 +90,10 @@ pub fn thumbnail(bin: &FfmpegBinaries, src: &Path, at_ms: u64, dst: &Path) -> Re
 /// audio streams produced a 2-stream file — the microphone track vanished from a clip the
 /// user recorded with one, with no error and exit status 0.
 pub fn concat_lossless(bin: &FfmpegBinaries, list_file: &Path, dst: &Path) -> Result<()> {
-    concat_lossless_sized(bin, list_file, dst, 0)
+    // One audio stream: the ordinary case for a recording with no microphone. A caller that
+    // concatenates a two-track recording must use [`concat_lossless_sized`] with the real count,
+    // or the microphone's track would come out named "Game Audio".
+    concat_lossless_sized(bin, list_file, dst, 0, 1)
 }
 
 /// As [`concat_lossless`], with the copy's budget derived from the bytes being moved.
@@ -98,17 +101,62 @@ pub fn concat_lossless(bin: &FfmpegBinaries, list_file: &Path, dst: &Path) -> Re
 /// A whole session is the case that needs this: at a few hundred MB the floor is fine, at
 /// several GB it is not, and a copy that runs out of time fails only *after* doing the
 /// work. `total_bytes` is the summed size of the listed segments; pass 0 for the floor.
+/// The `title` the game-audio track is tagged with — the encoder's own string.
+pub const GAME_AUDIO_TITLE: &str = "Game Audio";
+
+/// The `title` the microphone track is tagged with — the encoder's own string.
+pub const MICROPHONE_TITLE: &str = "Microphone";
+
+/// The titles for a lossless concatenation's audio tracks, in stream order.
+///
+/// **A `-c copy` through the concat demuxer does not carry per-stream metadata.** Measured: the
+/// encoder's own segments *do* carry it — `tags: { "name": "Game Audio" }`, because ffmpeg's MP4
+/// muxer stores `title=` in the track's `name` atom — but after `-map 0 -c copy` neither name
+/// survives, with or without `-map_metadata 0`. So every clip and every session file made from
+/// segments came out with **anonymous** audio tracks: a player showed two tracks both called
+/// "Audio", with nothing to say which was the game and which the microphone. Found by probing a
+/// real clip produced on Windows (`docs/verification-status.md` §10.2). The concat therefore
+/// re-applies them.
+///
+/// The convention is the encoder's and these are the encoder's strings: it is the thing that
+/// decides a recording has the game audio first and the microphone second, so this reproduces
+/// that decision rather than inventing a second one. One audio stream is the game audio; two are
+/// the game audio plus the microphone. More than two cannot happen — the encoder maps at most
+/// two — and any beyond that are left as the muxer named them rather than mislabelled.
+pub fn audio_titles(audio_streams: usize) -> Vec<&'static str> {
+    match audio_streams {
+        0 => Vec::new(),
+        1 => vec![GAME_AUDIO_TITLE],
+        _ => vec![GAME_AUDIO_TITLE, MICROPHONE_TITLE],
+    }
+}
+
+/// As [`concat_lossless`], with the copy's budget derived from the bytes being moved, and the
+/// audio tracks re-named.
+///
+/// A whole session is the case that needs the budget: at a few hundred MB the floor is fine, at
+/// several GB it is not, and a copy that runs out of time fails only *after* doing the work.
+/// `total_bytes` is the summed size of the listed segments; pass 0 for the floor.
+///
+/// `audio_streams` is how many audio streams the segments carry — the count
+/// [`check_concat_layout`] returns — and it changes only the **names**, never the mapping:
+/// `-map 0` keeps every stream whatever this says. See [`audio_titles`] for why the names have
+/// to be re-applied here at all.
 pub fn concat_lossless_sized(
     bin: &FfmpegBinaries,
     list_file: &Path,
     dst: &Path,
     total_bytes: u64,
+    audio_streams: usize,
 ) -> Result<()> {
     let mut cmd = Command::new(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(list_file)
-        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])
-        .arg(dst);
+        .args(["-map", "0", "-c", "copy"]);
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(dst);
     expect_success(cmd, "concat", dst, copy_budget(total_bytes))
 }
 
