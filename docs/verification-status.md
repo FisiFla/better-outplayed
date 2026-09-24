@@ -1083,3 +1083,41 @@ buffer session #2 closed: 34 segment(s), 84335007 bytes held in RAM, no session 
 line that reports the held bytes had been printing `bytes=0` for exactly this case, because it read
 the *disk* figure from `Ledger::stats`; the status field and the log now read the same
 `buffered_bytes` value once, so they cannot disagree.
+
+---
+
+## 14. Where the 4K CPU actually goes (2026-09-25) — `capture=97.1% submit=0.1%`
+
+Issue #3's remaining half is the CPU figure, and the decision it needs — whether to move the frame
+out of system memory — turns on which half of the cost the readback is. A process-wide CPU
+percentage cannot say: it cannot distinguish the 33.2 MB GPU-to-CPU copy per frame from time spent
+waiting for ffmpeg. So the pump now measures its own two expensive calls
+(`PumpCounts::capture` / `::submit`) and the periodic line reports both as a share of wall clock.
+
+Same box, same display, same 4K/60 soak as §13, with the attribution:
+
+```
+frames=8788 segments=34 bytes=93230279 span=155649ms dropped=9 dropped_audio=0 dropped_mic=0
+  skipped=193 fps=56.7/60 configured=60 capture=97.1% submit=0.1%
+```
+
+| | |
+|---|---|
+| Inside the capture backend (`next_frame` + `discard_pending`) | **97.1%** of wall clock |
+| Inside the encoder's submit, i.e. waiting for ffmpeg | **0.1%** |
+
+**The cost is the readback, and ffmpeg is not blocking us at all.** That is a stronger statement
+than §13 could make: the 88.9%-of-one-core figure is almost entirely the copy out of the GPU, and
+the encoder's own work is invisible in this loop because it happens on the other side of a queue
+that never fills.
+
+The consequence for issue #3 is that **97% of the current cost is addressable by removing the
+readback alone** — the target of "under 3%" is credible rather than aspirational — and that a
+change which only *reduces* the bytes (capturing at the output size, 4x fewer) leaves roughly a
+quarter of the wall clock in the same place. It also settles a question §13 left open: the encoder
+is not where the money is, so a native encoder that still required a CPU copy would buy almost
+nothing.
+
+What this does **not** say: nothing here has been tested with a zero-copy path, because there is
+not one yet. It bounds what such a path can save, and it does so from the inside of the loop rather
+than from a total.
