@@ -288,8 +288,30 @@ mod tests {
     #[test]
     fn explicit_path_wins() {
         let found = FfmpegBinaries::discover_from(Some(PathBuf::from("/custom/dir")), &[])
-            .expect("explicit path is used verbatim");
-        assert_eq!(found.ffmpeg, PathBuf::from("/custom/dir/ffmpeg"));
+            .expect("the configured directory is used");
+
+        // The configured directory decides *where* the binaries are; the platform decides what
+        // an executable is called. So this asserts the parent and the stem rather than one
+        // literal path.
+        //
+        // It used to demand `/custom/dir/ffmpeg` exactly, and failed on Windows, where the
+        // resolved path came back as `/custom/dir\ffmpeg.exe` — the `.exe` being a real and
+        // legitimate difference, since a bare `ffmpeg` is not an executable there. (Measured on
+        // the Windows test box; the assertion was about the host, not about which directory wins,
+        // which is the property its name claims.)
+        assert_eq!(found.ffmpeg.parent(), Some(std::path::Path::new("/custom/dir")));
+        assert_eq!(found.ffmpeg.file_stem().and_then(|s| s.to_str()), Some("ffmpeg"));
+        assert_eq!(
+            found.ffmpeg.extension().and_then(|s| s.to_str()),
+            if cfg!(windows) { Some("exe") } else { None },
+            "a Windows executable is named ffmpeg.exe; elsewhere it is named ffmpeg"
+        );
+        assert_eq!(
+            found.ffprobe.parent(),
+            found.ffmpeg.parent(),
+            "and ffprobe resolves beside it, not from PATH"
+        );
+        assert_eq!(found.ffprobe.file_stem().and_then(|s| s.to_str()), Some("ffprobe"));
     }
 
     #[test]
