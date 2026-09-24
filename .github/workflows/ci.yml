@@ -27,15 +27,25 @@
 # ---------------------------------------------------------------------------
 #   - No Windows runtime verification. Not one line of the WASAPI or WGC backends
 #     is *executed* here; they are only compiled. A green run says nothing about
-#     how the app behaves on a real machine, and the audio/video paths have never
-#     been observed producing a clip.
+#     how the app behaves on a real machine.
+#
+#     (Those paths HAVE now been observed producing a clip — a 2026-09-24 session on
+#     the developer's own Windows box, recorded in documented form in
+#     `docs/verification-status.md` §10, together with the three test defects it
+#     found and the one thing still broken there. That session was a human running
+#     the suite and a capture by hand. This job still executes none of it, and that
+#     is the point: green here is a statement about macOS and about the Windows
+#     code's *type* correctness, and nothing more.)
 #   - No GUI window. No window is opened, the screen is never captured and no input
 #     is synthesised — the desktop command layer is driven with the Tauri runtime
 #     mocked, exactly as the crate is designed to be testable without a window.
 #   - `localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell
-#     are only *host*-verified: they depend on rusqlite's bundled SQLite, whose C
-#     source cannot be built for MSVC from macOS, so they are excluded from the
-#     Windows cross-check and the store/CLI cannot be cross-checked anywhere here.
+#     are excluded from the Windows cross-check *from this host*: they depend on
+#     rusqlite's bundled SQLite, whose C source cannot be built for MSVC from macOS.
+#     They are not unverifiable on Windows, only unverifiable from here — §10 of
+#     `docs/verification-status.md` records the whole workspace, bundled SQLite
+#     included, building *and its tests running* on the Windows box. What this job
+#     cannot do is carry that check; it needs a Windows runner or a human.
 
 name: CI
 

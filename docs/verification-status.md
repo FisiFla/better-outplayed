@@ -14,20 +14,26 @@ named, so every line below can be re-checked.
 
 ## The headline, stated plainly
 
-> **Almost none of the Windows-only surface has ever executed on Windows.**
-> A small number of capture runs have now executed on real Windows boxes. The one whose
-> measurements are recorded in-tree is the 2026-09-23 session (RTX 3090, 3840x2160 at
-> 150% scaling, [issue #1]): it proved the capture→encode→ring-buffer→splice path can run,
-> and found that **the pipeline cannot sustain the configured frame rate at 4K and burns
-> ~50% of a CPU core doing it** ([issue #1]). A run with a 15 MB cap left a scratch ring on
-> the box that was re-read (read-only) after the fact; that re-read re-confirms the path — real
-> pixels, non-silent audio, a cap that held and evicted oldest-first — and resolves the
-> three items this ledger previously could not verify (§1). Everything written after that
-> first session — the readback skip, the WASAPI engine-side sample-rate conversion, the
-> whole recording engine, the desktop GUI's recording wiring, the storage policy, both
-> Phase 4 game integrations and the sidecar pipeline — is **type-checked for
-> `x86_64-pc-windows-msvc` or tested on macOS, and has never run on Windows.** The two
-> game integrations have never been run against a game at all.
+> **The Windows-only surface has now run on Windows.** On 2026-09-24 the whole Rust workspace
+> was built *and its test suite executed* on the box (Windows 11, RTX 3090): every crate's
+> tests, the egress guards, and — in a real desktop session, with the owner's approval — a
+> genuine capture run that wrote a clip. That session is §10. It is the first time the
+> recording engine, the storage policy, the game-presence code, the WGC and WASAPI capture
+> backends and the shipping hardware-encoder selection have *executed* rather than being
+> type-checked for it. Doing it found three test defects — each fixed — and one thing that is
+> still broken on Windows and is not a test's fault.
+>
+> What has still never run anywhere: the desktop **GUI** (no window has been opened on the
+> box, and the shell's background half has never been a background application in practice),
+> `cargo xtask verify`, the two game integrations **against a real game**, the microphone's
+> silence detector *firing*, `[app] start_with_system` writing a registry value, and anything
+> that would need a synthesised keypress — which this project will not do on a machine that
+> runs an anti-cheat.
+>
+> The earlier measurement stands and is not superseded: the 2026-09-23 session (RTX 3090,
+> 3840x2160 at 150% scaling, [issue #1]) proved the capture→encode→ring-buffer→splice path can
+> run, and found that **the pipeline cannot sustain the configured frame rate at 4K and burns
+> ~50% of a CPU core doing it** ([issue #1]). Both are still open.
 
 If that paragraph surprises you, it is doing its job. The rest of this file is the detail.
 
@@ -42,7 +48,8 @@ against the synthetic backends), so its own report is part of what you are check
 first row to look at is `capture_started` — if the WGC line is missing, or the geometry is
 `1280x720`, the session has no desktop (or the stub ran) and the rest of that report says
 nothing. It cannot check the GUI, a real keypress, anything needing a real game, or the
-live clock divergence; §9 lists what stays manual.
+live clock divergence; §9 lists what stays manual and §10 records which parts of it the
+2026-09-24 session got to by hand instead.
 
 [issue #1]: https://github.com/FisiFla/localplay/issues/1
 [issue #2]: https://github.com/FisiFla/localplay/issues/2
@@ -85,8 +92,9 @@ read-only re-read of files retained on the box (see §1). They move from *Unveri
 *Verified on Windows hardware*: 16 → 19 Verified, 3 → 0 Unverified. The desktop shell's
 background half (§3, §8) then added three claims of its own: two at *verified on the dev
 host* — the background logic, and the trigger path driven through a real recording — and one
-at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller, which needs
-a Windows message queue to run. The measured-rate change (§4) added one at *verified on
+at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller. (**That last
+one has since moved**, and the move is the 2026-09-24 session: see §10 — the branch does run,
+it runs on the *first* SSH login, and it is now verified rather than type-checked.) The measured-rate change (§4) added one at *verified on
 the dev host* — the rate decision, its new config key and the probe's own bounds are tested,
 and the startup lines were produced by real runs — while the *accuracy* of its measurement at
 4K on the target hardware was explicitly not claimed. The timeline fix (§1, §4) adds two more
@@ -94,6 +102,16 @@ at the same level — that the media clock is the frames' arrival timestamps (a 
 regression test that fails without it), and that the VFR output still splices, probes and
 plays (a splice test that decodes every frame) — and *demotes* the measured-rate claim to a
 pacing aid rather than a timeline guarantee: 20 → 23 Verified on the dev host.
+
+**These counts are stale, and left stale on purpose.** The 2026-09-24 Windows session (§10)
+moves several items and adds a whole class of them — the recording engine, the storage policy,
+the game-presence code, the CLI and the bundled-SQLite store now *run* on Windows rather than
+being type-checked for it, and the hotkey-failure and self-test-trigger rows move to *Verified
+on Windows hardware*. The numbers above are therefore wrong **in the direction of
+under-claiming**. They have not been adjusted by estimate: a tally is worth having only if it
+was counted, and the per-item tables below are the source of truth — §10 is the evidence for
+whatever moved, and the next pass should recount from those tables rather than from this
+paragraph.
 
 ---
 
@@ -318,7 +336,7 @@ executes a Windows API.
 | Desktop **recording wiring** — Start/Stop/Save clip over the engine (`ce81aef`, `bf87be0`) | Verified on the dev host (headless) | frontend `vitest` (`apps/desktop/src/lib/recording.test.ts` etc.), shell Rust tests, and headless render screenshots (`2f0be65`). **No GUI window is opened.** |
 | Desktop **background half** — the tray menu and its state-dependent labels, the tooltip and icon state, the menu-action → shell-call mapping, the close-to-hide rule, the `[app]` defaults and the autostart decision table | Verified on the dev host | `apps/desktop/src-tauri/src/background.rs` unit tests (pure functions over plain data), `config.rs` tests for the new `[hotkeys]`/`[app]` reader, `apps/desktop/src/lib/recording.test.ts` for the two display rules, and the headless screenshot state `11-hotkey-not-installed`. **The tray, the window hide and the keypress themselves are not covered by any of this** — see §9. |
 | The hotkey **trigger path** in the GUI — one press, one clip, through `RecorderHost::clip_now` | Verified on the dev host (headless) | `apps/desktop/src-tauri/src/commands.rs::one_hotkey_press_writes_exactly_one_clip_through_the_recorder` drives a **real** recording (stub capture source, libx264, a real ring, a real splice, a real index row) and asserts exactly one clip file, one index row and one count in the engine. The press is an in-process call — no input is synthesised. |
-| **Hotkey registration failure is reported** (`225a1fe` in `crates/events`) | Type-checked only (Windows) + verified on the dev host (the parse half) | the `listen` path that carries `RegisterHotKey`'s error back and returns it — with the chord named — compiles for `x86_64-pc-windows-msvc` and **has never run**: registering a chord needs a Windows message queue. The parse-failure and "no global hotkey on this platform" branches are unit-tested (`background::install_hotkey`). |
+| **Hotkey registration failure is reported** (`225a1fe` in `crates/events`) | **Verified on Windows hardware** (2026-09-24, §10) | `RegisterHotKey` genuinely failed on the box — `This operation requires an interactive window station. (0x800705B3)`, over SSH — and the error returned to the caller **named the chord**: "the chord Ctrl+F8 could not be registered (RegisterHotKey failed: …)". The previous claim was that this "has never run"; it has, and the branch that was expected to be unreachable in practice turns out to be the one an SSH session always takes. A `#[cfg(windows)]` test now asserts the failure names the chord. The parse-failure and "no global hotkey on this platform" branches remain unit-tested (`background::install_hotkey`). |
 | **Sidecar pipeline** (`07b9d83`) — fetch + SHA-256 verify + allowlisted extract | Verified on the dev host | `xtask/src/sidecars.rs` unit tests (zip-slip rejected, symlink rejected, mismatch refused, allowlist honoured) |
 | **Phase 4 — LoL Live Client poller** (`3ae0a01`) | Verified on the dev host (mocks only) | `crates/events/tests/lol_mock.rs` drives a real TLS server on loopback; see §5 |
 | **Phase 4 — CS2/Dota 2 GSI listener** (`32774ff`) | Verified on the dev host (mocks only) | `crates/events/tests/gsi_listener.rs` over real loopback sockets |
@@ -360,12 +378,12 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | Silence detector | `2a63949` | Type-checked only |
 | CI workflow (tests + Windows cross-check + frontend) | `42b68a9` | Verified on the dev host |
 | GSI accept-loop blocking-mode fix | `c5abc58` | Verified on the dev host (CI) |
-| Self-test clip trigger (`--self-test-clip-after`) — the clip path without synthetic input | `d8ec96b` | Verified on the dev host (an integration test drives it end to end over real ffmpeg); never run on Windows |
+| Self-test clip trigger (`--self-test-clip-after`) — the clip path without synthetic input | `d8ec96b` | **Verified on Windows hardware** (2026-09-24, §10): the shipping CLI ran it in a real desktop session and took a clip — `self-test: the ring holds 7000ms of media; taking the clip` → a 7083ms file, indexed. Also verified on the dev host |
 | Desktop background half: tray, global clip hotkey, hide-on-close, `[app] start_with_system` | `225a1fe`, `e3fcb95`, `d20d748` | Verified on the dev host (headless: pure logic + a real recording driven through the trigger path). **Never observed on any machine**: no tray icon drawn, no window closed, no key pressed, no Run-key write executed |
 | A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
 | The pipeline **paces capture to a rate it can actually keep**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate`. **This is a pacing aid and a diagnostic, not the timeline guarantee** (see the two rows below, and §1) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, its numbers do not transfer to NVENC (hardware, content-blind), and the probe measures the encode path only — on this host it reported 62 fps where the pipeline achieved 8 |
-| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Not verified on Windows**: nothing has run there, and `-fps_mode` on the pinned sidecar is evidenced only by the option's own strings inside `binaries/ffmpeg.exe` |
+| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the box against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **fails on Windows** for a reason that is not yet understood (§10). |
 | A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`localplay_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
 
 The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
@@ -600,8 +618,12 @@ observation; the Phase 1 runbook
 6. **Force a `vendor` that is not present** — confirms criterion 7's fail-loud path on the
    current build.
 7. **Set the Windows default playback device to 44.1 kHz or 96 kHz and record a clip** —
-   exercises the WASAPI autoconversion (`0848fc7`) and the silence detector (`2a63949`),
-   neither of which has ever run.
+   exercises the WASAPI autoconversion (`0848fc7`) and the silence detector (`2a63949`).
+   **Half done** (§10.2): the autoconversion *has* now run — the box's default render endpoint
+   reported `native_sample_format=F32` and the backend logged `converting=true`, and the clip
+   that came out had audio in it. What has still never run anywhere is the **detector
+   firing**: that needs an endpoint that converts *and* is silent, which a live machine does
+   not offer.
 8. **Launch the desktop GUI on Windows and press Start / Save clip** — the entire GUI
    recording path (`ce81aef`, `bf87be0`) has only ever run headlessly.
 9. **Play one bot game (League) and one CS2 round** — the last step for the Phase 4
@@ -625,3 +647,142 @@ observation; the Phase 1 runbook
     HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v localplay`.** Then set it back
     to `false`, restart, and check the value is gone and nothing else in the Run key was
     touched. Nothing has ever written that value.
+
+---
+
+## 10. The 2026-09-24 Windows session — the suite, run on Windows
+
+The first time this project's tests were **executed** on Windows rather than type-checked for
+it. Method: `git archive HEAD | tar -xz` on the box (`C:\Users\player\localplay`; the box has
+no `git`), then `cargo test`. The toolchain is cargo/rustc 1.98.1 and the *system* ffmpeg
+9.0.2 — the same ffmpeg version as the dev host, which matters for reading §10.4 below.
+
+### 10.1 What ran, and what it proved
+
+`cargo test --workspace --features localplay-encoder/test-encoders --no-fail-fast`, in an SSH
+session (session 0, no desktop):
+
+| Crate | Result |
+|---|---|
+| `localplay-capture` | 27 passed |
+| `localplay-encoder` | 22 + 3 + 2 passed; **1 failed** (§10.4) |
+| `localplay-events` | 151 + 8 + 10 + 11 + 4 passed, plus doc-tests |
+| `localplay-media` | 34 + 2 passed; **1 failed** (§10.3), now fixed |
+| `localplay-recorder` | 58 passed |
+| `localplay-replay` | 22 + 1 passed |
+| `localplay-store` | 59 + 5 + 12 passed |
+| `localplay-cli` | 18 + 1 + 2 + 2 + 3 passed; the capture test refused (§10.2) |
+| `xtask` | 44 passed, 1 ignored |
+
+Two things this settles that no amount of type-checking could:
+
+* **rusqlite's bundled SQLite compiles and runs** on this toolchain, so the whole store and
+  recorder suite executes on Windows.
+* **The egress guards pass on Windows** — `only_the_loopback_modules_talk_to_a_socket_at_all`
+  and `no_http_client_is_constructed_outside_the_loopback_module` — which is the platform whose
+  network stack they exist to guard.
+
+### 10.2 The real capture, in a real desktop session
+
+Run under `schtasks /create … /it` so it executed in session 1 (`running as the console user in session 1`,
+`explorer running (a real desktop): True`), with the **shipping** build — no test-encoder
+features, so no CPU software fallback exists:
+
+```
+WASAPI loopback capture started on the default render endpoint
+  native_sample_rate=48000 native_channels=2 native_sample_format=F32
+  requested_sample_rate=48000 requested_channels=2 requested_sample_format=s16 converting=true
+clip clip-1790250224: video 7000ms  audio 6997ms  drift 86ms
+wrote …\clip-1790250224.mp4 (7083ms, 4782052 bytes, encoder=h264_nvenc)
+indexed clip #1 (media t=2000ms, 7083ms, 4782052 bytes, h264_nvenc)
+recorded bookmark event #1 at media t=7000ms against clip #Some(1)
+buffer session #1 closed: 9 segment(s), 7114374 bytes in the scratch ring, no session file
+→ ffprobe: 3 streams — video, audio, audio
+```
+
+Read that against the ledger above. It moves, in one run: **WGC capture** on a real display,
+**WASAPI loopback** including the engine-side sample-rate conversion (`converting=true`),
+**hardware-encoder selection in the shipping build** (`h264_nvenc` chosen by `vendor = "auto"`
+on the box's own GPU — six `type-checked only` rows in §1 turn on this alone), the **microphone
+track surviving the lossless concat** (two audio streams in the clip — the defect §10.3 fixed,
+now confirmed on hardware), and the **bookmark event** a manual clip records, linked to its
+session.
+
+Two caveats, stated rather than glossed:
+
+* **The clip's audio tracks are unnamed.** `-metadata:s:a:0 title=Game Audio` /
+  `title=Microphone` are set by the encoder, and the clip's `stream_tags=name` came back
+  **empty** — so a player shows two anonymous "Audio" tracks. Worth a small fix; recorded here
+  so it is not mistaken for working.
+* **The pipeline could not hold 30fps at 4K** and said so itself:
+  `only 28.0 frames per second are reaching it, and its queue is dropping the rest (2 in total)`
+  — the engine's own warning, doing exactly what it is written to do. It is the issue #1
+  finding reproduced on a *current* build, at 30fps rather than 60.
+
+### 10.3 Three test defects, found and fixed
+
+All three are the same species as the CI flakiness fixed earlier the same week — an assertion
+that encodes a fact about the **host** rather than a property of the code — but across the
+platform instead of across load. Each is committed with its reasoning.
+
+| Test | What it asserted | What Windows did |
+|---|---|---|
+| `hotkey::tests::listening_off_windows_reports_no_failure_and_never_fires` | `listen(chord).expect(…)` — not gated to non-Windows, though its name and doc say that is what it is about | `listen` really tried `RegisterHotKey`, which failed (`0x800705B3`) — so the assertion was about the session, not the code. Now gated, with a Windows counterpart asserting the failure is *reported* and names the chord |
+| `lol::client::tests::a_refused_connection…` | that a closed loopback port yields `FetchError::Connection` | port 1 **timed out** instead of being refused. The product was already right (`is_no_game()` accepts both); the test was over-specific about which the OS produces |
+| `media::binaries::tests::explicit_path_wins` | the literal path `/custom/dir/ffmpeg` | `/custom/dir\ffmpeg.exe` — a real and legitimate difference, since a bare `ffmpeg` is not an executable there |
+
+### 10.4 One thing still broken on Windows, and it is not a test's fault
+
+`crates/encoder/tests/timeline.rs` fails on Windows on the assertion that the audio and video
+streams agree:
+
+```
+46 frames over 3.000228s: 4 segments, video 2934ms, audio 2023ms, fed audio 144480 frames = 3010ms
+the two timelines must agree to within the muxer's granularity: video 2934ms, audio 2023ms
+```
+
+Per segment, from the sibling test on the same box:
+
+```
+seg-000000.mp4: video 1000ms, audio 896ms
+seg-000001.mp4: video 1000ms, audio 560ms
+seg-000002.mp4: video 1000ms, audio   0ms
+seg-000003.mp4: video   67ms, audio   0ms
+```
+
+The audio ends about 1.5s into a 3s feed while 3010ms was *fed*. What is known: the system
+ffmpeg there is 9.0.2, the same version as the dev host, so this is not an ffmpeg difference;
+and **the real capture run in §10.2 measured `video 7000ms audio 6997ms`**, a 3ms difference —
+so it is **not general to the Windows product**, and looks specific to this synthetic feed
+loop. The assertion is deliberately **left failing** rather than widened: it guards a real
+property, and a bound that moves to accommodate the observed value would be the mistake §10.3
+is about. Whoever picks this up should start from the per-segment table.
+
+### 10.5 What this session did **not** run
+
+The list is shorter than it was, and every remaining item needs something a script cannot
+supply:
+
+* **The desktop GUI.** No window was opened on the box. The recording-wiring claims move from
+  *type-checked only* to nothing at all — they are still unexecuted, and §8 stands.
+* **`cargo xtask verify`** (`07b90fc`): never run on Windows. §10 is not a substitute — it ran
+  the *tests*, not the acceptance harness, and the harness's own report is still the thing to
+  read.
+* **A real game.** Both Phase 4 integrations remain unrun against one.
+* **The silence detector *firing*** (`2a63949`): the converted-loopback path executed in §10.2
+  (`converting=true`), but the detector did not trip — a live microphone was connected.
+* **The pinned sidecar** (`binaries/ffmpeg.exe`): §10.2 used the box's *system* ffmpeg.
+* **A synthesised keypress.** Never, by policy: input synthesis is exactly what must not happen
+  on a machine running an anti-cheat, and a test is not a reason to make an exception. The
+  hotkey's *failure* path is now verified (§10.3); its *success* path needs a human at the
+  keyboard.
+
+### 10.6 One consequence worth knowing
+
+`localplay-cli` **exits** when the clip hotkey cannot be registered — deliberate, and the
+comment explains why (a buffer run whose chord does nothing is not worth starting). The
+2026-09-24 session showed what that means in practice: **the CLI cannot run at all over SSH,
+as a service, or on a headless box**, and neither can `--mode session`, which records
+continuously and needs no hotkey. Kept as designed, by the owner's decision; recorded here
+because "the CLI refuses to start headlessly" is the kind of thing that belongs in a ledger
+rather than in a bug report later.

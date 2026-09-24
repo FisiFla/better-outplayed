@@ -278,30 +278,40 @@ stays manual.
 
 - [x] **Phase 0** — repo, tooling, design spec
 - [x] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC).
-      **Ran on real Windows hardware once** and produced correct clips, but two criteria
+      **Ran on real Windows hardware** and produced correct clips, but two criteria
       miss: at 4K it sustains ~24 fps against 30 configured (~45% of frames dropped) and
       costs ~50.8% of a CPU core against a < 5% target (open as
-      [issue #1](https://github.com/FisiFla/localplay/issues/1)). The fixes written since
-      that run are **type-checked, not re-run on Windows**.
+      [issue #1](https://github.com/FisiFla/localplay/issues/1)). **Re-run on the box and
+      still open**: a 2026-09-24 capture held 28fps against 30 at 4K and said so itself.
 - [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
       recording wiring exist, and so do the tray, the global clip hotkey and the
       hide-on-close behaviour that make it a background application; all of it is exercised
       **headlessly in CI, never opened as a real window on Windows** — the tray, the
       keypress and the hide have never been observed on any machine.
-- [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified)*
+- [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified,
+      and the bundled-SQLite store now builds and its tests run on the Windows box too)*
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
       tested against local mocks; **never run against a real game** — see the
       [Phase 4 note](docs/plans/2026-09-23-localplay-phase-4-integrations.md))*
-- [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer *(bundling and
-      the sidecar resource mapping are configured and a macOS `.app` was built and inspected;
-      **code signing, notarisation, an auto-updater and a Windows install are all still
-      missing** — see [`docs/packaging.md`](docs/packaging.md))*
+- [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer. The recording
+      and the chapter marks are **done**: full-session mode with lossless finalise and crash
+      recovery, an optional microphone on its own track, game-driven auto-record (off by
+      default), the session IPC and a desktop session view that plots the markers and cuts a
+      clip out of a finished session. What keeps the box unticked is **packaging**: bundling
+      and the sidecar resource mapping are configured and a macOS `.app` was built and
+      inspected, but **code signing, notarisation, an auto-updater and a Windows install are
+      all still missing** — see [`docs/packaging.md`](docs/packaging.md).
 
-> **Caveat on every `[x]` above.** Only the Phase 1 capture path has ever run on Windows,
-> once, and it only partly passed. The Windows-specific code added since that run — and all
-> of Phases 2–4 — is type-checked for `x86_64-pc-windows-msvc` or tested on macOS, never
-> executed on Windows. The per-item truth, and the ordered list of the next Windows runs
-> that would change it, are in [`docs/verification-status.md`](docs/verification-status.md).
+> **Caveat on every `[x]` above.** The Windows-only surface has now run on Windows: on
+> 2026-09-24 the whole Rust workspace was built **and its test suite executed** on the box,
+> and a real desktop session produced a clip — WGC capture, WASAPI loopback, a microphone
+> track surviving the concat and `h264_nvenc` chosen by `vendor = "auto"`, all for the first
+> time. Three test defects were found and fixed by doing it, and one assertion still fails
+> there for a reason nobody has explained yet. What has *still* never run anywhere: the
+> desktop **GUI**, `cargo xtask verify`, either game integration against a real game, and any
+> synthesised keypress. The per-item truth is in
+> [`docs/verification-status.md`](docs/verification-status.md) — §10 is that session, and its
+> headline paragraph is the short version.
 
 Phase 1's eight acceptance criteria and how to run them are in the
 [Phase 1 verification runbook](docs/runbooks/phase-1-verification.md).

@@ -27,7 +27,10 @@ apps/desktop/
 │       ├── recording.ts      # recorder + hotkey readout rules
 │       ├── trim.ts           # trim-range clamping, validation, timeline geometry
 │       ├── clips.ts          # clip-list view model
-│       └── components/       # ClipList, ClipDetail, RecordingPanel, Timeline, StoragePanel
+│       ├── markers.ts        # a session's timeline markers: colours, placement, click-lead
+│       ├── sessions.ts       # session view model, duration labels, extraction blockers
+│       └── components/       # ClipList, ClipDetail, SessionList, SessionDetail,
+│                             # RecordingPanel, Timeline, StoragePanel
 └── src-tauri/
     ├── Cargo.toml            # its own workspace — see below
     ├── build.rs, capabilities/default.json
