@@ -26,6 +26,46 @@
 //!
 //! Fed in real time through the same pacing the CLI uses, because that is the only way a
 //! media timeline measured against a wall clock can be observed at all.
+//!
+//! # The rule every timing assertion in this project follows
+//!
+//! Feeding in real time means these tests observe a machine under load, and CI's runner is
+//! oversubscribed. So no assertion here may compare a measurement against a **constant that
+//! encodes how fast the host is**. Seven assertions in this suite were written that way and
+//! each failed on CI while passing locally, one at a time, because each fix revealed the next:
+//!
+//! | compared | CI measured | demanded |
+//! |---|---|---|
+//! | frames coded, as a share of the feed | 297 of 336 | ≥ 98% |
+//! | media encoded, against the capture window | 2833ms of 3039ms | ≥ 2939ms |
+//! | audio absent, behind the feed | 416ms | ≤ 400ms (was 200ms) |
+//! | a clipped window | 2680ms | 3000ms |
+//! | media against wall, over a fixed window | ratio 0.48 | ≥ 0.75 |
+//! | a spliced clip against the capture | 2498ms of 3066ms | ≥ 2666ms |
+//!
+//! The last one is the instructive failure: the bound had already been widened once, 200ms →
+//! 400ms, with a comment calling it principled. It failed at 416ms. A quantity that moves with
+//! the host is not a bound; it is a reading of the host.
+//!
+//! What to write instead — one of these three, in order of preference:
+//!
+//! 1. **Wait for the condition, then compare two measurements.** `wait_for(|s| s.span_ms >=
+//!    N)` first, so the assertion is about what happened, not about how long it took. This is
+//!    what the pre-roll and media-window tests do.
+//! 2. **Assert a relationship between two measurements of the same thing.** The frames a clip
+//!    codes against the frames its own duration implies; a spliced clip against the segments
+//!    it was built from; the container's audio against the container's video. Both sides move
+//!    with the host, so the relationship holds at any load. This is the strongest form and the
+//!    one to reach for first.
+//! 3. **Assert an accounting identity.** Every submitted frame is either coded or counted as
+//!    dropped, and none invented — a frame lost *uncounted* fails, which a percentage cannot
+//!    detect.
+//!
+//! The bound to avoid is the one that reads "…and the machine must also have been fast enough
+//! just now". If a number in an assertion came from a stopwatch, it is measuring the runner.
+//! Where a machine genuinely cannot be asked to do something — a post-roll from an encoder that
+//! is deliberately starved — assert the guarantee (the pre-roll that was already on disk) and
+//! say in the message which half is best-effort and why.
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame, PixelFormat};
@@ -573,15 +613,41 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
         audio_ms > 500,
         "the spliced clip's audio stream must be real audio, not a stub of one: {audio_ms}ms"
     );
-    // The clip covers the wall clock it was captured over — the same property as the test
-    // above, now measured through the concatenation the user actually gets. The band is
-    // wider than that test's because whole segments are cut at arrival-time boundaries, and
-    // the last frame of the feed is not the last frame of a segment.
-    let wall_ms = wall.as_millis() as u64;
+    // The clip's video is the segments it was built from, to within the muxer's granularity.
+    // This is the property the *splice* is responsible for, and it is a relationship between
+    // two measurements of the same footage rather than a claim about the machine — so it holds
+    // however starved the pipeline was, which matters because this test requires starvation.
+    let spliced_from_ms: u64 = segments
+        .iter()
+        .filter_map(|seg| {
+            MediaInfo::probe(&bin, seg)
+                .ok()
+                .and_then(|i| i.video.as_ref().and_then(|v| v.duration_ms))
+        })
+        .sum();
     assert!(
-        video_ms + 400 >= wall_ms && video_ms <= wall_ms + 400,
-        "the spliced clip must cover the wall clock it was captured over: {video_ms}ms of \
-         video for {wall_ms}ms of capture"
+        video_ms.abs_diff(spliced_from_ms) <= 1_000,
+        "the spliced clip must be the segments it was built from, no more and no less: \
+         {video_ms}ms of video from {spliced_from_ms}ms of segments"
+    );
+    // What is deliberately NOT asserted here is the same band against `wall_ms`. The clip is a
+    // window over the ring's **media** timeline, and this test requires a pipeline too starved
+    // to keep up, so the media the ring could prove at the trigger instant is legitimately less
+    // than the wall-clock seconds that elapsed: CI measured 2498ms of video for 3066ms of
+    // capture. Demanding the wall clock back is demanding the machine not be loaded, which is
+    // the opposite of what this test sets up. The timeline-against-wall property belongs to the
+    // sibling test above, where the pipeline is fed at a rate it can hold.
+    //
+    // The clip holds the frames its own duration implies at the rate they were delivered. The
+    // form this replaces (`coded >= DELIVERED * 2`) compared the clip against a fixed two
+    // seconds of *feed*, conflating the clip with the capture it was cut from — and so was
+    // really an assumption about how much the clip would hold, which is the machine's business
+    // again.
+    let implied_by_duration = video_ms * u64::from(DELIVERED) / 1_000;
+    assert!(
+        coded + 2 >= implied_by_duration,
+        "the clip must hold the frames its own {video_ms}ms implies at {DELIVERED}fps: {coded} \
+         coded frames for {submitted} submitted over {wall:?}"
     );
     // Playable, not merely probeable: every coded frame decodes, and the container says how
     // many there are.

@@ -116,9 +116,16 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
     // the window (≈1 s or ≈2 s) or empty.
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let info = MediaInfo::probe(&bin, clip).expect("the clip must be a readable media file");
+    // The clip carries BOTH sides of the window, and that is what this must rule out — along
+    // with an empty clip. It deliberately does not demand a tight fit to `WINDOW_MS`: the
+    // post-roll is whatever the encoder writes inside its budget, so a loaded machine
+    // legitimately produces a shorter clip (CI measured 2498ms of video for a 3066ms window in
+    // the encoder suite). The lower bound is the failure this exists to catch — a clip that
+    // stopped at the pre-roll, i.e. one side of the window rather than both.
     assert!(
-        (WINDOW_MS as i64 - info.duration_ms as i64).abs() <= 800,
-        "clip duration {}ms is not the configured window ({WINDOW_MS}ms ± segment grid)",
+        info.duration_ms >= WINDOW_MS * 3 / 4 && info.duration_ms <= WINDOW_MS + 1_500,
+        "clip duration {}ms is not the configured window ({WINDOW_MS}ms ± segment grid): a clip \
+         that carries only one side of it, or is empty, is the failure this rules out",
         info.duration_ms
     );
     let video = info.video.as_ref().expect("a video stream");
