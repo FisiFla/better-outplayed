@@ -84,8 +84,9 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
 
 ## 3. What a full session does, and where it can fail
 
-* Segments go into `sessions/session-<start>/`; `buffer.scratch_cap_bytes` is **not**
-  applied to them (structurally: the session's ledger never calls `evict_to_cap`).
+* Segments go into `sessions/session-<start>/`; no size cap is applied to them (structurally:
+  the session's ledger never evicts, and the bounded ring that used to be the one with a cap is
+  memory-backed now — see §12 of the verification ledger).
 * At stop the segments are concatenated with `-c copy` into `sessions/session-<start>.mp4`
   and the temporary segments are removed. The concatenation is `localplay_media::edit`'s —
   `check_concat_layout` → `write_concat_list` → `concat_lossless_sized`, the same three steps

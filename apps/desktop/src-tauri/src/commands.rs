@@ -2417,7 +2417,6 @@ mod tests {
         settings.buffer.pre_seconds = PRE_SECONDS;
         settings.buffer.post_seconds = POST_SECONDS;
         settings.buffer.segment_time = 1;
-        settings.buffer.scratch_cap_bytes = 512 * 1024 * 1024;
         settings.encode.fps = 10;
         settings.encode.output_size = String::new();
         settings.storage.max_total_bytes = u64::MAX;

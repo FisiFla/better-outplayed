@@ -186,8 +186,8 @@ pub const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How often the storage policy is re-applied once the buffer is running (spec §8.1).
 ///
-/// This is the **clips** directory's rule, not the scratch ring's: the ring evicts its
-/// own segments to `buffer.scratch_cap_bytes` on every scan, while a clip is written once
+/// This is the **clips** directory's rule, not a recording's: the in-memory ring drops its
+/// oldest footage by construction when it fills, while a clip is written once
 /// and — before this — kept forever. The clips directory therefore only grows when a clip
 /// is triggered, and one pass costs a `list_clips` plus a `SUM`, i.e. a few hundred
 /// microseconds on a library of thousands of rows. Five minutes is long enough that the
@@ -254,10 +254,9 @@ impl RecorderConfig {
     /// The sessions area: where a full session's segment directory and its concatenated
     /// file live ([`RecordingMode::FullSession`], `session`).
     ///
-    /// Its own directory rather than a corner of `scratch/`, because the two are managed by
-    /// different rules: the ring evicts its scratch to `buffer.scratch_cap_bytes` on every
-    /// scan, while a session directory is only ever removed by its own finalise (or by the
-    /// retention rules through its session row).
+    /// Its own directory rather than a corner of `scratch/`, because a session directory is only
+    /// ever removed by its own finalise or by the retention rules through its session row:
+    /// nothing drops segments out of it while it is recording.
     pub fn sessions_dir(&self) -> PathBuf {
         resolve_dir(&self.app_data_dir, "sessions", &self.storage.sessions.sessions_dir)
     }
@@ -1066,7 +1065,6 @@ impl Prepared {
         let buffer_cfg = BufferConfig {
             pre_ms: cfg.buffer.pre_seconds * 1000,
             post_ms: cfg.buffer.post_seconds * 1000,
-            scratch_cap_bytes: cfg.buffer.scratch_cap_bytes,
             segment_ms: cfg.buffer.segment_time * 1000,
             clips_dir: self.clips_dir.clone(),
         };
@@ -1158,7 +1156,7 @@ impl Prepared {
             RecordingMode::ReplayBuffer => {
                 // Fragmented MP4 on the child's stdout: **no file is written while buffering**,
                 // which is the whole point of this mode. `scratch_dir` is deliberately left in
-                // the config unconsumed — see the note on `BufferSection::scratch_cap_bytes`.
+                // the config unconsumed: it is session mode's segment directory, not this one.
                 encode_cfg.output = localplay_encoder::EncodeOutput::FragmentedStream;
                 let (mut enc, name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
                 let stream = enc.take_output_stream().context(
@@ -1629,9 +1627,9 @@ struct Engine {
 
 /// The segments a recording's trigger and shutdown work against.
 ///
-/// Two shapes, one timeline: the replay ring evicts to `buffer.scratch_cap_bytes` when it
-/// scans (it is a bounded window by definition), and the full session's own store never
-/// evicts — a whole session is footage that was asked for, so the cap does not apply to it
+/// Two shapes, one timeline: the in-memory ring is a bounded window by definition and drops its
+/// oldest footage when it fills, while the full session's own store never evicts — a whole
+/// session is footage that was asked for
 /// at all ([`crate::session`] explains why that is structural rather than a large cap).
 enum Ledger {
     /// The rolling replay buffer, held **in RAM**.

@@ -39,7 +39,6 @@ const CONFIG: &str = r#"
 pre_seconds = 2
 post_seconds = 1
 segment_time = 1
-scratch_cap_bytes = 268435456
 scratch_dir = ""
 
 [encode]

@@ -33,9 +33,10 @@ pub struct RecorderSection {
 
 /// What the engine records.
 ///
-/// * [`RecordingMode::ReplayBuffer`] — the Phase 1 behaviour: a bounded scratch ring, a
+/// * [`RecordingMode::ReplayBuffer`] — a bounded ring holding the last few minutes of play, a
 ///   hotkey (or a game event) splices a clip out of it, and everything older than
-///   `buffer.scratch_cap_bytes` is evicted. Nothing else survives the run.
+///   `buffer.ram_cap_bytes` is dropped. Nothing else survives the run, and — because the ring is
+///   memory — nothing was written until a clip was asked for (§12 of the verification ledger).
 /// * [`RecordingMode::FullSession`] — the whole session is written to disk: segments go
 ///   into a per-session directory under the sessions area, **the scratch cap is not
 ///   applied to them** (a full session is not a ring: evicting the oldest segment of a
@@ -135,16 +136,6 @@ pub struct BufferSection {
     /// Length of one scratch segment. Also the keyframe interval, which is what makes a
     /// clip a lossless concatenation of whole segments (spec §6.3).
     pub segment_time: u64,
-    /// Total bytes the scratch ring may occupy (spec §8.1).
-    ///
-    /// **Nothing enforces this any more, and that is worth saying rather than leaving implied.**
-    /// It was the file-backed replay ring's rule, checked on every scan; a replay buffer now
-    /// holds its footage in RAM, where `ram_cap_bytes` is the cap that applies, and a session
-    /// deliberately never evicts — its segments are the recording the user asked for, and what
-    /// bounds disk usage for both is the `[storage]` policy, which evicts whole clips and
-    /// sessions. The key is still accepted so that configs carrying it keep parsing, and it is
-    /// documented here as doing nothing rather than being quietly dropped.
-    pub scratch_cap_bytes: u64,
     /// Empty means `<app data dir>/scratch`.
     pub scratch_dir: String,
     /// Bytes of **RAM** the in-memory replay ring may occupy. Default 256 MiB.
@@ -263,7 +254,7 @@ output_size = \"\"
         }
         let text = format!(
             "{MINIMAL}\n[buffer]\npre_seconds = 30\npost_seconds = 5\nsegment_time = 1\n\
-             scratch_cap_bytes = 2147483648\nscratch_dir = \"\"\n"
+             scratch_dir = \"\"\n"
         );
         let file = toml::from_str::<File>(&text).expect("a config from before this key parses");
         assert_eq!(

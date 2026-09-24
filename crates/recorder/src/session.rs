@@ -6,9 +6,8 @@
 //! The two modes look alike — a directory of `seg-%06d.mp4` files written by one ffmpeg
 //! segment muxer — and they are deliberately *not* the same object, because the one thing
 //! that defines the ring is the one thing a full session must not have: eviction.
-//! A file-backed ring's `scan_once` indexed new segments **and** called
-//! `SegmentLedger::evict_to_cap`, which deletes the oldest segment files until the ring is
-//! under `buffer.scratch_cap_bytes`. A four-hour session has no oldest segment to spare,
+//! The file-backed ring this was paired with indexed new segments **and** evicted the oldest to
+//! stay under a size cap. A four-hour session has no oldest segment to spare,
 //! so [`SessionRing`] scans the same directory names with the same
 //! [`localplay_replay::scanner`] functions and never evicts anything.
 //!
@@ -88,8 +87,7 @@ impl SessionRing {
     ///
     /// The `BufferConfig` carries the segment length and the trigger window, exactly as it
     /// does for the replay ring — the two modes resolve a clip the same way, and taking the
-    /// same configuration type is what keeps that true. Its `scratch_cap_bytes` is the one
-    /// field this ring does not read: it is the *ring's* rule (see the module docs).
+    /// same configuration type is what keeps that true.
     pub fn open(
         bin: &FfmpegBinaries,
         dir: &Path,
@@ -776,7 +774,6 @@ mod tests {
         localplay_replay::buffer::BufferConfig {
             pre_ms: 2_000,
             post_ms: 1_000,
-            scratch_cap_bytes: 1 << 30,
             segment_ms: 1_000,
             clips_dir: clips_dir.to_path_buf(),
         }

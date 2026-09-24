@@ -349,7 +349,7 @@ mod tests {
         std::fs::write(
             &path,
             "[buffer]\npre_seconds = 12\npost_seconds = 3\nsegment_time = 1\n\
-             scratch_cap_bytes = 1024\nscratch_dir = \"\"\n\n\
+             scratch_dir = \"\"\n\n\
              [encode]\nvendor = \"nvenc\"\ncodec = \"hevc\"\nbitrate_kbps = 20000\n\
              fps = 60\noutput_size = \"1920x1080\"\n\n\
              [storage]\nclips_dir = \"\"\nmax_total_bytes = 2048\nmax_age_days = 1\n",

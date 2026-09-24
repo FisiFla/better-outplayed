@@ -20,7 +20,6 @@ use std::path::PathBuf;
 pub struct BufferConfig {
     pub pre_ms: u64,
     pub post_ms: u64,
-    pub scratch_cap_bytes: u64,
     pub segment_ms: u64,
     pub clips_dir: PathBuf,
 }

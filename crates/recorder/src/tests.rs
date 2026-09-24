@@ -70,7 +70,6 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             pre_seconds: PRE_SECONDS,
             post_seconds: POST_SECONDS,
             segment_time: SEGMENT_SECONDS,
-            scratch_cap_bytes: 1 << 30,
             scratch_dir: String::new(),
             // Deliberately large: these tests are about the pipeline, and a ring that evicted
             // mid-recording would make them about eviction instead.
@@ -703,13 +702,14 @@ fn wait_for_finished_session(bin: &FfmpegBinaries, db: &Path) -> localplay_store
 }
 
 #[test]
-fn a_full_session_records_into_its_own_directory_and_ignores_the_scratch_cap() {
-    // The cap is 1 KiB and the session is several seconds of 64x48 video: if this mode
-    // enforced `buffer.scratch_cap_bytes`, the oldest segments would vanish and the session
-    // would be a fragment — or the tick would fail with a "scratch cap violated" error.
+fn a_full_session_records_into_its_own_directory_and_keeps_every_segment() {
+    // This used to be stated as "ignores the scratch cap", with the cap set to 1 KiB so that
+    // enforcing it would visibly gut the session. There is no cap to ignore any more — the
+    // file-backed ring that enforced one is gone — but the property it was standing in for is
+    // still worth pinning, and is now stated directly: a session never evicts. It keeps its
+    // segments as they age, which is the whole difference between it and a rolling buffer.
     let (_tmp, app_data_dir) = application_data_dir("full-session");
-    let mut cfg = stub_config(&app_data_dir);
-    cfg.buffer.scratch_cap_bytes = 1_024;
+    let cfg = stub_config(&app_data_dir);
     let db_path = cfg.db_path();
     let bin = cfg.bin.clone();
 
@@ -721,10 +721,14 @@ fn a_full_session_records_into_its_own_directory_and_ignores_the_scratch_cap() {
     });
     assert_eq!(grown.mode, RecordingMode::FullSession);
     assert!(
-        grown.bytes > 4 * 1_024,
-        "the session is past the 1 KiB scratch cap and still on disk: {grown:?}"
+        grown.segments >= 4,
+        "four seconds of 1s segments must all still be there — a session evicts nothing: {grown:?}"
     );
-    assert_eq!(grown.error, None, "no scratch-cap violation happened");
+    assert!(
+        grown.bytes > 4 * 1_024,
+        "and the footage is on disk: {grown:?}"
+    );
+    assert_eq!(grown.error, None, "nothing failed");
 
     // The segments are in a per-session directory under the sessions area, not in scratch/.
     let (dirs, files) = sessions_on_disk(&app_data_dir);

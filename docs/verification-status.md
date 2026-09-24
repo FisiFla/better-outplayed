@@ -619,8 +619,11 @@ observation; the Phase 1 runbook
 4. **Repeat run 2 at 1080p.** issue #1 asks explicitly whether the criteria pass at 1080p;
    that separates "4K is hard" from "the pipeline is slow", and it is the measurement the
    acceptance thresholds were actually written for.
-5. **Set a low `scratch_cap_bytes` and soak 5 minutes** — re-confirms criterion 2 eviction
-   *on the current build*; a **15 MB** cap is already on record in §1 from the retained ring.
+5. ~~Set a low `scratch_cap_bytes` and soak 5 minutes~~ — **no longer possible, and no longer a
+   criterion.** Criterion 2 measured eviction from a bounded disk ring; a replay buffer holds its
+   footage in RAM now and evicts against `ram_cap_bytes`, which the ring's own tests cover
+   exhaustively. What remains checkable on real hardware is the RAM budget under a long soak:
+   watch that the reported `bytes=` settles rather than climbing (§12).
 6. **Force a `vendor` that is not present** — confirms criterion 7's fail-loud path on the
    current build.
 7. **Set the Windows default playback device to 44.1 kHz or 96 kHz and record a clip** —
@@ -974,10 +977,19 @@ went from 538 to 535 passing — three tests fewer, each removed with the thing 
 
 **One consequence that was nearly missed.** The file ring was the only thing that *enforced*
 `[buffer].scratch_cap_bytes`: it evicted to that cap on every scan, and `session.rs` deliberately
-never does. With the ring gone the key has no reader at all, so it bounds nothing — and the note in
-this section said the opposite when it was first written, that it "bounds a directory that session
-mode writes into". That was wrong, and it was corrected in the key's own doc comment and in
-`config.example.toml` rather than left as a plausible sentence. The key is still accepted so
-existing configs keep parsing, and both places now say outright that it does nothing; what bounds
-disk usage is the `[storage]` policy. Removing the key outright is a user-facing change worth doing
-on its own evidence, not as a side effect of this one.
+never does. With the ring gone the key had no reader at all — it bounded nothing. The note in this
+section said the opposite when it was first written, that it "bounds a directory that session mode
+writes into"; that was wrong, and it was corrected rather than left as a plausible sentence.
+
+The key is now **removed** — from `BufferSection`, from `BufferConfig`, from `config.example.toml`
+and from every fixture that carried it. Removing it is backward compatible: the config structs do
+not `deny_unknown_fields`, so a `config.toml` still carrying the key keeps parsing and the key is
+ignored, exactly as it was when it did nothing. What bounds disk usage in both modes is the
+`[storage]` policy, which evicts whole clips and sessions.
+
+Removing it also dissolved a test rather than deleting one. `a_full_session_records_into_its_own_
+directory_and_ignores_the_scratch_cap` stated its subject through the cap — set to 1 KiB so that
+enforcing it would visibly gut the session. With no cap to ignore, the property it was standing in
+for is stated directly and the test is now
+`..._and_keeps_every_segment`, asserting that four seconds of 1s segments are all still there. That
+is the real difference between a session and a rolling buffer, and it is better said than implied.

@@ -14,8 +14,8 @@
 #               of it. Default, and what every build before Phase 5 did.
 #
 #   "session" — record the whole session. Segments are written into their own
-#               directory under `sessions/` as you play, `buffer.scratch_cap_bytes`
-#               does NOT apply to them (a full session is not a ring: evicting its
+#               directory under `sessions/` as you play, and no cap applies to them
+#               (a full session is not a ring: evicting its
 #               oldest segment would delete footage you asked for), and when the
 #               recording stops they are concatenated losslessly into one
 #               `session-<timestamp>.mp4` — never re-encoded — after which the
@@ -36,15 +36,6 @@ post_seconds = 5
 # therefore the granularity of lossless trimming (cuts snap to <= this value).
 # Lower = more precise cuts, higher = larger files.
 segment_time = 1
-# Total bytes the scratch ring may occupy, in bytes (spec 8.1).
-#
-# This key does nothing at present, and says so rather than being silently dropped.
-# It was the file-backed replay ring's eviction rule, checked on every scan; a replay
-# buffer now holds the last few minutes of unclipped footage in memory, where
-# `ram_cap_bytes` below is the cap that applies, and a full session deliberately never
-# evicts. What bounds disk usage in both cases is the [storage] policy, which evicts
-# whole clips and sessions. Left accepted so that existing configs keep parsing.
-scratch_cap_bytes = 2147483648
 # Empty = %LOCALAPPDATA%\localplay\scratch
 scratch_dir = ""
 # How much memory a replay buffer may use for the footage it has not been asked to keep,

@@ -143,7 +143,6 @@ mod tests {
 pre_seconds = 30
 post_seconds = 5
 segment_time = 1
-scratch_cap_bytes = 2147483648
 scratch_dir = \"\"
 
 [encode]
