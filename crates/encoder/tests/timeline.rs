@@ -172,24 +172,26 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
         segments.len()
     );
     // Audio keeps its own exact timeline: it is derived from the 48kHz sample count rather
-    // than from a clock, so the container's audio duration tracks the number of frames
-    // actually fed. That is the property worth pinning, and unlike the fixed ">= 2800ms"
-    // floor it replaced it does not depend on the host keeping up with the feed — under
-    // `cargo test --workspace` (test binaries in parallel) the loop above can be starved
-    // and legitimately deliver fewer audio blocks, which is what made that floor flaky
-    // while it passed every time in isolation. Both sides here shrink together, so the
-    // assertion holds under load.
+    // than from a clock, so the container's audio duration tracks the frames it was handed.
     //
-    // The tail: measured 207ms of a 3010ms feed is absent (2803ms in the container),
-    // because a segment ends at a video boundary and the audio arriving after the last
-    // video frame of the final segment is not muxed. 400ms bounds that tail; the upper
-    // bound exists so the assertion cannot pass by inventing audio that was never fed.
+    // Only ONE direction of that comparison is checkable, and this assertion used to make
+    // both. The container must not hold more audio than the feed delivered — that is
+    // host-independent, because the muxer cannot invent samples, and it is the direction that
+    // catches the defect (a declared-rate grid resampling the audio would produce extra ones).
+    //
+    // The other direction is not a property of the code at all: the container's audio length
+    // is bounded by its *video* length, because a segment ends at a video boundary and the
+    // audio arriving after the last video frame is never muxed. How much of the fed audio is
+    // therefore absent depends on how far ahead the audio feed ran, which is the machine's
+    // business. Measured: 207ms of a 3010ms feed idle, and 416ms of a 3060ms feed on a CI
+    // runner. Two fixed tails were tried (200ms, then 400ms) and each failed at the next
+    // measurement — a bound that keeps moving with the host is not a bound, it is a reading of
+    // the host. The envelope that IS checkable is audio-against-video, asserted just below.
     let fed_audio_ms = audio_frames * 1_000 / u64::from(AudioFormat::default().sample_rate);
     assert!(
-        audio_ms + 400 >= fed_audio_ms && audio_ms <= fed_audio_ms + 200,
-        "the audio timeline must track the submitted sample count (a segment-boundary tail of \
-         up to 400ms is expected): {audio_frames} frames were fed ({fed_audio_ms}ms) but the \
-         container says {audio_ms}ms"
+        audio_ms <= fed_audio_ms + 200,
+        "the container must not hold more audio than the feed delivered: {audio_ms}ms against \
+         {audio_frames} frames fed ({fed_audio_ms}ms)"
     );
     assert!(
         video_ms.abs_diff(audio_ms) < 700,
