@@ -198,12 +198,17 @@ fn a_source_faster_than_the_pacer_is_discarded_without_being_read_back() {
         "a 4x-faster source must lose more frames than it contributes: {discarded} discarded \
          vs {read_back} materialised"
     );
-    assert!(
-        discarded > 50,
-        "over a second of a {SOURCE_FPS}fps source against a {TARGET_FPS}fps pacer, the \
-         surplus is ~90 frames; only {discarded} were discarded, which means the pump is not \
-         taking the discard path"
-    );
+    // No absolute floor here. There used to be one (`discarded > 50`) and it failed in CI
+    // with only 34 discarded. The counts on either side are governed by different things:
+    // `read_back` is the PACER's rate (~TARGET_FPS/s), which is why the band below is stable,
+    // while `discarded` is the SOURCE's offered rate minus that, so on a loaded runner the
+    // stub source is itself starved and offers far fewer than SOURCE_FPS frames. An absolute
+    // floor therefore measured the machine, not the pump.
+    //
+    // The regression it was meant to catch is still caught: if the pump stopped taking the
+    // discard path, `discarded` would be 0 and `discarded > read_back` above would fail. The
+    // deterministic counter accounting at the top of this test is what pins the behaviour
+    // exactly; these are the corroborating rate checks.
 
     // --- The configured rate, not the source's. Generous bands: the exact counts depend on
     // where the run starts relative to the frame grid and on how the loop is scheduled under
