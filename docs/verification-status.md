@@ -845,9 +845,10 @@ directory and a filesystem ledger deleted the oldest; that write churn is gone i
 | **Constraint 1**: buffering writes nothing, and a saved clip is the only thing that is written | `crates/recorder/src/tests.rs` | **Verified** — `buffering_writes_nothing_to_disk_and_only_a_saved_clip_does` |
 | `buffer.ram_cap_bytes`, defaulting to 256 MiB, and the RAM budget that replaced the scratch cap as the engine's check | `crates/recorder/src/config.rs`, `config.example.toml` | **Verified on the dev host** — the default, the example, and a pre-existing config without the key |
 
-Full workspace suite: **537 passed, 0 failed, 1 ignored**. The desktop shell's separate crate
-graph: **112 passed, 0 failed**. Clippy on the touched crates adds no warning that was not
-already there.
+Full workspace suite on the dev host: **538 passed, 0 failed, 1 ignored**. The desktop shell's
+separate crate graph: **112 passed, 0 failed**. The Windows cross-check (`media`, `replay`,
+`encoder`, `capture`, `events`) is clean, and the Windows *run* is its own section below. Clippy on
+the touched crates adds no warning that was not already there.
 
 ### The thing the first attempt got wrong, because it is the useful part
 
@@ -899,6 +900,48 @@ borrowed rule cost a whole fragment of span, and a clip's window is resolved aga
 The file ledger's rule — *a segment's end is proved by the next segment's start* — is kept as the
 fallback for a sample table this build cannot read, so the failure mode is the previous behaviour
 rather than a guessed length.
+
+### It runs on Windows (2026-09-25)
+
+The tree was shipped to the box as an archive — it has no `git` — and extracted to a **fresh
+directory** (`C:\Users\player\localplay-ram`), so nothing of the owner's was overwritten, then
+built and tested there natively (`cargo 1.98.1`, host `x86_64-pc-windows-msvc`). League was not
+running at the time and nothing captured, displayed or injected anything: `cargo test` is CPU
+only.
+
+**The buffer-mode tests pass on Windows**, which is the claim constraint 3 needs:
+
+| Target | Result |
+|---|---|
+| `localplay-recorder --lib` | **60 passed, 0 failed** — reproduced **4 consecutive times** |
+| `buffering_writes_nothing_to_disk_and_only_a_saved_clip_does` | **ok** — constraint 1, on Windows |
+| `a_recorder_records_produces_a_clip_and_stops_cleanly` (buffer mode, RAM ring) | **ok** |
+| `a_clip_records_why_it_was_taken` | **ok** |
+| every `a_full_session_*` test | **ok** — session mode unchanged |
+
+The whole-workspace run reported three failing targets. Two of them **also fail at `1875a89`**, the
+commit before this feature existed, which was checked rather than assumed by extracting that
+revision to a second directory and running the same three targets:
+
+| Target | at `1875a89` | at the RAM commit |
+|---|---|---|
+| `localplay-cli --test self_test_clip` | **FAILED** | FAILED — pre-existing (this is §10.4's hotkey defect) |
+| `localplay-encoder --test timeline` | **FAILED** | FAILED — pre-existing |
+| `localplay-recorder --lib` | ok. 58 passed | 1 failure in the workspace-wide run, **4/4 clean** in its own suite |
+
+The one recorder failure was `a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_pass`,
+asserting the status had dropped its game after the session ended. It is **not** a regression from
+this change, and the evidence is two measurements rather than a reading of the diff: it passes
+**6/6 in isolation** and the recorder suite passes **4/4** with it included. It is a presence-watcher
+timing assertion that is sensitive to how much else is running — and the workspace-wide run has the
+whole tree's binaries in flight at once. This change adds a reader thread and two tests, so it
+genuinely does alter the load profile, which is enough to tip a test like that without being a
+defect in it. Worth fixing as its own piece of work; not evidence about the RAM buffer.
+
+What is **not** claimed: nothing here exercises NVENC, AMF or QSV — the tests run the software
+encoder, as they do on the dev host. The hardware-encoder selection was verified on this box in
+§10, before this change, and this change does not touch it. A real capture run into a RAM buffer
+on Windows is still unperformed; what ran is the test suite with stub sources.
 
 ### The open decision: what happens to the file ledger
 
