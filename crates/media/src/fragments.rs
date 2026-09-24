@@ -35,6 +35,15 @@ pub struct Fragment {
     /// measures its span with and what a clip's range is selected against; nothing is decoded
     /// to get it.
     pub start_ms: u64,
+    /// How long this fragment's video samples span, in ms — its `trun`/`tfhd` sample durations,
+    /// converted with the video track's timescale.
+    ///
+    /// **`0` means unknown**, not "instantaneous": a sample table this build cannot read leaves
+    /// the fragment usable but its length unclaimed, and a caller that needs a proven end must
+    /// treat 0 as "not measured" (see `MemorySegment::is_closed`). Reading it here rather than
+    /// taking it from the next fragment's `tfdt` is what keeps a ring's `span_ms` from lagging a
+    /// whole fragment behind the footage it is holding.
+    pub duration_ms: u64,
     /// The bytes: this fragment's `moof` and its `mdat`, and nothing else.
     pub bytes: Vec<u8>,
     /// Whether the fragment starts on a keyframe.
@@ -62,8 +71,10 @@ pub struct FragmentSplitter {
     /// own timescale (measured: 15360 for video, 48000 for audio in the same stream), and the
     /// video one is the clock a clip's range is measured on.
     tracks: HashMap<u32, (bool, u32)>,
-    /// A `moof` whose `mdat` has not arrived yet, with the start time read out of it.
-    pending: Option<(u64, Vec<u8>)>,
+    /// A `moof` whose `mdat` has not arrived yet, with the start time and sample span read out
+    /// of it. The duration is read here, with the start, because it is in the same `moof` — and
+    /// reading it when the fragment is assembled would leave the ring guessing instead.
+    pending: Option<(u64, u64, Vec<u8>)>,
     next_seq: u64,
 }
 
@@ -138,11 +149,11 @@ impl FragmentSplitter {
                              received its `mdat`, so its samples cannot be recovered"
                         );
                     }
-                    let start_ms = self.start_ms(&body)?;
-                    self.pending = Some((start_ms, body));
+                    let (start_ms, duration_ms) = self.placement(&body)?;
+                    self.pending = Some((start_ms, duration_ms, body));
                 }
                 "mdat" => {
-                    let Some((start_ms, moof)) = self.pending.take() else {
+                    let Some((start_ms, duration_ms, moof)) = self.pending.take() else {
                         // A bare `mdat` with no `moof` in front of it is not a fragment. This
                         // is not an error — `free`/`skip` boxes and other muxer furniture are
                         // legal at the top level — but it is not footage either, so it is
@@ -154,6 +165,7 @@ impl FragmentSplitter {
                     out.push(Fragment {
                         seq: self.next_seq,
                         start_ms,
+                        duration_ms,
                         bytes,
                         // See `Fragment::keyframe`: `frag_keyframe` guarantees it.
                         keyframe: true,
@@ -167,8 +179,9 @@ impl FragmentSplitter {
         Ok(out)
     }
 
-    /// The `tfdt` of a fragment's **video** track, in ms.
-    fn start_ms(&self, moof: &[u8]) -> Result<u64> {
+    /// The `tfdt` of a fragment's **video** track (its start, in ms) and how long its video
+    /// samples span (its duration, in ms).
+    fn placement(&self, moof: &[u8]) -> Result<(u64, u64)> {
         for traf in children(moof, 8, "traf") {
             let Some(track_id) = track_id(traf) else { continue };
             let Some((is_video, timescale)) = self.tracks.get(&track_id) else {
@@ -180,7 +193,14 @@ impl FragmentSplitter {
             let Some(ticks) = base_media_decode_time(traf) else {
                 continue;
             };
-            return Ok(ticks.saturating_mul(1_000) / u64::from(*timescale));
+            let scale = u64::from(*timescale);
+            let start_ms = ticks.saturating_mul(1_000) / scale;
+            // A fragment whose length cannot be read is still usable, but its end must not be
+            // invented: reporting 0 makes `MemorySegment::is_closed` false, and the ring then
+            // treats it the way the file ledger treats an untrusted segment — held, not
+            // measured. That is the honest answer for a sample table this build cannot read.
+            let duration_ms = sample_span_ticks(traf).map_or(0, |t| t.saturating_mul(1_000) / scale);
+            return Ok((start_ms, duration_ms));
         }
         // A fragment with no video track is not something this pipeline produces (the video is
         // input 0 and always mapped), so it is a malformed stream rather than a case to guess at.
@@ -323,6 +343,74 @@ fn base_media_decode_time(traf: &[u8]) -> Option<u64> {
         let b = tfdt.get(4..8)?;
         Some(u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
     }
+}
+
+/// How many media ticks this `traf`'s samples span.
+///
+/// A fragment's own bytes carry its duration, so this is a *measurement* rather than something
+/// to wait for. That matters: without it a ring has to borrow the file ledger's rule — "the next
+/// segment proves this one's end" — which costs a whole fragment of lag, so `span_ms`
+/// under-reports the footage the ring holds by exactly one fragment. A clip's window is resolved
+/// against `span_ms`, and that lag is the difference between a clip of the length the user asked
+/// for and one a fragment short of it (measured: 2200ms of a 3000ms request before this).
+///
+/// The two places a duration can hide, in the order ffmpeg uses them:
+///
+/// * `trun`'s per-sample durations, when its flags say so (bit `0x000100`) — the general case,
+///   and what a variable-frame-rate stream needs;
+/// * `tfhd`'s `default_sample_duration` (bit `0x000008`), multiplied by the sample count.
+///
+/// `None` when neither is present, which a caller must read as "unknown" rather than as zero.
+fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
+    let tfhd = *children(traf, 0, "tfhd").first()?;
+    // `tfhd`: version(1) flags(3) track_id(4), then whichever of base_data_offset (8 bytes),
+    // sample_description_index, default_sample_duration, default_sample_size and
+    // default_sample_flags are present — in that order, four bytes each except the first.
+    let tf_flags = u32::from_be_bytes([tfhd[1], tfhd[2], tfhd[3], 0]) >> 8;
+    let mut at = 8usize;
+    if tf_flags & 0x00_0001 != 0 {
+        at += 8; // base_data_offset
+    }
+    if tf_flags & 0x00_0002 != 0 {
+        at += 4; // sample_description_index
+    }
+    let default_duration = if tf_flags & 0x00_0008 != 0 {
+        let b = tfhd.get(at..at + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    } else {
+        None
+    };
+
+    let trun = *children(traf, 0, "trun").first()?;
+    let tr_flags = u32::from_be_bytes([trun[1], trun[2], trun[3], 0]) >> 8;
+    let sample_count = u32::from_be_bytes([trun[4], trun[5], trun[6], trun[7]]);
+    let mut at = 8usize;
+    if tr_flags & 0x00_0001 != 0 {
+        at += 4; // data_offset
+    }
+    if tr_flags & 0x00_0004 != 0 {
+        at += 4; // first_sample_flags
+    }
+
+    if tr_flags & 0x00_0100 != 0 {
+        // Per-sample durations, one four-byte field per sample — but not the *only* field:
+        // each entry in `trun` carries whichever of duration, size, flags and composition
+        // offset the flags select, in that order. Reading with a four-byte stride instead of
+        // the real one sums sample sizes into the total, which is how a one-second fragment
+        // once measured 3576ms. The entry's width is what the flags say it is.
+        let entry = 4
+            + if tr_flags & 0x00_0200 != 0 { 4 } else { 0 } // sample_size
+            + if tr_flags & 0x00_0400 != 0 { 4 } else { 0 } // sample_flags
+            + if tr_flags & 0x00_0800 != 0 { 4 } else { 0 }; // sample_composition_time_offset
+        let mut total = 0u64;
+        for i in 0..sample_count as usize {
+            let b = trun.get(at + i * entry..at + i * entry + 4)?;
+            total += u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+        }
+        return Some(total);
+    }
+    // No per-sample durations: every sample is `default_sample_duration` long.
+    default_duration.map(|d| u64::from(d) * u64::from(sample_count))
 }
 
 #[cfg(test)]

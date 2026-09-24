@@ -97,25 +97,26 @@ impl ClipSplicer {
         out: &Path,
         encoder: &str,
     ) -> Result<ClipMetadata> {
-        let Some(first) = window.segments.first() else {
-            bail!("cannot splice an empty in-memory window");
-        };
-        if !first.keyframe {
-            bail!(
-                "the first fragment of this window starts at {}ms and is not a keyframe, so a \
-                 clip cut here would open mid-GOP",
-                first.start_ms
-            );
-        }
-        if window.segments.iter().any(|s| !s.is_closed()) {
-            bail!(
-                "this window contains a fragment whose end nothing has proved yet, so the \
-                 clip's duration would be a claim rather than a measurement"
-            );
-        }
-
+        window.validate()?;
         let audio_tracks = window.audio_tracks();
-        localplay_media::edit::remux_stream_lossless(bin, window.assemble(), out, audio_tracks)?;
+        Self::splice_stream(bin, window.assemble(), out, encoder, audio_tracks)
+    }
+
+    /// The same save path, from **bytes** a caller has already assembled.
+    ///
+    /// This exists because a recorder holds its ring behind a lock and a
+    /// [`crate::ram_buffer::MemoryWindow`] borrows the ring, so the bytes have to be lifted out
+    /// before the lock is dropped — see [`crate::ram_buffer::MemoryWindow::validate`] for why
+    /// holding it across the muxer would stall the recording. Callers on this path run
+    /// `validate` themselves; that is what the split is for.
+    pub fn splice_stream(
+        bin: &FfmpegBinaries,
+        bytes: Vec<u8>,
+        out: &Path,
+        encoder: &str,
+        audio_tracks: usize,
+    ) -> Result<ClipMetadata> {
+        localplay_media::edit::remux_stream_lossless(bin, bytes, out, audio_tracks)?;
 
         let info = localplay_media::MediaInfo::probe(bin, out)?;
         log_drift(out, &info);

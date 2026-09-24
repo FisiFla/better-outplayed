@@ -84,6 +84,44 @@ pub struct MemoryWindow<'a> {
 }
 
 impl MemoryWindow<'_> {
+    /// The checks a splice must pass, so that a caller which assembles the bytes itself runs the
+    /// same ones.
+    ///
+    /// That is not a hypothetical caller: a recorder holds its ring behind a lock, and a window
+    /// borrows the ring, so it cannot outlive the lock. Assembling under the lock and splicing
+    /// outside it is the only safe order — holding the lock across ffmpeg would block the reader
+    /// thread for as long as the muxer takes, which fills the pipe, which stops ffmpeg draining
+    /// stdin, which stalls the recording. Splitting these two steps is what lets both paths
+    /// check the same invariants.
+    ///
+    /// Each check is a *silent-damage* case rather than an error ffmpeg would raise:
+    ///
+    /// * a window with no fragments has nothing to cut;
+    /// * a first fragment that is not a keyframe opens the clip mid-GOP, and its first frames
+    ///   decode as garbage or not at all;
+    /// * an unclosed fragment has no proven end, so the clip's duration would be a claim rather
+    ///   than a measurement.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(first) = self.segments.first() else {
+            anyhow::bail!("cannot splice an empty in-memory window");
+        };
+        if !first.keyframe {
+            anyhow::bail!(
+                "the first fragment of this window starts at {}ms and is not a keyframe, so a \
+                 clip cut here would open mid-GOP",
+                first.start_ms
+            );
+        }
+        if let Some(open) = self.segments.iter().find(|s| !s.is_closed()) {
+            anyhow::bail!(
+                "the fragment starting at {}ms has no proven end, so the clip's duration would \
+                 be a claim rather than a measurement",
+                open.start_ms
+            );
+        }
+        Ok(())
+    }
+
     /// The bytes to hand ffmpeg: the header once, then each fragment in order.
     ///
     /// This is a valid fragmented-MP4 stream, which is the whole trick — `ffmpeg -i this
@@ -156,9 +194,11 @@ impl MemoryRingBuffer {
         let fragments = self.splitter.push(chunk)?;
         let added = fragments.len();
         for fragment in fragments {
-            // This fragment's start is the first moment its predecessor's samples are proven
-            // to have ended. See the module note on why the end is not taken from the fragment
-            // being pushed.
+            // A predecessor whose own sample table could not be read is closed by this
+            // fragment's start. That rule — the file ledger's — is now only a fallback: a
+            // fragment normally arrives knowing its own length (`Fragment::duration_ms`), and
+            // waiting for the next one to prove it would make `span_ms` lag a whole fragment
+            // behind the footage the ring is actually holding.
             if let Some(previous) = self.segments.back_mut() {
                 if !previous.is_closed() {
                     previous.end_ms = fragment.start_ms;
@@ -168,9 +208,10 @@ impl MemoryRingBuffer {
             self.segments.push_back(MemorySegment {
                 seq: self.next_seq,
                 start_ms: fragment.start_ms,
-                // Not yet known: the next fragment proves it. Equal to `start_ms`, so
-                // `is_closed` is false and no range can end here.
-                end_ms: fragment.start_ms,
+                // The fragment's own sample durations. Zero when they could not be read, which
+                // leaves `is_closed` false and makes this segment as untrusted as the file
+                // ledger's newest — the honest answer when the length is not known.
+                end_ms: fragment.start_ms.saturating_add(fragment.duration_ms),
                 keyframe: fragment.keyframe,
                 bytes: fragment.bytes,
             });
@@ -224,12 +265,16 @@ impl MemoryRingBuffer {
 
     /// Media time the ring can prove it holds, run-relative.
     ///
-    /// The newest fragment's `start_ms`: everything before it is complete and contiguous, and
-    /// the newest one's own length is what the fragment after it would prove. This is the number
-    /// a trigger's range is resolved against, and it is the in-memory counterpart of
-    /// `RingBuffer::stats().span_ms`.
+    /// The newest fragment's **end** — its start plus its own measured duration. Nothing is
+    /// guessed: a fragment carries its sample durations, so the ring knows how much footage it
+    /// holds the moment the bytes arrive. (When a sample table cannot be read the end falls back
+    /// to the fragment's start until the next fragment supplies it, which is why
+    /// [`MemorySegment::is_closed`] exists.)
+    ///
+    /// This is the number a trigger's range is resolved against, and the in-memory counterpart
+    /// of `RingBuffer::stats().span_ms`.
     pub fn span_ms(&self) -> u64 {
-        self.segments.back().map(|s| s.start_ms).unwrap_or(0)
+        self.segments.back().map(|s| s.end_ms).unwrap_or(0)
     }
 
     /// Bytes held in RAM.
@@ -348,14 +393,22 @@ mod tests {
                 "and that end is the successor's start — the segments are contiguous"
             );
         }
+        // The newest fragment is closed too: a fragment's own sample durations carry its length,
+        // so the ring knows how much footage it holds as soon as the bytes arrive — it does not
+        // have to wait for a successor to prove it. `is_closed` therefore stops meaning "has a
+        // successor" and meaning what it says, with the fallback only for a sample table this
+        // build cannot read.
         assert!(
-            !segments.last().unwrap().is_closed(),
-            "the newest fragment's length is not claimed until the next fragment proves it"
+            segments.last().unwrap().is_closed(),
+            "the newest fragment claims its own measured length, so it is closed on arrival"
         );
         assert!(segments.iter().all(|s| s.keyframe), "every fragment starts a GOP");
 
-        // `span_ms` is the newest fragment's start, which is what the ring can PROVE.
-        assert_eq!(ring.span_ms(), segments.last().unwrap().start_ms);
+        // `span_ms` is the newest fragment's END — the media time the ring holds, not the media
+        // time of its last boundary. Reading a fragment's length here instead of borrowing the
+        // next fragment's start is worth one whole fragment of span, and a clip's window is
+        // resolved against the span.
+        assert_eq!(ring.span_ms(), segments.last().unwrap().end_ms);
         assert!(
             ring.span_ms() > 2_000,
             "four fragments of media must give a span of seconds, got {}ms",

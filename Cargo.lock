@@ -392,6 +392,7 @@ dependencies = [
  "localplay-encoder",
  "localplay-media",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
