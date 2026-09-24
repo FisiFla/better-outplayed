@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 /// The schema this build writes. Each version adds columns in place, without reading,
 /// copying or losing a row (see [`Store::migrate`]): **v2** the session columns Phase 5
-/// needs, **v3** the media-clock anchor a session's event timeline is measured from.
-const SCHEMA_VERSION: i32 = 3;
+/// needs, **v3** the media-clock anchor a session's event timeline is measured from, **v4**
+/// the media *length* that timeline is plotted against.
+const SCHEMA_VERSION: i32 = 4;
 
 /// The mode of a session the ring buffer opened: the row exists to group the clips and
 /// events of one buffer run, and there is no concatenated session file (spec §5.5).
@@ -114,6 +115,23 @@ const V2_SESSION_COLUMNS: [(&str, &str); 4] = [
 const V3_SESSION_COLUMNS: [(&str, &str); 1] = [(
     "media_epoch_ms",
     "ALTER TABLE sessions ADD COLUMN media_epoch_ms INTEGER NOT NULL DEFAULT 0",
+)];
+
+/// The columns schema v4 adds to `sessions`, and the DDL that adds each.
+///
+/// The media length of a session. `started_at`/`ended_at` are wall clock and `size_bytes` is
+/// a byte count; none of them is the axis a timeline is drawn on, so a review UI had nothing
+/// to scale its scrubber against and could only guess from the last marker's offset. This is
+/// the length of the recorded media itself — the concatenated file's probed duration, which
+/// `end_session` records.
+///
+/// A legacy row defaults to 0, and 0 is honest here rather than convenient: those rows were
+/// never concatenated by this build, so no probed duration exists for them. A 0 length means
+/// "unknown", which is what makes a UI disable the scrubber rather than draw an axis of one
+/// pixel per second and pretend.
+const V4_SESSION_COLUMNS: [(&str, &str); 1] = [(
+    "duration_ms",
+    "ALTER TABLE sessions ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
 )];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +240,16 @@ pub struct Session {
     /// [`Store::end_session`] (and, while it is still running, by
     /// [`Store::set_session_size`]); the retention cap's arithmetic uses this number.
     pub size_bytes: i64,
+    /// How long the recorded media is, in ms — the concatenated file's probed duration, and
+    /// the axis a review timeline is drawn against. Written by [`Store::end_session`]; `0`
+    /// means unknown, which is the case for a session recovered from a crash (there is no file
+    /// to probe) and for every row written before schema v4.
+    ///
+    /// Deliberately **not** derivable from the other columns: `started_at`/`ended_at` are wall
+    /// clock and measure how long the *window* was open, not how much footage it holds — a
+    /// session whose encoder could not keep up is shorter than the wall clock says, and a
+    /// session recovered from a crash has no footage at all to measure.
+    pub duration_ms: i64,
     /// Exempt from both retention rules, exactly as a favourited clip is
     /// (spec §8.1). [`Store::set_session_favourite`] is the user's only way in.
     pub favourite: bool,
@@ -309,6 +337,9 @@ impl Store {
         if current < 3 {
             self.upgrade_to_v3()?;
         }
+        if current < 4 {
+            self.upgrade_to_v4()?;
+        }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     }
@@ -322,6 +353,12 @@ impl Store {
     /// from (see [`V3_SESSION_COLUMNS`]).
     fn upgrade_to_v3(&self) -> Result<()> {
         self.add_session_columns(&V3_SESSION_COLUMNS)
+    }
+
+    /// v3 → v4: `sessions` gains the media length that timeline is plotted against (see
+    /// [`V4_SESSION_COLUMNS`]).
+    fn upgrade_to_v4(&self) -> Result<()> {
+        self.add_session_columns(&V4_SESSION_COLUMNS)
     }
 
     /// Add whichever of `columns` the `sessions` table does not already have.
@@ -529,8 +566,14 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Finish a session: stamp `ended_at`, record the final file and the bytes the session
-    /// holds.
+    /// Finish a session: stamp `ended_at`, record the final file, the bytes the session
+    /// holds, and how long the recorded media is.
+    ///
+    /// `duration_ms` is the **media** length — the concatenated file's probed duration, which
+    /// is the axis a review timeline is drawn on. `0` means unknown, which is the honest value
+    /// for a session recovered from a crash: the caller ends it with a `final_path` of `None`
+    /// because there is no file to probe. A UI must therefore treat 0 as "no axis" rather than
+    /// as a zero-length recording.
     ///
     /// # The two states this refuses, and why refusing is the boring answer
     ///
@@ -561,6 +604,7 @@ impl Store {
         ended_at_ms: i64,
         final_path: Option<&str>,
         size_bytes: i64,
+        duration_ms: i64,
     ) -> Result<()> {
         let ended: Option<Option<i64>> = self
             .conn
@@ -576,9 +620,9 @@ impl Store {
         }
 
         let updated = self.conn.execute(
-            "UPDATE sessions SET ended_at = ?2, final_path = ?3, size_bytes = ?4
+            "UPDATE sessions SET ended_at = ?2, final_path = ?3, size_bytes = ?4, duration_ms = ?5
              WHERE id = ?1 AND ended_at IS NULL",
-            params![id, ended_at_ms, final_path, size_bytes],
+            params![id, ended_at_ms, final_path, size_bytes, duration_ms],
         )?;
         if updated != 1 {
             anyhow::bail!(
@@ -774,7 +818,7 @@ impl Store {
 /// The `sessions` columns [`read_session`] expects, in order — one definition, so a
 /// query and its reader cannot drift.
 const SESSION_COLUMNS: &str = "id, game, mode, started_at, ended_at, scratch_dir, final_path, \
-     size_bytes, favourite, media_epoch_ms";
+     size_bytes, favourite, media_epoch_ms, duration_ms";
 
 fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -788,6 +832,7 @@ fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         size_bytes: row.get(7)?,
         favourite: row.get::<_, i64>(8)? != 0,
         media_epoch_ms: row.get(9)?,
+        duration_ms: row.get(10)?,
     })
 }
 
@@ -1099,13 +1144,30 @@ mod tests {
         assert_eq!(running.scratch_dir, "/scratch/1");
         assert_eq!(running.final_path, None, "there is no session file yet");
         assert_eq!(running.size_bytes, 0);
+        assert_eq!(
+            running.duration_ms, 0,
+            "and no media length either: a session that has not been concatenated has no \
+             probed duration, and 0 means unknown rather than zero-length"
+        );
         assert!(!running.favourite, "a new session is not a favourite");
 
-        s.end_session(id, 1_120_000, Some("/sessions/1.mp4"), 4_096).expect("the session ends");
+        s.end_session(id, 1_120_000, Some("/sessions/1.mp4"), 4_096, 118_400)
+            .expect("the session ends");
         let ended = s.get_session(id).expect("the session").expect("it is still there");
         assert_eq!(ended.ended_at_ms, Some(1_120_000));
         assert_eq!(ended.final_path.as_deref(), Some("/sessions/1.mp4"));
         assert_eq!(ended.size_bytes, 4_096);
+        assert_eq!(
+            ended.duration_ms, 118_400,
+            "the media length the row carries, which is what a review timeline is drawn on"
+        );
+        // Deliberately different from the wall-clock window (120s) in this fixture: the two are
+        // independent facts, and a test that made them equal could not tell them apart.
+        assert_ne!(
+            ended.duration_ms,
+            ended.ended_at_ms.unwrap() - ended.started_at_ms,
+            "media length is not the wall clock the window was open for"
+        );
     }
 
     #[test]
@@ -1134,10 +1196,10 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let id = running_session(&s);
-        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096).expect("the session ends");
+        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0).expect("the session ends");
 
         let err = s
-            .end_session(id, 1_200_000, Some("/sessions/other.mp4"), 9_999)
+            .end_session(id, 1_200_000, Some("/sessions/other.mp4"), 9_999, 0)
             .expect_err("a second finalisation is refused, not silently ignored");
         assert!(format!("{err:#}").contains("already ended"), "{err:#}");
 
@@ -1152,7 +1214,7 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let err = s
-            .end_session(42, 1, None, 0)
+            .end_session(42, 1, None, 0, 0)
             .expect_err("there is no session 42 — a silent Ok would read as success");
         assert!(format!("{err:#}").contains("no such session"), "{err:#}");
         assert!(s.list_sessions().expect("the sessions").is_empty());
@@ -1305,7 +1367,7 @@ mod tests {
         assert_eq!(s.total_session_bytes().expect("the session store's bytes"), 3_000);
 
         // Once it has ended, `end_session` owns the number.
-        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096).expect("the session ends");
+        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0).expect("the session ends");
         assert_eq!(s.total_session_bytes().expect("the session store's bytes"), 4_096);
         assert!(s.set_session_size(id, 1).is_err(), "a finished session's size is final");
         assert!(s.set_session_size(id + 1, 1).is_err(), "and there is no session to size");
@@ -1316,7 +1378,7 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let session = running_session(&s);
-        s.end_session(session, 1_120_000, Some("/sessions/1.mp4"), 9_000).expect("the session ends");
+        s.end_session(session, 1_120_000, Some("/sessions/1.mp4"), 9_000, 0).expect("the session ends");
 
         // A clip extracted from the session. `insert_clip` takes no session_id — its
         // signature is frozen for this pass — so the link is written the way the session
@@ -1390,7 +1452,7 @@ mod tests {
         // The escape hatch is explicit: end it — with the clock the caller believes and the
         // bytes it measured — and it becomes an ordinary deletable session. A session left
         // running by a crash is the same case, and this is how a recovery pass resolves it.
-        s.end_session(id, 1_200_000, None, 0).expect("the session ends");
+        s.end_session(id, 1_200_000, None, 0, 0).expect("the session ends");
         let paths = s.delete_session_returning_paths(id).expect("the session is deleted");
         assert_eq!(
             paths,
@@ -1463,6 +1525,11 @@ mod tests {
             sessions[0].media_epoch_ms, 0,
             "a legacy row's media epoch is 0 — the only value its own contents support, and \
              the correct one for the ordinary case of a fresh scratch directory"
+        );
+        assert_eq!(
+            sessions[0].duration_ms, 0,
+            "and so is its media length: a row this build never concatenated has no probed \
+             duration, and 0 means unknown rather than zero-length"
         );
         assert_eq!(sessions[0].started_at_ms, 1_000);
         assert_eq!(sessions[0].ended_at_ms, Some(61_000));

@@ -744,6 +744,11 @@ mod tests {
             scratch_dir: format!("/scratch/{id}"),
             final_path: Some(format!("/sessions/{id}.mp4")),
             size_bytes: size_bytes as i64,
+            // A minute of media, matching the minute between `started_at` and `ended_at`
+            // above: these fixtures describe sessions whose encoder kept up, so the media
+            // length and the wall-clock window agree. (That is not generally true — see
+            // `Session::duration_ms` — but it is the case a retention planner sees.)
+            duration_ms: 60_000,
             favourite,
         }
     }
@@ -1000,7 +1005,7 @@ mod tests {
         let session_id = store
             .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/keep", 0)
             .expect("open a session");
-        store.end_session(session_id, 1, None, 0).expect("end it");
+        store.end_session(session_id, 1, None, 0, 0).expect("end it");
 
         let plan = RetentionPlan {
             clips: ClassPlan {
@@ -1065,7 +1070,7 @@ mod tests {
         let id = store
             .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/absent", 0)
             .expect("open a session");
-        store.end_session(id, 1, None, 0).expect("end it");
+        store.end_session(id, 1, None, 0, 0).expect("end it");
         let plan = RetentionPlan {
             clips: ClassPlan::default(),
             sessions: ClassPlan {

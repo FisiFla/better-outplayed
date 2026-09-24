@@ -1249,7 +1249,7 @@ impl Prepared {
             }
             let _ = capture.stop();
             let _ = audio.stop();
-            let _ = store.end_session(session, now_ms(), None, 0);
+            let _ = store.end_session(session, now_ms(), None, 0, 0);
             if mode.is_full_session() {
                 session::remove_session_dir(&segment_dir);
             }
@@ -2083,7 +2083,7 @@ impl Engine {
             RecordingMode::ReplayBuffer => {
                 let stats = self.ledger.stats();
                 self.store
-                    .end_session(self.session, now_ms(), None, stats.bytes_on_disk as i64)
+                    .end_session(self.session, now_ms(), None, stats.bytes_on_disk as i64, 0)
                     .with_context(|| format!("closing session #{}", self.session))?;
                 tracing::info!(
                     "buffer session #{} closed: {} segment(s), {} bytes in the scratch ring, \
@@ -2117,7 +2117,7 @@ impl Engine {
                     // the row was opened, a game that started and stopped inside ffmpeg's
                     // start-up. Closed honestly, with no file to name.
                     self.store
-                        .end_session(self.session, now_ms(), None, 0)
+                        .end_session(self.session, now_ms(), None, 0, 0)
                         .with_context(|| format!("closing empty session #{}", self.session))?;
                     session::remove_session_dir(&directory);
                     tracing::info!(
@@ -2149,6 +2149,10 @@ impl Engine {
                         now_ms(),
                         Some(&meta.path.display().to_string()),
                         meta.size_bytes as i64,
+                        // The probed length of the file just written: the axis a review
+                        // timeline is drawn on, and the one number in the row that is the
+                        // recorded media rather than the window it was recorded in.
+                        meta.duration_ms as i64,
                     )
                     .with_context(|| format!("closing session #{}", self.session))?;
                 let removed = session::remove_session_dir(&directory);

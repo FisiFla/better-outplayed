@@ -123,7 +123,7 @@ impl Fixture {
             self.write_session(started_at_ms, segments, final_bytes);
         let final_path_arg = final_path.as_ref().map(|p| p.to_string_lossy().into_owned());
         self.store
-            .end_session(id, started_at_ms + 60_000, final_path_arg.as_deref(), bytes_on_disk as i64)
+            .end_session(id, started_at_ms + 60_000, final_path_arg.as_deref(), bytes_on_disk as i64, 0)
             .expect("end the session");
         SessionFiles { id, scratch_dir, final_path, bytes_on_disk }
     }
@@ -572,7 +572,7 @@ fn a_session_left_running_by_a_crash_is_evicted_once_it_is_ended_explicitly() {
 
     // The recovery pass, in one call: the session is over, with no final file to name.
     fx.store
-        .end_session(crashed.id, now_ms(), None, crashed.bytes_on_disk as i64)
+        .end_session(crashed.id, now_ms(), None, crashed.bytes_on_disk as i64, 0)
         .expect("end the session a crash left running");
 
     let plan = fx.plan(&policy(generous(), rules(u64::MAX, 7)));

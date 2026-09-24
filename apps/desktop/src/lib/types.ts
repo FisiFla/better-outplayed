@@ -88,6 +88,17 @@ export interface SessionDto {
   favourite: boolean;
   /** Where the segments are, so the footage can be found without the database. */
   scratch_dir: string;
+  /**
+   * How long the recorded media is, in ms — the axis a review timeline is drawn against.
+   *
+   * `0` means **unknown**, not "zero length": a session recovered from a crash has no
+   * concatenated file to probe, and rows written before schema v4 predate the column. Disable
+   * the scrubber on 0 rather than drawing an axis of no length.
+   *
+   * Not derivable from `started_at_ms`/`ended_at_ms`, which are the wall-clock window: a
+   * session whose encoder could not keep up is shorter than the clock says.
+   */
+  duration_ms: number;
 }
 
 /** One marker on a session's timeline, as the scrubber plots it. */

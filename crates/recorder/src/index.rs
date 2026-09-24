@@ -416,7 +416,7 @@ mod tests {
         let session = reopened
             .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch", 0)
             .expect("the index carries the session columns");
-        reopened.end_session(session, 2_000, None, 0).expect("and can close a session");
+        reopened.end_session(session, 2_000, None, 0, 0).expect("and can close a session");
         assert_eq!(reopened.list_sessions().unwrap().len(), 1);
     }
 
@@ -611,7 +611,7 @@ mod tests {
             let id = store
                 .start_session(Some("Dota 2"), localplay_store::SESSION_MODE_SESSION, i * 1_000, &scratch.display().to_string(), 0)
                 .unwrap();
-            store.end_session(id, i * 1_000 + 5, Some(&final_path.display().to_string()), 1_000).unwrap();
+            store.end_session(id, i * 1_000 + 5, Some(&final_path.display().to_string()), 1_000, 0).unwrap();
             if i == 2 {
                 store.set_session_favourite(id, true).unwrap();
             }
@@ -692,7 +692,7 @@ mod tests {
 
         // The recording ends (with the bytes its directory holds) and the clip is
         // un-favourited: now the same policy has something it may delete.
-        store.end_session(running, 9_000, None, 2_000).unwrap();
+        store.end_session(running, 9_000, None, 2_000, 0).unwrap();
         store.set_favourite(clip_id, false).unwrap();
         let outcome = cleanup_pass(&store, &storage, &mut report);
         assert_eq!(outcome.deleted(), 2, "once nothing is immune, both classes shrink: {outcome:?}");

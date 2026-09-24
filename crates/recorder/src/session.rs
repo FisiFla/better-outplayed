@@ -535,7 +535,7 @@ pub fn recover_sessions(
             // A buffer-mode session (or a mode a newer build wrote): its footage belongs to
             // the ring, which manages the scratch directory by itself. All this pass owes it
             // is an end stamp, so the retention rules can see it as history.
-            match store.end_session(row.id, now_ms(), None, row.size_bytes) {
+            match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
                 Ok(()) => {
                     tracing::info!(
                         "closed the {} session #{} a previous run left running ({} bytes)",
@@ -606,7 +606,7 @@ fn recover_session_row(
 
     if segments.is_empty() {
         if running {
-            match store.end_session(row.id, now_ms(), None, row.size_bytes) {
+            match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
                 Ok(()) => {
                     tracing::info!(
                         "session #{} was left running by a previous run and recorded nothing; \
@@ -652,7 +652,15 @@ fn recover_session_row(
     match finalise(bin, &out, &segments, encoder, true) {
         Ok(meta) => {
             let path = meta.path.display().to_string();
-            match store.end_session(row.id, now_ms(), Some(&path), meta.size_bytes as i64) {
+            match store.end_session(
+                row.id,
+                now_ms(),
+                Some(&path),
+                meta.size_bytes as i64,
+                // The probed length of the file just concatenated: a recovered session has a
+                // real media length, and the timeline needs it as much as a normal one does.
+                meta.duration_ms as i64,
+            ) {
                 Ok(()) => {
                     tracing::info!(
                         "recovered session #{} left by a previous run: {} segment(s) ({bytes} \
@@ -1065,7 +1073,7 @@ mod tests {
         let file = session_file_path(&sessions_dir, 1_700_000_000_000);
         std::fs::write(&file, b"a finished session").unwrap();
         store
-            .end_session(id, 1_700_000_001_000, Some(&file.display().to_string()), 20)
+            .end_session(id, 1_700_000_001_000, Some(&file.display().to_string()), 20, 0)
             .expect("ending it");
 
         let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");

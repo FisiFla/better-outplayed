@@ -273,6 +273,16 @@ pub struct SessionDto {
     pub favourite: bool,
     /// Where the segments are, so an operator can find the footage without the database.
     pub scratch_dir: String,
+    /// How long the recorded media is, in ms — the axis the review timeline is drawn against.
+    ///
+    /// `0` means **unknown**, not "zero length": a session recovered from a crash has no
+    /// concatenated file to probe, and every row written before schema v4 predates the column.
+    /// A front-end must disable its scrubber on 0 rather than draw an axis of no length and
+    /// pretend the recording was empty.
+    ///
+    /// Deliberately not derivable from `started_at_ms`/`ended_at_ms`, which are the wall-clock
+    /// window: a session whose encoder could not keep up is shorter than the clock says.
+    pub duration_ms: i64,
 }
 
 impl From<&Session> for SessionDto {
@@ -287,6 +297,7 @@ impl From<&Session> for SessionDto {
             size_bytes: s.size_bytes,
             favourite: s.favourite,
             scratch_dir: s.scratch_dir.clone(),
+            duration_ms: s.duration_ms,
         }
     }
 }
@@ -1651,6 +1662,8 @@ mod tests {
                     WALL_START_MS + i64::from(seconds) * 1_000,
                     Some(&final_path.to_string_lossy()),
                     std::fs::metadata(&final_path).unwrap().len() as i64,
+                    // The fixture encodes `seconds` of video, so that IS its media length.
+                    i64::from(seconds) * 1_000,
                 )
                 .unwrap();
             (id, final_path)
@@ -2592,6 +2605,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "duration_ms",
                 "ended_at_ms",
                 "favourite",
                 "final_path",
@@ -2716,7 +2730,7 @@ mod tests {
         let f = Fixture::new();
         let (id, dir) = f.add_running_session(localplay_store::SESSION_MODE_BUFFER);
         f.store
-            .end_session(id, WALL_START_MS + 1_000, None, 0)
+            .end_session(id, WALL_START_MS + 1_000, None, 0, 0)
             .unwrap();
 
         let err = extract_clip(&f.deps(), id, 0, 500).expect_err("no concatenated file");

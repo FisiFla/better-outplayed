@@ -738,6 +738,15 @@ fn a_full_session_records_into_its_own_directory_and_ignores_the_scratch_cap() {
         "the session file covers the whole session: {}ms",
         info.duration_ms
     );
+    // The row's `duration_ms` is the file's own probed length — the axis a review timeline is
+    // drawn against, written by the finalise rather than re-derived by a reader. Two
+    // measurements of the same file, so the equality holds however loaded the machine was, and
+    // it is what would catch the finalise recording the wall-clock window instead.
+    assert_eq!(
+        row.duration_ms, info.duration_ms as i64,
+        "the session row must carry the recorded media's length, not the window it was \
+         recorded in"
+    );
     let (dirs, files) = sessions_on_disk(&app_data_dir);
     assert!(dirs.is_empty(), "the temporary segments are removed: {dirs:?}");
     assert_eq!(files, vec![final_path], "and the session file is the only thing left");
@@ -1007,7 +1016,7 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
             .start_session(Some("Dota 2"), SESSION_MODE_SESSION, now_ms() - two_days_ms, &old_dir.display().to_string(), 0)
             .expect("opening the old session");
         store
-            .end_session(id, now_ms() - two_days_ms + 1_000, Some(&old_file.display().to_string()), 512)
+            .end_session(id, now_ms() - two_days_ms + 1_000, Some(&old_file.display().to_string()), 512, 0)
             .expect("ending the old session");
     }
 
