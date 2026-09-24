@@ -758,6 +758,18 @@ impl Encoder for FfmpegEncoder {
     fn submit_video(&mut self, frame: Frame) -> Result<()> {
         // The frame's geometry is checked by the caller (`pump_once_counted`), which is
         // the only place that holds both the frame and the pipe's declared size.
+        //
+        // What the caller cannot check is whether the frame has **pixels** at all. A frame whose
+        // pixels stayed in VRAM has an empty `data` by design (`localplay_capture::Frame`), and
+        // this encoder writes `data` to the child's stdin — so accepting one would feed ffmpeg a
+        // zero-length rawvideo frame, which it would read as the *next* frame's leading bytes.
+        // The result is a stream desync that surfaces as corruption seconds later with nothing
+        // pointing back here, which is exactly the class of failure worth an explicit refusal.
+        if !frame.has_pixels() {
+            bail!(
+                "this frame's pixels are not in CPU memory, and this encoder feeds ffmpeg a raw                  byte stream: a zero-length frame would be read as the next frame's bytes. A                  frame must carry pixels to reach this encoder."
+            );
+        }
         let queued = match self.video_tx.as_ref() {
             Some(tx) => enqueue_or_drop(tx, frame.data, &self.dropped_video, "video"),
             None => bail!("encoder already finished"),
@@ -1332,6 +1344,60 @@ mod tests {
     /// needed, and the path under test — a pump thread noticing the broken pipe, then the
     /// submitter asking the child what happened — is the one the real encoder uses.
     #[cfg(unix)]
+    /// A frame with no pixels is refused rather than written as a zero-length frame.
+    ///
+    /// This guard is what makes the zero-copy plumbing safe to land *ahead* of the encoder that
+    /// consumes textures. A frame whose pixels stayed in VRAM has an empty `data` by design, and
+    /// this encoder writes `data` to ffmpeg's stdin — so accepting one would hand the child a
+    /// zero-length rawvideo frame, which it reads as the next frame's leading bytes. The damage
+    /// would then appear seconds later as a stream desync pointing at nothing in this function.
+    #[test]
+    fn a_frame_without_pixels_is_refused_rather_than_written_as_nothing() {
+        use localplay_capture::{Frame, PixelFormat};
+        use crate::VideoCodec;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = EncodeConfig::for_tests_software(
+            VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
+
+        let pixel_less = Frame {
+            data: Vec::new(),
+            pts: Duration::ZERO,
+            width: 64,
+            height: 64,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        };
+        let err = encoder
+            .submit_video(pixel_less)
+            .expect_err("a frame with no pixels must be refused");
+        assert!(
+            err.to_string().contains("not in CPU memory"),
+            "the refusal must name the reason rather than surfacing later as corruption: {err}"
+        );
+
+        // And a frame with pixels still goes through, so the guard refuses a shape rather than
+        // quietly refusing work.
+        let honest = Frame {
+            data: vec![0u8; 64 * 64 * 4],
+            pts: Duration::ZERO,
+            width: 64,
+            height: 64,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        };
+        encoder.submit_video(honest).expect("a frame with pixels is accepted");
+        encoder.finish().expect("flush the encoder");
+    }
+
     #[test]
     fn a_dead_writer_reports_ffmpegs_exit_status_and_stderr() {
         use crate::VideoCodec;
@@ -1364,6 +1430,7 @@ mod tests {
             width: 64,
             height: 64,
             format: PixelFormat::Bgra8,
+            texture: None,
         };
         let mut failure = None;
         for _ in 0..50 {

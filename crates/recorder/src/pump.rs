@@ -584,7 +584,7 @@ impl RateMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
+    use localplay_capture::stub::StubAudio;
     use localplay_capture::{AudioFormat, PixelFormat};
     use localplay_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
 
@@ -614,6 +614,7 @@ mod tests {
                 width,
                 height,
                 format: PixelFormat::Bgra8,
+                texture: None,
             }))
         }
         fn native_size(&self) -> (u32, u32) {

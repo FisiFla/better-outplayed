@@ -84,7 +84,7 @@ impl StubCapture {
             self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64,
         );
         self.frame_index += 1;
-        Frame { data, pts, width: w, height: h, format: PixelFormat::Bgra8 }
+        Frame { data, pts, width: w, height: h, format: PixelFormat::Bgra8, texture: None }
     }
 }
 

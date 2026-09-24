@@ -38,7 +38,85 @@ pub enum PixelFormat {
     Bgra8,
 }
 
-/// A single captured frame with CPU-visible pixels.
+/// A captured frame's pixels, still in GPU memory, on a platform that can hand them over.
+///
+/// Wrapped rather than used bare because the `windows` crate's COM interfaces implement neither
+/// `Clone`, `PartialEq` nor `Debug`, and [`Frame`] has all three. A bare `ID3D11Texture2D` field
+/// would therefore strip three derives off every frame on every platform, which is a large blast
+/// radius for one platform's optimisation. The three impls below are the interface's own
+/// semantics, spelled out once, here:
+///
+/// * **`Clone` is an `AddRef`**, not a copy of pixels. It is what keeps a texture alive after
+///   WGC's frame — and the pool slot behind it — has been released, which is the lifetime
+///   question this whole path turns on.
+/// * **`PartialEq` is identity**: equal when they are the same COM object. A frame has never
+///   meant "same contents" and comparing 33.2MB to answer that would be absurd.
+/// * **`Debug` prints the pointer**, because the interface has no `Debug` of its own and a
+///   frame's log line should not need one.
+///
+/// Off Windows this type is **uninhabited**, so `Frame::texture` can only ever be `None` there —
+/// which is the honest statement rather than a placeholder: every other capture backend copies
+/// its pixels into `Frame::data`, so there is nothing to hand over.
+#[cfg(windows)]
+pub struct GpuTexture(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D);
+
+#[cfg(windows)]
+impl GpuTexture {
+    /// Wrap a texture the capture backend is handing over.
+    pub fn new(texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D) -> Self {
+        Self(texture)
+    }
+
+    /// The texture itself, for the encoder that will bind it to a media buffer.
+    pub fn as_raw(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        &self.0
+    }
+}
+
+#[cfg(windows)]
+impl Clone for GpuTexture {
+    /// `AddRef`, by way of a `QueryInterface` for the same interface — the `windows` crate's
+    /// interfaces are not `Clone`, and re-querying is its own safe idiom for taking a reference.
+    fn clone(&self) -> Self {
+        use windows::core::Interface;
+
+        Self(self.0.cast().expect("a texture's own interface cannot refuse to be AddRef'd"))
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for GpuTexture {
+    fn eq(&self, other: &Self) -> bool {
+        use windows::core::Interface;
+
+        self.0.as_raw() == other.0.as_raw()
+    }
+}
+
+#[cfg(windows)]
+impl Eq for GpuTexture {}
+
+#[cfg(windows)]
+impl std::fmt::Debug for GpuTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use windows::core::Interface;
+
+        f.debug_tuple("GpuTexture").field(&self.0.as_raw()).finish()
+    }
+}
+
+/// See the Windows variant above: off Windows there is no such thing as a frame whose pixels
+/// never reached the CPU, so this type has no values at all.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuTexture {}
+
+/// A single captured frame.
+///
+/// The pixels are in [`Frame::data`] **unless** the backend delivered them as a GPU texture and
+/// the encoder asked for that: in that case `data` is empty *by design*, because the pixels never
+/// left VRAM. A consumer that needs bytes must therefore ask ([`Frame::has_pixels`]) rather than
+/// finding an empty buffer and treating it as a black frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub data: Vec<u8>,
@@ -47,6 +125,19 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// The frame's pixels in VRAM, when the backend produced them there and the encoder asked
+    /// for them that way. `None` is the ordinary case and the only case off Windows.
+    pub texture: Option<GpuTexture>,
+}
+
+impl Frame {
+    /// Whether this frame's pixels are in [`Frame::data`].
+    ///
+    /// `false` means the pixels are in [`Frame::texture`], not that there are none: the two are
+    /// alternatives, and a frame with neither is a bug rather than a black picture.
+    pub fn has_pixels(&self) -> bool {
+        !self.data.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

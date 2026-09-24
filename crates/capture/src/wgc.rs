@@ -502,7 +502,7 @@ impl Session {
             self.context.Unmap(dst, 0);
         }
 
-        Ok(Frame { data, pts, width, height, format: PixelFormat::Bgra8 })
+        Ok(Frame { data, pts, width, height, format: PixelFormat::Bgra8, texture: None })
     }
 
     /// The CPU-readable staging texture, created once per (size, format).

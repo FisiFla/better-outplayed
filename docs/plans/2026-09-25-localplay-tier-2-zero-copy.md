@@ -50,11 +50,23 @@ because ffmpeg still writes the containers they consume.
 
 ## Sub-steps, each independently verifiable
 
-1. **`Frame` can carry a texture.** `#[cfg(windows)] pub texture: Option<ID3D11Texture2D>` on
-   `crates/capture/src/lib.rs::Frame`. There are five construction sites (`wgc.rs`, `stub.rs`,
-   `encoder/tests/timeline.rs`, `encoder/src/ffmpeg.rs`, `recorder/src/pump.rs`) and only the
-   Windows-compiled ones need the new field. Verified by `cargo check --target
-   x86_64-pc-windows-msvc` and by the dev-host suite, in which nothing changes.
+1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on
+   `crates/capture/src/lib.rs::Frame`, plus `Frame::has_pixels()`. Five construction sites took
+   `texture: None`. Verified by `cargo check --target x86_64-pc-windows-msvc` (clean) and the
+   dev-host suite (537 passed).
+   Two things this step found that the sketch did not know, both worth carrying forward:
+
+   * **A bare `ID3D11Texture2D` field would have stripped three derives off `Frame` on every
+     platform.** The `windows` crate's COM interfaces implement neither `Clone`, `PartialEq` nor
+     `Debug`, and `Frame` derives all three — so the field is a newtype, `GpuTexture`, whose three
+     impls are the interface's own semantics written out once: `Clone` is an `AddRef` (this is the
+     frame-pool lifetime question, in one place), `PartialEq` is COM identity, `Debug` prints the
+     pointer. Off Windows the type is **uninhabited**, so `texture` there can only be `None`.
+   * **`cast()` and `as_raw()` live on the `Interface` trait**, which has to be in scope. The
+     cross-check caught this; nothing else could have, since the code compiles only for Windows.
+   * (The sketch's step 4 was wrong about `guard_frame_size`: it checks only width and height today,
+     never `data.len()`, so it needed no change. The guard that *is* needed went into
+     `FfmpegEncoder::submit_video` instead — see step 4 below.)
 2. **The backend can be asked for one.** A capability on `CaptureBackend` (default: no), off by
    default so no behaviour changes until the encoder exists.
 3. **`WgcCapture::copy_out` gains the zero-copy branch.** The texture is already extracted from
@@ -62,9 +74,12 @@ because ffmpeg still writes the containers they consume.
    `data` instead of staging, `CopyResource`, `Map` and memcpy. The frame's reference must be
    held (the pool reuses buffers) — `ID3D11Texture2D` is `Send` in the pinned `windows` 0.58 but
    that says nothing about the pool, so this needs a deliberate look at when the pool recycles.
-4. **`guard_frame_size` stops requiring pixels.** It checks `data.len()` today; a texture frame
-   has none. It also becomes the place to refuse a texture frame on a path that cannot carry
-   one, rather than letting a zero-length frame reach an encoder.
+4. **A frame with no pixels is refused by the encoder that cannot carry one.** Done, in
+   `FfmpegEncoder::submit_video`: it writes `data` to the child's stdin, so a texture frame would
+   become a zero-length rawvideo frame that ffmpeg reads as the next frame's leading bytes — a
+   desync surfacing as corruption seconds later, pointing at nothing. Refused with the reason,
+   and asserted by `a_frame_without_pixels_is_refused_rather_than_written_as_nothing`. This is
+   what makes step 1 safe to land *before* the encoder that consumes textures exists.
 5. **`WmfEncoder`** (`crates/encoder/src/wmf.rs`, `#[cfg(windows)]`): `MFStartup`,
    `MFCreateDXGIDeviceManager` + `ResetDevice`, the encoder MFT found by **`MFTEnumEx`** — the
    pinned `windows` 0.58 does **not** expose `CLSID_CMSH264EncoderMFT`, and

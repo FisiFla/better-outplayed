@@ -278,7 +278,7 @@ fn noise_frame(width: u32, height: u32, seed: u64) -> Frame {
     for _ in 0..width * height {
         data.extend_from_slice(&[next(), next(), next(), 255]);
     }
-    Frame { data, pts: Duration::ZERO, width, height, format: PixelFormat::Bgra8 }
+    Frame { data, pts: Duration::ZERO, width, height, format: PixelFormat::Bgra8, texture: None }
 }
 
 /// Every scratch segment, in order.
