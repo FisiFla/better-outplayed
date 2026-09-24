@@ -235,14 +235,33 @@ pub struct PumpCounts {
     /// Frames the backend offered that the pacer will not keep, discarded without copying
     /// their pixels to CPU memory ([`CaptureBackend::discard_pending`]).
     pub skipped: u64,
+    /// Time this pump spent **inside the capture backend** — `next_frame` and
+    /// `discard_pending` together.
+    ///
+    /// This is the readback: at 3840x2160 BGRA the backend copies 33.2MB out of the GPU and
+    /// memcpys it into a `Vec` the encoder will hand to ffmpeg. It is the largest single
+    /// thing this process does per frame, and the whole reason issue #1's CPU figure is what
+    /// it is — so it is measured rather than argued about. Reported against wall clock, the
+    /// percentage is a ceiling on what any change to the capture path could save.
+    pub capture: Duration,
+    /// Time this pump spent **inside the encoder's submit** — `submit_video`, `submit_audio`
+    /// and `submit_mic_audio`.
+    ///
+    /// Only the video submit blocks in practice, and what it waits for is the encoder's
+    /// bounded queue draining: this is the pipeline's backpressure, i.e. time spent waiting
+    /// for ffmpeg rather than working. Its complement is the difference between the two
+    /// numbers above.
+    pub submit: Duration,
 }
 
 impl PumpCounts {
-    /// The two counters added together, for a caller accumulating several pumps.
+    /// The counters and the timings added together, for a caller accumulating several pumps.
     pub fn plus(self, other: PumpCounts) -> PumpCounts {
         PumpCounts {
             submitted: self.submitted + other.submitted,
             skipped: self.skipped + other.skipped,
+            capture: self.capture + other.capture,
+            submit: self.submit + other.submit,
         }
     }
 }
@@ -337,24 +356,34 @@ pub fn pump_once_counted_with_mic(
 ) -> Result<PumpCounts> {
     let mut counts = PumpCounts::default();
     if pacer.is_due(Instant::now()) {
-        if let Some(frame) = capture.next_frame(FRAME_POLL)? {
+        let before = Instant::now();
+        let frame = capture.next_frame(FRAME_POLL)?;
+        counts.capture += before.elapsed();
+        if let Some(frame) = frame {
             guard_frame_size(&frame, encoder.source_size())?;
             // One slot, one frame. Committing here — after the frame exists, rather than
             // at the instant it was offered — is what lets `is_due` above be a pure query.
             pacer.commit(Instant::now());
             // Ownership moves into the encoder so the pixel buffer is queued, not
             // copied: at 3840x2160 BGRA a clone is 33.2MB per frame, ~1GB/s of pure
-            // memcpy at 30fps on this path (see `localplay_encoder::ffmpeg`).
+            // memcpy at 30fps on this path (see `localplay_encoder::ffmpeg`). Where it
+            // *blocks* is the encoder's queue being full, so the time here is the
+            // pipeline waiting on ffmpeg rather than this thread working.
+            let before = Instant::now();
             encoder.submit_video(frame)?;
+            counts.submit += before.elapsed();
             counts.submitted += 1;
         }
     } else {
+        let before = Instant::now();
         counts.skipped += capture.discard_pending()? as u64;
+        counts.capture += before.elapsed();
         // The wait described above. `time_until_due` is measured from a fresh `now`
         // because the discard call above took time of its own; it saturates to zero if the
         // slot came due in the meantime, in which case the next iteration takes the frame.
         std::thread::sleep(pacer.time_until_due(Instant::now()).min(FRAME_POLL));
     }
+    let before = Instant::now();
     while let Some(block) = audio.next_buffer(Duration::ZERO)? {
         encoder.submit_audio(block)?;
     }
@@ -366,6 +395,7 @@ pub fn pump_once_counted_with_mic(
             encoder.submit_mic_audio(block)?;
         }
     }
+    counts.submit += before.elapsed();
     Ok(counts)
 }
 
@@ -554,6 +584,115 @@ impl RateMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
+    use localplay_capture::{AudioFormat, PixelFormat};
+    use localplay_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
+
+    /// A capture backend that spends a *known* time in `next_frame`.
+    ///
+    /// The attribution below is only worth having if it measures the call it claims to, and a
+    /// stub that returns instantly cannot tell the difference between being timed and not. This
+    /// one sleeps for a set duration, so `counts.capture` has a floor to be checked against.
+    struct SlowCapture {
+        size: (u32, u32),
+        spend: Duration,
+    }
+
+    impl CaptureBackend for SlowCapture {
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<Frame>> {
+            std::thread::sleep(self.spend);
+            let (width, height) = self.size;
+            Ok(Some(Frame {
+                data: vec![0u8; (width * height * 4) as usize],
+                pts: Duration::ZERO,
+                width,
+                height,
+                format: PixelFormat::Bgra8,
+            }))
+        }
+        fn native_size(&self) -> (u32, u32) {
+            self.size
+        }
+    }
+
+    /// A real ffmpeg child at 8x8, which is the smallest thing that exercises the encoder
+    /// contract without pretending to be one: the timings come from the calls, not the pixels.
+    ///
+    /// Its own temp directory, not the shared system one: a segment muxer pointed at `/tmp`
+    /// writes there and every test in the suite shares that directory, which is a way to make
+    /// unrelated tests interfere through the filesystem. The directory is returned so it
+    /// outlives the child.
+    fn tiny_encoder() -> (FfmpegEncoder, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a temp dir for the encoder's scratch");
+        let cfg = EncodeConfig::for_tests_software(
+            VideoCodec::H264,
+            8,
+            8,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        (FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder"), dir)
+    }
+
+    /// The two attributions measure the calls they claim to.
+    ///
+    /// Worth a test because the numbers exist to be *believed* instead of argued with: issue #1
+    /// is a question about which half of a 4K frame's cost dominates, and a counter that quietly
+    /// timed the wrong call would answer it wrongly and confidently. The `plus` accumulator is
+    /// checked too, since the run adds up hundreds of these and one that dropped a field would
+    /// under-report the very thing it was added to reveal.
+    #[test]
+    fn the_pump_attributes_its_time_to_the_capture_and_to_the_encoder() {
+        let spend = Duration::from_millis(25);
+        let mut capture = SlowCapture { size: (8, 8), spend };
+        let mut audio = StubAudio::new(AudioFormat::default());
+        audio.start().expect("start the stub audio");
+        let (mut encoder, _scratch) = tiny_encoder();
+        let (mut pacer, _) = pacer(30);
+
+        let started = Instant::now();
+        let counts = pump_once_counted(&mut pacer, &mut capture, &mut audio, &mut encoder)
+            .expect("one pump against a real encoder");
+        let elapsed = started.elapsed();
+        encoder.finish().expect("flush");
+
+        assert_eq!(counts.submitted, 1, "the frame was admitted");
+        assert!(
+            counts.capture >= spend,
+            "the backend's own time must be attributed to the backend: {:?} against a {:?} \
+             sleep in next_frame",
+            counts.capture,
+            spend
+        );
+        assert!(
+            counts.capture <= elapsed,
+            "and it cannot exceed the pump that contains it: {:?} of {:?}",
+            counts.capture,
+            elapsed
+        );
+
+        // The submit is timed too. A real ffmpeg child accepts the first frame without
+        // blocking, so this asserts the counter is *live* rather than that it is large —
+        // which is the property that matters, because a submit that never blocks is the
+        // healthy case and must not be reported as a missing measurement.
+        assert!(counts.submit <= elapsed, "the submit's wait is inside the pump as well");
+
+        let summed = PumpCounts { submitted: 2, skipped: 3, capture: spend, submit: spend }
+            .plus(PumpCounts { submitted: 5, skipped: 7, capture: spend, submit: spend });
+        assert_eq!(
+            (summed.submitted, summed.skipped, summed.capture, summed.submit),
+            (7, 10, spend * 2, spend * 2),
+            "every field accumulates, timings included"
+        );
+    }
 
     /// A pacer plus the instant its schedule is measured from.
     ///

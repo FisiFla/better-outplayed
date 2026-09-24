@@ -1336,6 +1336,9 @@ impl Prepared {
             effective_fps: encoder_fps,
             frames: 0,
             skipped: 0,
+            capture_time: Duration::ZERO,
+            submit_time: Duration::ZERO,
+            pump_started: Instant::now(),
             achieved: 0.0,
             last_counted_dropped: 0,
             last_warned_dropped: 0,
@@ -1614,6 +1617,20 @@ struct Engine {
     effective_fps: u32,
     /// The last rate a window closed on, published on every pump and logged on every tick.
     achieved: f64,
+    /// Time spent inside the capture backend, accumulated over the run
+    /// ([`localplay_recorder::pump::PumpCounts::capture`]).
+    ///
+    /// Kept because this is the number that decides issue #1: at 3840x2160 the backend copies
+    /// 33.2MB out of the GPU and into system memory for every frame, and whether that is the
+    /// cost or the encode is a question about this figure against the run's wall clock — not
+    /// something to infer from a total CPU percentage, which cannot say which half it is in.
+    capture_time: Duration,
+    /// Time spent inside the encoder's submit, i.e. waiting for its bounded queue to drain.
+    /// Its complement to the wall clock is the time this thread actually spent working.
+    submit_time: Duration,
+    /// When the pump's counters started, so the two above can be reported as a share of wall
+    /// clock. Set when the engine is built, because that is the first pump.
+    pump_started: Instant,
     /// The dropped count as of the last time each of the two consumers looked at it: the
     /// rate meter ([`Engine::last_counted_dropped`]) and the warning
     /// ([`Engine::last_warned_dropped`]). Both are cumulative counters, so each drop must
@@ -1874,7 +1891,7 @@ impl Engine {
         // probe measured less and adaptation is on (the startup line says so in words).
         tracing::debug!(
             "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} \
-             dropped_mic={} skipped={} fps={:.1}/{} configured={}",
+             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}%",
             self.frames,
             stats.segments,
             // The bytes the ring is holding, wherever it holds them — RAM for a replay buffer,
@@ -1888,7 +1905,12 @@ impl Engine {
             self.skipped,
             self.achieved,
             self.effective_fps,
-            self.configured_fps
+            self.configured_fps,
+            // Shares of wall clock since the first pump, so they can be read against the
+            // process's own CPU figure: `capture=` is the readback and the copy, `submit=` is
+            // waiting for ffmpeg, and what is left is the audio drains, the tick and the loop.
+            Self::share(self.capture_time, self.pump_started.elapsed()),
+            Self::share(self.submit_time, self.pump_started.elapsed()),
         );
         // The cap the ring is held to is **RAM**, not scratch (spec §8.1): a rolling buffer
         // holds unclipped footage in memory, so a bounded window that overruns its budget is the
@@ -2097,10 +2119,29 @@ impl Engine {
         }
     }
 
+    /// `part` as a percentage of `whole`, for the periodic line's two attributions.
+    ///
+    /// A share of **wall clock**, not of the process's CPU time, because that is the figure the
+    /// two can be read against: `capture=71.2% submit=12.0%` on a run the OS reports as 88.9% of
+    /// one core says the readback is most of it and waiting for ffmpeg is not. A zero-length
+    /// window — the first tick — reports 0 rather than dividing by it.
+    fn share(part: Duration, whole: Duration) -> f64 {
+        let whole = whole.as_secs_f64();
+        if whole <= 0.0 {
+            0.0
+        } else {
+            100.0 * part.as_secs_f64() / whole
+        }
+    }
+
     /// Fold one pump's counts into the counters and publish them.
     fn account(&mut self, counts: PumpCounts) {
         self.frames += counts.submitted;
         self.skipped += counts.skipped;
+        // The two halves of what this thread does per frame, accumulated where every pump's
+        // counts already pass through — the steady-state loop and the post-roll wait both.
+        self.capture_time += counts.capture;
+        self.submit_time += counts.submit;
         // Frames that reached ffmpeg: everything handed to the encoder, minus whatever its
         // bounded queue dropped because it could not keep up. This, not `frames=`, is "the
         // achieved rate" — it is the rate the recorded footage actually carries. The count
