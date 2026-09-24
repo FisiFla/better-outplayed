@@ -10,8 +10,12 @@
 //! is developed on, so the code had never run once.
 //!
 //! The hotkey itself is still untested (it needs Windows). What *is* tested here is the
-//! wait it drives, in isolation: `localplay_recorder::pump_until_span` over stub capture
-//! sources and a real ffmpeg encoder.
+//! wait it drives, in isolation: `localplay_recorder::pump_until_span_on` over stub capture
+//! sources, a real ffmpeg encoder and the **in-memory** ring the replay buffer actually ships
+//! with. That last part is deliberate rather than incidental: the file-backed ring this file
+//! used to drive has been removed, and a wait whose span comes from RAM behaves differently in
+//! one respect that matters here — a fragment carries its own length, so the span is exact
+//! instead of lagging a segment behind. The assertions below were written against both.
 //!
 //! Gating: this file is deliberately **not** `#![cfg(feature = "test-encoders")]`.
 //! The suite runs as `cargo test --workspace --features
@@ -30,10 +34,11 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::{pump_until_span, FramePacer, PumpCounts};
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
+use localplay_recorder::{pump_once, pump_until_span_on, FramePacer, PumpCounts};
+use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
-use localplay_replay::buffer::{BufferConfig, RingBuffer};
+use localplay_replay::MemoryStats;
 use std::time::{Duration, Instant};
 
 const WIDTH: u32 = 64;
@@ -51,14 +56,18 @@ const POST_MS: u64 = 2_000;
 /// behaviour that was fixed, not a property to test around.
 const PRE_FED: Duration = Duration::from_secs(3);
 
-/// A live pipeline over stub sources: capture → encoder → ring buffer.
+/// A live pipeline over stub sources: capture → encoder → **in-memory** ring.
 ///
-/// Owns its temp directories, so they outlive the pipeline that writes into them.
+/// Owns its temp directory, so it outlives the clip the pipeline writes into it. There is no
+/// scratch directory to own: the buffer keeps its footage in RAM, which is what it is for.
 struct Fixture {
-    _scratch: tempfile::TempDir,
     _clips: tempfile::TempDir,
+    /// Never written to. `EncodeConfig::for_tests_software` asks for a segment directory because
+    /// every other test uses one; this pipeline runs in `FragmentedStream` mode, where ffmpeg
+    /// writes to its stdout and no file per second is produced anywhere.
+    _segment_dir: tempfile::TempDir,
     bin: FfmpegBinaries,
-    ring: RingBuffer,
+    ring: MemoryRing,
     capture: StubCapture,
     audio: StubAudio,
     encoder: FfmpegEncoder,
@@ -70,35 +79,40 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-        let scratch = tempfile::tempdir().unwrap();
+        let segment_dir = tempfile::tempdir().unwrap();
         let clips = tempfile::tempdir().unwrap();
 
-        let encode = EncodeConfig::for_tests_software(
+        let mut encode = EncodeConfig::for_tests_software(
             VideoCodec::H264,
             WIDTH,
             HEIGHT,
             FPS,
-            scratch.path().to_path_buf(),
+            segment_dir.path().to_path_buf(),
             SEGMENT_MS,
         );
-        let cfg = BufferConfig {
-            pre_ms: PRE_MS,
-            post_ms: POST_MS,
-            scratch_cap_bytes: 1 << 30,
-            segment_ms: SEGMENT_MS,
-            clips_dir: clips.path().to_path_buf(),
-        };
+        // The mode the replay buffer ships with, and the only difference that matters to this
+        // fixture: fragmented MP4 on the child's stdout instead of files in a scratch directory.
+        encode.output = EncodeOutput::FragmentedStream;
 
         let mut capture = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
         let mut audio = StubAudio::new(AudioFormat::default());
         let mut encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn encoder");
-        let mut ring = RingBuffer::start(
-            &bin,
-            cfg,
-            scratch.path().to_path_buf(),
-            "libx264".to_string(),
+        let stream = encoder.take_output_stream().expect("the stream mode exposes its pipe");
+        let mut ring = MemoryRing::start(
+            stream,
+            RingSetup {
+                bin: bin.clone(),
+                clips_dir: clips.path().to_path_buf(),
+                ram_cap_bytes: 256 * 1024 * 1024,
+                // The window a trigger can ask for, sized as the engine sizes it: the pre-roll,
+                // the post-roll, and one segment of slack for a fragment boundary.
+                cap_ms: PRE_MS + POST_MS + SEGMENT_MS,
+                pre_ms: PRE_MS,
+                post_ms: POST_MS,
+                encoder: "libx264".to_string(),
+            },
         )
-        .expect("start ring buffer");
+        .expect("start the in-memory ring");
 
         // Feed the pipeline in real time, through the same `pump_once` the engine's loop
         // and the post-roll wait use. The media timeline comes from the wall clock, so
@@ -115,35 +129,57 @@ impl Fixture {
                 .expect("feeding the fixture's stubs");
         }
 
-        // Submits hand the bytes to the encoder's writer threads, so segment files
-        // appear as ffmpeg consumes them, not as they are submitted — and a segment is
-        // only trusted once a strictly later one exists. Wait for the ring to index
-        // something rather than assuming the fed timeline is already on disk.
+        // The ring is filled by its own reader thread, and a fragment is only pushed once its
+        // `mdat` has arrived in full — so wait for the first one rather than assuming the fed
+        // timeline has landed. Nothing is scanned for: there is no directory in the picture.
         let deadline = Instant::now() + Duration::from_secs(15);
-        while ring.stats().span_ms == 0 {
+        while ring.span_ms().expect("the ring is readable") == 0 {
             assert!(
                 Instant::now() < deadline,
-                "fixture never completed a segment ({:?} of timeline fed)",
+                "fixture never completed a fragment ({:?} of timeline fed)",
                 PRE_FED
             );
             std::thread::sleep(Duration::from_millis(20));
-            ring.scan_once().expect("scan scratch dir");
         }
 
-        Self { _scratch: scratch, _clips: clips, bin, ring, capture, audio, encoder, pacer }
+        Self {
+            _clips: clips,
+            _segment_dir: segment_dir,
+            bin,
+            ring,
+            capture,
+            audio,
+            encoder,
+            pacer,
+        }
     }
 
     /// Exactly the call the trigger makes, returning what the wait pumped.
     fn pump(&mut self, need_ms: u64, budget: Duration) -> anyhow::Result<PumpCounts> {
-        pump_until_span(
+        // `_on` rather than the ring-specific wrapper, because this is the entry point the
+        // engine's own wait uses and it takes any `MediaRing` — the microphone slot is `None`
+        // here, as it is for a recording with the microphone off.
+        pump_until_span_on(
             &mut self.pacer,
             &mut self.ring,
             &mut self.capture,
             &mut self.audio,
+            None,
             &mut self.encoder,
             need_ms,
             budget,
         )
+    }
+
+    /// What the ring holds. A ring that cannot be read is a broken fixture, not a zero to fold
+    /// into the assertions below.
+    fn stats(&self) -> MemoryStats {
+        self.ring.stats().expect("the ring is readable")
+    }
+
+    /// Media time the ring can prove it holds.
+    fn span_ms(&self) -> u64 {
+        self.ring.span_ms().expect("the ring is readable")
     }
 }
 
@@ -154,10 +190,10 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     // One iteration of the steady-state pump the CLI loop uses and `pump_until_span`
     // shares. The stub clock has caught up with real time by now, so whether a frame is
     // due does not matter: what matters is that a pump iteration cannot fail.
-    localplay_recorder::pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
         .expect("a pump iteration must not fail");
 
-    let before = fx.ring.stats();
+    let before = fx.stats();
     assert!(
         before.span_ms > 0,
         "fixture must leave timeline in the buffer, got {}ms",
@@ -174,7 +210,7 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     );
 
     result.expect("the wait must reach the post-roll, not time out");
-    let after = fx.ring.stats();
+    let after = fx.stats();
     eprintln!(
         "after the wait: span={}ms segments={} (was span={}ms segments={})",
         after.span_ms, after.segments, before.span_ms, before.segments
@@ -264,7 +300,7 @@ fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
     // Exactly the engine's trigger path: the trigger position comes from the ledger, in
     // media time; `need_ms` is `post_ms` further along that same timeline; the budget is
     // the wall-clock wait for it (post-roll + margin, as the CLI sizes it).
-    let trigger_ms = fx.ring.stats().span_ms;
+    let trigger_ms = fx.stats().span_ms;
     assert!(trigger_ms >= PRE_MS, "sanity: the pre-roll must be fully buffered");
     let need_ms = trigger_ms + POST_MS;
     let budget = Duration::from_millis(POST_MS) + Duration::from_secs(5);
@@ -277,7 +313,7 @@ fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
 
     // The ledger now covers `trigger_ms + post_ms` of media — precisely the window's
     // far edge — so the trigger below cannot refuse for `PostRollUnavailable`.
-    let after = fx.ring.stats();
+    let after = fx.stats();
     assert!(
         after.span_ms >= need_ms,
         "span must cover the media-time post-roll: need {need_ms}ms, span {}ms",
