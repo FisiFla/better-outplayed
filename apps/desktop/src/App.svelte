@@ -12,13 +12,27 @@
   import ClipDetail from './lib/components/ClipDetail.svelte';
   import ClipList from './lib/components/ClipList.svelte';
   import RecordingPanel from './lib/components/RecordingPanel.svelte';
+  import SessionDetail from './lib/components/SessionDetail.svelte';
+  import SessionList from './lib/components/SessionList.svelte';
   import StoragePanel from './lib/components/StoragePanel.svelte';
   import { describeDelete, describeTrim, resolveSelection, thumbnailAtMs, toClipViews } from './lib/clips';
   import type { ClipView } from './lib/clips';
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
   import { describeRecordedClip } from './lib/recording';
-  import type { AppStatus, RecordingStatus, StorageStats, TrimRange } from './lib/types';
+  import {
+    describeExtraction,
+    describeSessionDelete,
+    toSessionViews,
+  } from './lib/sessions';
+  import type { SessionView } from './lib/sessions';
+  import type {
+    AppStatus,
+    RecordingStatus,
+    SessionEvent,
+    StorageStats,
+    TrimRange,
+  } from './lib/types';
 
   /**
    * How often the recorder's counters are read.
@@ -38,6 +52,10 @@
   let { source = tauriIpc }: Props = $props();
 
   let clips = $state<ClipView[]>([]);
+  /** The sessions the index knows, newest first, as the sidebar lists them. */
+  let sessions = $state<SessionView[]>([]);
+  /** The markers of the selected session, read when it is selected. */
+  let sessionEvents = $state<SessionEvent[]>([]);
   let stats = $state<StorageStats | null>(null);
   /** The engine's live counters; `null` until the first poll answers. */
   let recording = $state<RecordingStatus | null>(null);
@@ -46,6 +64,8 @@
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   let selectedId = $state<number | null>(null);
+  /** The selected session, if the main pane is showing one instead of a clip. */
+  let selectedSessionId = $state<number | null>(null);
   /** A command is in flight; the controls that mutate are held while it is. */
   let busy = $state(false);
   /** A recording command is in flight (a start handshake, a stop, or a clip trigger). */
@@ -55,13 +75,27 @@
   let loaded = $state(false);
 
   const selected = $derived(clips.find((clip) => clip.id === selectedId) ?? null);
+  const selectedSession = $derived(
+    sessions.find((session) => session.id === selectedSessionId) ?? null,
+  );
 
   async function refresh() {
     try {
-      const [rows, storage] = await Promise.all([source.listClips(), source.storageStats()]);
+      const [rows, storage, sessionRows] = await Promise.all([
+        source.listClips(),
+        source.storageStats(),
+        source.listSessions(),
+      ]);
       clips = toClipViews(rows, source.assetUrl);
       stats = storage;
+      sessions = toSessionViews(sessionRows);
       selectedId = resolveSelection(clips, selectedId);
+      // A selected session that is no longer in the list was deleted — here or by a retention
+      // pass — so the main pane stops showing a session that does not exist.
+      if (selectedSessionId !== null && !sessions.some((s) => s.id === selectedSessionId)) {
+        selectedSessionId = null;
+        sessionEvents = [];
+      }
       error = null;
     } catch (err) {
       error = errorMessage(err);
@@ -232,6 +266,82 @@
     return clips.find((clip) => clip.id === id)?.name ?? `clip #${id}`;
   }
 
+  /**
+   * Show a session's timeline in the main pane.
+   *
+   * The two selections are exclusive because there is one main pane, and a session's timeline
+   * is not a clip's: selecting a session clears the clip, which is what makes the pane's
+   * content unambiguous.
+   *
+   * The markers are read here rather than with the list, because they are per session and
+   * nothing draws them until one is selected. An empty list is a real answer; a failure is
+   * reported and the timeline simply has no markers, which is the same thing the user would
+   * see for an untagged session.
+   */
+  async function selectSession(id: number) {
+    selectedId = null;
+    selectedSessionId = id;
+    sessionEvents = [];
+    try {
+      sessionEvents = await source.sessionEvents(id);
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function extractClip(range: TrimRange) {
+    const session = selectedSession;
+    if (session === null) return;
+    busy = true;
+    try {
+      const written = await source.extractClip(session.id, range.startMs, range.endMs);
+      notice = describeExtraction(session.title, written);
+      await refresh();
+      void loadThumbnails();
+      // Deliberately stays on the session: extracting several clips from one game is the
+      // ordinary thing to do, and the notice names the clip that was just cut.
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleSessionFavourite(id: number, favourite: boolean) {
+    busy = true;
+    try {
+      await source.setSessionFavourite(id, favourite);
+      notice = favourite
+        ? 'Favourite: this session is protected from both retention rules.'
+        : 'No longer a favourite: the retention rules may delete this session.';
+      await refresh();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function deleteSession(id: number) {
+    const title = sessions.find((session) => session.id === id)?.title ?? `session #${id}`;
+    busy = true;
+    try {
+      const outcome = await source.deleteSession(id);
+      notice = describeSessionDelete(outcome, title);
+      if (outcome.row_deleted && selectedSessionId === id) {
+        selectedSessionId = null;
+        sessionEvents = [];
+      }
+      await refresh();
+    } catch (err) {
+      // A session that is still recording is refused by the Rust side; the message says so,
+      // and the row stays where it was.
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
   onMount(() => {
     // Thumbnails are requested per clip, so they must wait for the list to arrive — which
     // is why this is one sequential step rather than three independent ones.
@@ -267,9 +377,25 @@
       {clips}
       {thumbnails}
       {selectedId}
-      onSelect={(id) => (selectedId = id)}
+      onSelect={(id) => {
+        selectedId = id;
+        // One main pane: selecting a clip takes it back from a session.
+        selectedSessionId = null;
+        sessionEvents = [];
+      }}
       onFavourite={toggleFavourite}
       onDelete={(id) => deleteClip(id, clipName(id))}
+    />
+    <div class="pane-head">
+      <h2>Sessions</h2>
+      <span class="muted">{sessions.length} indexed</span>
+    </div>
+    <SessionList
+      {sessions}
+      selectedId={selectedSessionId}
+      onSelect={selectSession}
+      onFavourite={toggleSessionFavourite}
+      onDelete={deleteSession}
     />
     {#if stats !== null}
       <StoragePanel {stats} />
@@ -292,7 +418,19 @@
       </div>
     {/if}
 
-    {#if selected !== null}
+    {#if selectedSession !== null}
+      {@const session = selectedSession}
+      {#key session.id}
+        <SessionDetail
+          {session}
+          events={sessionEvents}
+          {busy}
+          onExtract={extractClip}
+          onFavourite={(favourite) => toggleSessionFavourite(session.id, favourite)}
+          onDelete={() => deleteSession(session.id)}
+        />
+      {/key}
+    {:else if selected !== null}
       {@const clip = selected}
       {#key clip.id}
         <ClipDetail
@@ -304,7 +442,8 @@
       {/key}
     {:else if loaded}
       <p class="empty">
-        Select a clip on the left to play it, scrub it and trim it.
+        Select a clip on the left to play it, scrub it and trim it — or a session, to see its
+        markers and cut a clip out of it.
       </p>
     {/if}
   </main>
