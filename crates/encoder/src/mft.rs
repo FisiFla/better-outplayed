@@ -16,20 +16,22 @@
 //! A refusal in that handshake is not a detail: it is the answer to whether this design is
 //! viable, and it is far cheaper to learn here than after the encoder is written.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFCreateDXGIDeviceManager,
+    IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType,
     MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
     MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2, MF_VERSION,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
+    MFVideoInterlace_Progressive, MF_VERSION, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -58,7 +60,18 @@ pub struct HardwareEncoder {
     /// Empty when the MFT could not be asked — it would not activate, or it would not unlock —
     /// which is what the `refusal` beside it explains.
     pub input_subtypes: Vec<String>,
-    /// Why not, when it did not — a driver's own words are worth more than a summary of them.
+    /// Which of the formats this pipeline might feed it the MFT actually **took**, by being asked
+    /// to accept one.
+    ///
+    /// This is the answer, where `input_subtypes` above is only the enumeration attempt: a
+    /// hardware encoder refuses to enumerate its types (`GetInputAvailableType` came back empty on
+    /// the box even after the D3D11 handshake), but it will not refuse a `SetInputType` it likes —
+    /// and that is the same call the encoder makes, so agreement here is agreement about the real
+    /// thing. Names come from [`CANDIDATE_INPUTS`].
+    pub accepts: Vec<String>,
+    /// Why no full answer could be had, when that happened — a driver's own words are worth more
+    /// than a summary of them. Covers the handshake, an activation that failed, an unlock that was
+    /// refused, and a type negotiation that would not start.
     pub refusal: Option<String>,
 }
 
@@ -154,6 +167,7 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
                 asynchronous,
                 accepts_d3d11: false,
                 input_subtypes: Vec::new(),
+                accepts: Vec::new(),
                 refusal: Some(format!("could not be activated: {err:#}")),
             }
         }
@@ -183,6 +197,7 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
                 asynchronous,
                 accepts_d3d11: false,
                 input_subtypes: Vec::new(),
+                accepts: Vec::new(),
                 refusal: Some(format!("could not be unlocked for asynchronous use: {err}")),
             };
         }
@@ -206,6 +221,14 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
     }
 
     let input_subtypes = input_subtypes(&transform);
+    // Asked at a modest size: the answer is about the *format*, and a 640x480 type is as much a
+    // statement about that as a 3840x2160 one, without depending on this machine's display.
+    // A negotiation failure is a finding rather than a panic: it means the machine will not tell us
+    // what it eats, which is exactly what `refusal` is for.
+    let (accepts, negotiation) = match accepted_subtypes(&transform, (640, 480)) {
+        Ok(accepts) => (accepts, None),
+        Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+    };
     // The transform is released at the end of this function; the attribute query above is the last
     // thing it is needed for.
     match handshake {
@@ -215,7 +238,8 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
             asynchronous,
             accepts_d3d11: true,
             input_subtypes,
-            refusal: None,
+            accepts,
+            refusal: negotiation,
         },
         Err(err) => HardwareEncoder {
             name,
@@ -223,9 +247,109 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
             asynchronous,
             accepts_d3d11: false,
             input_subtypes,
-            refusal: Some(format!("refused MFT_MESSAGE_SET_D3D_MANAGER: {err}")),
+            accepts,
+            refusal: Some(match negotiation {
+                Some(note) => format!("refused MFT_MESSAGE_SET_D3D_MANAGER: {err}; and {note}"),
+                None => format!("refused MFT_MESSAGE_SET_D3D_MANAGER: {err}"),
+            }),
         },
     }
+}
+
+/// The formats worth asking about, in the order worth asking.
+///
+/// `RGB32` and `ARGB32` first because Windows Graphics Capture delivers BGRA8 and either of those
+/// names means the texture can go straight in, with no conversion anywhere. `NV12` last because it
+/// is the format a hardware encoder most often *wants* and the one this pipeline cannot produce
+/// without help — if only it is accepted, the chain needs a Video Processor MFT on the GPU.
+const CANDIDATE_INPUTS: [(&windows::core::GUID, &str); 3] = [
+    (&MFVideoFormat_RGB32, "RGB32 (BGRA byte order — what WGC delivers)"),
+    (&MFVideoFormat_ARGB32, "ARGB32"),
+    (&MFVideoFormat_NV12, "NV12"),
+];
+
+/// Which candidate input formats this transform will actually take.
+///
+/// Asked with `SetInputType` rather than read from an enumeration, because an asynchronous
+/// hardware MFT will not enumerate (measured on the box) and because *accepting a type* is the fact
+/// that matters: it is the call the encoder will make, with a media type built the same way.
+fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32)) -> Result<Vec<String>> {
+    // **The output type first, and this is not a detail.** An encoder will not accept an *input*
+    // type until it knows what it is producing: Media Foundation negotiates the output side first,
+    // and an input attempt made before that is refused for the ordering rather than for the format.
+    // Measured the hard way — the first version of this probe asked for the input alone and
+    // reported "takes no candidate input format" on an encoder that has one, which is the same
+    // shape of false negative as the async lock was, and would have been believed just as easily.
+    set_h264_output_type(transform, size)
+        .context("setting the output type, which must come before the input")?;
+
+    let mut accepted = Vec::new();
+    let mut refusals = Vec::new();
+    for (subtype, name) in CANDIDATE_INPUTS {
+        match accepts_subtype(transform, subtype, size) {
+            Ok(()) => accepted.push(name.to_string()),
+            Err(err) => refusals.push(format!("{name}: {err:#}")),
+        }
+    }
+    if accepted.is_empty() {
+        // Every candidate refused, which is worth saying in full: the driver's own words for each
+        // are the only thing that can distinguish "wrong format" from "wrong ordering" from
+        // "wrong size".
+        bail!("set an output type but no candidate input type was accepted: {}", refusals.join("; "));
+    }
+    Ok(accepted)
+}
+
+/// Configure the encoder's output: H.264 at `size`, which is what makes it willing to talk about
+/// its input at all.
+fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()> {
+    // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
+    let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
+    let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
+    // SAFETY: every call sets an attribute on a media type this function owns.
+    unsafe {
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(30, 1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        // A bitrate is not optional for a rate-controlled encoder: without one it has no reason to
+        // accept a producing type at all.
+        media_type.SetUINT32(&MF_MT_AVG_BITRATE, 2_000_000)?;
+    }
+    // SAFETY: setting the output type on a transform that was just unlocked and given its device
+    // manager, with a media type that outlives the call.
+    unsafe { transform.SetOutputType(0, &media_type, 0) }.context("SetOutputType(H264)")
+}
+
+/// Try to set `subtype` as the transform's input type at `size`.
+///
+/// The media type carries the four attributes every video encoder insists on seeing — major type,
+/// subtype, frame size, frame rate, interlace mode and pixel aspect ratio — packed the way Media
+/// Foundation packs them (two 32-bit halves in a `u64`), because a type missing any of them is
+/// rejected for the missing attribute rather than for the format under test.
+fn accepts_subtype(
+    transform: &IMFTransform,
+    subtype: &windows::core::GUID,
+    size: (u32, u32),
+) -> Result<()> {
+    // SAFETY: `MFCreateMediaType` is the documented constructor and returns an empty type.
+    let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
+    let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
+    // SAFETY: every call below sets an attribute on a media type this function owns.
+    unsafe {
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(30, 1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    }
+    // SAFETY: setting the input type on a transform that was just unlocked and given its device
+    // manager, with a media type that outlives the call.
+    unsafe { transform.SetInputType(0, &media_type, 0) }
+        .with_context(|| format!("SetInputType({subtype:?})"))
 }
 
 /// The input subtypes an MFT offers, by enumerating until it stops answering.

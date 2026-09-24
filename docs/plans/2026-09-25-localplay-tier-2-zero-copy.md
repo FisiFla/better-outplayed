@@ -94,7 +94,34 @@ tells step 5 two things it would otherwise have learned by debugging: the MFT mu
 before it is configured, and the encoder has to be *chosen* rather than assumed, because the
 hardware flag enumerates MFTs that cannot be instantiated on this machine at all.
 
-### What the encoder will *eat* is still open, and the reason is instructive
+### The chain is now settled: WGC's texture goes straight in
+
+Asking the *right way* answered it. **The NVIDIA MFT accepts `ARGB32`, which is the format Windows
+Graphics Capture already delivers** — `DXGI_FORMAT_B8G8R8A8_UNORM` is BGRA bytes with alpha, and
+`MFVideoFormat_ARGB32` is Media Foundation's name for exactly that:
+
+```
+NVIDIA H.264 Encoder MFT    d3d11=true  async=true
+    takes: ARGB32
+    takes: NV12
+```
+
+So there is **no colour conversion anywhere** and no Video Processor MFT in the chain. Setting the
+output type before the input is what made the difference; `NV12` being accepted as well is a bonus
+(the MFT could take a converted frame if some future path needed one), but the path this design
+wants is the direct one.
+
+**`RGB32` was refused and `ARGB32` accepted**, which is worth knowing precisely because the two look
+interchangeable: `RGB32` is BGRX — the alpha byte ignored — and `ARGB32` carries it. Capture
+delivers the alpha-bearing variant, so the encoder's preference and the capture's format agree on
+the nose.
+
+What step 5 still has to confirm rather than assume: this was measured at **640x480**, because the
+question was about the *format*. Whether the same MFT takes `ARGB32` at 3840x2160 is a property of
+the encoder's level and of the driver, and it is the first thing step 5 should check — with the
+output type set first, since that ordering has now bitten three times in a row.
+
+### What the encoder will *eat* was open, and the reason is instructive
 
 The same probe now also asks each encoder which input subtypes it offers — the question that
 decides the chain's shape, because Windows Graphics Capture delivers **BGRA8** and a hardware

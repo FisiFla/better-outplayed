@@ -29,12 +29,15 @@ fn main() -> anyhow::Result<()> {
             encoder.asynchronous,
             encoder.hardware_url.as_deref().unwrap_or("-"),
         );
-        if encoder.input_subtypes.is_empty() {
-            println!("      input types: (could not be asked)");
+        if encoder.accepts.is_empty() {
+            println!("      takes no candidate input format");
         } else {
-            for subtype in &encoder.input_subtypes {
-                println!("      accepts: {subtype}");
+            for subtype in &encoder.accepts {
+                println!("      takes: {subtype}");
             }
+        }
+        if encoder.input_subtypes.is_empty() {
+            println!("      (it enumerates no types, which is what an async MFT does)");
         }
         if let Some(why) = &encoder.refusal {
             println!("      refused: {why}");
