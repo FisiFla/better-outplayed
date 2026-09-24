@@ -336,6 +336,7 @@ dependencies = [
  "localplay-media",
  "tempfile",
  "tracing",
+ "windows",
 ]
 
 [[package]]
