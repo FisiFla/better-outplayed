@@ -22,8 +22,9 @@ use background::{
     AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,
 };
 use commands::{
-    AppPaths, ClipDto, CommandError, DeleteOutcome, Deps, ErrorCode, RecorderHost,
-    RecordedClipDto, RecordingStatusDto, StorageConfigView, StorageStats, ThumbnailRef,
+    AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, ErrorCode,
+    RecorderHost, RecordedClipDto, RecordingStatusDto, SessionDto, SessionEventDto,
+    StorageConfigView, StorageStats, ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use localplay_media::FfmpegBinaries;
@@ -244,6 +245,66 @@ fn delete_clip(state: State<'_, AppState>, id: i64) -> Result<DeleteOutcome, Com
     state.with_deps(|deps| commands::delete_clip(deps, id))
 }
 
+// -- sessions ----------------------------------------------------------------------------
+//
+// Phase 5's session recorder: one scratch directory per recording, concatenated when it
+// stops. The timeline these commands read is computed by the store from the session's media
+// epoch — see `commands::session_events` for why it must not be recomputed here.
+
+/// Every session the index knows, newest first.
+#[tauri::command(rename_all = "snake_case")]
+fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionDto>, CommandError> {
+    state.with_deps(commands::list_sessions)
+}
+
+/// One session's row, for the detail panel.
+#[tauri::command(rename_all = "snake_case")]
+fn session_detail(
+    state: State<'_, AppState>,
+    session_id: i64,
+) -> Result<SessionDto, CommandError> {
+    state.with_deps(|deps| commands::session_detail(deps, session_id))
+}
+
+/// A session's timeline markers, in media-time order.
+#[tauri::command(rename_all = "snake_case")]
+fn session_events(
+    state: State<'_, AppState>,
+    session_id: i64,
+) -> Result<Vec<SessionEventDto>, CommandError> {
+    state.with_deps(|deps| commands::session_events(deps, session_id))
+}
+
+/// Mark a session as a favourite, or clear it.
+#[tauri::command(rename_all = "snake_case")]
+fn set_session_favourite(
+    state: State<'_, AppState>,
+    session_id: i64,
+    favourite: bool,
+) -> Result<SessionDto, CommandError> {
+    state.with_deps(|deps| commands::set_session_favourite(deps, session_id, favourite))
+}
+
+/// Delete a session: the row first, then its segments and its recorded file.
+#[tauri::command(rename_all = "snake_case")]
+fn delete_session(
+    state: State<'_, AppState>,
+    session_id: i64,
+) -> Result<DeleteSessionOutcome, CommandError> {
+    state.with_deps(|deps| commands::delete_session(deps, session_id))
+}
+
+/// Cut a clip out of a finished session, losslessly. Refused while it is still recording.
+#[tauri::command(rename_all = "snake_case")]
+fn extract_clip(
+    state: State<'_, AppState>,
+    session_id: i64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<ClipDto, CommandError> {
+    state.with_deps(|deps| commands::extract_clip(deps, session_id, start_ms, end_ms))
+}
+
 // -- recording ---------------------------------------------------------------------------
 //
 // These four are `async`, unlike every other command here, for one reason: tauri runs a
@@ -411,6 +472,12 @@ pub fn run() {
             trim_clip,
             thumbnail,
             delete_clip,
+            list_sessions,
+            session_detail,
+            session_events,
+            set_session_favourite,
+            delete_session,
+            extract_clip,
             start_recording,
             stop_recording,
             recording_status,

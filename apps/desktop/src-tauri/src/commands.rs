@@ -29,7 +29,7 @@ use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::{Recorder, RecorderConfig, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
-use localplay_store::{Clip, NewClip, Store};
+use localplay_store::{Clip, NewClip, Session, SessionEvent, Store};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -131,6 +131,11 @@ impl From<&crate::config::StorageConfig> for StorageConfigView {
 pub enum ErrorCode {
     /// No clip with that id is in the index.
     ClipNotFound,
+    /// No recording session with that id is in the index.
+    SessionNotFound,
+    /// The session is still recording. Its scratch directory is the only copy of the
+    /// footage, so there is nothing safe to cut from it or delete yet.
+    SessionStillRecording,
     /// The range has no length (`end <= start`). Rejected before ffmpeg is ever spawned.
     InvalidRange,
     /// The range reaches past the end of the clip, or a timestamp does.
@@ -169,6 +174,10 @@ impl CommandError {
 
     pub fn clip_not_found(id: i64) -> Self {
         Self::new(ErrorCode::ClipNotFound, format!("no clip with id {id} is in the index"))
+    }
+
+    pub fn session_not_found(id: i64) -> Self {
+        Self::new(ErrorCode::SessionNotFound, format!("no session with id {id} is in the index"))
     }
 
     /// `{:#}` on the wrapped error keeps the `context` chain, which is where the useful
@@ -227,6 +236,90 @@ impl From<&Clip> for ClipDto {
             codec: clip.codec.clone(),
             favourite: clip.favourite,
             created_at_ms: clip.created_at_ms,
+        }
+    }
+}
+
+/// One recording session, as the Sessions list sees it.
+///
+/// Mirrored by hand in `src/lib/types.ts`, and pinned by a test below that asserts the exact
+/// JSON keys — the same contract the clip and storage DTOs carry.
+///
+/// `media_epoch_ms` is deliberately **not** here. It is the anchor the store subtracts to
+/// turn an event's absolute media time into a timeline offset, and the offsets arrive
+/// already computed; exposing the epoch as well would invite the frontend to do the
+/// subtraction a second time, which is precisely the cross-clock defect the column was added
+/// to fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDto {
+    pub id: i64,
+    /// The game the watcher matched. `None` for a session nobody detected, which is the
+    /// ordinary case for a manual start.
+    pub game: Option<String>,
+    /// `"buffer"` or `"session"` (see `localplay_store::SESSION_MODE_*`). A buffer session
+    /// has no concatenated file: the row exists to group one run's clips and events.
+    pub mode: String,
+    /// Wall clock, ms since the Unix epoch. **Not** comparable with `offset_ms`, which is
+    /// media time — two different clocks, on purpose, and the reason both are named.
+    pub started_at_ms: i64,
+    /// When it stopped. **`None` means it is still recording.**
+    pub ended_at_ms: Option<i64>,
+    /// The concatenated file, once finalised. `None` while it runs, and always for a
+    /// buffer-mode session.
+    pub final_path: Option<String>,
+    /// Bytes the session occupies, as the store recorded them.
+    pub size_bytes: i64,
+    /// Exempt from both session retention rules, exactly as a favourited clip is.
+    pub favourite: bool,
+    /// Where the segments are, so an operator can find the footage without the database.
+    pub scratch_dir: String,
+}
+
+impl From<&Session> for SessionDto {
+    fn from(s: &Session) -> Self {
+        Self {
+            id: s.id,
+            game: s.game.clone(),
+            mode: s.mode.clone(),
+            started_at_ms: s.started_at_ms,
+            ended_at_ms: s.ended_at_ms,
+            final_path: s.final_path.clone(),
+            size_bytes: s.size_bytes,
+            favourite: s.favourite,
+            scratch_dir: s.scratch_dir.clone(),
+        }
+    }
+}
+
+/// One marker on a session's timeline, as the scrubber plots it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventDto {
+    pub id: i64,
+    /// The integration's tag — `"kill"`, `"death"`, `"round_start"`, or the `"bookmark"` a
+    /// hotkey clip writes. Passed through verbatim: this layer does not know the vocabulary
+    /// and must not, so a tag it has never seen is a marker that exists rather than an error.
+    /// The UI colours unknown tags neutrally for the same reason.
+    pub kind: String,
+    /// The marker's position on the **session timeline**, in ms of media time from the
+    /// session's start. Computed by the store, in one SQL expression, so the scrubber, the
+    /// tests and any future consumer cannot disagree about what a position means.
+    pub offset_ms: i64,
+    /// The integration's own detail, as JSON text, verbatim. `None` for a bookmark, which
+    /// has no source to describe.
+    pub payload: Option<String>,
+    /// The clip this marker produced, when it produced one. `None` for a marker recorded
+    /// without clipping.
+    pub clip_id: Option<i64>,
+}
+
+impl From<&SessionEvent> for SessionEventDto {
+    fn from(e: &SessionEvent) -> Self {
+        Self {
+            id: e.id,
+            kind: e.kind.clone(),
+            offset_ms: e.offset_ms,
+            payload: e.payload.clone(),
+            clip_id: e.clip_id,
         }
     }
 }
@@ -411,13 +504,29 @@ pub fn trim_clip(
     // The file exists from here on. Everything below can fail, and if it does the file
     // stays: it is what the user asked for, and deleting it to report a bookkeeping error
     // would destroy the only copy of their edit.
-    index_new_clip(deps, &clip, &dst, start_ms, end_ms)
+    index_new_clip(
+        deps,
+        &format!("clip #{}", clip.id),
+        clip.started_at_ms,
+        &clip.codec,
+        &dst,
+        start_ms,
+        end_ms,
+    )
 }
 
 /// Describe a newly written file and add it to the index.
+///
+/// The parent is passed as what it *is* — a label for the log, the media position the new
+/// clip should be placed at, and a codec to name when the new file turns out to have no video
+/// stream — rather than as a `&Clip`. A session's extracted clip has no parent `Clip`: a
+/// session is not a clip, and inventing one to satisfy a parameter would put a fake row's id
+/// in a log line and a fake `started_at` on a real clip.
 fn index_new_clip(
     deps: &Deps<'_>,
-    parent: &Clip,
+    parent: &str,
+    parent_started_at_ms: u64,
+    parent_codec: &str,
     dst: &Path,
     start_ms: u64,
     end_ms: u64,
@@ -446,7 +555,7 @@ fn index_new_clip(
         .map(|v| v.codec.clone())
         // A file with no video stream is not a clip this app can show; falling back to the
         // parent's codec would name a codec the file may not contain, so say what is known.
-        .unwrap_or_else(|| parent.codec.clone());
+        .unwrap_or_else(|| parent_codec.to_string());
 
     // `started_at` is the trimmed clip's position on its **parent's** media timeline. The
     // file's own timeline starts at zero, and nothing compares `started_at` across clips
@@ -456,7 +565,7 @@ fn index_new_clip(
     // `start_ms` that was asked for (spec §6.3).
     let new = NewClip {
         path: dst.to_path_buf(),
-        started_at_ms: parent.started_at_ms.saturating_add(start_ms),
+        started_at_ms: parent_started_at_ms.saturating_add(start_ms),
         duration_ms: info.duration_ms,
         size_bytes,
         codec,
@@ -478,9 +587,8 @@ fn index_new_clip(
     })?;
 
     tracing::info!(
-        "trimmed clip #{} [{start_ms}ms, {end_ms}ms) into clip #{new_id}: {size_bytes} \
+        "{parent} [{start_ms}ms, {end_ms}ms) was written as clip #{new_id}: {size_bytes} \
          bytes, probed duration {}ms, {}",
-        parent.id,
         info.duration_ms,
         dst.display()
     );
@@ -646,28 +754,41 @@ fn find_clip(store: &Store, id: i64) -> Result<Clip, CommandError> {
 /// exists so that a range reaching past the end of the clip is an explicit, actionable
 /// error rather than an ffmpeg failure to decode.
 fn validate_trim_range(clip: &Clip, start_ms: u64, end_ms: u64) -> Result<(), CommandError> {
+    validate_range("clip", clip.id, clip.duration_ms, start_ms, end_ms)
+}
+
+/// The same rules for anything a range can be cut out of — a clip, or a session recording.
+///
+/// `subject` names which, so the message a user reads says "clip #7" or "session #3" instead
+/// of making them work out which one they asked for.
+fn validate_range(
+    subject: &str,
+    id: i64,
+    duration_ms: u64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<(), CommandError> {
     if end_ms <= start_ms {
         return Err(CommandError::new(
             ErrorCode::InvalidRange,
             format!(
-                "the trim range for clip #{} is empty or inverted: start={start_ms}ms, \
-                 end={end_ms}ms. A range with no length cannot be cut.",
-                clip.id
+                "the range for {subject} #{id} is empty or inverted: start={start_ms}ms, \
+                 end={end_ms}ms. A range with no length cannot be cut."
             ),
         ));
     }
-    if clip.duration_ms == 0 {
+    if duration_ms == 0 {
         return Err(CommandError::new(
             ErrorCode::InvalidInput,
-            format!("clip #{} is indexed with a duration of 0ms, so it cannot be trimmed", clip.id),
+            format!("{subject} #{id} has a duration of 0ms, so it cannot be cut from"),
         ));
     }
-    if end_ms > clip.duration_ms {
+    if end_ms > duration_ms {
         return Err(CommandError::new(
             ErrorCode::OutOfRange,
             format!(
-                "the trim range for clip #{} ends at {end_ms}ms but the clip is only {}ms long",
-                clip.id, clip.duration_ms
+                "the range for {subject} #{id} ends at {end_ms}ms but it is only {duration_ms}ms \
+                 long"
             ),
         ));
     }
@@ -769,6 +890,336 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------------------
+//
+// Phase 5's session recorder writes every second it was told to into one scratch directory,
+// then concatenates it at the end. This is the window onto that. Two things are worth
+// naming, because the obvious implementations get them wrong:
+//
+// * `offset_ms` comes from the **store**, computed from the session's media epoch. Nothing
+//   here recomputes it against the wall clock. That recomputation *was* the defect — a
+//   timeline measured across two clocks — and it stays fixed only for as long as the
+//   subtraction lives in one place.
+// * `extract_clip` refuses a session that is still recording. Its scratch directory is the
+//   only copy of the footage, so a cut taken while the encoder is still writing into it
+//   would be a cut from a moving target.
+
+/// One session row, or a `session_not_found` naming the id.
+fn load_session(deps: &Deps<'_>, id: i64) -> Result<Session, CommandError> {
+    deps.store
+        .get_session(id)
+        .map_err(|e| CommandError::store("reading the session", e))?
+        .ok_or_else(|| CommandError::session_not_found(id))
+}
+
+/// Every session the index knows, newest first.
+///
+/// The order is the store's own (`ORDER BY started_at DESC, id DESC`) rather than re-sorted
+/// here: one definition of "newest", and it is the one the retention rules order by too.
+pub fn list_sessions(deps: &Deps<'_>) -> Result<Vec<SessionDto>, CommandError> {
+    let sessions = deps
+        .store
+        .list_sessions()
+        .map_err(|e| CommandError::store("listing the sessions", e))?;
+    Ok(sessions.iter().map(SessionDto::from).collect())
+}
+
+/// One session's row, for the detail panel.
+pub fn session_detail(deps: &Deps<'_>, session_id: i64) -> Result<SessionDto, CommandError> {
+    Ok(SessionDto::from(&load_session(deps, session_id)?))
+}
+
+/// A session's timeline, in media-time order.
+///
+/// An empty vector is a real answer: a session nobody tagged has no markers. A *missing*
+/// session is not — it is a [`ErrorCode::SessionNotFound`], which is why the row is checked
+/// first rather than letting an unknown id look like a session with an empty timeline.
+pub fn session_events(
+    deps: &Deps<'_>,
+    session_id: i64,
+) -> Result<Vec<SessionEventDto>, CommandError> {
+    load_session(deps, session_id)?;
+    let events = deps
+        .store
+        .events_for_session(session_id)
+        .map_err(|e| CommandError::store("reading the session timeline", e))?;
+    Ok(events.iter().map(SessionEventDto::from).collect())
+}
+
+/// Mark a session as a favourite, or clear it — the user's only way to protect one from the
+/// session retention rules, exactly as it is for a clip.
+pub fn set_session_favourite(
+    deps: &Deps<'_>,
+    session_id: i64,
+    favourite: bool,
+) -> Result<SessionDto, CommandError> {
+    // Checked first so a bogus id is a `session_not_found` rather than the store's own
+    // "nothing was favourited", which carries no code the frontend can switch on.
+    load_session(deps, session_id)?;
+    deps.store
+        .set_session_favourite(session_id, favourite)
+        .map_err(|e| CommandError::store("setting the session's favourite flag", e))?;
+    session_detail(deps, session_id)
+}
+
+/// What deleting a session actually did.
+///
+/// The row goes first and the bytes after, for the same reason [`DeleteOutcome`] exists: the
+/// index must never name files that are gone. What differs with a session is that the bytes
+/// are a *directory* of segments plus, usually, one concatenated file — so "did it work" is
+/// two answers, and both are reported rather than collapsed into one boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteSessionOutcome {
+    pub id: i64,
+    /// False when nothing named that id. A UI acting on a list it fetched a moment ago can
+    /// race a retention pass, and telling it "already gone" lets it refresh truthfully —
+    /// the same contract as [`DeleteOutcome::row_deleted`].
+    pub row_deleted: bool,
+    /// The scratch directory of segments is gone.
+    pub scratch_removed: bool,
+    /// The concatenated session file is gone.
+    pub final_file_removed: bool,
+    /// Bytes freed, measured from what was on disk immediately before removal.
+    pub bytes_reclaimed: u64,
+    /// Paths the committed row delete named that could not be removed afterwards. Reported
+    /// rather than swallowed: an orphan is recoverable, a silent one is not.
+    pub orphaned: Vec<String>,
+}
+
+/// Delete a session: its row, then its scratch directory and its concatenated file.
+///
+/// **A session that is still recording is refused** with
+/// [`ErrorCode::SessionStillRecording`]. The store refuses it too, and that is the check that
+/// guarantees it; this one exists so the frontend can say *why* without parsing a message.
+pub fn delete_session(
+    deps: &Deps<'_>,
+    session_id: i64,
+) -> Result<DeleteSessionOutcome, CommandError> {
+    // The row is read first so a *running* session is refused with a code the frontend can
+    // switch on. A missing row is **not** an error, it is `row_deleted: false` — the same
+    // answer `delete_clip` gives, so a UI acting on a list it fetched a moment ago can race a
+    // retention pass and still refresh truthfully.
+    let Some(session) = deps
+        .store
+        .get_session(session_id)
+        .map_err(|e| CommandError::store("reading the session", e))?
+    else {
+        return Ok(DeleteSessionOutcome {
+            id: session_id,
+            row_deleted: false,
+            scratch_removed: false,
+            final_file_removed: false,
+            bytes_reclaimed: 0,
+            orphaned: Vec::new(),
+        });
+    };
+    if session.ended_at_ms.is_none() {
+        return Err(CommandError::new(
+            ErrorCode::SessionStillRecording,
+            format!(
+                "session #{session_id} is still recording: its scratch directory is the \
+                 recording, and no ordering makes deleting it safe. Stop the recording first."
+            ),
+        ));
+    }
+
+    // Committed before anything is unlinked, and the paths are the ones a committed row
+    // delete named — the store's own contract.
+    let paths = deps
+        .store
+        .delete_session_returning_paths(session_id)
+        .map_err(|e| CommandError::store("deleting the session's row", e))?;
+    let Some(paths) = paths else {
+        // Raced away between the read above and this delete. Nothing is unlinked, because no
+        // committed row delete named anything.
+        return Ok(DeleteSessionOutcome {
+            id: session_id,
+            row_deleted: false,
+            scratch_removed: false,
+            final_file_removed: false,
+            bytes_reclaimed: 0,
+            orphaned: Vec::new(),
+        });
+    };
+
+    let mut outcome = DeleteSessionOutcome {
+        id: session_id,
+        row_deleted: true,
+        scratch_removed: false,
+        final_file_removed: false,
+        bytes_reclaimed: 0,
+        orphaned: Vec::new(),
+    };
+
+    // The recorded file is removed **before** the scratch directory. They are separate
+    // locations in the normal layout — the segments go in the session's scratch directory and
+    // the concatenated file in the sessions output directory — but nothing enforces that: the
+    // store takes both as caller-supplied strings, so a layout that did place the file among
+    // the segments would otherwise have its removal reported as a failure, because
+    // `remove_dir_all` had already taken it. File first, and the nested case is correct too.
+    //
+    // A buffer-mode session has no file, which is not a failure.
+    if let Some(final_path) = paths.final_path {
+        let final_path = PathBuf::from(final_path);
+        let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&final_path) {
+            Ok(()) => {
+                outcome.final_file_removed = true;
+                outcome.bytes_reclaimed += size;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::error!(
+                    "session #{session_id} was deleted from the index but its recorded file \
+                     could not be removed: {} ({err})",
+                    final_path.display()
+                );
+                outcome.orphaned.push(final_path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // The store hands these back as strings (they come out of the database), so they are
+    // turned into paths once, here, rather than at each use.
+    let scratch_dir = PathBuf::from(&paths.scratch_dir);
+    let scratch = dir_size(&scratch_dir);
+    match std::fs::remove_dir_all(&scratch_dir) {
+        Ok(()) => {
+            outcome.scratch_removed = true;
+            outcome.bytes_reclaimed += scratch;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "session #{session_id} was deleted from the index but its scratch directory \
+                 was already gone: {}",
+                scratch_dir.display()
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                "session #{session_id} was deleted from the index but its scratch directory \
+                 could not be removed: {} ({err})",
+                scratch_dir.display()
+            );
+            outcome.orphaned.push(scratch_dir.to_string_lossy().into_owned());
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Cut `[start_ms, end_ms)` out of a **finished** session into a new clip, and index it.
+///
+/// The same lossless path [`trim_clip`] uses — read that for what a stream copy can and
+/// cannot cut — with one extra refusal: a session that is still recording cannot be cut
+/// from, because the file the range was measured against is not the file that would be read.
+///
+/// A buffer-mode session has no concatenated file at all (it keeps a rolling ring), so the
+/// range has nothing to be measured against; that is refused with the reason, and pressing
+/// the clip hotkey is what a running buffer is for.
+pub fn extract_clip(
+    deps: &Deps<'_>,
+    session_id: i64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<ClipDto, CommandError> {
+    let session = load_session(deps, session_id)?;
+    if session.ended_at_ms.is_none() {
+        return Err(CommandError::new(
+            ErrorCode::SessionStillRecording,
+            format!(
+                "session #{session_id} is still recording, so there is no finished file to cut \
+                 from. Stop the recording, then extract the clip."
+            ),
+        ));
+    }
+    let Some(final_path) = session.final_path.as_deref() else {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "session #{session_id} has no concatenated file: it was recorded in buffer \
+                 mode, which keeps a rolling ring rather than one session file. Use the clip \
+                 hotkey while it is running."
+            ),
+        ));
+    };
+    let src = PathBuf::from(final_path);
+    if !src.is_file() {
+        return Err(CommandError::new(
+            ErrorCode::Io,
+            format!(
+                "session #{session_id} names {} as its recorded file, but that is not on disk, \
+                 so there is nothing to cut from",
+                src.display()
+            ),
+        ));
+    }
+
+    let bins = deps.binaries()?;
+    // The range is validated against the file's own probed duration, not against a stored
+    // number: the only duration that matters is the one in the file about to be cut.
+    let info = MediaInfo::probe(bins, &src)
+        .map_err(|e| CommandError::media("reading the session file's duration", e))?;
+    validate_range("session", session_id, info.duration_ms, start_ms, end_ms)?;
+    let Some(video) = info.video.as_ref() else {
+        return Err(CommandError::new(
+            ErrorCode::Media,
+            format!(
+                "{} has no video stream, so there is no picture to cut a clip from",
+                src.display()
+            ),
+        ));
+    };
+
+    let dst = free_output_path(trim_output_path(&src, start_ms, end_ms))?;
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CommandError::io("creating the clips directory", dir, e))?;
+    }
+
+    trim_lossless(bins, &src, &dst, start_ms, end_ms)
+        .map_err(|e| CommandError::media("extracting the clip from the session", e))?;
+
+    // The new row's `started_at` is the clip's position on the **session's** media timeline,
+    // which is what the session's markers are measured on — so a clip extracted at a marker
+    // sits at that marker. The file's own timeline starts at zero, and nothing compares
+    // `started_at` across files, so this is the only reading that carries information. An
+    // estimate, not a measurement: a stream copy cannot cut at an arbitrary point.
+    let parent_started_at_ms = session.media_epoch_ms.max(0) as u64;
+    index_new_clip(
+        deps,
+        &format!("session #{session_id}"),
+        parent_started_at_ms,
+        &video.codec,
+        &dst,
+        start_ms,
+        end_ms,
+    )
+}
+
+/// Total bytes of every file under `dir`, or 0 when it cannot be walked.
+///
+/// Used only to report what a deletion freed, so a directory that cannot be read is 0 rather
+/// than an error: the deletion itself reports its own failure separately, and refusing to
+/// delete because the *measurement* failed would be backwards.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let path = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => dir_size(&path),
+                _ => std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            }
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1157,6 +1608,71 @@ mod tests {
                 })
                 .unwrap();
             (id, path)
+        }
+
+        /// A **finished** session whose recorded file is a real, decodable video.
+        ///
+        /// The wall start and the media epoch are deliberately different numbers, and far
+        /// apart: that is the entire reason the column exists, and a fixture with the two
+        /// equal cannot tell one clock from the other.
+        ///
+        /// The segments and the recorded file live in **different** directories, which is the
+        /// real layout (see the recorder's `session_file_path`: the concatenation is written
+        /// into a sessions output directory, not among the segments it was built from).
+        fn add_finished_session(&self, seconds: u32, media_epoch_ms: i64) -> (i64, PathBuf) {
+            // Inside the same temporary root the fixture owns — `AppPaths` deliberately does
+            // not publish the app-data directory itself.
+            let root = self
+                .paths
+                .clips_dir
+                .parent()
+                .expect("the clips directory has a parent")
+                .to_path_buf();
+            let scratch_dir = root.join("sessions").join("session-1");
+            let out_dir = root.join("sessions-out");
+            std::fs::create_dir_all(&scratch_dir).unwrap();
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let final_path = out_dir.join("session-1.mp4");
+            write_test_video(&self.bins, &final_path, seconds);
+
+            let id = self
+                .store
+                .start_session(
+                    Some("Dota 2"),
+                    localplay_store::SESSION_MODE_SESSION,
+                    WALL_START_MS,
+                    &scratch_dir.to_string_lossy(),
+                    media_epoch_ms,
+                )
+                .unwrap();
+            self.store
+                .end_session(
+                    id,
+                    WALL_START_MS + i64::from(seconds) * 1_000,
+                    Some(&final_path.to_string_lossy()),
+                    std::fs::metadata(&final_path).unwrap().len() as i64,
+                )
+                .unwrap();
+            (id, final_path)
+        }
+
+        /// A session row that is still running, so it has no concatenated file. `mode` is
+        /// which engine opened it — a buffer run and a full-session run both look like this
+        /// until one of them stops.
+        fn add_running_session(&self, mode: &str) -> (i64, PathBuf) {
+            let dir = self
+                .paths
+                .clips_dir
+                .parent()
+                .expect("the clips directory has a parent")
+                .join("sessions")
+                .join(mode);
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = self
+                .store
+                .start_session(None, mode, WALL_START_MS, &dir.to_string_lossy(), 0)
+                .unwrap();
+            (id, dir)
         }
     }
 
@@ -2054,6 +2570,221 @@ mod tests {
         let custom = AppPaths::resolve(&dir, "/mnt/games/localplay-clips");
         assert_eq!(custom.clips_dir, PathBuf::from("/mnt/games/localplay-clips"));
         assert_eq!(custom.asset_roots()[0], Path::new("/mnt/games/localplay-clips"));
+    }
+
+    // -- sessions ------------------------------------------------------------------------
+
+    /// The wall clock the session fixtures start at: deliberately enormous, so that a
+    /// timeline offset computed against the wall start instead of the media epoch is
+    /// unmistakably wrong rather than merely imprecise.
+    const WALL_START_MS: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn the_session_dto_json_matches_the_typescript_interface() {
+        // `src/lib/types.ts` mirrors these by hand. Without this, a rename on either side is
+        // discovered by a user looking at an empty session list.
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(2, 1_000);
+
+        let dto = serde_json::to_value(session_detail(&f.deps(), session_id).unwrap()).unwrap();
+        let mut keys: Vec<&str> = dto.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "ended_at_ms",
+                "favourite",
+                "final_path",
+                "game",
+                "id",
+                "mode",
+                "scratch_dir",
+                "size_bytes",
+                "started_at_ms"
+            ]
+        );
+        assert!(
+            !keys.contains(&"media_epoch_ms"),
+            "the epoch stays behind the IPC boundary. Offsets arrive computed, and publishing \
+             the anchor as well would invite the frontend to subtract a second time — which is \
+             the cross-clock defect the column exists to fix"
+        );
+
+        f.store
+            .insert_event(&localplay_store::NewEvent {
+                session_id: Some(session_id),
+                kind: "kill".to_string(),
+                at_ms: 1_500,
+                payload: Some("{\"source\":\"lol\"}".to_string()),
+                clip_id: None,
+            })
+            .unwrap();
+        let events = session_events(&f.deps(), session_id).unwrap();
+        let event = serde_json::to_value(&events[0]).unwrap();
+        let mut keys: Vec<&str> = event.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["clip_id", "id", "kind", "offset_ms", "payload"]);
+
+        let outcome = delete_session(&f.deps(), session_id).unwrap();
+        let value = serde_json::to_value(&outcome).unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["bytes_reclaimed", "final_file_removed", "id", "orphaned", "row_deleted", "scratch_removed"]
+        );
+    }
+
+    #[test]
+    fn a_session_timeline_is_measured_from_the_media_epoch_not_the_wall_clock() {
+        // The defect this pins, at the IPC boundary: `offset_ms` used to be
+        // `events.at - sessions.started_at` — media time minus wall time. With the two clocks
+        // 1.7e12 ms apart, subtracting the wrong one is not a rounding error, it is a
+        // different number entirely, and this is what the scrubber plotted.
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(4, 1_000);
+        for (kind, at_ms) in [("kill", 1_200u64), ("death", 4_000)] {
+            f.store
+                .insert_event(&localplay_store::NewEvent {
+                    session_id: Some(session_id),
+                    kind: kind.to_string(),
+                    at_ms,
+                    payload: None,
+                    clip_id: None,
+                })
+                .unwrap();
+        }
+
+        let events = session_events(&f.deps(), session_id).unwrap();
+        assert_eq!(
+            events.iter().map(|e| (e.kind.as_str(), e.offset_ms)).collect::<Vec<_>>(),
+            vec![("kill", 200), ("death", 3_000)],
+            "offset = at - media_epoch_ms (1000ms), not at - the wall start"
+        );
+    }
+
+    #[test]
+    fn an_empty_timeline_and_a_missing_session_are_different_answers() {
+        // A session nobody tagged has no markers — an empty list. A session that does not
+        // exist is an error. Conflating the two would show an empty scrubber for a typo.
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(1, 0);
+        assert!(session_events(&f.deps(), session_id).unwrap().is_empty());
+
+        let err = session_events(&f.deps(), 9_999).expect_err("no such session");
+        assert_eq!(err.code, ErrorCode::SessionNotFound);
+        assert_eq!(session_detail(&f.deps(), 9_999).unwrap_err().code, ErrorCode::SessionNotFound);
+        assert_eq!(
+            set_session_favourite(&f.deps(), 9_999, true).unwrap_err().code,
+            ErrorCode::SessionNotFound
+        );
+    }
+
+    #[test]
+    fn a_favourite_can_be_set_and_cleared_and_is_visible_in_the_list() {
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(1, 0);
+        assert!(!list_sessions(&f.deps()).unwrap()[0].favourite);
+
+        assert!(set_session_favourite(&f.deps(), session_id, true).unwrap().favourite);
+        assert!(list_sessions(&f.deps()).unwrap()[0].favourite, "the list reflects it");
+
+        assert!(!set_session_favourite(&f.deps(), session_id, false).unwrap().favourite);
+    }
+
+    #[test]
+    fn extracting_a_clip_from_a_running_session_is_refused() {
+        // Its scratch directory is being written into, so the file a range would be measured
+        // against is not the file that would be read.
+        let f = Fixture::new();
+        let (id, _) = f.add_running_session(localplay_store::SESSION_MODE_SESSION);
+
+        let err = extract_clip(&f.deps(), id, 0, 500).expect_err("a running session has no file");
+        assert_eq!(err.code, ErrorCode::SessionStillRecording);
+        assert!(err.message.contains("still recording"), "{}", err.message);
+
+        // Deleting it is refused for the same reason, and by the same code.
+        let err = delete_session(&f.deps(), id).expect_err("a running session is not deletable");
+        assert_eq!(err.code, ErrorCode::SessionStillRecording);
+        assert!(f.store.get_session(id).unwrap().is_some(), "and the row is untouched");
+    }
+
+    #[test]
+    fn a_buffer_session_has_no_file_to_extract_from() {
+        // Buffer mode keeps a rolling ring rather than one session file, so there is nothing
+        // for a range to be measured against. The message says which mode it was.
+        let f = Fixture::new();
+        let (id, dir) = f.add_running_session(localplay_store::SESSION_MODE_BUFFER);
+        f.store
+            .end_session(id, WALL_START_MS + 1_000, None, 0)
+            .unwrap();
+
+        let err = extract_clip(&f.deps(), id, 0, 500).expect_err("no concatenated file");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("buffer"), "{}", err.message);
+        assert!(dir.exists(), "the refusal changes nothing on disk");
+    }
+
+    #[test]
+    fn extracting_a_clip_from_a_finished_session_writes_and_indexes_it() {
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(4, 1_000);
+
+        let clip = extract_clip(&f.deps(), session_id, 1_000, 2_000).expect("the extract");
+        assert!(PathBuf::from(&clip.path).is_file(), "the clip is on disk: {}", clip.path);
+        assert!(clip.size_bytes > 0);
+        assert!(
+            (500..=1_500).contains(&clip.duration_ms),
+            "a stream copy cuts on keyframes, so the range is approximate, but it must be \
+             near the second that was asked for: got {}ms",
+            clip.duration_ms
+        );
+        // The new row is placed on the *session's* media timeline, so a clip extracted at a
+        // marker sits at that marker: epoch 1000 + start 1000.
+        assert_eq!(clip.started_at_ms, 2_000, "positioned on the session's own timeline");
+        assert_eq!(
+            list_clips(&f.deps()).unwrap().iter().filter(|c| c.id == clip.id).count(),
+            1,
+            "and it is in the library, not merely on disk"
+        );
+    }
+
+    #[test]
+    fn extracting_out_of_range_or_inverted_is_refused_before_ffmpeg_runs() {
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(2, 0);
+
+        let err = extract_clip(&f.deps(), session_id, 500, 500).expect_err("an empty range");
+        assert_eq!(err.code, ErrorCode::InvalidRange);
+        assert!(err.message.contains("session #"), "the message names what it refused: {}", err.message);
+
+        let err = extract_clip(&f.deps(), session_id, 1_500, 900_000).expect_err("past the end");
+        assert_eq!(err.code, ErrorCode::OutOfRange);
+    }
+
+    #[test]
+    fn deleting_a_finished_session_removes_its_row_its_segments_and_its_file() {
+        let f = Fixture::new();
+        let (id, final_path) = f.add_finished_session(1, 0);
+        // What the concatenation leaves behind in the scratch directory.
+        let scratch = PathBuf::from(&f.store.get_session(id).unwrap().unwrap().scratch_dir);
+        std::fs::write(scratch.join("seg-000001.mp4"), b"pretend segment").unwrap();
+
+        let outcome = delete_session(&f.deps(), id).unwrap();
+        assert!(outcome.row_deleted);
+        assert!(outcome.scratch_removed, "the segments go");
+        assert!(outcome.final_file_removed, "and the recorded file");
+        assert!(outcome.orphaned.is_empty(), "nothing was left behind: {:?}", outcome.orphaned);
+        assert!(!scratch.exists());
+        assert!(!final_path.exists());
+        assert!(outcome.bytes_reclaimed > 0, "the bytes that were freed are reported");
+        assert!(f.store.get_session(id).unwrap().is_none(), "the row is gone");
+
+        // A second delete is not an error: it says nothing was deleted, so a UI racing a
+        // retention pass can refresh truthfully. Same contract as `delete_clip`.
+        let again = delete_session(&f.deps(), id).unwrap();
+        assert!(!again.row_deleted);
+        assert_eq!(again.bytes_reclaimed, 0);
     }
 }
 

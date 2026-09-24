@@ -22,9 +22,12 @@ import type {
   ClipDto,
   CommandError,
   DeleteOutcome,
+  DeleteSessionOutcome,
   ErrorCode,
   RecordedClip,
   RecordingStatus,
+  SessionDto,
+  SessionEvent,
   StorageStats,
   ThumbnailRef,
 } from './types';
@@ -37,6 +40,24 @@ export interface ClipSource {
   trimClip(id: number, startMs: number, endMs: number): Promise<ClipDto>;
   thumbnail(id: number, atMs: number): Promise<ThumbnailRef>;
   deleteClip(id: number): Promise<DeleteOutcome>;
+  /**
+   * Sessions: one recording, the file it was concatenated into, and the markers on its
+   * timeline. Read-only apart from the favourite flag and deletion — the engine that writes
+   * a session is the recorder, not this window.
+   */
+  listSessions(): Promise<SessionDto[]>;
+  sessionDetail(sessionId: number): Promise<SessionDto>;
+  /**
+   * A session's markers, in media-time order. `offset_ms` is media time from the session's
+   * start, computed by the store; nothing here recomputes it against the wall clock.
+   * An empty list is a real answer — a session nobody tagged has no markers.
+   */
+  sessionEvents(sessionId: number): Promise<SessionEvent[]>;
+  setSessionFavourite(sessionId: number, favourite: boolean): Promise<SessionDto>;
+  /** Delete a session: its row, then its segments and its recorded file. */
+  deleteSession(sessionId: number): Promise<DeleteSessionOutcome>;
+  /** Cut a clip out of a **finished** session, losslessly. Refused while it is recording. */
+  extractClip(sessionId: number, startMs: number, endMs: number): Promise<ClipDto>;
   /**
    * Recording, through the same engine the CLI drives (`localplay-recorder`). These four
    * are the only commands that make the shell capture anything, and none of them is
@@ -65,6 +86,16 @@ export const tauriIpc: ClipSource = {
     invoke<ClipDto>('trim_clip', { id, start_ms: startMs, end_ms: endMs }),
   thumbnail: (id, atMs) => invoke<ThumbnailRef>('thumbnail', { id, at_ms: atMs }),
   deleteClip: (id) => invoke<DeleteOutcome>('delete_clip', { id }),
+  listSessions: () => invoke<SessionDto[]>('list_sessions'),
+  sessionDetail: (sessionId) => invoke<SessionDto>('session_detail', { session_id: sessionId }),
+  sessionEvents: (sessionId) =>
+    invoke<SessionEvent[]>('session_events', { session_id: sessionId }),
+  setSessionFavourite: (sessionId, favourite) =>
+    invoke<SessionDto>('set_session_favourite', { session_id: sessionId, favourite }),
+  deleteSession: (sessionId) =>
+    invoke<DeleteSessionOutcome>('delete_session', { session_id: sessionId }),
+  extractClip: (sessionId, startMs, endMs) =>
+    invoke<ClipDto>('extract_clip', { session_id: sessionId, start_ms: startMs, end_ms: endMs }),
   startRecording: () => invoke<RecordingStatus>('start_recording'),
   stopRecording: () => invoke<RecordingStatus>('stop_recording'),
   recordingStatus: () => invoke<RecordingStatus>('recording_status'),

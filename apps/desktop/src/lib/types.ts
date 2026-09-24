@@ -64,6 +64,63 @@ export interface DeleteOutcome {
   thumbnails_removed: number;
 }
 
+/**
+ * One recording session, as the Sessions list sees it.
+ *
+ * `media_epoch_ms` is deliberately absent, and its absence is part of the contract: the
+ * timeline offsets arrive already computed by the store, and publishing the anchor as well
+ * would invite a second subtraction here — which is exactly the cross-clock defect the
+ * column exists to fix.
+ */
+export interface SessionDto {
+  id: number;
+  /** The game the watcher matched, or `null` for a session started by hand. */
+  game: string | null;
+  /** `'buffer'` or `'session'`; a buffer session has no concatenated file. */
+  mode: string;
+  /** Wall clock, ms since the Unix epoch. **Not** comparable with an event's `offset_ms`. */
+  started_at_ms: number;
+  /** `null` means it is still recording. */
+  ended_at_ms: number | null;
+  /** The concatenated file, once finalised. `null` while running, and for buffer mode. */
+  final_path: string | null;
+  size_bytes: number;
+  favourite: boolean;
+  /** Where the segments are, so the footage can be found without the database. */
+  scratch_dir: string;
+}
+
+/** One marker on a session's timeline, as the scrubber plots it. */
+export interface SessionEvent {
+  id: number;
+  /**
+   * The integration's tag: `'kill'`, `'death'`, `'round_start'`, or the `'bookmark'` a hotkey
+   * clip writes. Passed through verbatim — the UI colours an unknown tag neutrally rather
+   * than hiding it, because a tag this build has never heard of is a marker that exists.
+   */
+  kind: string;
+  /** Position on the session timeline: media time in ms from the session's start. */
+  offset_ms: number;
+  /** The integration's detail, as JSON text, verbatim. `null` for a bookmark. */
+  payload: string | null;
+  /** The clip this marker produced, when it produced one. */
+  clip_id: number | null;
+}
+
+/** What deleting a session did, in the vocabulary of spec §8.2. */
+export interface DeleteSessionOutcome {
+  id: number;
+  /** False when nothing named that id: a race with a retention pass is not an error. */
+  row_deleted: boolean;
+  /** The scratch directory of segments is gone. */
+  scratch_removed: boolean;
+  /** The concatenated session file is gone. */
+  final_file_removed: boolean;
+  bytes_reclaimed: number;
+  /** Paths the row delete named that could not be removed afterwards. */
+  orphaned: string[];
+}
+
 /** The live recording status, as `recording_status` returns it. */
 export interface RecordingStatus {
   /** False also means "never started": there is one status shape, not two. */
@@ -155,6 +212,8 @@ export interface AppStatus {
 /** The machine-readable half of a command failure. */
 export type ErrorCode =
   | 'clip_not_found'
+  | 'session_not_found'
+  | 'session_still_recording'
   | 'invalid_range'
   | 'out_of_range'
   | 'invalid_input'
