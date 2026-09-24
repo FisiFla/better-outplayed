@@ -23,11 +23,13 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFCreateDXGIDeviceManager, MFShutdown,
-    MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFMediaType_Video, MFSTARTUP_FULL,
-    MFVideoFormat_H264, MF_VERSION, MF_TRANSFORM_ASYNC_UNLOCK,
+    IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFCreateDXGIDeviceManager,
+    MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
+    MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2, MF_VERSION,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -46,6 +48,16 @@ pub struct HardwareEncoder {
     pub asynchronous: bool,
     /// **The question this module exists for**: did `MFT_MESSAGE_SET_D3D_MANAGER` succeed?
     pub accepts_d3d11: bool,
+    /// The input subtypes this MFT will accept, named where this build knows the name.
+    ///
+    /// This decides the *shape* of the chain rather than whether it exists. Windows Graphics
+    /// Capture delivers **BGRA8**; if the encoder will only take **NV12**, then something has to
+    /// convert between them, and the honest place for that is a Video Processor MFT on the GPU
+    /// rather than a CPU loop in this process — which is precisely the cost this whole plan exists
+    /// to remove. If it accepts BGRA directly, the texture can go straight in.
+    /// Empty when the MFT could not be asked — it would not activate, or it would not unlock —
+    /// which is what the `refusal` beside it explains.
+    pub input_subtypes: Vec<String>,
     /// Why not, when it did not — a driver's own words are worth more than a summary of them.
     pub refusal: Option<String>,
 }
@@ -141,6 +153,7 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
                 hardware_url,
                 asynchronous,
                 accepts_d3d11: false,
+                input_subtypes: Vec::new(),
                 refusal: Some(format!("could not be activated: {err:#}")),
             }
         }
@@ -169,6 +182,7 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
                 hardware_url,
                 asynchronous,
                 accepts_d3d11: false,
+                input_subtypes: Vec::new(),
                 refusal: Some(format!("could not be unlocked for asynchronous use: {err}")),
             };
         }
@@ -191,12 +205,16 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
         let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
 
+    let input_subtypes = input_subtypes(&transform);
+    // The transform is released at the end of this function; the attribute query above is the last
+    // thing it is needed for.
     match handshake {
         Ok(()) => HardwareEncoder {
             name,
             hardware_url,
             asynchronous,
             accepts_d3d11: true,
+            input_subtypes,
             refusal: None,
         },
         Err(err) => HardwareEncoder {
@@ -204,9 +222,97 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
             hardware_url,
             asynchronous,
             accepts_d3d11: false,
+            input_subtypes,
             refusal: Some(format!("refused MFT_MESSAGE_SET_D3D_MANAGER: {err}")),
         },
     }
+}
+
+/// The input subtypes an MFT offers, by enumerating until it stops answering.
+///
+/// Bounded rather than unbounded: an MFT that answered forever would hang the probe, and no
+/// encoder has ever offered more than a handful. The documented signal for "no more types" is an
+/// error, which is the break.
+fn input_subtypes(transform: &IMFTransform) -> Vec<String> {
+    const ENOUGH: u32 = 32;
+    let mut found = Vec::new();
+    for index in 0..ENOUGH {
+        // SAFETY: enumerating the first input stream's available types. The index is walked from
+        // zero until the call refuses, which is the documented terminator.
+        let Ok(media_type) = (unsafe { transform.GetInputAvailableType(0, index) }) else { break };
+        // SAFETY: reading the subtype GUID out of a media type this call just returned.
+        match unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) } {
+            Ok(subtype) => found.push(describe_subtype(&subtype)),
+            Err(_) => break,
+        }
+    }
+    found
+}
+
+/// A video subtype's name, for the ones this build knows, and its GUID otherwise.
+///
+/// `RGB32` is included deliberately: Media Foundation's name for it is BGRX/RGB32 in memory, which
+/// is the *same byte order* Windows Graphics Capture delivers as BGRA8, so an encoder that lists it
+/// can take a captured texture without a colour conversion — which is not obvious from the name.
+fn describe_subtype(guid: &windows::core::GUID) -> String {
+    let known: [(&windows::core::GUID, &str); 6] = [
+        (&MFVideoFormat_NV12, "NV12"),
+        (&MFVideoFormat_ARGB32, "ARGB32"),
+        (&MFVideoFormat_RGB32, "RGB32 (BGRA byte order — what WGC delivers)"),
+        (&MFVideoFormat_YUY2, "YUY2"),
+        (&MFVideoFormat_P010, "P010"),
+        (&MFVideoFormat_H264, "H264"),
+    ];
+    for (candidate, name) in known {
+        if candidate == guid {
+            return name.to_string();
+        }
+    }
+    format!("{guid:?}")
+}
+
+/// Whether this machine offers a hardware-accelerated **Video Processor** MFT.
+///
+/// Only needed if the encoder refuses BGRA: a processor is where a BGRA→NV12 conversion belongs if
+/// one is required, because it runs on the GPU. Reported either way, since "there is one" is worth
+/// knowing before the design depends on it.
+pub fn probe_video_processors() -> Result<Vec<String>> {
+    enumerate_names(MFT_CATEGORY_VIDEO_PROCESSOR)
+}
+
+/// The friendly names of the MFTs in one category, hardware-flagged and sorted.
+fn enumerate_names(category: windows::core::GUID) -> Result<Vec<String>> {
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: `activates`/`count` are the out-parameters this call fills.
+    unsafe {
+        MFTEnumEx(
+            category,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            None,
+            None,
+            &mut activates,
+            &mut count,
+        )
+    }
+    .context("MFTEnumEx for a category")?;
+    if activates.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: `activates` points at `count` initialised `Option<IMFActivate>`s written by the call
+    // above, and the array is released with the matching free below.
+    let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+    let names = candidates
+        .iter()
+        .flatten()
+        .map(|candidate| {
+            attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string())
+        })
+        .collect();
+    // SAFETY: as above.
+    unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+    Ok(names)
 }
 
 /// A D3D11 device of the kind the capture backend creates.

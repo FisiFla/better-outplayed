@@ -29,12 +29,39 @@ fn main() -> anyhow::Result<()> {
             encoder.asynchronous,
             encoder.hardware_url.as_deref().unwrap_or("-"),
         );
+        if encoder.input_subtypes.is_empty() {
+            println!("      input types: (could not be asked)");
+        } else {
+            for subtype in &encoder.input_subtypes {
+                println!("      accepts: {subtype}");
+            }
+        }
         if let Some(why) = &encoder.refusal {
             println!("      refused: {why}");
         }
     }
     let usable = encoders.iter().filter(|e| e.accepts_d3d11).count();
     println!("\nof those, {usable} accepted MFT_MESSAGE_SET_D3D_MANAGER over a BGRA-capable D3D11 device");
+
+    // Whether frames would need converting before an encoder will take them. WGC delivers BGRA8; an
+    // encoder that lists NV12 but not RGB32 means a Video Processor MFT belongs in the chain, on the
+    // GPU, rather than a CPU conversion loop — which is the cost this plan exists to remove.
+    let takes_bgra = encoders.iter().any(|e| {
+        e.input_subtypes
+            .iter()
+            .any(|s| s.starts_with("RGB32") || s.starts_with("ARGB32"))
+    });
+    println!("any encoder takes BGRA/ARGB directly: {takes_bgra}");
+    match localplay_encoder::mft::probe_video_processors() {
+        Ok(processors) if processors.is_empty() => {
+            println!("video processor MFTs (for a GPU-side colour conversion): none")
+        }
+        Ok(processors) => println!(
+            "video processor MFTs (for a GPU-side colour conversion): {}",
+            processors.join(", ")
+        ),
+        Err(err) => println!("video processor MFTs: could not be asked: {err}"),
+    }
     if usable == 0 {
         // Not an error: it is a finding, and the one the plan most needs. Exit non-zero so a
         // script notices, but print the reason rather than a stack trace.

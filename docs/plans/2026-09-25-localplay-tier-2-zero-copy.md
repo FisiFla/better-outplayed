@@ -94,6 +94,43 @@ tells step 5 two things it would otherwise have learned by debugging: the MFT mu
 before it is configured, and the encoder has to be *chosen* rather than assumed, because the
 hardware flag enumerates MFTs that cannot be instantiated on this machine at all.
 
+### What the encoder will *eat* is still open, and the reason is instructive
+
+The same probe now also asks each encoder which input subtypes it offers — the question that
+decides the chain's shape, because Windows Graphics Capture delivers **BGRA8** and a hardware
+encoder that wants **NV12** needs a colour conversion, which belongs on the GPU if it cannot be
+avoided. The answer was not the expected one:
+
+```
+NVIDIA H.264 Encoder MFT    d3d11=true  async=true
+    input types: (could not be asked)
+any encoder takes BGRA/ARGB directly: false
+video processor MFTs (for a GPU-side colour conversion): none
+```
+
+`IMFTransform::GetInputAvailableType` refuses on this MFT even after it has accepted the D3D11
+manager, which is consistent with what an **asynchronous** MFT is: it does not offer types for
+inspection the way a synchronous one does, and Media Foundation's own guidance for hardware
+encoders is to read the *registered* types out of band (`MFTGetInfo`, by the CLSID the activation
+carries in `MFT_TRANSFORM_CLSID_Attribute`) rather than to ask an instance. So the honest reading of
+that line is "not asked properly yet", **not** "NV12 only" — and the `false` beside it therefore
+means nothing yet either.
+
+Two things follow, both for step 5:
+
+1. **Settle the input format by trying it, not by enumerating it.** `SetInputType` with a candidate
+   `IMFMediaType` (BGRA/RGB32 first, then NV12) answers the question directly: an MFT accepting a
+   type is the fact that matters, and it is the same call the encoder will make anyway. `MFTGetInfo`
+   by CLSID is the alternative.
+2. **If the conversion is needed, the chain needs a processor and this probe did not find one**
+   under the hardware flag. That flag is the wrong filter for a Video Processor MFT, which is
+   normally a software MFT that drives the GPU's video processor — so the next probe should look at
+   the whole category, and should test BGRA→NV12 negotiation rather than mere presence.
+
+Neither is a reason to doubt the design; the D3D11 handshake above is the part that could have
+killed it, and it passed. It is a reason not to write step 5's type negotiation from the assumption
+that a captured texture can go straight in.
+
 ## Sub-steps, each independently verifiable
 
 1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on
