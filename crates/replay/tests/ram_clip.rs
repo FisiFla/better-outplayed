@@ -17,7 +17,7 @@ use localplay_replay::splice::ClipSplicer;
 use localplay_replay::MemoryRingBuffer;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Record `seconds` of stub capture into a ring, and hold the stream's bytes.
@@ -200,4 +200,91 @@ fn audio_stream_names(bin: &FfmpegBinaries, path: &std::path::Path) -> Vec<Optio
         .filter(|s| s["codec_type"] == "audio")
         .map(|s| s["tags"]["name"].as_str().map(str::to_string))
         .collect()
+}
+
+/// The recorder's shape, without the recorder: the stream is **ingested on the thread that owns
+/// the pipe**, concurrently with the frames being fed.
+///
+/// `ring_of_stub_capture` above collects the stream first and parses it afterwards. That is
+/// easier to write and it is not what the recorder does — and the difference is exactly where a
+/// stall hides. A reader that falls behind backs the whole pipeline up: ffmpeg blocks writing to
+/// a full stdout, so it stops draining stdin, so the encoder's frame channel fills and the
+/// submit side slows to whatever the reader is still moving. The symptom is not an error, it is
+/// a recording that quietly runs at a fraction of its configured rate.
+///
+/// So this asserts the two halves that would show it: that the capture side kept its pace, and
+/// that the ring holds the footage wall time says it should.
+#[test]
+fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
+    let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut cfg = EncodeConfig::for_tests_software(
+        VideoCodec::H264,
+        64,
+        48,
+        30,
+        dir.path().to_path_buf(),
+        1_000,
+    );
+    cfg.output = EncodeOutput::FragmentedStream;
+
+    let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
+    let stream = enc.take_output_stream().expect("the stream mode exposes its pipe");
+
+    let ring = Arc::new(Mutex::new(MemoryRingBuffer::new(256 * 1024 * 1024, 120_000)));
+    let reader = {
+        let ring = Arc::clone(&ring);
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break, // the encoder closed the pipe
+                    Ok(n) => {
+                        let Ok(mut ring) = ring.lock() else { break };
+                        if ring.push(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 30 });
+    let mut audio = StubAudio::new(AudioFormat::default());
+    video.start().expect("start the capture stub");
+    audio.start().expect("start the audio stub");
+
+    let until = Instant::now() + Duration::from_secs(4);
+    let mut frames = 0u32;
+    while Instant::now() < until {
+        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+            enc.submit_video(frame).expect("submit video");
+            frames += 1;
+        }
+        while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
+            enc.submit_audio(block).expect("submit audio");
+        }
+    }
+    enc.finish().expect("flush the encoder");
+    reader.join().expect("the reader thread");
+
+    // 4s at 30fps is ~120 frames. Half of that is a wide margin that still fails loudly if the
+    // submit side is being throttled by a reader that cannot keep up.
+    assert!(
+        frames > 60,
+        "the capture side stalled: {frames} frames in 4s at 30fps, which is not the stub's \
+         doing — a reader that falls behind throttles the encoder"
+    );
+
+    let ring = ring.lock().expect("the ring");
+    let span = ring.span_ms();
+    assert!(
+        span >= 3_000,
+        "the ring holds {span}ms of provable footage after 4s of capture: the reader fell \
+         behind and the pipeline paid for it"
+    );
 }

@@ -851,28 +851,43 @@ removed.
 mode. So **constraint 1 of this task is not satisfied by the shipping binary**: unclipped
 footage still goes to disk. The pieces above are used by tests, not by the recorder.
 
-The wiring was written, type-checked, and **reverted unlanded**, because it stalled the
-pipeline. The evidence, from a buffer-mode recording in the recorder's own suite:
+The wiring was written, type-checked, and **reverted unlanded**, because in a buffer-mode
+recording in the recorder's own suite a 3000ms clip request came back as **2000ms** — exactly
+the pre-roll, with the post-roll missing.
+
+**An earlier reading of that evidence blamed a stalled reader thread. That was wrong**, and is
+recorded here so the next pass does not chase it. The status line at the moment in question was:
 
 ```
-after the buffer filled: frames: 21, segments: 1, bytes: 8372, span_ms: 900
-two seconds later:        frames: 21 -> 23, span 900ms -> 1000ms
+after the buffer filled: frames: 21, segments: 1, bytes: 8372, span_ms: 900,
+                         fps: 9.99, configured_fps: 10, effective_fps: 10
+two seconds later:       frames: 21 -> 23, span 900ms -> 1000ms
 ```
 
-Roughly one frame per second, where the pacer asked for ten. That signature — the pump and the
-span advancing in lockstep, both far below the configured rate — is the reader thread failing
-and the pipe backing up: ffmpeg blocks writing to a full stdout, so it stops draining stdin, so
-the encoder's frame channel fills and `push_frame` blocks, so the pump slows to whatever the
-reader is still moving. The reader's own `failure` slot stayed empty, which points at a
-**panic** in the reader thread — a panic unwinds without setting that slot. The prime suspect is
-`sample_span_ticks` (`crates/media/src/fragments.rs`), where `sample_count` is read from the
-stream and used to index: that indexing needs a checked multiply before it can be trusted with
-a number the stream chooses.
+`fps` is *measured from frames actually submitted*, so 9.99 against a requested 10 is positive
+evidence that the pump was running at its configured rate and nothing was throttled. The two
+`frames` readings were therefore about 200ms apart, not the two seconds the surrounding test
+wording suggests — and `span 900 -> 1000` is one fragment boundary, not a frozen ring. A reader
+that had died would have shown a measured `fps` near 1, and would have shown it in the pacer's
+own number.
 
-**The next step is to log the reader thread's death before re-applying anything** — a
-`catch_unwind` or a panic hook at the `push` boundary, run against the recorder test that
-produced the numbers above. Guessing at the fix is what produced two wrong offsets already
-(see below); the difference here is that a wrong guess is a hang, not a failed assertion.
+That reading is now backed by a test rather than an argument:
+`a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline`
+(`crates/replay/tests/ram_clip.rs`) drives the recorder's actual shape — a reader thread that
+parses into the ring *while* frames are fed — and asserts both halves, that the capture side
+keeps its pace and that the ring holds the footage wall time says it should. **It passes.** It
+is a regression test for the seam no other test covered: `ring_of_stub_capture` collects the
+stream first and parses it afterwards, which is easier to write and is not what the recorder
+does.
+
+**So the defect to chase is clip length, not throughput.** A 3000ms request resolving to
+2000ms means the window `[trigger - pre, trigger + post)` was not fully covered — either the
+post-roll wait's target was reached at a lower span than the window's end, or the window's end
+was clamped. The ring's `span_ms`, the trigger's time base and `pump_until_span`'s `need_ms` all
+have to be shown to be the same clock, which is the measurement to make next: log
+`trigger_ms`, `pre_ms`, `post_ms`, the ring's oldest and newest fragment bounds, and the
+post-roll wait's exit span, and check that the selected window is the one the request asked
+for.
 
 ### Two parse bugs found by measurement, not by reading
 
