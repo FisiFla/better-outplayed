@@ -11,9 +11,10 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-/// The schema this build writes. **v2** adds the session columns Phase 5 needs to the
-/// v1 tables, in place and without touching a row (see [`Store::migrate`]).
-const SCHEMA_VERSION: i32 = 2;
+/// The schema this build writes. Each version adds columns in place, without reading,
+/// copying or losing a row (see [`Store::migrate`]): **v2** the session columns Phase 5
+/// needs, **v3** the media-clock anchor a session's event timeline is measured from.
+const SCHEMA_VERSION: i32 = 3;
 
 /// The mode of a session the ring buffer opened: the row exists to group the clips and
 /// events of one buffer run, and there is no concatenated session file (spec §5.5).
@@ -95,6 +96,26 @@ const V2_SESSION_COLUMNS: [(&str, &str); 4] = [
     ),
 ];
 
+/// The columns schema v3 adds to `sessions`, and the DDL that adds each.
+///
+/// One column, and it fixes a real defect rather than tidying one. `events.at` is **media**
+/// time — the ledger's clock, which restarts with the scratch directory — while
+/// `started_at` is the **wall** clock. The session timeline used to be their difference,
+/// which is arithmetic on two unrelated clocks: it is why a session's events plotted
+/// nowhere near the moment they happened. `media_epoch_ms` records the media position the
+/// session began at, so the timeline becomes `at - media_epoch_ms` — one clock, and the
+/// number the scrubber plots.
+///
+/// A legacy row defaults to 0, and that is honest rather than convenient: those rows were
+/// recorded against the buffer's own ledger, and 0 is the only epoch this build can supply
+/// for them without inventing a measurement it never took. It is the same choice v2 made
+/// for `mode`, and for the same reason — the default describes what the row's own contents
+/// support.
+const V3_SESSION_COLUMNS: [(&str, &str); 1] = [(
+    "media_epoch_ms",
+    "ALTER TABLE sessions ADD COLUMN media_epoch_ms INTEGER NOT NULL DEFAULT 0",
+)];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewClip {
     pub path: PathBuf,
@@ -168,12 +189,24 @@ pub struct Session {
     /// [`SESSION_MODE_BUFFER`] or [`SESSION_MODE_SESSION`]; a closed set today, stored as
     /// TEXT so a row written by a newer build is still readable rather than an error.
     pub mode: String,
-    /// When the session started, on the **caller's** clock — the same clock as the
-    /// `events.at` it records, because the two are subtracted to place an event on the
-    /// session timeline (see [`Store::events_for_session`]). This is also the instant the
-    /// retention rules age a session by and order the session store with (see
-    /// [`retention::plan_retention`]).
+    /// When the session started on the **wall** clock — the instant the retention rules age
+    /// a session by and order the session store with (see [`retention::plan_retention`]),
+    /// and what a UI shows as "recorded at". It is deliberately *not* what the event
+    /// timeline is measured from: `events.at` is media time, and subtracting one from the
+    /// other was arithmetic across two unrelated clocks. That is
+    /// [`Session::media_epoch_ms`]'s job.
     pub started_at_ms: i64,
+    /// The **media** position this session began at, in ms: what
+    /// [`Store::events_for_session`] subtracts from `events.at` to place an event on the
+    /// session timeline. `0` for a session that started against a scratch directory whose
+    /// ledger was empty — the ordinary case — and for every row written before schema v3.
+    ///
+    /// Two clocks, two columns, on purpose. Media time restarts with the scratch directory
+    /// and is the axis a clip's frames are measured on; wall time survives a restart and is
+    /// the axis "how old is this" is measured on. A session that reuses a scratch directory
+    /// inherits a non-zero epoch, so a single column cannot serve both purposes, and
+    /// subtracting the wrong one put every event of such a session in the wrong place.
+    pub media_epoch_ms: i64,
     /// When the recording stopped. **`None` means it is still recording** — the one state
     /// in the row that is not history, and the one retention must never evict.
     pub ended_at_ms: Option<i64>,
@@ -207,7 +240,7 @@ pub struct SessionEvent {
     /// passed through verbatim. `localplay-store` does not know the vocabulary and must
     /// not: a tag this build has never heard of is a row that exists, not an error.
     pub kind: String,
-    /// The event's position on the session timeline: `events.at - sessions.started_at`,
+    /// The event's position on the session timeline: `events.at - sessions.media_epoch_ms`,
     /// in ms. Derived in SQL, in exactly one place ([`Store::events_for_session`]), so
     /// the scrubber, a test and the UI cannot disagree about it. `0` is an event at the
     /// very instant the session started; a **negative** offset is possible and is
@@ -273,22 +306,36 @@ impl Store {
         if current < 2 {
             self.upgrade_to_v2()?;
         }
+        if current < 3 {
+            self.upgrade_to_v3()?;
+        }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     }
 
     /// v1 → v2: `sessions` gains the columns the session recorder needs.
-    ///
-    /// The step is safe to run against a database it has already been applied to, on
-    /// purpose and twice over. The version check above means it normally is not; and each
-    /// column is checked against `PRAGMA table_info` before it is added, so a database
-    /// that already has one of them — a hand-edited file, an index another build
-    /// half-upgraded — upgrades instead of dying on `duplicate column name`. The whole
-    /// step is one transaction, so an interrupted upgrade leaves a v1 database rather
-    /// than a table with two of the four columns.
     fn upgrade_to_v2(&self) -> Result<()> {
+        self.add_session_columns(&V2_SESSION_COLUMNS)
+    }
+
+    /// v2 → v3: `sessions` gains the media-clock anchor its event timeline is measured
+    /// from (see [`V3_SESSION_COLUMNS`]).
+    fn upgrade_to_v3(&self) -> Result<()> {
+        self.add_session_columns(&V3_SESSION_COLUMNS)
+    }
+
+    /// Add whichever of `columns` the `sessions` table does not already have.
+    ///
+    /// Safe to run against a database it has already been applied to, on purpose and twice
+    /// over. The version check in [`Store::migrate`] means it normally is not; and each
+    /// column is checked against `PRAGMA table_info` before it is added, so a database that
+    /// already has one of them — a hand-edited file, an index another build half-upgraded —
+    /// upgrades instead of dying on `duplicate column name`. The whole set is one
+    /// transaction, so an interrupted upgrade leaves the table as it was rather than
+    /// half-widened.
+    fn add_session_columns(&self, columns: &[(&str, &str)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        for (column, ddl) in V2_SESSION_COLUMNS {
+        for (column, ddl) in columns {
             if !column_exists(&tx, "sessions", column)? {
                 tx.execute_batch(ddl)?;
             }
@@ -449,17 +496,24 @@ impl Store {
     /// quietly read as "not the mode I know". The set is closed until a third engine
     /// exists, at which point it is one line here and one arm in the readers.
     ///
-    /// `started_at_ms` must be on the **same clock as the `events.at` values this session
-    /// will record**; the timeline is the difference of the two, so supplying a wall-clock
-    /// start for media-time events (or the reverse) would produce offsets that are
-    /// arithmetic on two different clocks. The store cannot check this, and does not
-    /// guess: it records what it is handed.
+    /// `started_at_ms` is when it started on the **wall** clock and `media_epoch_ms` is
+    /// where it started on the **media** clock — two clocks, both recorded, neither
+    /// derivable from the other. The event timeline is `events.at - media_epoch_ms` (media
+    /// minus media); `started_at` is what ages the session and orders the store. Handing
+    /// the wall clock over as the epoch would put every event of a session that reused a
+    /// scratch directory in the wrong place, which is the defect this parameter closes.
+    ///
+    /// The store cannot check that the epoch is plausible — it has no access to the
+    /// recorder's ledger — and does not guess: it records what it is handed. `0` is the
+    /// correct value for a session whose scratch directory is empty, which is the ordinary
+    /// case.
     pub fn start_session(
         &self,
         game: Option<&str>,
         mode: &str,
         started_at_ms: i64,
         scratch_dir: &str,
+        media_epoch_ms: i64,
     ) -> Result<i64> {
         if !SESSION_MODES.contains(&mode) {
             anyhow::bail!(
@@ -468,9 +522,9 @@ impl Store {
             );
         }
         self.conn.execute(
-            "INSERT INTO sessions (game, mode, started_at, scratch_dir)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![game, mode, started_at_ms, scratch_dir],
+            "INSERT INTO sessions (game, mode, started_at, scratch_dir, media_epoch_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![game, mode, started_at_ms, scratch_dir, media_epoch_ms],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -594,14 +648,18 @@ impl Store {
     /// bookmark and a game-derived kill or death are rows of the same timeline, and this
     /// method does not know the difference between the tags.
     ///
-    /// `offset_ms` is derived here and only here: `events.at - sessions.started_at`, one
-    /// SQL expression, so the UI, the tests and any future consumer cannot disagree about
-    /// what a position means. A session that does not exist has no events (an inner join),
-    /// and so does one whose events were detached by its own deletion — in both cases the
-    /// honest answer is an empty timeline rather than an error.
+    /// `offset_ms` is derived here and only here:
+    /// `events.at - sessions.media_epoch_ms`, one SQL expression, so the UI, the tests and
+    /// any future consumer cannot disagree about what a position means. Both sides are media
+    /// time — subtracting `started_at` instead was arithmetic across two clocks, which is
+    /// what this used to do and why a session's events plotted in the wrong place.
+    ///
+    /// A session that does not exist has no events (an inner join), and so does one whose
+    /// events were detached by its own deletion — in both cases the honest answer is an
+    /// empty timeline rather than an error.
     pub fn events_for_session(&self, id: i64) -> Result<Vec<SessionEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT e.id, e.kind, e.at - s.started_at, e.payload, e.clip_id
+            "SELECT e.id, e.kind, e.at - s.media_epoch_ms, e.payload, e.clip_id
              FROM events e
              JOIN sessions s ON s.id = e.session_id
              WHERE e.session_id = ?1
@@ -715,8 +773,8 @@ impl Store {
 
 /// The `sessions` columns [`read_session`] expects, in order — one definition, so a
 /// query and its reader cannot drift.
-const SESSION_COLUMNS: &str =
-    "id, game, mode, started_at, ended_at, scratch_dir, final_path, size_bytes, favourite";
+const SESSION_COLUMNS: &str = "id, game, mode, started_at, ended_at, scratch_dir, final_path, \
+     size_bytes, favourite, media_epoch_ms";
 
 fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -729,6 +787,7 @@ fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         final_path: row.get(6)?,
         size_bytes: row.get(7)?,
         favourite: row.get::<_, i64>(8)? != 0,
+        media_epoch_ms: row.get(9)?,
     })
 }
 
@@ -1009,7 +1068,7 @@ mod tests {
     /// A session that is running: opened, not ended, and nothing on disk yet.
     fn running_session(store: &Store) -> i64 {
         store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000_000, "/scratch/1")
+            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000_000, "/scratch/1", 0)
             .expect("open the session")
     }
 
@@ -1053,7 +1112,9 @@ mod tests {
     fn a_session_may_have_no_game_and_an_unknown_mode_is_refused() {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
-        let id = s.start_session(None, SESSION_MODE_BUFFER, 5, "/scratch/2").expect("the session opens");
+        let id = s
+            .start_session(None, SESSION_MODE_BUFFER, 5, "/scratch/2", 0)
+            .expect("the session opens");
         assert_eq!(
             s.get_session(id).expect("the session").expect("the session row").game,
             None,
@@ -1062,7 +1123,7 @@ mod tests {
 
         // A typo must not be stored: every reader of `mode` switches on the column.
         let err = s
-            .start_session(None, "ful-session", 6, "/scratch/3")
+            .start_session(None, "ful-session", 6, "/scratch/3", 0)
             .expect_err("an unknown mode is refused");
         assert!(format!("{err:#}").contains("unknown session mode"), "{err:#}");
         assert_eq!(s.list_sessions().expect("the sessions").len(), 1, "and nothing was written");
@@ -1110,14 +1171,14 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let first = s
-            .start_session(None, SESSION_MODE_BUFFER, 1_000, "/scratch/a")
+            .start_session(None, SESSION_MODE_BUFFER, 1_000, "/scratch/a", 0)
             .expect("the session opens");
         let second = s
-            .start_session(None, SESSION_MODE_BUFFER, 2_000, "/scratch/b")
+            .start_session(None, SESSION_MODE_BUFFER, 2_000, "/scratch/b", 0)
             .expect("the session opens");
         // A tie on `started_at`: the id breaks it, so the order is total.
         let tied = s
-            .start_session(None, SESSION_MODE_BUFFER, 2_000, "/scratch/c")
+            .start_session(None, SESSION_MODE_BUFFER, 2_000, "/scratch/c", 0)
             .expect("the session opens");
 
         assert_eq!(
@@ -1131,7 +1192,20 @@ mod tests {
     fn a_session_timeline_is_chronological_with_offsets_from_the_start() {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
-        let session = running_session(&s); // started at 1_000_000
+        // Two clocks, deliberately different numbers: the timeline must be measured from the
+        // MEDIA epoch, not the wall start. The old code subtracted `started_at` (wall) from
+        // `events.at` (media) — arithmetic across two clocks, which put every event of a
+        // session that reused a scratch directory in the wrong place. With the two
+        // accidentally equal, as this fixture used to have them, that looked correct.
+        let session = s
+            .start_session(
+                Some("League of Legends"),
+                SESSION_MODE_SESSION,
+                1_700_000_000_000, // wall: when the recording began
+                "/scratch/timeline",
+                1_000_000, // media: where the ledger stood when it began
+            )
+            .expect("open the session");
         let clip = s.insert_clip(&NewClip {
             path: "/clips/kill.mp4".into(),
             started_at_ms: 30_000,
@@ -1161,7 +1235,7 @@ mod tests {
         }
         // An event of another session must not appear; nor must one with no session.
         let other = s
-            .start_session(None, SESSION_MODE_BUFFER, 2_000_000, "/scratch/other")
+            .start_session(None, SESSION_MODE_BUFFER, 2_000_000, "/scratch/other", 0)
             .expect("the session opens");
         s.insert_event(&an_event("kill", 2_000_001, None)).expect("the event is written");
         s.insert_event(&an_event("kill", 2_000_002, None)).expect("the event is written");
@@ -1375,12 +1449,21 @@ mod tests {
 
         store.migrate().expect("the upgrade");
 
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(
+            store.schema_version().expect("version"),
+            SCHEMA_VERSION,
+            "the upgrade lands on the version this build writes"
+        );
 
         // The v1 rows are all still there, with the values they had.
         let sessions = store.list_sessions().expect("the sessions");
         assert_eq!(sessions.len(), 1, "the legacy session survived");
         assert_eq!(sessions[0].game.as_deref(), Some("League of Legends"));
+        assert_eq!(
+            sessions[0].media_epoch_ms, 0,
+            "a legacy row's media epoch is 0 — the only value its own contents support, and \
+             the correct one for the ordinary case of a fresh scratch directory"
+        );
         assert_eq!(sessions[0].started_at_ms, 1_000);
         assert_eq!(sessions[0].ended_at_ms, Some(61_000));
         assert_eq!(sessions[0].scratch_dir, "/app/scratch");
@@ -1415,13 +1498,26 @@ mod tests {
         assert_eq!(columns(&store, "clips"), columns(&fresh, "clips"));
         assert_eq!(columns(&store, "events"), columns(&fresh, "events"));
 
-        // The timeline of the legacy session is readable through the new API, and re-running
-        // the migration is a no-op.
+        // The timeline of the legacy session is readable through the new API. Its epoch is
+        // the migration's default, so the offset is the event's own media position rather
+        // than a difference: this row was written before v3, which means it never recorded an
+        // epoch, and 0 is the only value its contents support. For the ordinary case — a
+        // session against a fresh scratch directory — that IS the session-relative offset.
+        //
+        // (The old code subtracted `started_at`, the wall clock, from a media timestamp:
+        // arithmetic across two clocks, which is the defect the column exists to fix.)
         let timeline = store.events_for_session(1).expect("the legacy timeline");
         assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].offset_ms, 29_000, "30000 - 1000: derived from the legacy row");
+        assert_eq!(
+            timeline[0].offset_ms, 30_000,
+            "a legacy row's epoch defaults to 0, so the offset is the event's own position"
+        );
         store.migrate().expect("migrating again");
-        assert_eq!(store.schema_version().expect("version"), 2, "and it stays at v2");
+        assert_eq!(
+            store.schema_version().expect("version"),
+            SCHEMA_VERSION,
+            "and it stays at the current version"
+        );
         assert_eq!(store.list_sessions().expect("sessions").len(), 1);
     }
 
@@ -1448,8 +1544,8 @@ mod tests {
 
         let store = Store::open(&path).expect("open through the store");
         store.migrate().expect("the upgrade must not die on a duplicate column");
-        assert_eq!(store.schema_version().expect("version"), 2);
-        for column in ["mode", "final_path", "size_bytes", "favourite"] {
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        for column in ["mode", "final_path", "size_bytes", "favourite", "media_epoch_ms"] {
             assert!(column_exists(&store.conn, "sessions", column).expect("table_info"), "{column}");
         }
         let session = store.get_session(1).expect("read").expect("the row survived");

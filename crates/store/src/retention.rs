@@ -737,6 +737,9 @@ mod tests {
             game: Some("League of Legends".into()),
             mode: SESSION_MODE_SESSION.into(),
             started_at_ms,
+            // These fixtures describe sessions that started against an empty scratch
+            // directory, which is the ordinary case and the one every pre-v3 row means.
+            media_epoch_ms: 0,
             ended_at_ms: Some(started_at_ms + 60_000),
             scratch_dir: format!("/scratch/{id}"),
             final_path: Some(format!("/sessions/{id}.mp4")),
@@ -995,7 +998,7 @@ mod tests {
         // executor that trusted it would delete a session when asked about a clip.
         let store = store();
         let session_id = store
-            .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/keep")
+            .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/keep", 0)
             .expect("open a session");
         store.end_session(session_id, 1, None, 0).expect("end it");
 
@@ -1026,7 +1029,7 @@ mod tests {
         // the moment the session started — must still not be a way to lose a recording.
         let store = store();
         let running_id = store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000, "/scratch/live")
+            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000, "/scratch/live", 0)
             .expect("open a session");
 
         let plan = RetentionPlan {
@@ -1060,7 +1063,7 @@ mod tests {
         // there is no authority to remove anything.
         let store = store();
         let id = store
-            .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/absent")
+            .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/absent", 0)
             .expect("open a session");
         store.end_session(id, 1, None, 0).expect("end it");
         let plan = RetentionPlan {

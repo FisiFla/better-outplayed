@@ -124,7 +124,8 @@ pub use config::{
 };
 pub use fps::FpsDecision;
 pub use index::{
-    cleanup_pass, index_clip, index_event, now_ms, open_clip_index, unix_seconds, CleanupReport,
+    cleanup_pass, index_bookmark, index_clip, index_event, now_ms, open_clip_index, unix_seconds,
+    CleanupReport, BOOKMARK_KIND,
 };
 pub use pump::{
     guard_frame_size, pump_once, pump_once_counted, pump_once_counted_with_mic, pump_until_span,
@@ -1192,29 +1193,23 @@ impl Prepared {
             encoder_fps,
             if microphone { format!(", plus a microphone track on port {mic_port:?}") } else { String::new() }
         );
-        if microphone && !mode.is_full_session() {
-            // The ring's trigger is `localplay_replay`'s and splices a clip with
-            // `ClipSplicer::splice`, whose concat has no `-map`: one audio stream survives it.
-            // A session's own trigger does not have that limit (this crate builds the concat
-            // for it — see `session::finalise`), so this is a buffer-mode limitation, and the
-            // user is told before pressing the hotkey rather than after.
-            tracing::warn!(
-                "the microphone track is being recorded, but a clip spliced out of the replay \
-                 buffer will carry only the game audio: the clip concatenation selects one \
-                 audio stream (it has no `-map`). Record in session mode ([recorder] \
-                 mode = \"session\") to keep the microphone in the clip's file."
-            );
-        }
-
         // The session row, before anything is captured: a crash mid-recording then always
         // leaves a row for the next start to find, and the retention rules manage the segment
-        // directory through this row (`scratch_dir`, `size_bytes`, `ended_at`). Its
-        // `started_at` is the instant read above, which also named the directory.
+        // directory through this row (`scratch_dir`, `size_bytes`, `ended_at`).
+        //
+        // `started_at` is the **wall** clock — what ages the session, orders the store and
+        // named the directory above. `media_epoch_ms` is where the ledger stands *now*, which
+        // is the position an event's `at` is measured from. Two clocks, on purpose: the
+        // timeline is media minus media, and the age is wall. Passing the wall clock as the
+        // epoch — or nothing at all, as this used to — is what put the events of a session
+        // that adopted segments from a previous run in the wrong place on the scrubber.
+        let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()) as i64;
         let session = match store.start_session(
             game.as_deref(),
             mode.store_mode(),
             session_started_ms,
             &segment_dir.display().to_string(),
+            media_epoch_ms,
         ) {
             Ok(id) => id,
             Err(err) => {
@@ -1944,20 +1939,24 @@ impl Engine {
         let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(self.pre_ms);
         let id = index_clip(&self.store, &clip, started_at_ms);
 
-        // Spec §5.5: an event-triggered clip says *why* it exists. The row's `at` is the
-        // trigger instant (which is `pre_ms` into the clip, not its start), so the marker
-        // lands on the moment that caused it. A failed insert is reported and not fatal, for
-        // the same reason a failed clip insert is not: the footage is what the user asked
-        // for, and the clip file is on disk either way.
-        if let Some(event) = reason.event() {
-            let at_ms = self.ledger.origin_ms() + trigger_ms;
-            if let Err(err) = index_event(&self.store, event, at_ms, id) {
-                tracing::error!(
-                    "could not record the {} event that asked for this clip ({err:#}); the \
-                     clip itself is kept, and the session timeline is missing one marker",
-                    event.kind
-                );
-            }
+        // Spec §5.5: an event-triggered clip says *why* it exists, and so does a manual one —
+        // the bookmark is the user's own marker, and without it a session's timeline showed
+        // the game's kills and none of the moments they chose. The row's `at` is the trigger
+        // instant (which is `pre_ms` into the clip, not its start), so the marker lands on the
+        // moment that caused it. A failed insert is reported and not fatal, for the same
+        // reason a failed clip insert is not: the footage is what the user asked for, and the
+        // clip file is on disk either way.
+        let at_ms = self.ledger.origin_ms() + trigger_ms;
+        let session_id = Some(self.session);
+        let recorded = match reason.event() {
+            Some(event) => index_event(&self.store, event, at_ms, id, session_id),
+            None => index_bookmark(&self.store, at_ms, id, session_id),
+        };
+        if let Err(err) = recorded {
+            tracing::error!(
+                "could not record the event that asked for this clip ({err:#}); the clip \
+                 itself is kept, and the session timeline is missing one marker"
+            );
         }
 
         self.status.clips.fetch_add(1, Ordering::Relaxed);
@@ -1967,7 +1966,7 @@ impl Engine {
     /// Record an event that did not ask for a clip (see [`Recorder::note_event`]).
     fn note_event(&mut self, event: &GameEvent) -> Result<i64> {
         let at_ms = self.ledger.origin_ms() + self.ledger.span_ms();
-        index_event(&self.store, event, at_ms, None)
+        index_event(&self.store, event, at_ms, None, Some(self.session))
     }
 
     /// Keep the `sessions` row's `size_bytes` current (spec §8.1, Phase 5).

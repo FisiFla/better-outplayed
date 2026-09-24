@@ -108,26 +108,65 @@ pub fn index_clip(store: &Store, clip: &ClipMetadata, started_at_ms: u64) -> Opt
     }
 }
 
+/// The `events.kind` a manual clip records: the user pressed the hotkey, and the timeline
+/// should show the moment they chose.
+///
+/// A manual clip used to record nothing but the clip, so a session's timeline carried the
+/// game's kills and none of the user's own marks — the scrubber had nothing to plot for the
+/// moments that mattered most. The tag is the same vocabulary the scrubber colours by
+/// (`localplay-store` passes it through verbatim), and it is deliberately not a
+/// [`GameEvent`]: nothing produced it but a keypress.
+pub const BOOKMARK_KIND: &str = "bookmark";
+
+/// Record the `events` row for a manual clip and return its id.
+///
+/// `payload` is `None`: a bookmark has no source to describe, and inventing one would make
+/// the timeline claim a provenance it does not have.
+pub fn index_bookmark(
+    store: &Store,
+    at_ms: u64,
+    clip_id: Option<i64>,
+    session_id: Option<i64>,
+) -> Result<i64> {
+    let id = store.insert_event(&NewEvent {
+        session_id,
+        kind: BOOKMARK_KIND.to_string(),
+        at_ms,
+        payload: None,
+        clip_id,
+    })?;
+    tracing::info!("recorded bookmark event #{id} at media t={at_ms}ms against clip #{clip_id:?}");
+    Ok(id)
+}
+
 /// Insert the `events` row for a derived game event (spec §5.5), linked to the clip it
 /// produced when it produced one.
 ///
 /// * `at_ms` is the event's position on the **ledger's media timeline** — the same clock
-///   `clips.started_at` is on, so a session timeline can place a marker against a clip
-///   without converting anything. For a clip's own event this is the *trigger* instant,
-///   which is `buffer.pre_seconds` into the clip, because that is the moment the event
-///   happened; the window merely starts earlier.
+///   `clips.started_at` and a session's `media_epoch_ms` are on, so a session timeline can
+///   place a marker against a clip without converting anything. For a clip's own event this
+///   is the *trigger* instant, which is `buffer.pre_seconds` into the clip, because that is
+///   the moment the event happened; the window merely starts earlier.
 /// * `clip_id` is `None` for a marker (a game or round boundary, recorded but not clipped —
 ///   see `EventKind::is_highlight`) and for an event whose clip could not be indexed. The
 ///   column is nullable for exactly those cases.
-/// * `session_id` is left NULL, as `index_clip` leaves it: this engine opens no `sessions`
-///   row.
+/// * `session_id` is the session that was recording. It was left NULL here for as long as
+///   "this engine opens no `sessions` row" was true, which stopped being true in Phase 5 —
+///   so NULL now means an event detached from its session, which is what deletion does to
+///   it, and not "there was no session".
 ///
 /// Returns the new row's id, or the error: the callers differ on what a failure means. A
 /// clip that has already been written must not be lost to a bookkeeping failure, while a
 /// marker is the *only* thing the caller asked for, so failing it is worth reporting.
-pub fn index_event(store: &Store, event: &GameEvent, at_ms: u64, clip_id: Option<i64>) -> Result<i64> {
+pub fn index_event(
+    store: &Store,
+    event: &GameEvent,
+    at_ms: u64,
+    clip_id: Option<i64>,
+    session_id: Option<i64>,
+) -> Result<i64> {
     let new = NewEvent {
-        session_id: None,
+        session_id,
         kind: event.kind.as_tag().to_string(),
         at_ms,
         payload: event.payload.clone(),
@@ -375,7 +414,7 @@ mod tests {
         // session columns a Phase 5 engine writes into are present, so a session row can be
         // opened and closed on this index.
         let session = reopened
-            .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch")
+            .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch", 0)
             .expect("the index carries the session columns");
         reopened.end_session(session, 2_000, None, 0).expect("and can close a session");
         assert_eq!(reopened.list_sessions().unwrap().len(), 1);
@@ -448,7 +487,7 @@ mod tests {
             // One line of JSON, which is what the payload column holds.
             serde_json::json!({ "source": "lol", "killer": "Ahri" }),
         );
-        let id = index_event(&store, &kill, 34_000, Some(clip_id)).expect("the reason is written");
+        let id = index_event(&store, &kill, 34_000, Some(clip_id), None).expect("the reason is written");
 
         let events = store.list_events().expect("read the events back");
         assert_eq!(events.len(), 1);
@@ -464,7 +503,7 @@ mod tests {
             localplay_events::Source::Gsi,
             localplay_events::EventKind::RoundStart,
         );
-        index_event(&store, &marker, 40_000, None).expect("a marker is written too");
+        index_event(&store, &marker, 40_000, None, None).expect("a marker is written too");
         let events = store.list_events().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "round_start");
@@ -481,7 +520,7 @@ mod tests {
             localplay_events::Source::Lol,
             localplay_events::EventKind::Kill,
         );
-        assert!(index_event(&store, &event, 1_000, Some(7)).is_err());
+        assert!(index_event(&store, &event, 1_000, Some(7), None).is_err());
         assert!(store.list_events().unwrap().is_empty());
     }
 
@@ -570,7 +609,7 @@ mod tests {
             let final_path = sessions_dir.join(format!("session-{i}.mp4"));
             std::fs::write(&final_path, vec![0u8; 600]).unwrap();
             let id = store
-                .start_session(Some("Dota 2"), localplay_store::SESSION_MODE_SESSION, i * 1_000, &scratch.display().to_string())
+                .start_session(Some("Dota 2"), localplay_store::SESSION_MODE_SESSION, i * 1_000, &scratch.display().to_string(), 0)
                 .unwrap();
             store.end_session(id, i * 1_000 + 5, Some(&final_path.display().to_string()), 1_000).unwrap();
             if i == 2 {
@@ -629,7 +668,7 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("seg-000000.mp4"), vec![0u8; 2_000]).unwrap();
         let running = store
-            .start_session(None, localplay_store::SESSION_MODE_SESSION, 1_000, &scratch.display().to_string())
+            .start_session(None, localplay_store::SESSION_MODE_SESSION, 1_000, &scratch.display().to_string(), 0)
             .unwrap();
         store.set_session_size(running, 2_000).unwrap();
 

@@ -798,7 +798,7 @@ mod tests {
     /// A `sessions` row for a recording that is (or was) running over `dir`.
     fn running_session(store: &Store, dir: &Path, mode: &str) -> i64 {
         store
-            .start_session(Some("Dota 2"), mode, 1_700_000_000_000, &dir.display().to_string())
+            .start_session(Some("Dota 2"), mode, 1_700_000_000_000, &dir.display().to_string(), 0)
             .expect("opening a session row")
     }
 

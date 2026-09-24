@@ -303,11 +303,28 @@ fn a_clip_records_why_it_was_taken() {
     assert_eq!(clips.len(), 2, "both triggers wrote a clip: {clips:?}");
 
     let events = store.list_events().expect("list the events");
+    // Three, not two: a manual clip used to write no event row at all, so a session's
+    // timeline showed the game's kills and none of the moments the user chose. A hotkey clip
+    // now records a `bookmark`, linked to the clip it produced.
     assert_eq!(
         events.len(),
-        2,
-        "the manual clip wrote no event row, the event trigger wrote one, and the marker \
-         wrote one: {events:?}"
+        3,
+        "the manual clip wrote a bookmark, the event trigger wrote a kill, and the marker \
+         wrote a round_start: {events:?}"
+    );
+
+    // And all three belong to the session that was recording. This was NULL for every one of
+    // them until the recorder started opening a `sessions` row; an event with no session is
+    // now a *detached* event — what deleting its session leaves behind — rather than the
+    // normal state of affairs.
+    let session_id = events[0].session_id;
+    assert!(
+        session_id.is_some(),
+        "an event is linked to the session that recorded it: {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e.session_id == session_id),
+        "all three events belong to the one recording session: {events:?}"
     );
 
     let kill_row = events.iter().find(|e| e.kind == "kill").expect("the kill's row");
@@ -323,7 +340,6 @@ fn a_clip_records_why_it_was_taken() {
         "the integration's detail is persisted verbatim: {:?}",
         kill_row.payload
     );
-    assert_eq!(kill_row.session_id, None, "this engine opens no session row");
     eprintln!("event row: {kill_row:?}");
 
     let marker_row = events.iter().find(|e| e.id == marker_id).expect("the marker's row");
@@ -337,10 +353,17 @@ fn a_clip_records_why_it_was_taken() {
         kill_row.at_ms
     );
 
-    assert!(
-        events.iter().all(|e| e.clip_id != manual.id),
-        "a manual clip is not an event, and writes no events row"
-    );
+    // The user's own marker. It is tagged with the same vocabulary the scrubber colours by,
+    // points at the clip the hotkey produced, and carries no payload — a bookmark has no
+    // source to describe, and inventing one would make the timeline claim a provenance it
+    // does not have.
+    let bookmark = events
+        .iter()
+        .find(|e| e.kind == BOOKMARK_KIND)
+        .expect("the manual clip recorded a bookmark");
+    assert_eq!(bookmark.clip_id, manual.id, "linked to the hotkey's own clip");
+    assert!(bookmark.payload.is_none(), "a bookmark has no source to describe");
+    assert_eq!(bookmark.session_id, session_id, "and it belongs to the same session");
 
     // The clip the event produced is a real clip — the reason did not change the media
     // path, only what was recorded about it.
@@ -970,7 +993,7 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
     {
         let store = open_clip_index(&db_path).expect("the index opens");
         let id = store
-            .start_session(Some("Dota 2"), SESSION_MODE_SESSION, now_ms() - two_days_ms, &old_dir.display().to_string())
+            .start_session(Some("Dota 2"), SESSION_MODE_SESSION, now_ms() - two_days_ms, &old_dir.display().to_string(), 0)
             .expect("opening the old session");
         store
             .end_session(id, now_ms() - two_days_ms + 1_000, Some(&old_file.display().to_string()), 512)
@@ -1072,7 +1095,7 @@ fn a_crashed_session_is_recovered_when_the_next_run_starts() {
     let id = {
         let store = open_clip_index(&db_path).expect("the index opens");
         let id = store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_700_000_000_000, &session_dir.display().to_string())
+            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_700_000_000_000, &session_dir.display().to_string(), 0)
             .expect("the row the crash left behind");
         store.set_session_size(id, bytes as i64).expect("its last known size");
         id

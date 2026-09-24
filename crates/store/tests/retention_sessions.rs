@@ -172,6 +172,7 @@ impl Fixture {
                 SESSION_MODE_SESSION,
                 started_at_ms,
                 &scratch_dir.to_string_lossy(),
+                0,
             )
             .expect("open the session");
         (id, scratch_dir, final_path, bytes_on_disk)
