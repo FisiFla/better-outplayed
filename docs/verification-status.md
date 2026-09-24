@@ -963,5 +963,15 @@ Two honest options, and this is a call for the owner, not for the next pass to m
 
 Option 1 is smaller and matches the constraint as written. Option 2 preserves a capability the
 task neither asked for nor forbade. **No decision has been made, and nothing has been deleted** —
-but the case for deciding is now stronger than when this section was first written, because the
+but the case for deciding is stronger than when this section was first written, because the
 recorder no longer calls the type at all.
+
+One consequence worth stating precisely, because the task's own wording points at it: the two
+tests it names as the place to verify "no temporary files are created on disk while buffering" —
+`apps/localplay-cli/tests/post_roll.rs` and `crates/replay/tests/end_to_end_clip.rs` — both drive
+`RingBuffer` **directly** rather than through a `Recorder`, so neither can verify that claim about
+the shipping path. The claim is asserted where it is actually made instead, in the recorder's own
+suite (`buffering_writes_nothing_to_disk_and_only_a_saved_clip_does`), which is also the test that
+proves it on Windows. Those two files are therefore not just the tests the open decision would
+delete; they are tests whose subject no user path reaches any more, and they will keep passing
+while that is true.
