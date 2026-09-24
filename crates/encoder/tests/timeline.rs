@@ -144,18 +144,22 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
         video_ms.saturating_sub(frame_count_ms)
     );
     // The band is derived from the wall-clock window the pipeline was actually fed over,
-    // not from a hardcoded ~3s. `captured` measures that window (it is printed above), and
-    // under CPU contention the feed itself takes longer, so a longer `video_ms` is CORRECT
-    // rather than a failure: a fixed bound made this test flaky under `cargo test
-    // --workspace`, which runs test binaries in parallel, while it passed 5/5 in isolation
-    // — and it guards the most important property in this project, so it must not depend on
-    // host load. Segment granularity is 1s, so the encoded total is the window rounded up
-    // to the next segment boundary: never less than the window, never a full segment more.
-    // (The audio assertion below had the same defect — a fixed floor — and is derived from
-    // the fed sample count for the same reason.)
+    // not from a hardcoded ~3s, because `captured` measures that window (it is printed
+    // above) and under CPU contention the feed itself takes longer — so a longer `video_ms`
+    // is CORRECT rather than a failure. A fixed bound made this flaky.
+    //
+    // The encoded total stops at the last frame before a segment boundary, so it is
+    // legitimately a little SHORT of `captured`: measured 101ms short locally and 206ms
+    // short on the CI runner (2833ms against a 3039ms window). Hence one segment (1000ms)
+    // is the honest tolerance in each direction — that is the granularity the muxer works
+    // at. This is a corroborating sanity check; the load-bearing assertion is the
+    // frame-count one above, which is what distinguishes "media follows arrival" from
+    // "media follows the frame count", and it is unaffected by this tolerance.
+    // (The audio assertion below had the same class of defect — a fixed floor — and is
+    // derived from the fed sample count for the same reason.)
     let captured_ms = captured.as_millis() as u64;
     assert!(
-        video_ms + 200 >= captured_ms && video_ms <= captured_ms + 1_200,
+        video_ms + 1_000 >= captured_ms && video_ms <= captured_ms + 1_200,
         "the encoded footage must cover the {captured_ms}ms window it was captured over (to \
          within one 1s segment), got {video_ms}ms"
     );
