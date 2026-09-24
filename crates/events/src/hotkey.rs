@@ -277,15 +277,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn listening_off_windows_reports_no_failure_and_never_fires() {
         // The non-Windows stub is a working "there is no hotkey here", not an error: the CLI
         // and the desktop shell share this call site. `wait_for_press` times out, which is
         // what its own callers expect.
+        //
+        // **Gated to non-Windows, because that is the claim.** It used to run everywhere and
+        // asserted `listen(...).expect(...)` — which on Windows really tries to register the
+        // chord, and failed on the Windows test box with
+        // `RegisterHotKey failed: This operation requires an interactive window station
+        // (0x800705B3)`. An SSH login, a service account and a headless CI runner all lack that
+        // window station, so the assertion was about the host, not the code.
         let chord = Hotkey::parse("Ctrl+F8").unwrap();
         let rx = listen(chord).expect("the non-Windows listener is a stub, not a failure");
         assert!(!wait_for_press(&rx, Duration::from_millis(50)), "nothing may fire off Windows");
-        if !cfg!(windows) {
-            assert!(!supported());
+        assert!(!supported());
+    }
+
+    /// The Windows counterpart: a chord this process cannot hold is **reported**, not panicked
+    /// and not silently a dead key.
+    ///
+    /// Which of the two it is depends on the session rather than on the code: an interactive
+    /// desktop session holds the chord, and one without an interactive window station — SSH,
+    /// a service, a headless CI runner — cannot. Both are answered here.
+    ///
+    /// This test deliberately does **not** synthesise a keypress to prove the listener fires.
+    /// It cannot: this project's safety rules forbid generating input on a machine that runs an
+    /// anti-cheat, and a test is not a reason to make an exception. What is checkable without
+    /// input is that the failure is a message naming the chord, which is what the desktop shell
+    /// shows a user instead of a hotkey that does nothing.
+    #[test]
+    #[cfg(windows)]
+    fn a_chord_this_process_cannot_hold_is_reported_and_never_panics() {
+        let chord = Hotkey::parse("Ctrl+F8").unwrap();
+        if let Err(err) = listen(chord) {
+            let text = err.to_string();
+            assert!(text.contains("Ctrl+F8"), "the failure must name the chord: {text}");
+            assert!(
+                text.contains("could not be registered") || text.contains("NOT installed"),
+                "the failure must say what went wrong, not just that something did: {text}"
+            );
         }
     }
 }

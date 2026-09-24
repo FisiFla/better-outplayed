@@ -212,9 +212,16 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_connection_is_the_no_game_case_and_not_a_failure() {
+    fn a_closed_loopback_port_is_the_no_game_case_and_not_a_failure() {
         // Port 1 on loopback: nothing listens there, and this is exactly what polling
         // between games looks like.
+        //
+        // Which error a closed port produces is the **OS's** decision, and it differs. macOS
+        // refuses the connection immediately — a `Connection` error — while on Windows the
+        // attempt times out instead, measured on the Windows test box. The original assertion
+        // demanded `Connection(..)` and failed there for exactly that reason; the property that
+        // matters is that either outcome is a *connection* result reading as "no game", never a
+        // protocol error, which is what this pins.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let ep = Endpoint::loopback(addr, "/liveclientdata/allgamedata").unwrap();
         let client = LoopbackClient::for_endpoint(ep).unwrap();
@@ -222,8 +229,9 @@ mod tests {
         let err = client.get().expect_err("nothing is listening on port 1");
         assert!(err.is_no_game(), "{err} must read as 'no game is running'");
         assert!(
-            matches!(err, FetchError::Connection(..)),
-            "a refused loopback connection is a connection error, not a protocol one: {err}"
+            matches!(err, FetchError::Connection(..) | FetchError::Timeout(..)),
+            "a closed loopback port is a connection outcome — refused or timed out — and never \
+             a protocol error: {err}"
         );
     }
 
