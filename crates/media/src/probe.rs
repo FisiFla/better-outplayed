@@ -42,6 +42,113 @@ pub struct MediaInfo {
     pub audio: Option<AudioStream>,
 }
 
+/// One stream, reduced to the parameters a lossless concatenation depends on.
+///
+/// Deliberately coarser than [`VideoStream`]/[`AudioStream`]: this is not a description
+/// of a file, it is the *shape* two files must share before `-f concat -c copy` may be
+/// trusted to treat them as one continuous timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamShape {
+    /// `codec_type` as ffprobe spells it: `video`, `audio`, `subtitle`, …
+    pub kind: String,
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl StreamShape {
+    /// One-line summary, for a refusal message a human has to read.
+    pub fn summary(&self) -> String {
+        match self.kind.as_str() {
+            "video" => format!("video/{} {}x{}", self.codec, self.width, self.height),
+            "audio" => {
+                format!("audio/{} {}Hz {}ch", self.codec, self.sample_rate, self.channels)
+            }
+            other => format!("{other}/{}", self.codec),
+        }
+    }
+}
+
+/// **Every** stream of a file, in muxer order.
+///
+/// [`MediaInfo`] holds one `video` and one `audio`, because that is all an A/V drift
+/// calculation needs. That is not enough to see a *dropped track*: a file that should
+/// carry 1 video + 2 audio streams and instead carries 1 + 1 has a perfectly good
+/// `video` and `audio` as far as `MediaInfo` is concerned. Anything that concatenates
+/// streams has to count them, which is what this type is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamLayout {
+    pub streams: Vec<StreamShape>,
+}
+
+impl StreamLayout {
+    pub fn video_count(&self) -> usize {
+        self.streams.iter().filter(|s| s.kind == "video").count()
+    }
+
+    pub fn audio_count(&self) -> usize {
+        self.streams.iter().filter(|s| s.kind == "audio").count()
+    }
+
+    /// `1 video, 2 audio` — the shape in the words a refusal message wants.
+    pub fn counts_summary(&self) -> String {
+        let v = self.video_count();
+        let a = self.audio_count();
+        let other = self.streams.len() - v - a;
+        let mut parts = vec![format!("{v} video"), format!("{a} audio")];
+        if other > 0 {
+            parts.push(format!("{other} other"));
+        }
+        parts.join(", ")
+    }
+
+    /// Parse the `streams` array of `ffprobe -show_streams -print_format json`.
+    pub fn from_ffprobe_json(json: &str) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct RawLayout {
+            streams: Vec<RawStream>,
+        }
+        let raw: RawLayout = serde_json::from_str(json).context("parsing ffprobe json")?;
+        Ok(Self {
+            streams: raw
+                .streams
+                .iter()
+                .map(|s| StreamShape {
+                    kind: s.codec_type.clone(),
+                    codec: s.codec_name.clone(),
+                    width: s.width.unwrap_or(0),
+                    height: s.height.unwrap_or(0),
+                    sample_rate: s
+                        .sample_rate
+                        .as_deref()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    channels: s.channels.unwrap_or(0),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Probe the full stream layout of a file on disk.
+pub fn stream_layout(bin: &FfmpegBinaries, path: &Path) -> Result<StreamLayout> {
+    let mut cmd = Command::new(&bin.ffprobe);
+    cmd.args(["-v", "error", "-print_format", "json", "-show_streams"])
+        .arg(path);
+    let out = run_with_timeout(cmd, PROBE_TIMEOUT)?;
+    if !out.status.success() {
+        bail!(
+            "ffprobe failed reading the stream layout of {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    StreamLayout::from_ffprobe_json(&String::from_utf8_lossy(&out.stdout))
+        .with_context(|| format!("reading the stream layout of {}", path.display()))
+}
+
 /// A/V offset observed **within one produced file**.
 ///
 /// This compares the audio stream's timeline to the video stream's timeline in the

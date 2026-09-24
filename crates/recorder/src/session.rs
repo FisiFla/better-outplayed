@@ -39,28 +39,14 @@
 
 use crate::index::now_ms;
 use anyhow::{bail, Context, Result};
-use localplay_media::{FfmpegBinaries, MediaInfo};
+use localplay_media::{edit, FfmpegBinaries, MediaInfo};
 use localplay_replay::ledger::{Segment, SegmentLedger};
 use localplay_replay::scanner::{self, newly_complete, next_segment_number};
 use localplay_replay::window;
-use localplay_replay::splice::{concat_list_path, ClipMetadata, ClipSplicer};
+use localplay_replay::splice::{ClipMetadata, ClipSplicer};
 use localplay_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
-
-/// The floor a whole-session concatenation is given, on top of the time its own size
-/// implies.
-///
-/// The splicer's clip-sized budget (`localplay_media::edit`'s 60 s) cannot be used for a
-/// session: a session is every second the user recorded, and a copy of 20 GB does not fit
-/// in a clip's budget on a slow disk. The budget here is derived from the bytes being
-/// copied instead — one minute, plus the time a 10 MB/s volume would need for them — so a
-/// wedged ffmpeg still ends, and a large session on a slow disk is not killed mid-copy.
-pub const SESSION_COPY_FLOOR: Duration = Duration::from_secs(60);
-
-/// The throughput the size-derived part of [`SESSION_COPY_FLOOR`]'s budget assumes.
-pub const SESSION_COPY_MIN_BYTES_PER_SEC: u64 = 10_000_000;
 
 /// How many whole-session concatenations were attempted before giving up on a name.
 const MAX_SESSION_DIR_ATTEMPTS: u32 = 100;
@@ -363,32 +349,21 @@ pub fn session_file_path(sessions_dir: &Path, started_at_ms: i64) -> PathBuf {
 /// `segments` must be in sequence order and complete; the caller flushes the encoder first
 /// and takes the list from [`segments_on_disk`] (or [`SessionRing::scan_all`]).
 ///
-/// # Why this is not `ClipSplicer::splice`, and what is reused
+/// # Sharing the lossless path with the splicer
 ///
-/// The splicer is the project's lossless concatenation and it is still what a *clip* is cut
-/// with (both modes, unchanged). It cannot finalise a session, for two reasons that were
-/// measured rather than assumed:
+/// This uses the same three steps `ClipSplicer::splice` does — `check_concat_layout`,
+/// `write_concat_list`, `concat_lossless_sized` — rather than keeping a private copy. It
+/// used to have its own concat, for two measured reasons that no longer exist: the splicer
+/// passed no `-map`, so ffmpeg's default stream selection kept one audio stream and dropped
+/// the microphone track from every microphone-enabled *clip*; and it bounded the copy with a
+/// clip-sized 60s, which is the wrong budget for a 20GB session and fails only after doing
+/// the work, on every recovery attempt. Both now live in `localplay_media::edit`, where one
+/// implementation serves both callers; a private copy here would be a second place for them
+/// to drift apart.
 ///
-/// 1. **No `-map`.** `ClipSplicer::splice` writes the concat list and runs `ffmpeg -f concat
-///    -safe 0 -i <list> -c copy -movflags +faststart <out>` (via
-///    `localplay_media::edit::concat_lossless`). With no `-map`, ffmpeg's default stream
-///    selection keeps **one** audio stream. Measured on this host: two 1 s segments with
-///    1 video + 2 audio streams each → a 2-stream file (`-map 0` on the same list → 3
-///    streams). A microphone track would therefore be silently dropped from every
-///    microphone-enabled session. (Replay is a crate this work may not edit, and its
-///    `splice` has no way to express "keep every stream".)
-/// 2. **A clip-sized budget.** `concat_lossless` bounds the copy with a fixed 60 s timeout
-///    (`localplay_media::edit::EDIT_TIMEOUT`), which is the right budget for a clip window
-///    and the wrong one for a whole session: 20 GB on a 100 MB/s volume takes 200 s, and
-///    the failure would then repeat on every recovery attempt — a session that can never be
-///    finalised.
-///
-/// So the concatenation is built here, with everything that *can* be reused reused:
-/// [`concat_list_path`] for the list's path escaping (the Windows verbatim-prefix
-/// normalisation this whole mechanism exists for), the same `-f concat -safe 0 -c copy
-/// -movflags +faststart`, and [`MediaInfo::probe`] for the metadata. The one added
-/// argument is `-map 0`; the one changed thing is the wait, sized from the bytes being
-/// copied ([`SESSION_COPY_FLOOR`]).
+/// What this adds over `splice` is what a *session* needs and a clip does not: a partial
+/// output is deleted rather than left occupying the space its own retry needs, and a session
+/// that recorded a microphone has its audio-stream count verified afterwards.
 pub fn finalise(
     bin: &FfmpegBinaries,
     out: &Path,
@@ -399,51 +374,28 @@ pub fn finalise(
     if segments.is_empty() {
         bail!("no segments to concatenate: this session recorded nothing");
     }
-    let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
+    let files: Vec<PathBuf> = segments.iter().map(|s| s.file.clone()).collect();
+
+    // Refused before anything is written: a segment whose layout differs from the first
+    // would make `-map 0` silently drop or truncate a track.
+    edit::check_concat_layout(bin, &files)?;
 
     let list = out.with_extension("concat.txt");
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&list)
-            .with_context(|| format!("creating {}", list.display()))?;
-        for segment in segments {
-            // Absolute and escaped, exactly as the splicer does it: the concat demuxer
-            // parses this file itself, and on Windows `canonicalize` returns a verbatim
-            // `\\?\` path ffmpeg cannot open.
-            let path = std::fs::canonicalize(&segment.file)
-                .with_context(|| format!("resolving {}", segment.file.display()))?;
-            writeln!(file, "file '{}'", concat_list_path(&path))?;
-        }
-    }
-
-    let mut cmd = Command::new(&bin.ffmpeg);
-    cmd.args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&list)
-        // `-map 0` is the microphone's whole contract here: every stream of the concatenated
-        // input, not ffmpeg's default single-choice pick. With one audio track it is a no-op.
-        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])
-        .arg(out)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().context("spawning ffmpeg for the session concat")?;
-    let budget = SESSION_COPY_FLOOR
-        + Duration::from_secs(bytes / SESSION_COPY_MIN_BYTES_PER_SEC.max(1));
-    let waited = localplay_media::wait_with_deadline(&mut child, budget);
-    let output = child.wait_with_output().context("collecting the concat's output")?;
+    let total_bytes = edit::write_concat_list(&files, &list)?;
+    // The list is scratch whether the copy works out or not.
+    let concat = edit::concat_lossless_sized(bin, &list, out, total_bytes);
     let _ = std::fs::remove_file(&list);
-    waited?;
-    if !output.status.success() {
+    if let Err(e) = concat {
         // The partial file is worse than useless: it occupies the space the retry needs and
         // it is not a session. Removing it is the only thing that gets that space back.
         let _ = std::fs::remove_file(out);
-        bail!(
-            "concatenating {} segment(s) into {} failed ({}): {}",
-            segments.len(),
-            out.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(e).with_context(|| {
+            format!(
+                "concatenating {} segment(s) into {}",
+                segments.len(),
+                out.display()
+            )
+        });
     }
 
     let info = MediaInfo::probe(bin, out)
@@ -850,19 +802,24 @@ mod tests {
             .expect("opening a session row")
     }
 
-    /// The gap that makes `finalise` build its own concat: the splicer's invocation has no
-    /// `-map`, and ffmpeg's default stream selection keeps one audio stream.
+    /// Both lossless concatenation paths keep **every** audio stream.
     ///
-    /// This is the measured reason ([`finalise`]'s doc comment has the whole story). If a
-    /// future ffmpeg changes its default selection, this assertion fails and whoever reads
-    /// it has the note that explains why `finalise` looks the way it does.
+    /// This is the regression test for a measured data-loss bug.
+    /// [`localplay_media::edit::concat_lossless`] passed no `-map`, so ffmpeg applied its
+    /// default stream selection and kept one audio stream: a clip cut from a session that
+    /// was recorded with a microphone came out with the voice track missing — exit status 0,
+    /// nothing logged, a file the user believes is whole.
+    ///
+    /// The splicer and `finalise` now share one `-map 0` invocation, so both must keep both
+    /// tracks. If a future ffmpeg changed its default selection, or someone dropped the
+    /// `-map`, the two halves of this test would disagree and point at which path regressed.
     #[test]
-    fn the_splicers_concat_drops_a_second_audio_track_and_finalise_does_not() {
+    fn every_lossless_concat_path_keeps_a_second_audio_track() {
         let dir = temp_dir("session-");
         let segments = write_segments(&dir.path().join("session-1"), 2);
         assert_eq!(segments.len(), 2, "two segments");
 
-        // The splicer: one audio stream survives (`-c copy` with no `-map`).
+        // The splicer: what a clip out of a session is cut with.
         let spliced = dir.path().join("spliced.mp4");
         let window = localplay_replay::window::SegmentWindow {
             segments: segments.clone(),
@@ -871,8 +828,8 @@ mod tests {
         let meta = ClipSplicer::splice(&bin(), &window, &spliced, "libx264").expect("the splice");
         assert_eq!(
             audio_stream_count(&bin(), &spliced),
-            Some(1),
-            "the splicer keeps one audio stream (this is what `-map 0` in `finalise` fixes)"
+            Some(2),
+            "the splicer must keep the microphone track as well as the game audio"
         );
 
         // The finalise: both tracks, and the file is as long as the two segments.
@@ -888,6 +845,16 @@ mod tests {
         );
         assert_eq!(meta2.size_bytes, std::fs::metadata(&out).unwrap().len());
         assert!(meta.size_bytes > 0);
+
+        // The clip must also be as long as the segments it was built from, not merely carry
+        // the right number of streams: a concat that kept both audio streams but truncated
+        // one would pass the count above.
+        let spliced_info = MediaInfo::probe(&bin(), &spliced).expect("probing the clip");
+        assert!(
+            spliced_info.duration_ms >= 1_900,
+            "the spliced clip must be ~2s of media, got {}ms",
+            spliced_info.duration_ms
+        );
     }
 
     /// Without a microphone, `finalise` goes through the same `-c copy` machinery and the
