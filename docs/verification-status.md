@@ -402,18 +402,22 @@ WARN localplay_recorder: encode.fps = 120 is not achievable at 1280x720 on this 
 
 ## 5. What CI covers, and what it does **not**
 
-CI (`.github/workflows/ci.yml`) runs on **`macos-latest` only** — the development host.
-Check it yourself:
+> **CI is currently dark, and not because of the code.** The account's GitHub Actions minutes
+> are exhausted, so a queued job never gets a runner: it fails in seconds with no steps and
+> `runner_id=0`, which is the same signature as a broken workflow and is not one. Verified by
+> re-running a commit that had passed in 3m28s unchanged — it failed the same way. Every `gh
+> run list` since 2026-09-24 11:51 shows that. **So `gh run list` is not evidence about this
+> tree right now**, and the gate below was reproduced by hand instead: the exact steps, run
+> locally in order, at commit `a8a8b9b` (§11).
 
-```console
-$ gh run list --limit 10
-```
+CI (`.github/workflows/ci.yml`) runs on **`macos-latest` only** — the development host.
 
 What a green run proves:
 
-- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) — 375
-  tests as measured on the dev host at this pass, `cargo test --workspace --features
-  localplay-encoder/test-encoders` (0 failed, 1 ignored);
+- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) —
+  `cargo test --workspace --features localplay-encoder/test-encoders`, **516 passed, 0 failed,
+  1 ignored** at `a8a8b9b` (the count was 375 at the pass this section was written for, and it
+  has grown with every phase since);
 - **`cargo check` for `x86_64-pc-windows-msvc`** of the cross-checkable crates
   (`capture`, `encoder`, `events`, `replay`, `media`, `xtask`) — *type-checking*, not
   running. No MSVC linker is needed because `check` stops before linking;
@@ -425,13 +429,15 @@ What a green run does **not** prove — quoted from the workflow's own header:
 
 - **No Windows runtime verification.** "Not one line of the WASAPI or WGC backends is
   *executed* here; they are only compiled. A green run says nothing about how the app
-  behaves on a real machine."
+  behaves on a real machine." (§10 is where they were executed — by hand, on the box.)
 - **No GUI window.** "No window is opened, the screen is never captured and no input is
   synthesised."
-- **`localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell are
-  never cross-checked for Windows at all**, because rusqlite's bundled SQLite C source
-  cannot be built for MSVC from macOS. They are host-verified only, and they "cannot be
-  cross-checked anywhere here."
+- **`localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell are not
+  cross-checked for Windows from this host**, because rusqlite's bundled SQLite C source
+  cannot be built for MSVC from macOS. They are host-verified *here*, and CI cannot carry
+  that check — which is not the same as unverifiable: §10 records the whole workspace,
+  bundled SQLite included, being built **and its tests run** on a Windows host. What that
+  needs is a Windows runner or a human, and there is no Windows runner.
 
 ---
 
@@ -790,3 +796,28 @@ as a service, or on a headless box**, and neither can `--mode session`, which re
 continuously and needs no hotkey. Kept as designed, by the owner's decision; recorded here
 because "the CLI refuses to start headlessly" is the kind of thing that belongs in a ledger
 rather than in a bug report later.
+
+---
+
+## 11. The CI gate, run by hand (2026-09-24, `a8a8b9b`)
+
+CI's runner quota is exhausted (§5), so the workflow's steps were run locally, in the
+workflow's own order and with its own `working-directory` for each — including the one that
+runs from `apps/desktop/src-tauri` rather than the repo root, which is easy to get wrong and
+silently runs the wrong tests if you do.
+
+| CI step | Where CI runs it | Reproduced locally |
+|---|---|---|
+| Rust workspace tests | repo root | **516 passed, 0 failed, 1 ignored** |
+| Windows cross-check (`capture`, `encoder`, `events`, `replay`, `media`, `xtask`) | repo root | `Finished` — all six type-check for `x86_64-pc-windows-msvc` |
+| Frontend — `npm ci` | `apps/desktop` | clean install |
+| Frontend — `svelte-check` | `apps/desktop` | **0 errors, 0 warnings** |
+| Frontend — `vitest` | `apps/desktop` | **134 passed** |
+| Frontend — production build | `apps/desktop` | `✓ built` |
+| Desktop shell Rust tests | `apps/desktop/src-tauri` | **112 passed** |
+| Clippy | repo root | only the pre-existing warnings: the `unwrap()`-in-tests lint and one `too many arguments (8/7)` in `EncodeConfig::hardware` |
+
+What this is worth: the same gates, the same results, and **not** a substitute for CI in one
+respect — it ran on the machine that wrote the code, so it is exactly as good as the dev host
+is representative. The Windows cross-check is a `check`, not a run, either way. What it does
+mean is that nothing in this tree is currently waiting on a gate nobody has exercised.
