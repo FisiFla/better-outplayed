@@ -32,6 +32,18 @@ impl VideoCodec {
             (VideoCodec::Hevc, Vendor::Amf) => "hevc_amf",
         }
     }
+
+    /// What ffmpeg calls this codec's elementary stream — the name for `-f`.
+    ///
+    /// It sits beside [`VideoCodec::hw_encoder_name`] because the two are the same kind of fact and
+    /// a mismatch between them is not an error ffmpeg reports: told `-f h264` about an HEVC stream it
+    /// misreads the framing, which produces a broken recording rather than a failed start.
+    pub fn bitstream_format(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "h264",
+            VideoCodec::Hevc => "hevc",
+        }
+    }
 }
 
 /// GPU encoder vendors. There is deliberately no software variant: a silent CPU

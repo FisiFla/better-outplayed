@@ -20,8 +20,17 @@
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
 
-    let encoders = localplay_encoder::mft::probe_hardware_encoders()?;
-    println!("hardware H.264 encoder MFTs: {}", encoders.len());
+    // `cargo run --example mft_probe -- hevc` asks the same questions about HEVC. A codec is not a
+    // flag on this probe's findings, it *is* the question: which MFTs will agree to produce it, and
+    // whether the ARGB32 handshake survives the different profile and level it needs.
+    let codec = if std::env::args().any(|arg| arg.eq_ignore_ascii_case("hevc")) {
+        localplay_encoder::VideoCodec::Hevc
+    } else {
+        localplay_encoder::VideoCodec::H264
+    };
+    println!("--- asking about {codec:?} ---");
+    let encoders = localplay_encoder::mft::probe_hardware_encoders(codec)?;
+    println!("hardware {codec:?} encoder MFTs: {}", encoders.len());
     for encoder in &encoders {
         println!(
             "  {:<46} d3d11={:<5} async={:<5}\n      url: {}",
@@ -88,7 +97,7 @@ fn main() -> anyhow::Result<()> {
             "  capture-kind device: {}",
             localplay_encoder::mft::adapter_description(&device)
         );
-        match localplay_encoder::mft::MftEncoder::open(&device, size) {
+        match localplay_encoder::mft::MftEncoder::open(&device, size, codec) {
             Ok(mut encoder) => {
                 println!(
                     "opened {} for {size:?}, taking {} input, on adapter {}",

@@ -266,10 +266,10 @@ pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
 /// bytes arrive. Measured on the box, both ways: streaming the encoder's output as it is produced
 /// gives **965 ms of container for 990 ms of paced frames**, and handing the same bytes over in one
 /// batch gives **196 ms**, because a batch makes every frame arrive at once.
-pub fn video_input_args_bitstream() -> Vec<String> {
+pub fn video_input_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
     [
         "-f",
-        "h264",
+        codec.bitstream_format(),
         "-use_wallclock_as_timestamps",
         "1",
         "-i",
@@ -296,8 +296,18 @@ pub fn video_input_args_bitstream() -> Vec<String> {
 ///   what this path exists to keep out of this process. **A scaled output therefore has to be asked
 ///   of the capture, not of ffmpeg** — so `encode.output_size` below the capture size is a reason to
 ///   capture at that size, not to filter here.
-pub fn video_output_args_bitstream() -> Vec<String> {
-    vec!["-c:v".to_string(), "copy".to_string()]
+pub fn video_output_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
+    let mut args = vec!["-c:v".to_string(), "copy".to_string()];
+    // **`hvc1`, not ffmpeg's default `hev1`.** Both describe the same stream; the difference is
+    // whether the parameter sets are in the sample description or in-band, and `hev1` is what some
+    // players — Apple's among them — refuse to open at all. The clips from this pipeline get played
+    // on a Mac, so the tag that works everywhere is the one to write. It is meaningless for H.264
+    // and is not passed for it.
+    if codec == crate::VideoCodec::Hevc {
+        args.push("-tag:v".to_string());
+        args.push("hvc1".to_string());
+    }
+    args
 }
 
 /// The ffmpeg arguments that describe **the encoder for that video input**: how frames are
@@ -408,7 +418,7 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     args.extend(
         match cfg.video {
             VideoInput::RawPixels => video_input_args(cfg),
-            VideoInput::EncodedBitstream => video_input_args_bitstream(),
+            VideoInput::EncodedBitstream => video_input_args_bitstream(cfg.codec),
         }
         .into_iter()
         .map(OsString::from),
@@ -447,7 +457,7 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     args.extend(
         match cfg.video {
             VideoInput::RawPixels => video_output_args(cfg),
-            VideoInput::EncodedBitstream => video_output_args_bitstream(),
+            VideoInput::EncodedBitstream => video_output_args_bitstream(cfg.codec),
         }
         .into_iter()
         .map(OsString::from),
@@ -680,7 +690,7 @@ impl FfmpegEncoder {
         // ffmpeg is the same one whether it was encoded in this process or by the child.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream)
-            .then(|| crate::mft::MftFeed::spawn(video_tx.clone()));
+            .then(|| crate::mft::MftFeed::spawn(cfg.codec, video_tx.clone()));
         let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
 
         let video_writer = std::thread::Builder::new()
@@ -1352,7 +1362,7 @@ mod tests {
     /// the entire cost this path exists to remove.
     #[test]
     fn the_bitstream_args_copy_the_video_and_impose_nothing_on_it() {
-        let input = video_input_args_bitstream();
+        let input = video_input_args_bitstream(crate::VideoCodec::H264);
         let got: Vec<&str> = input.iter().map(String::as_str).collect();
         assert_eq!(
             got,
@@ -1366,7 +1376,7 @@ mod tests {
             );
         }
 
-        let output = video_output_args_bitstream();
+        let output = video_output_args_bitstream(crate::VideoCodec::H264);
         let got: Vec<&str> = output.iter().map(String::as_str).collect();
         assert_eq!(got, ["-c:v", "copy"], "the video is copied, not encoded again");
         for forbidden in ["-force_key_frames", "-g", "-b:v", "-fps_mode", "-vf"] {
@@ -1980,5 +1990,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bitstream arguments follow the codec, and that is the whole of what makes the hybrid
+    /// codec-agnostic: ffmpeg is told what it is reading, told to copy it rather than encode it, and
+    /// given the container tag that makes the result openable.
+    #[test]
+    fn the_bitstream_arguments_follow_the_codec() {
+        let h264 = video_input_args_bitstream(crate::VideoCodec::H264);
+        assert!(h264.windows(2).any(|w| w == ["-f", "h264"]), "{h264:?}");
+        let hevc = video_input_args_bitstream(crate::VideoCodec::Hevc);
+        assert!(hevc.windows(2).any(|w| w == ["-f", "hevc"]), "{hevc:?}");
+
+        // Both outputs are copies — the encoder has already run, whichever it was.
+        for args in [
+            video_output_args_bitstream(crate::VideoCodec::H264),
+            video_output_args_bitstream(crate::VideoCodec::Hevc),
+        ] {
+            assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]), "{args:?}");
+        }
+
+        // **`hvc1` is the container's business, not the codec's, and only HEVC needs it.** `hev1` and
+        // `hvc1` describe the same stream; the difference is where the parameter sets live, and
+        // `hev1` is what some players refuse to open at all. The clips from this pipeline get played
+        // on a Mac, so the tag that works everywhere is the one to write — and H.264 must not be
+        // given it, because `hvc1` on an AVC track is a lie about the codec.
+        let hevc_out = video_output_args_bitstream(crate::VideoCodec::Hevc);
+        assert!(hevc_out.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "{hevc_out:?}");
+        assert_eq!(
+            video_output_args_bitstream(crate::VideoCodec::H264),
+            vec!["-c:v".to_string(), "copy".to_string()],
+            "H.264's output arguments should be what they always were"
+        );
     }
 }

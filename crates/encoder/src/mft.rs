@@ -17,6 +17,7 @@
 //! viable, and it is far cheaper to learn here than after the encoder is written.
 
 use crate::ffmpeg::MFT_TIMEOUT;
+use crate::VideoCodec;
 use anyhow::{bail, Context, Result};
 use localplay_capture::GpuTexture;
 use std::time::{Duration, Instant};
@@ -36,9 +37,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
-    MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264,
+    MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264, MFVideoFormat_HEVC,
     MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
-    eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION,
+    eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION, eAVEncH265VLevel5_1, eAVEncH265VProfile_Main_420_8,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, METransformHaveOutput,
@@ -103,11 +104,11 @@ pub struct HardwareEncoder {
 /// Returns an error only when the question could not be *asked* (Media Foundation would not start,
 /// the enumeration itself failed). A machine that offers no hardware encoder returns an empty list,
 /// because "there are none" is an answer rather than a failure.
-pub fn probe_hardware_encoders() -> Result<Vec<HardwareEncoder>> {
+pub fn probe_hardware_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
     // SAFETY: `MFStartup` is the documented first call before any other MF entry point, and it is
     // paired with `MFShutdown` on every path out of this function.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
-    let probed = probe_started_encoders();
+    let probed = probe_started_encoders(codec);
     // SAFETY: balances the successful `MFStartup` above. A failure here means Media Foundation did
     // not shut down cleanly, which is not a reason to discard an answer already measured.
     unsafe {
@@ -116,7 +117,7 @@ pub fn probe_hardware_encoders() -> Result<Vec<HardwareEncoder>> {
     probed
 }
 
-fn probe_started_encoders() -> Result<Vec<HardwareEncoder>> {
+fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
@@ -159,7 +160,7 @@ fn probe_started_encoders() -> Result<Vec<HardwareEncoder>> {
     let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
     let mut probed = Vec::with_capacity(candidates.len());
     for candidate in candidates.iter().flatten() {
-        probed.push(ask_one(candidate, &manager));
+        probed.push(ask_one(candidate, &manager, codec));
     }
 
     // SAFETY: as above — the array is released here.
@@ -168,7 +169,11 @@ fn probe_started_encoders() -> Result<Vec<HardwareEncoder>> {
 }
 
 /// Ask one enumerated MFT for the handshake, and describe it either way.
-fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEncoder {
+fn ask_one(
+    activate: &IMFActivate,
+    manager: &IMFDXGIDeviceManager,
+    codec: VideoCodec,
+) -> HardwareEncoder {
     let name = attribute_string(activate, &MFT_FRIENDLY_NAME_Attribute)
         .unwrap_or_else(|| "<unnamed MFT>".to_string());
     let hardware_url = attribute_string(activate, &MFT_ENUM_HARDWARE_URL_Attribute);
@@ -248,7 +253,7 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
     // statement about that as a 3840x2160 one, without depending on this machine's display.
     // A negotiation failure is a finding rather than a panic: it means the machine will not tell us
     // what it eats, which is exactly what `refusal` is for.
-    let (accepts, negotiation) = match accepted_subtypes(&transform, (640, 480)) {
+    let (accepts, negotiation) = match accepted_subtypes(&transform, (640, 480), codec) {
         Ok(accepts) => (accepts, None),
         Err(err) => (Vec::new(), Some(format!("{err:#}"))),
     };
@@ -307,14 +312,14 @@ const CANDIDATE_INPUTS: [(&windows::core::GUID, &str); 3] = [
 /// Asked with `SetInputType` rather than read from an enumeration, because an asynchronous
 /// hardware MFT will not enumerate (measured on the box) and because *accepting a type* is the fact
 /// that matters: it is the call the encoder will make, with a media type built the same way.
-fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32)) -> Result<Vec<String>> {
+fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<Vec<String>> {
     // **The output type first, and this is not a detail.** An encoder will not accept an *input*
     // type until it knows what it is producing: Media Foundation negotiates the output side first,
     // and an input attempt made before that is refused for the ordering rather than for the format.
     // Measured the hard way — the first version of this probe asked for the input alone and
     // reported "takes no candidate input format" on an encoder that has one, which is the same
     // shape of false negative as the async lock was, and would have been believed just as easily.
-    set_h264_output_type(transform, size)
+    set_output_type(transform, size, codec)
         .context("setting the output type, which must come before the input")?;
 
     let mut accepted = Vec::new();
@@ -334,16 +339,36 @@ fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32)) -> Result<Vec<S
     Ok(accepted)
 }
 
-/// Configure the encoder's output: H.264 at `size`, which is what makes it willing to talk about
-/// its input at all.
-fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()> {
+/// Configure the encoder's output, which is what makes it willing to talk about its input at all.
+///
+fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<()> {
     // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
     let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
     let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
+    // **The one place the codec matters.** The profile and the level are load-bearing at 4K — see the
+    // long note below — and they are per codec rather than per encoder: an H.265 profile number handed
+    // to an H.264 encoder is not a format it can refuse, it is a value it does not know.
+    //
+    // `Main_420_8` because that is what this pipeline's input converts to: WGC hands over 8-bit RGB,
+    // not 10-bit, so Main10 would describe a stream nothing here produces. The level is the rung 4K
+    // needs, which is the same one H.264 asked for.
+    let (subtype, profile, level) = match codec {
+        VideoCodec::H264 => (
+            MFVideoFormat_H264,
+            eAVEncH264VProfile_High.0 as u32,
+            eAVEncH264VLevel5_1.0 as u32,
+        ),
+        VideoCodec::Hevc => (
+            MFVideoFormat_HEVC,
+            eAVEncH265VProfile_Main_420_8.0 as u32,
+            eAVEncH265VLevel5_1.0 as u32,
+        ),
+    };
+
     // SAFETY: every call sets an attribute on a media type this function owns.
     unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
         media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
@@ -357,8 +382,8 @@ fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()
         // every day — because the level it would have to claim to carry 4K@60 is not one it can
         // assume on the caller's behalf. Measured: 0xC00D36B4 for ARGB32 and NV12, 0xC00D36BD for
         // RGB32, all three before these two lines existed.
-        media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-        media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel5_1.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+        media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level)?;
         // **The GOP is the MFT's to set, and this is where it is set.**
         //
         // The plan named this as the risk that lives in this half of the change: `-force_key_frames`
@@ -370,7 +395,7 @@ fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()
     }
     // SAFETY: setting the output type on a transform that was just unlocked and given its device
     // manager, with a media type that outlives the call.
-    unsafe { transform.SetOutputType(0, &media_type, 0) }.context("SetOutputType(H264)")
+    unsafe { transform.SetOutputType(0, &media_type, 0) }.with_context(|| format!("SetOutputType({codec:?})"))
 }
 
 /// Try to set `subtype` as the transform's input type at `size`.
@@ -608,11 +633,11 @@ impl MftEncoder {
     /// `device` is the **capture path's** device, deliberately: an MFT given a manager over a
     /// different device cannot be handed the captured texture at all, so the two have to be the
     /// same one. That is why this takes a device rather than creating its own.
-    pub fn open(device: &ID3D11Device, size: (u32, u32)) -> Result<Self> {
+    pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec) -> Result<Self> {
         // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
         // in one process is a supported sequence.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
-        match Self::open_started(device, size) {
+        match Self::open_started(device, size, codec) {
             Ok(encoder) => Ok(encoder),
             Err(err) => {
                 // SAFETY: balances the `MFStartup` above, which succeeded.
@@ -624,7 +649,7 @@ impl MftEncoder {
         }
     }
 
-    fn open_started(device: &ID3D11Device, size: (u32, u32)) -> Result<Self> {
+    fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec) -> Result<Self> {
         let manager = create_device_manager(device)?;
         let input = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -649,7 +674,7 @@ impl MftEncoder {
                 // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
                 unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
             }
-            bail!("no hardware H.264 encoder MFT on this machine");
+            bail!("no hardware {codec:?} encoder MFT on this machine")
         }
         // SAFETY: `activates` points at `count` initialised entries written by the call above.
         let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
@@ -659,7 +684,7 @@ impl MftEncoder {
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            match configure_encoder(candidate, &manager, size) {
+            match configure_encoder(candidate, &manager, size, codec) {
                 Ok((transform, input_format)) => {
                     chosen = Some((transform, name, input_format));
                     break;
@@ -704,14 +729,14 @@ impl MftEncoder {
     /// The geometry comes from the texture for the same reason. It is the size that will actually
     /// arrive rather than the size somebody configured, and for this mode they are required to be the
     /// same anyway — `VideoInput::EncodedBitstream` refuses a scaled output at spawn.
-    pub fn open_for_texture(texture: &ID3D11Texture2D) -> Result<Self> {
+    pub fn open_for_texture(texture: &ID3D11Texture2D, codec: VideoCodec) -> Result<Self> {
         // SAFETY: `texture` is a live D3D11 texture and `GetDevice` is the documented way to ask
         // which device it belongs to. The device it returns is a new reference, held by the encoder.
         let device = unsafe { texture.GetDevice() }.context("ID3D11Texture2D::GetDevice")?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `desc` is a valid out-parameter for this texture.
         unsafe { texture.GetDesc(&mut desc) };
-        Self::open(&device, (desc.Width, desc.Height))
+        Self::open(&device, (desc.Width, desc.Height), codec)
     }
 
     /// The geometry this encoder was opened for.
@@ -920,6 +945,7 @@ fn configure_encoder(
     activate: &IMFActivate,
     manager: &IMFDXGIDeviceManager,
     size: (u32, u32),
+    codec: VideoCodec,
 ) -> Result<(IMFTransform, String)> {
     // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
     let transform: IMFTransform =
@@ -939,7 +965,7 @@ fn configure_encoder(
     unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
         .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
 
-    set_h264_output_type(&transform, size)?;
+    set_output_type(&transform, size, codec)?;
 
     // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
     // 3840x2160 with `MF_E_INVALIDMEDIATYPE`, so what it will eat is a function of the size as well
@@ -1055,13 +1081,13 @@ pub struct MftFeed {
 impl MftFeed {
     /// Start the encoder's thread, whose output goes into `out` — the same video queue the pump
     /// used to write to, so the depth accounting stays in one place.
-    pub fn spawn(out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
+    pub fn spawn(codec: VideoCodec, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&dropped);
         let handle = std::thread::Builder::new()
             .name("localplay-mft".to_string())
-            .spawn(move || encode_loop(rx, out, counter))
+            .spawn(move || encode_loop(rx, out, counter, codec))
             .expect("spawning the hardware encoder thread");
         Self {
             tx: Some(tx),
@@ -1112,6 +1138,7 @@ fn encode_loop(
     rx: std::sync::mpsc::Receiver<GpuTexture>,
     out: std::sync::mpsc::SyncSender<Vec<u8>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    codec: VideoCodec,
 ) {
     // Opened on the first texture rather than up front, because both the device and the size come
     // from that texture — and opening it here rather than on the pump takes the open off the
@@ -1121,7 +1148,7 @@ fn encode_loop(
 
     while let Ok(texture) = rx.recv() {
         if encoder.is_none() {
-            match MftEncoder::open_for_texture(texture.as_raw()) {
+            match MftEncoder::open_for_texture(texture.as_raw(), codec) {
                 Ok(mut opened) => {
                     if let Err(err) = opened.start() {
                         tracing::error!("could not start the hardware encoder: {err:#}");
