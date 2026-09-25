@@ -199,6 +199,41 @@ async loop, and it is now known work rather than an open question:
    texture, `METransformHaveOutput` → `ProcessOutput` into a sample and take the H.264 bytes.
 3. `MFT_MESSAGE_COMMAND_DRAIN` at the end, then keep draining until the output stops.
 
+### H.264 out of the 4K encoder, from GPU textures, with no CPU copy
+
+The async loop closes the video half, and it is measured end to end on the box:
+
+```
+--- the encoder core, at 3840x2160 ---
+opened NVIDIA H.264 Encoder MFT for (3840, 2160), taking ARGB32 input
+30 frames submitted, 9342 bytes of H.264 out
+first output chunk: 2250 bytes, starts [00, 00, 00, 01, 09, 10, 00, 00]
+```
+
+Thirty textures went in and a real elementary stream came out: `00 00 00 01` is an Annex-B start
+code and `09` is an access-unit delimiter. **No pixel of those frames crossed the CPU** — that is
+the entire point of the exercise, and it now works at 3840x2160 with the capture path's own format
+on the capture path's own device.
+
+The bytes are small (9.3 KB for 30 frames) because the frame is zero-filled and compresses to
+nothing; the size is not the finding, the format is.
+
+What the async contract cost, and why it is standard rather than mysterious:
+
+* `MFT_MESSAGE_NOTIFY_BEGIN_STREAMING` and `NOTIFY_START_OF_STREAM` before the first frame — an
+  async MFT will not take input before it has been told streaming began;
+* `GetEvent(MF_EVENT_FLAG_NO_WAIT)` in a poll, answering `METransformNeedInput` by pushing the next
+  texture and `METransformHaveOutput` by calling `ProcessOutput`;
+* `MF_E_TRANSFORM_NEED_MORE_INPUT` from `ProcessOutput` is not an error — it is "nothing yet";
+* `MFT_MESSAGE_COMMAND_DRAIN` at the end, then keep draining, or the last frames stay inside the
+  encoder and never reach the container.
+
+**What is left is integration, not discovery.** The video half is proven; the remaining work is
+handing these bytes to ffmpeg (step 6) and re-soaking (§13's 88.9% is the number to beat). The
+open risk there is unchanged and named: `-force_key_frames` cannot apply to a copied stream, so the
+GOP has to come from the MFT and the segment muxer has to cut at those keyframes for the
+one-fragment-per-keyframe contract that `MemoryRingBuffer` and the clip path depend on.
+
 ## Sub-steps, each independently verifiable
 
 1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on

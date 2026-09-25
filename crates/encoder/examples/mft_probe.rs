@@ -88,9 +88,42 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 let texture = fake_frame(encoder.device(), size)?;
-                match encoder.push_texture(&texture, 0) {
-                    Ok(()) => println!("the encoder accepted a GPU texture with no CPU copy"),
-                    Err(err) => println!("push_texture failed: {err:#}"),
+                encoder.start()?;
+                // Feed it a second of frames and collect what comes out. What is being tested is
+                // that H.264 bytes exist at all — that a captured texture reaches the encoder with
+                // no CPU copy *and* that the encoder is willing to make a stream of it.
+                let mut total = 0usize;
+                let mut frames = 0usize;
+                let mut first: Option<Vec<u8>> = None;
+                for index in 0..30 {
+                    match encoder.encode_texture(&texture, index * 33, std::time::Duration::from_secs(2)) {
+                        Ok(bytes) => {
+                            if !bytes.is_empty() {
+                                if first.is_none() {
+                                    first = Some(bytes.clone());
+                                }
+                                total += bytes.len();
+                            }
+                            frames += 1;
+                        }
+                        Err(err) => {
+                            println!("frame {index} rejected: {err:#}");
+                            break;
+                        }
+                    }
+                }
+                match encoder.finish(std::time::Duration::from_secs(2)) {
+                    Ok(bytes) => total += bytes.len(),
+                    Err(err) => println!("drain failed: {err:#}"),
+                }
+                println!("{frames} frames submitted, {total} bytes of H.264 out");
+                match &first {
+                    Some(bytes) => println!(
+                        "first output chunk: {} bytes, starts {:02x?}",
+                        bytes.len(),
+                        &bytes[..bytes.len().min(8)]
+                    ),
+                    None => println!("no output yet, which is a finding rather than a failure"),
                 }
             }
             Err(err) => println!("could not open one for {size:?}: {err:#}"),

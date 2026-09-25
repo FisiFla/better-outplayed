@@ -17,6 +17,7 @@
 //! viable, and it is far cheaper to learn here than after the encoder is written.
 
 use anyhow::{bail, Context, Result};
+use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -24,7 +25,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIDeviceManager, IMFMediaType, IMFTransform, MFCreateDXGIDeviceManager,
+    IMFActivate, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFTransform,
+    MFCreateDXGIDeviceManager,
     MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
     MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
@@ -34,9 +36,20 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, METransformHaveOutput,
+    METransformNeedInput, MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
 };
+
+/// What an encoder asked for, when its events were drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// `METransformNeedInput`: it will take a frame now.
+    Input,
+    /// Nothing queued — which is what a poll looks like when there is no work.
+    Quiet,
+}
 use windows::Win32::System::Com::CoTaskMemFree;
 
 /// One hardware video encoder this machine offers, and what it said when asked for the handshake.
@@ -551,6 +564,9 @@ fn attribute_u32(activate: &IMFActivate, key: &windows::core::GUID) -> Option<u3
 ///   instantiated on this machine at all.
 pub struct MftEncoder {
     transform: IMFTransform,
+    /// The same transform seen as an event generator, which is how an asynchronous MFT says it
+    /// wants input and has output. Cast once at open rather than per frame.
+    events: IMFMediaEventGenerator,
     /// Held because the manager only borrows it: releasing the device while an MFT holds a manager
     /// over it is exactly the dangling-association case Media Foundation warns about.
     device: ID3D11Device,
@@ -648,8 +664,13 @@ impl MftEncoder {
                 refusals.join("; ")
             )
         })?;
+        // SAFETY: an asynchronous MFT implements the event generator, and this one has just been
+        // configured as asynchronous.
+        let events: IMFMediaEventGenerator =
+            transform.cast().context("IMFTransform as IMFMediaEventGenerator")?;
         Ok(Self {
             transform,
+            events,
             device: device.clone(),
             size,
             encoder_name,
@@ -669,6 +690,146 @@ impl MftEncoder {
     /// probe uses it to build a synthetic frame; the recorder will have got it from capture.
     pub fn device(&self) -> &ID3D11Device {
         &self.device
+    }
+
+    /// Start the stream. Media Foundation's asynchronous contract begins here, not with the first
+    /// frame: an async MFT will not accept input until it has been told streaming has begun.
+    pub fn start(&mut self) -> Result<()> {
+        // SAFETY: both are messages to the encoder's own transform, with no parameter.
+        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) }
+            .context("MFT_MESSAGE_NOTIFY_BEGIN_STREAMING")?;
+        // SAFETY: as above.
+        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) }
+            .context("MFT_MESSAGE_NOTIFY_START_OF_STREAM")
+    }
+
+    /// Hand the encoder one captured texture once it asks for one, and return what it produced.
+    ///
+    /// The async contract is the whole reason this is not just "push the frame": an async MFT takes
+    /// input only when it has said it wants some (`METransformNeedInput`), and it says so through
+    /// the event generator rather than by accepting whatever arrives. `ProcessInput` called at any
+    /// other moment answers `MF_E_NOTACCEPTING` — measured, on the first attempt to feed this
+    /// encoder — which is why the wait is here rather than at the call site.
+    ///
+    /// `deadline` bounds the wait for that request: an encoder that never asks is a fault to report,
+    /// not a hang to sit in.
+    pub fn encode_texture(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        pts_ms: i64,
+        deadline: Duration,
+    ) -> Result<Vec<u8>> {
+        let mut produced = Vec::new();
+        let started = Instant::now();
+        loop {
+            if self.pump_events(&mut produced)? == Asked::Input {
+                break;
+            }
+            if started.elapsed() > deadline {
+                bail!(
+                    "the encoder did not ask for input within {deadline:?}, so nothing could be                      handed to it"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        self.push_texture(texture, pts_ms)?;
+        // Collect without waiting further: what this frame produced, if anything, is already queued
+        // by the time it was accepted.
+        let _ = self.pump_events(&mut produced);
+        Ok(produced)
+    }
+
+    /// Tell the encoder no more input is coming, and take everything it still has.
+    ///
+    /// A drain is what makes the tail of a stream real: without it the last few frames sit inside
+    /// the encoder and never reach the container.
+    pub fn finish(&mut self, deadline: Duration) -> Result<Vec<u8>> {
+        // SAFETY: a message to the encoder's own transform, with no parameter.
+        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+            .context("MFT_MESSAGE_COMMAND_DRAIN")?;
+        let mut produced = Vec::new();
+        let started = Instant::now();
+        loop {
+            self.pump_events(&mut produced)?;
+            if started.elapsed() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // SAFETY: as above — the stream is over.
+        let _ = unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0) };
+        Ok(produced)
+    }
+
+    /// Drain whatever the encoder has to say, collecting its H.264 as it goes.
+    fn pump_events(&mut self, produced: &mut Vec<u8>) -> Result<Asked> {
+        loop {
+            // SAFETY: the event generator on this encoder's own transform. `NO_WAIT` makes an empty
+            // queue an error rather than a block, which is what a poll needs.
+            let event = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => event,
+                // Nothing queued. Not a failure: this is how a poll ends.
+                Err(_) => return Ok(Asked::Quiet),
+            };
+            // SAFETY: reading this event's own type.
+            let kind = unsafe { event.GetType() }.context("IMFMediaEvent::GetType")?;
+            if kind == METransformNeedInput.0 as u32 {
+                return Ok(Asked::Input);
+            }
+            if kind == METransformHaveOutput.0 as u32 {
+                self.take_output(produced)?;
+            }
+            // Anything else — a drain completing, an error event — is not this exchange's business;
+            // the loop simply continues until the queue is empty.
+        }
+    }
+
+    /// Take one finished sample's bytes out of the encoder.
+    fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<()> {
+        // `ManuallyDrop` because that is how this struct is generated: the sample inside is owned by
+        // the caller once taken, and leaving the field un-taken must not release it twice.
+        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        // SAFETY: one output stream, and the sample is the MFT's to allocate — an encoder that
+        // provides samples is the case here, which is why `dwFlags` is zero and the buffer carries
+        // no sample of ours. The slice is exactly one element, which is what this stream has, and
+        // `status` is the documented out-parameter for the per-stream flags.
+        let taken =
+            unsafe { self.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        // The MFT hands back a sample only when it has one; being asked before that is the
+        // documented `MF_E_TRANSFORM_NEED_MORE_INPUT`, which is not an error to propagate.
+        match taken {
+            Ok(()) => {}
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+            Err(err) => return Err(err).context("IMFTransform::ProcessOutput"),
+        }
+        // SAFETY: taken exactly once, which is the contract for a `ManuallyDrop` field the callee
+        // filled in.
+        let Some(sample) = (unsafe { std::mem::ManuallyDrop::take(&mut buffer.pSample) }) else {
+            return Ok(());
+        };
+        // SAFETY: this sample is the one the encoder just produced, and the contiguous buffer is a
+        // view of it that is locked and unlocked around the copy.
+        let bytes = unsafe { sample.ConvertToContiguousBuffer() }.context("ConvertToContiguousBuffer")?;
+        let mut data: *mut u8 = std::ptr::null_mut();
+        let mut length = 0u32;
+        // SAFETY: `data`/`length` are the out-parameters; the buffer is unlocked on every path below.
+        unsafe { bytes.Lock(&mut data, None, Some(&mut length)) }.context("IMFMediaBuffer::Lock")?;
+        if !data.is_null() && length > 0 {
+            // SAFETY: `Lock` guarantees `length` readable bytes at `data` until `Unlock`.
+            produced.extend_from_slice(unsafe { std::slice::from_raw_parts(data, length as usize) });
+        }
+        // SAFETY: pairs the `Lock` above.
+        unsafe {
+            let _ = bytes.Unlock();
+        };
+        Ok(())
     }
 
     /// Hand one captured texture to the encoder, with no copy of its pixels.
