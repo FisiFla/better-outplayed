@@ -35,8 +35,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateDXGIDeviceManager,
     MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
     MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_HARDWARE_URL_Attribute,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER,
     MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264, MFVideoFormat_HEVC,
     MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
     eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION, eAVEncH265VLevel5_1, eAVEncH265VProfile_Main_420_8,
@@ -118,13 +118,21 @@ pub fn probe_hardware_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>
 }
 
 fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
-    // **The fourth argument below is `pOutputType`, and this is what an encoder has to be able to
-    // produce** — not what it consumes, whatever the shape of the call suggests. Pinned to H.264, it
-    // made every HEVC encoder on the machine invisible.
-    let output_type = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: output_subtype(codec),
-    };
+    // **No type filter, deliberately.**
+    //
+    // This used to ask for encoders that declare a given output subtype, and that question has two
+    // ways to be wrong. It can hide an encoder whose registration does not match its name, and
+    // `MFT_ENUM_FLAG_SORTANDFILTER` additionally filters against a *preference* list, which says
+    // nothing useful without a type to prefer for. Measured on the box: asking for HEVC returned the
+    // two H.264 encoders and one Quick Sync encoder, while the unfiltered list had held
+    // "NVIDIA HEVC Encoder MFT" and "Intel® Hardware H265 Encoder MFT" the whole time. The MFT was
+    // never missing; the question was.
+    //
+    // The negotiation below is what actually decides, and always was — that is why the input side has
+    // always been asked with `SetInputType` rather than read from a filter. So the enumeration's job
+    // is to be *complete* and the asking to be precise: hand it every hardware encoder on the machine
+    // and let each one say for itself what it will do. It costs a few more activations and removes a
+    // whole class of bug where a filter silently answers for the hardware.
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
 
@@ -134,9 +142,9 @@ fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            MFT_ENUM_FLAG_HARDWARE,
             None,
-            Some(&output_type),
+            None,
             &mut activates,
             &mut count,
         )
@@ -507,7 +515,7 @@ fn enumerate_names(category: windows::core::GUID) -> Result<Vec<String>> {
     unsafe {
         MFTEnumEx(
             category,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            MFT_ENUM_FLAG_HARDWARE,
             None,
             None,
             &mut activates,
@@ -669,19 +677,21 @@ impl MftEncoder {
 
     fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec) -> Result<Self> {
         let manager = create_device_manager(device)?;
-        let input = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
-        };
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
-        // SAFETY: `activates`/`count` are the out-parameters this call fills; `input` outlives it.
+        // **Unfiltered, for the reason written out at `probe_started_encoders`.** This asked for
+        // encoders declaring an H.264 output subtype, which is how the HEVC encoder on this machine
+        // stayed invisible to the code that actually records — the probe and the recorder share this
+        // mistake, and fixing only the probe would have left the recorder unable to find an encoder
+        // the machine demonstrably has. The negotiation below is the fact that decides.
+        //
+        // SAFETY: `activates`/`count` are the out-parameters this call fills.
         unsafe {
             MFTEnumEx(
                 MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                MFT_ENUM_FLAG_HARDWARE,
                 None,
-                Some(&input),
+                None,
                 &mut activates,
                 &mut count,
             )
@@ -692,7 +702,7 @@ impl MftEncoder {
                 // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
                 unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
             }
-            bail!("no hardware {codec:?} encoder MFT on this machine")
+            bail!("no hardware encoder MFT on this machine will take {codec:?} at this size")
         }
         // SAFETY: `activates` points at `count` initialised entries written by the call above.
         let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
