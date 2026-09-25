@@ -127,6 +127,59 @@ tag, the fragment splitter, the clip `-c copy`.
 the readback, which is the 88.9% of a core this whole line of work exists to delete. So HEVC is
 available now as a trade, and available *without* the trade once the NV12 pass exists.
 
+## Where it stands now: HEVC records, the zero-copy path does not
+
+**HEVC works end to end today on the raw path**, verified on the box with `codec = "hevc"` and the
+key left unset:
+
+```
+frames=2667  fps=59.6/60  dropped=8  capture_copy=65.4%
+buffer session #11 closed: 36 segment(s), 93828980 bytes held in RAM
+CLIENT_EXIT=0
+codec_name=hevc  codec_tag_string=hvc1  width=3840  height=2160
+```
+
+60 fps and 8 dropped frames, against the H.264 raw path's 55.5–56.9 and 8 — the same shape, because
+it is the same pipeline with a different encoder. The clip is `hvc1`, so it opens where `hev1` does
+not.
+
+**The zero-copy path is blocked, and not by anything in this repository.** The `NVIDIA HEVC Encoder
+MFT` is enumerated, activates, and refuses the HEVC output type at 4K with `0xC00D6D76` ("the input
+type is not supported for D3D device") while accepting the same type at 640x480. Three things were
+tried against it and none moved it:
+
+* an NV12 texture instead of ARGB32 — the format-aware candidate order works (the H.264 encoder now
+  opens *taking NV12*, straight from the texture's desc), and HEVC refuses identically;
+* `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` on the device, since the message names the device — no change;
+* and the outside opinion: `ffmpeg -c:v hevc_mf` cannot open an HEVC encoder at **any** size on this
+  machine (`-40`, "Function not implemented"), while `h264_mf` encodes 4K with exit 0.
+
+So the MediaFoundation HEVC path is not functional on this box as a whole, whichever wrapper asks.
+The remaining avenue is bisecting the output media type (profile, level, bitrate, `HEVC_ES`) on the
+chance one combination it likes exists; that is the next thing to try and not a promising one.
+
+## What the bitrate actually buys, since the expectation matters
+
+**At the same `bitrate_kbps`, HEVC is not a smaller file** — both are rate-controlled to the same
+target, and the measured clips say so: 88.1 MB for 45 s of 4K HEVC against 101.9 MB for 90 s of H.264
+is *more* bits per second, not fewer. What the same bits buy is **quality**.
+
+The smaller RAM ring the user was promised comes from **lowering the bitrate**, which HEVC then makes
+acceptable where H.264 would not: `bitrate_kbps` is a config value, so it is a knob rather than a code
+change, and the ring holds whatever the encoder puts in it.
+
+## Two bugs the verification found, both by reading output
+
+1. **A software HEVC run produced H.264.** `EncodeConfig::encoder_name` fell back to a hardcoded
+   `libx264` whatever `codec` said, so a `vendor = none` HEVC recording would have been an AVC file
+   claiming to be HEVC. The fallback is per codec now (`libx265`), and a new test caught it by
+   printing the argument list it was asserting about.
+2. **The `hvc1` tag was on the wrong path.** It was written into the *bitstream* arguments — the
+   zero-copy hybrid's path — and that is precisely the path HEVC does not run on here, because it is
+   the path whose hardware encoder refuses. `ffprobe` on a real clip said `codec_tag_string=hev1`.
+   Reading the clip caught what reading the code would not. The tag is on both paths now, with tests
+   for the raw one and for H.264 *not* being given it.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
