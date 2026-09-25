@@ -52,7 +52,7 @@
     "publisher": "FisiFla",
     "copyright": "Copyright (c) 2026 FisiFla",
     "category": "Video",
-    "homepage": "https://github.com/FisiFla/localplay",
+    "homepage": "https://github.com/FisiFla/better-outplayed",
     "shortDescription": "Local, zero-cloud game clipping and replay buffer for Windows",
     "longDescription": "localplay keeps the last 30-120 seconds of gameplay in a ring buffer and writes a lossless clip to disk the instant you press a hotkey or your game reports an event. No account, no telemetry, no cloud upload, no Overwolf runtime. Windows 10 1903+ / Windows 11, x86_64, with a hardware encoder (NVENC, QuickSync or AMF)."
   }

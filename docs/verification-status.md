@@ -51,8 +51,8 @@ nothing. It cannot check the GUI, a real keypress, anything needing a real game,
 live clock divergence; §9 lists what stays manual and §10 records which parts of it the
 2026-09-24 session got to by hand instead.
 
-[issue #1]: https://github.com/FisiFla/localplay/issues/1
-[issue #2]: https://github.com/FisiFla/localplay/issues/2
+[issue #1]: https://github.com/FisiFla/better-outplayed/issues/1
+[issue #2]: https://github.com/FisiFla/better-outplayed/issues/2
 
 ---
 

@@ -39,7 +39,7 @@ rest of the repository rather than invented here:
 | `publisher` | `FisiFla` | the copyright holder in `LICENSE-MIT` and the GitHub account that owns the repository |
 | `copyright` | `Copyright (c) 2026 FisiFla` | verbatim from `LICENSE-MIT` |
 | `category` | `Video` | the app records and cuts video; maps to `public.app-category.video` on macOS |
-| `homepage` | `https://github.com/FisiFla/localplay` | `repository` in the root `Cargo.toml` |
+| `homepage` | `https://github.com/FisiFla/better-outplayed` | `repository` in the root `Cargo.toml` |
 | `shortDescription` | *Local, zero-cloud game clipping and replay buffer for Windows* | the README's tagline |
 | `longDescription` | the README's first paragraph, plus the Windows/encoder requirement | README + spec §2 |
 | `licenseFile` | **unset, deliberately** | localplay is dual-licensed (MIT **OR** Apache-2.0) and this key takes a single path. Naming one file would misstate the licence. A release should add a short file that states the dual licence and points at both, or the installer simply shows no licence page |

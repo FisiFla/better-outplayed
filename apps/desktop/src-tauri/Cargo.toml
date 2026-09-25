@@ -3,7 +3,7 @@ name = "localplay-desktop"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/FisiFla/localplay"
+repository = "https://github.com/FisiFla/better-outplayed"
 description = "localplay desktop shell — the Phase 2 session review UI (Tauri v2)"
 publish = false
 

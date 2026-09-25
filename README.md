@@ -1,12 +1,16 @@
-# localplay
+# better-outplayed
 
 > **100% local, zero-cloud game clipping and replay buffer for Windows.**
 
-localplay is an open-source alternative to [Outplayed](https://overwolf.com) and
+better-outplayed is an open-source alternative to [Outplayed](https://overwolf.com) and
 [Ascent](https://tryascent.gg) that runs entirely on your machine. No account, no
 telemetry, no cloud upload, no Overwolf runtime. Just a native desktop app that keeps
 the last 30–120 seconds of your gameplay in a ring buffer and writes a lossless clip
 to disk the instant you press a hotkey or your game reports an event.
+
+> **Naming.** The repository is `better-outplayed`. The crates, the CLI binary and the data
+> directory still carry the original `localplay` name — so `localplay-cli`, `localplay-encoder`
+> and `%LOCALAPPDATA%\localplay` below are all current, and only the repository was renamed.
 
 ---
 
@@ -104,7 +108,7 @@ screen. The clip hotkey (`[hotkeys] clip`, `Ctrl+F8` by default) is registered w
 `RegisterHotKey` at startup and is what takes a clip while the window is hidden; the tray
 icon and its tooltip carry the recording state, and the tray menu shows/hides the window,
 starts and stops recording, saves a clip now, opens `config.toml` and quits. A chord that
-cannot be registered — another application already owns it, or another localplay does, since
+cannot be registered — another application already owns it, or another better-outplayed does, since
 the CLI and the desktop app cannot both hold one chord — is reported in the window, in the
 tooltip and in the log, and the window keeps working without it. `[app] start_with_system`
 (default `false`) is the Windows Run-key entry.
@@ -281,7 +285,7 @@ stays manual.
       **Ran on real Windows hardware** and produced correct clips, but two criteria
       miss: at 4K it sustains ~24 fps against 30 configured (~45% of frames dropped) and
       costs ~50.8% of a CPU core against a < 5% target (open as
-      [issue #1](https://github.com/FisiFla/localplay/issues/1)). **Re-run on the box and
+      [issue #1](https://github.com/FisiFla/better-outplayed/issues/1)). **Re-run on the box and
       still open**: a 2026-09-24 capture held 28fps against 30 at 4K and said so itself.
 - [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
       recording wiring exist, and so do the tray, the global clip hotkey and the
@@ -330,7 +334,7 @@ shipping an LGPL-licensed `ffmpeg` sidecar.
 
 ### A note on the `ffmpeg` build
 
-localplay only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
+better-outplayed only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
 so it never requires `libx264`. That means an **LGPL** `ffmpeg` build is sufficient,
 and shipping it does not pull the GPL `libx264`/`libx265` obligations into this
 project.

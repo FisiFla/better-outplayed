@@ -1,4 +1,4 @@
-# localplay — desktop shell (Phase 2)
+# better-outplayed — desktop shell (Phase 2)
 
 The session review window: clip list, player with a timeline scrubber, lossless trim, and a
 storage panel. Tauri v2 shell + Svelte 5 frontend, per [spec §3](../../docs/specs/2026-09-23-localplay-design.md)
