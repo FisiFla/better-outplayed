@@ -44,6 +44,24 @@ are enumerated but report `d3d11=false` and cannot take a D3D11 device, so they 
    `hevc_nvenc`/`hevc_qsv`/`hevc_amf` for the hardware-vendor raw path) and the MFT for the
    zero-copy path.
 
+## Good news found while checking: the selection already generalises
+
+`MFTEnumEx` is called with `None` for the **output**-type filter and `Some(&input)` for the input
+one, so it enumerates every hardware video encoder on the machine — H.264, HEVC, and AV1 on a card
+that has it — and then `configure_encoder` tries each candidate in turn and keeps the first that
+accepts the output type. Nothing selects on the encoder's name; the `bail!("no hardware H.264
+encoder MFT on this machine")` is a message rather than a filter.
+
+That means HEVC needs no new selection logic and no new enumeration: fix the output type and the
+same loop finds the NVIDIA HEVC MFT on its own. It was designed that way by accident — the probe
+needed to know which encoders existed, and enumerating by input rather than output is what made the
+answer complete — and it is worth keeping, because the alternative (matching on "H.264" in the
+friendly name) would have quietly pinned the pipeline to one codec.
+
+Worth considering at the same time, though not required: passing `MFVideoFormat_HEVC` as the output
+filter would stop the probe from offering H.264-only MFTs as if they were candidates. It changes
+only what is reported, since the ones that cannot comply are refused either way.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
