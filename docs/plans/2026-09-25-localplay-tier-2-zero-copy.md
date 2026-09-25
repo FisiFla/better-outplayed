@@ -412,6 +412,34 @@ the achieved rate wrong, any CPU comparison is confounded anyway — fewer frame
 work per second. The number that matters can only be taken once the pump is not throttled by the
 encoder, and until then this design has not been shown to reduce CPU at all.
 
+### Is `capture=` copying or waiting? Measured: copying, 69.6% against 18.9%
+
+The question this plan could not answer from its own instrumentation, and the one that would have
+decided whether the whole approach was aimed at the right thing. `capture=` is a single number for
+all of `next_frame`, and a backend that spends it waiting for a 60 Hz display reports the same figure
+as one spending it copying 33 MB out of VRAM — with opposite remedies.
+
+So the split was measured, on the shipping path (`zero_copy = false`), 4K/60, `vendor = auto`:
+
+```
+capture=96.7% submit=0.1% capture_wait=18.9% capture_copy=69.6%
+```
+
+**The copy is ~70% of wall clock and waiting is ~19%.** The remaining ~10% of `capture=` is the
+polling loop's own clock reads and deadline arithmetic, which the two counters deliberately do not
+claim. Read against the same run's CPU figure (88.9% of one core), this is consistent and it settles
+the premise: **the readback is the dominant cost of the 4K pipeline**, not the display's refresh
+interval, and removing it removes roughly 70% of the loop and most of the core.
+
+That also retires a suspicion worth recording, because it would have redirected months of work: after
+the first hybrid soak left `capture=` almost unchanged (94.5% against 97.1%), the obvious alternative
+explanation was that the metric had been measuring idleness all along. It had not.
+
+**What it does not explain** is why the hybrid's `capture=` barely moved. If the handover removed the
+copy, that figure should have fallen to something near the waiting share. It did not — which points
+at the handover blit itself, and is the next thing to measure rather than argue about: the same soak
+with `zero_copy = true`, whose `capture_copy` the new instrumentation will now report directly.
+
 ## Known constraints to carry
 
 * `windows` 0.58: `MFCreateDXGISurfaceBuffer`, `MFCreateDXGIDeviceManager`, `MFCreateSample`,
