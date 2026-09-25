@@ -22,7 +22,7 @@ use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFTransform,
@@ -685,6 +685,28 @@ impl MftEncoder {
             encoder_name,
             input_format,
         })
+    }
+
+    /// Open an encoder for frames shaped like `texture`, taking its device from the texture itself.
+    ///
+    /// **The device is the texture's by construction, and that is stronger than a promise.** An MFT
+    /// can only be handed a texture that lives on the device its manager was built over, so a design
+    /// that had the caller pass a device separately would be trusting two components to agree about
+    /// which one capture chose — and the failure mode of that disagreement is a texture the encoder
+    /// silently cannot see. Asking the texture removes the question: whatever produced this frame is
+    /// what the encoder is opened on.
+    ///
+    /// The geometry comes from the texture for the same reason. It is the size that will actually
+    /// arrive rather than the size somebody configured, and for this mode they are required to be the
+    /// same anyway — `VideoInput::EncodedBitstream` refuses a scaled output at spawn.
+    pub fn open_for_texture(texture: &ID3D11Texture2D) -> Result<Self> {
+        // SAFETY: `texture` is a live D3D11 texture and `GetDevice` is the documented way to ask
+        // which device it belongs to. The device it returns is a new reference, held by the encoder.
+        let device = unsafe { texture.GetDevice() }.context("ID3D11Texture2D::GetDevice")?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `desc` is a valid out-parameter for this texture.
+        unsafe { texture.GetDesc(&mut desc) };
+        Self::open(&device, (desc.Width, desc.Height))
     }
 
     /// The geometry this encoder was opened for.

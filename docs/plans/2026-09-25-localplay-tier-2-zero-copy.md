@@ -347,6 +347,26 @@ over its texture, the pump not reading back — and then the re-soak against §1
    process under 3% of one core, with `dropped=` still ~0 and the timeline (`media=` vs `wall=`)
    unchanged from §13.
 
+### The encoder takes its device from the frame, not from a capability
+
+Step 7's wiring needs the MFT opened on the **capture path's** device — an MFT can only be handed a
+texture from the device its manager was built over. The obvious design is a capability on
+`CaptureBackend` that hands the device out; it was not taken, because there is a stronger source:
+
+```rust
+let device = texture.GetDevice()?;              // whatever made this frame
+let size = texture.GetDesc().Width/Height;      // whatever shape it will be
+MftEncoder::open(&device, size)
+```
+
+`MftEncoder::open_for_texture` asks the frame. That removes the question rather than answering it:
+a handoff capability would have had two components agreeing about which device capture uses, and the
+failure mode of their disagreement is a texture the encoder silently cannot see. A texture's device
+is its own by definition.
+
+It also removes an API: no `CaptureBackend::d3d11_device`, no newtype to carry an interface between
+two crates, and nothing to keep in step when capture's device handling changes.
+
 ## Known constraints to carry
 
 * `windows` 0.58: `MFCreateDXGISurfaceBuffer`, `MFCreateDXGIDeviceManager`, `MFCreateSample`,
