@@ -365,6 +365,21 @@ pub trait CaptureBackend: Send {
         Ok(0)
     }
 
+    /// Ask this backend to hand frames over as GPU textures instead of copying their pixels to
+    /// [`Frame::data`].
+    ///
+    /// Off by default, and a backend that cannot do it says so by leaving it off: the default is a
+    /// no-op, and a backend that ignores it keeps delivering pixels, which every consumer
+    /// understands. Only a backend whose frames are *born* on the GPU can save anything here — on
+    /// this project that is Windows Graphics Capture, where the copy out of VRAM is ~97% of what
+    /// the 4K pipeline does (§14 of `docs/verification-status.md`).
+    ///
+    /// Textures are only useful to an encoder that can *take* one (a hardware MFT through a
+    /// `IMFDXGIDeviceManager`), and that encoder must be on the same D3D11 device. A caller that
+    /// turns this on without one gets frames with no pixels in them and, in this project, an
+    /// encoder that refuses them by name rather than writing a zero-length frame into a pipe.
+    fn deliver_textures(&mut self, _textures: bool) {}
+
     /// The frame geometry this backend delivers.
     ///
     /// Infallible by design: the size is fixed once the backend is constructed (the

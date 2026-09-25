@@ -300,33 +300,49 @@ over its texture, the pump not reading back — and then the re-soak against §1
    * (The sketch's step 4 was wrong about `guard_frame_size`: it checks only width and height today,
      never `data.len()`, so it needed no change. The guard that *is* needed went into
      `FfmpegEncoder::submit_video` instead — see step 4 below.)
-2. **The backend can be asked for one.** A capability on `CaptureBackend` (default: no), off by
-   default so no behaviour changes until the encoder exists.
-3. **`WgcCapture::copy_out` gains the zero-copy branch.** The texture is already extracted from
-   the frame's `IDirect3DDxgiInterfaceAccess` (`wgc.rs:439`); the branch returns it with empty
-   `data` instead of staging, `CopyResource`, `Map` and memcpy. The frame's reference must be
-   held (the pool reuses buffers) — `ID3D11Texture2D` is `Send` in the pinned `windows` 0.58 but
-   that says nothing about the pool, so this needs a deliberate look at when the pool recycles.
+2. **The backend can be asked for one.** ✅ **Done.** `CaptureBackend::deliver_textures` (default:
+   a no-op, so a backend that cannot do it keeps delivering pixels and every consumer is unaffected),
+   overridden by `WgcCapture`. The answer is remembered on the backend as well as the session, so it
+   survives a `stop`/`start` cycle and can be given *before* `start` — which is when an encoder is
+   configured and therefore when it decides whether it can take a texture.
+3. **`WgcCapture::copy_out` gains the handover branch.** ✅ **Done**, and the lifetime question the
+   sketch flagged changed what this is called. **WGC recycles the surface it hands out**, so the
+   frame's own texture cannot be passed on at all — it is valid only until `Close()`. What goes to
+   the encoder is therefore a texture *we* own, with the captured surface blitted into it on the GPU.
+   So this is not zero-copy; it is **no CPU copy**, which is the thing that costs 97% of the loop: one
+   `CopyResource` replaces a 33 MB copy through system memory, per frame.
+   The blit needs a **ring**, not one texture: a single one would be overwritten by the next frame
+   while the encoder was still reading it. Three deep — the standard slack for a hardware encoder
+   keeping one or two frames in flight; deeper would only cost VRAM at 33 MB a texture. The ring is
+   built on first use, so a session never asked for textures pays nothing.
 4. **A frame with no pixels is refused by the encoder that cannot carry one.** Done, in
    `FfmpegEncoder::submit_video`: it writes `data` to the child's stdin, so a texture frame would
    become a zero-length rawvideo frame that ffmpeg reads as the next frame's leading bytes — a
    desync surfacing as corruption seconds later, pointing at nothing. Refused with the reason,
    and asserted by `a_frame_without_pixels_is_refused_rather_than_written_as_nothing`. This is
    what makes step 1 safe to land *before* the encoder that consumes textures exists.
-5. **`WmfEncoder`** (`crates/encoder/src/wmf.rs`, `#[cfg(windows)]`): `MFStartup`,
-   `MFCreateDXGIDeviceManager` + `ResetDevice`, the encoder MFT found by **`MFTEnumEx`** — the
-   pinned `windows` 0.58 does **not** expose `CLSID_CMSH264EncoderMFT`, and
-   `IMFDXGIDeviceManager` lives in `Win32::System::WinRT::Media`, not beside the other MF
-   functions — `MFT_MESSAGE_SET_D3D_MANAGER`, input type at the capture size,
-   `CODECAPI_AVLowLatencyMode`, and `MFCreateDXGISurfaceBuffer` per frame. Its output is the
-   H.264 elementary stream that step 6 consumes.
-6. **ffmpeg takes the encoded stream.** `-c:v copy` with the MFT's output on a pipe, audio and
-   muxing unchanged. The one real risk lives here: `-force_key_frames` cannot apply to a copied
-   stream, so **the GOP is the MFT's to set** (`CODECAPI_AVEncMPVGOPSize`), and the segment
-   muxer must cut at those keyframes for the one-fragment-per-keyframe contract that
-   `MemoryRingBuffer` and the clip path depend on. This wants a test before it wants trust.
-7. **Selection and fallback.** `WmfEncoder` only when Windows and no software encoder was
-   requested; `FfmpegEncoder` everywhere else, including every test.
+5. **The hardware encoder.** ✅ **Done**, as `MftEncoder` in `crates/encoder/src/mft.rs` rather
+   than a `wmf.rs` — the name in the sketch presumed an `Encoder` implementation, and what was
+   needed first was the core it will be built on, proven on its own. It selects an encoder by
+   `MFTEnumEx` (the pinned `windows` 0.58 does not expose `CLSID_CMSH264EncoderMFT`; it and
+   `IMFDXGIDeviceManager` are both in `Media::MediaFoundation`, not `System::WinRT::Media` as the
+   sketch expected), unlocks it for asynchronous use, hands it the capture path's **own** device
+   manager, sets its output type — profile, level, bitrate and **the GOP**
+   (`MF_MT_MAX_KEYFRAME_SPACING`) — before negotiating the input, and drives the async event loop.
+   Proven on the box: 90 frames of 4K `ARGB32` in, an H.264 elementary stream out, no CPU copy.
+6. **ffmpeg takes the encoded stream.** ✅ **The shape is proven, not yet wired.** `-c:v copy` with
+   the MFT's output on a pipe, audio and muxing unchanged, and the risk the sketch named is closed:
+   the GOP comes from the MFT, and ffmpeg produced **three fragments a second apart, each a
+   keyframe**, which the project's own `FragmentSplitter` read back. Two things that only came from
+   doing it: the bitstream must be **streamed as it is produced** (a batch write made ffmpeg stamp
+   every frame at once — 196 ms of container for a second of frames, against 965 ms when streamed),
+   and the 4K input type is `ARGB32`, tested rather than enumerated, because this MFT will not
+   enumerate its types and refuses `ARGB32` at some sizes and not others.
+7. **Selection and fallback.** The hardware path only when Windows and no software encoder was
+   requested; `FfmpegEncoder` everywhere else, including every test. **Still to write**, and it is
+   the same seam as step 6's wiring: an `Encoder` implementation that drives `MftEncoder` and its
+   ffmpeg child, reusing the existing audio input and output arguments — the hybrid changes the video
+   input and the video codec and nothing else.
 8. **Re-soak.** The same 180 s 4K/60 soak that produced 88.9%, expecting `capture≈0%` and the
    process under 3% of one core, with `dropped=` still ~0 and the timeline (`media=` vs `wall=`)
    unchanged from §13.

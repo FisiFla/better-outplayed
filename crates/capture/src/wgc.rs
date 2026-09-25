@@ -72,7 +72,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-};
+    D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE,
+    D3D11_USAGE_DEFAULT,};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
@@ -118,6 +120,10 @@ pub struct WgcCapture {
     /// defect B was.
     size: (u32, u32),
     session: Option<Session>,
+    /// Whether the caller asked for textures rather than pixels, held here as well as in the
+    /// session so the answer survives a `stop`/`start` cycle — and so it can be given *before*
+    /// `start`, which is when an encoder decides whether it can take a texture.
+    want_textures: bool,
     /// Whether `start` has been called and `stop` has not.
     ///
     /// Tracked separately from `session` because the session is built in [`Self::new`]
@@ -128,6 +134,79 @@ pub struct WgcCapture {
     com_owned: bool,
 }
 
+/// The ring of textures a session hands to an encoder that asked for them.
+///
+/// Sized on first use and recreated if the geometry changes — the same caching rule as the staging
+/// texture, for the same reason: the capture item's size can change when the display mode does.
+#[derive(Default)]
+struct Handover {
+    ring: Vec<ID3D11Texture2D>,
+    next: usize,
+    size: (u32, u32),
+    format: DXGI_FORMAT,
+}
+
+impl Handover {
+    /// How many textures the ring holds. Three: enough for a hardware encoder's one-to-two frames
+    /// in flight plus the one being copied into, and no more.
+    const DEPTH: usize = 3;
+
+    /// The next texture in the ring, building it if there is none or the geometry changed.
+    fn texture(
+        &mut self,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<ID3D11Texture2D> {
+        if self.ring.is_empty() || self.size != (width, height) || self.format != format {
+            let mut ring = Vec::with_capacity(Self::DEPTH);
+            for _ in 0..Self::DEPTH {
+                ring.push(create_handover_texture(device, width, height, format)?);
+            }
+            self.ring = ring;
+            self.next = 0;
+            self.size = (width, height);
+            self.format = format;
+        }
+        let picked = self.next % self.ring.len();
+        self.next = picked + 1;
+        Ok(self.ring[picked].clone())
+    }
+}
+
+/// One texture for the handover ring.
+///
+/// `BIND_RENDER_TARGET` and `BIND_SHADER_RESOURCE` because that is the shape Windows Graphics
+/// Capture's own frames carry and the shape a hardware encoder MFT accepts — measured on the box,
+/// where a texture with exactly these flags is taken as `ARGB32` input at 3840x2160. A texture with
+/// narrower bind flags would be refused for a reason that has nothing to do with the format.
+fn create_handover_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut created: Option<ID3D11Texture2D> = None;
+    // SAFETY: `created` is the out-parameter and `desc` outlives the call. No initial data: the
+    // first thing that happens to this texture is a copy from a captured frame.
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut created)) }
+        .with_context(|| format!("creating a handover texture {width}x{height}"))?;
+    created.context("CreateTexture2D returned no texture")
+}
+
 /// Everything a session acquires, so there is one thing to release.
 struct Session {
     device: ID3D11Device,
@@ -136,6 +215,16 @@ struct Session {
     /// The capture item's size in physical pixels, taken from the item itself: the frame
     /// pool is created with this value, so it is the size of the frames to come.
     size: (u32, u32),
+    /// The textures this session hands out when it has been asked for textures, and how many
+    /// have gone round the ring. `None` until it is asked.
+    ///
+    /// A **ring**, not one texture. WGC recycles the surface it gives us, so the captured
+    /// texture cannot be held past `frame.Close()`; what we hand to an encoder therefore has to
+    /// be a texture we own, with the frame copied into it on the GPU. But one such texture races:
+    /// the copy is issued, handed over, and the *next* frame would overwrite it while the encoder
+    /// was still reading it. Three is the standard slack — a hardware encoder keeps one or two
+    /// frames in flight — and a deeper ring would only cost VRAM.
+    handover: Option<Handover>,
     /// Held deliberately: the pool and the session capture *this* item, and dropping
     /// our reference to it while they are running is not something WGC documents as
     /// safe. Nothing below `start` reads it, hence the underscore.
@@ -167,6 +256,7 @@ impl WgcCapture {
             monitor_index,
             size: (0, 0),
             session: None,
+            want_textures: false,
             started: false,
             com_owned: false,
         };
@@ -178,8 +268,12 @@ impl WgcCapture {
     fn start_session(&mut self) -> Result<()> {
         self.com_owned = init_com()?;
         match Session::new() {
-            Ok(session) => {
+            Ok(mut session) => {
                 self.size = session.size;
+                // Carry the caller's answer into the session, since it may have been given before
+                // this session existed — an encoder is configured between construction and `start`,
+                // and that is when the question is asked.
+                session.deliver_textures(self.want_textures);
                 tracing::info!(
                     width = self.size.0,
                     height = self.size.1,
@@ -276,6 +370,18 @@ impl CaptureBackend for WgcCapture {
         Ok(())
     }
 
+    /// Ask for textures rather than pixels, forwarding to the session when there is one.
+    ///
+    /// Remembered even with no session, because a caller may ask between construction and `start`
+    /// — which is exactly when the encoder is being configured, and therefore when it decides
+    /// whether it can take a texture. [`Self::start_session`] carries it into the session it builds.
+    fn deliver_textures(&mut self, textures: bool) {
+        self.want_textures = textures;
+        if let Some(session) = self.session.as_mut() {
+            session.deliver_textures(textures);
+        }
+    }
+
     fn native_size(&self) -> (u32, u32) {
         // The invariant this method owes its caller: the value returned here is the size
         // of every frame `next_frame` produces, because both come from the capture item
@@ -360,7 +466,16 @@ impl Session {
             "WGC capture started on the primary monitor"
         );
 
-        Ok(Self { device, context, pool, size, _item: item, capture, staging: None })
+        Ok(Self {
+            device,
+            context,
+            pool,
+            size,
+            _item: item,
+            capture,
+            staging: None,
+            handover: None,
+        })
     }
 
     /// One poll of the frame pool. `Ok(None)` means "nothing available yet".
@@ -450,6 +565,22 @@ impl Session {
             );
         }
         let (width, height) = (desc.Width, desc.Height);
+
+        // Handed over rather than read back, when this session was asked for textures. There is no
+        // staging texture, no `Map` and no row copy on this path at all: the pixels stay in VRAM and
+        // the only thing that crosses is a COM reference.
+        if self.handover.is_some() {
+            let owned = self.handover_texture(&texture)?;
+            return Ok(Frame {
+                data: Vec::new(),
+                pts,
+                width,
+                height,
+                format: PixelFormat::Bgra8,
+                texture: Some(crate::GpuTexture::new(owned)),
+            });
+        }
+
         let row_bytes = width as usize * 4;
         let staging = self.staging_texture(width, height, desc.Format)?;
         let dst: &ID3D11Resource = &staging;
@@ -506,6 +637,41 @@ impl Session {
     }
 
     /// The CPU-readable staging texture, created once per (size, format).
+    /// Ask this session to hand out textures rather than pixels.
+    ///
+    /// The ring is built on first use rather than here, because a session that is never asked pays
+    /// nothing for it — and the buffers it would build are 33 MB each at 4K.
+    fn deliver_textures(&mut self, textures: bool) {
+        if textures && self.handover.is_none() {
+            self.handover = Some(Handover::default());
+        }
+        if !textures {
+            self.handover = None;
+        }
+    }
+
+    /// A texture to hand over, in ring order, copied from the frame's own surface.
+    ///
+    /// This is where the CPU stops being involved: `CopyResource` moves 33 MB on the GPU in
+    /// microseconds, where the staging copy and the row-by-row `Map` it replaces moved the same 33 MB
+    /// through system memory per frame.
+    fn handover_texture(&mut self, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `desc` is a valid out-parameter for `source`.
+        unsafe { source.GetDesc(&mut desc) };
+        let ring = self
+            .handover
+            .get_or_insert_with(Handover::default)
+            .texture(&self.device, desc.Width, desc.Height, desc.Format)?;
+        let dst: &ID3D11Resource = &ring;
+        // SAFETY: both textures are on this session's device, and they match in size, format, mip
+        // level, array size and sample count — which is what makes a whole-resource copy valid. The
+        // copy is issued on the immediate context, which is the same context the encoder's manager
+        // was given, so it is ordered ahead of the encoder reading it.
+        unsafe { self.context.CopyResource(dst, source) };
+        Ok(ring)
+    }
+
     fn staging_texture(
         &mut self,
         width: u32,
