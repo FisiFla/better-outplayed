@@ -29,6 +29,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
 };
 use windows::Win32::Media::MediaFoundation::{
@@ -581,7 +582,12 @@ fn enumerate_names(category: windows::core::GUID) -> Result<Vec<String>> {
 
 /// A D3D11 device of the kind the capture backend creates.
 ///
-/// `D3D11_CREATE_DEVICE_BGRA_SUPPORT` is the flag that matters: Windows Graphics Capture requires
+/// **`BGRA_SUPPORT | VIDEO_SUPPORT`, and the second one is not optional for HEVC.** BGRA is what
+/// Windows Graphics Capture requires; VIDEO_SUPPORT is what a Media Foundation encoder asks for when
+/// it is handed a D3D11 texture it has to convert, and the HEVC encoder answers
+/// `0xC00D6D76` — "the input type is not supported for D3D device" — without it, at any size, while
+/// the H.264 encoder is content either way. An earlier version of this comment said BGRA was the flag
+/// that matters; it was right about capture and wrong about what comes after it.
 /// it, so a device without it could not receive a captured texture and the handshake would be
 /// answering a question nobody is asking.
 /// A D3D11 device of the kind the capture backend creates.
@@ -598,7 +604,7 @@ pub fn create_capture_kind_device() -> Result<ID3D11Device> {
             None,
             D3D_DRIVER_TYPE_HARDWARE,
             None,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None,
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -606,7 +612,7 @@ pub fn create_capture_kind_device() -> Result<ID3D11Device> {
             None,
         )
     }
-    .context("D3D11CreateDevice(HARDWARE, BGRA_SUPPORT)")?;
+    .context("D3D11CreateDevice(HARDWARE, BGRA_SUPPORT | VIDEO_SUPPORT)")?;
     device.context("D3D11CreateDevice returned no device")
 }
 
