@@ -262,6 +262,42 @@ explains itself and says nothing about NVIDIA's MFT.
 skips any encoder whose output type is refused, which is exactly the encoder that needed
 interrogating — so the one transform whose *own* answer matters produced no offerings at all.
 
+## It works: HEVC on the zero-copy path
+
+With the warm-up in place, `codec = "hevc"` and the key left unset took the hardware path, on the box:
+
+```
+CPU 4.2% of one core, RSS 356.9 MB
+capture=94.6%  submit=0.1%  capture_wait=62.0%  capture_copy=0.6%
+buffer session #13 closed: 35 segment(s), 167671496 bytes held in RAM
+CLIENT_EXIT=0        no ffmpeg left behind
+clip: codec_name=hevc  codec_tag_string=hvc1  3840x2160
+```
+
+Against the H.264 hybrid this replaced — 4.0% of a core, `capture_copy=0.7%`, 59.6 fps, 0 dropped —
+that is the same pipeline doing HEVC at 4K with no readback. `capture_copy=0.6%` is the number that
+says so: the pixels never came back to the CPU.
+
+**Two things it does not yet match, both worth knowing rather than assuming:**
+
+* **Throughput.** 56.9 fps and 9 dropped frames, against the H.264 hybrid's 59.6 and 0. This is the one
+  cost the work predicted: NVENC's HEVC pass is slightly more expensive per frame than its H.264 one,
+  and the recorder says so out loud (`the encoder cannot sustain the 60fps it was told`). It is not a
+  regression from the zero-copy change; `capture_copy` and the CPU are what that change moved.
+* **The bitrate.** The clip came out at 37 Mbps against a `bitrate_kbps = 20000` setting, where the
+  H.264 path honours the same setting. `MF_MT_AVG_BITRATE` is set on the output type either way, so
+  this is an HEVC-specific rate-control difference rather than a wiring mistake — and it matters,
+  because "smaller files for the same picture" is the whole reason HEVC was wanted.
+
+## The blocker was mine, and so was the wrong conclusion
+
+Written down in full above because it is the interesting part. For several rounds this plan said the
+machine had no usable Media Foundation HEVC encoder. It did, the whole time, and it accepts the
+pipeline's own 4K output type — it just refuses it as the *first* thing it is asked for, and the
+refusal is sticky. A ladder rising from 640x480 accepted every size including 4K, twice; a ladder
+starting at 4K refused every size including 640x480. The fix is one best-effort configuration at a
+small size before the real one.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
