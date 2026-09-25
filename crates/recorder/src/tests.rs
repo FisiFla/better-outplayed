@@ -79,9 +79,10 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             vendor: "auto".to_string(),
             codec: "h264".to_string(),
             bitrate_kbps: 2_000,
-            // Off: the pipeline tests drive the rawvideo path, and the hybrid needs
-            // a hardware encoder MFT this host does not have.
-            zero_copy: false,
+            // Explicitly off: the pipeline tests drive the rawvideo path, and the hybrid needs
+            // a hardware encoder MFT this host does not have. Explicit rather than unset so that
+            // these tests say what they mean and do not depend on where they run.
+            zero_copy: Some(false),
             fps: FPS,
             // The shipping default. At 64x48 libx264 measures far above 10fps, so the probe
             // cannot reduce the rate here — which is what the plain end-to-end test wants
@@ -1250,5 +1251,67 @@ fn buffering_writes_nothing_to_disk_and_only_a_saved_clip_does() {
         saved.len(),
         1,
         "the clips directory must hold exactly the one saved clip, found {saved:?}"
+    );
+}
+
+/// The `zero_copy` key has three meanings, and the one that decides whether this project keeps
+/// working on machines it was not built on is the unset one.
+///
+/// `None` means the key was never mentioned, and it has to be survivable wherever it lands — this
+/// host, any machine without an NVIDIA or AMD encoder, any non-Windows box. A *default* that refuses
+/// to start is a recorder that does not record, which is a worse outcome than a slow one. The
+/// hardware path itself is verified on the box that has the hardware; this is the part that can be
+/// proven anywhere.
+#[test]
+fn an_unset_zero_copy_survives_a_host_that_cannot_run_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+    cfg.encode.zero_copy = None;
+
+    match build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (64, 48)) {
+        Ok(encode) => assert_eq!(
+            encode.video,
+            localplay_encoder::VideoInput::RawPixels,
+            "with no hardware encoder the unset key resolves to the ordinary path"
+        ),
+        Err(err) => panic!("an unset zero_copy must not refuse to start: {err:#}"),
+    }
+}
+
+/// Asking for it explicitly is a different thing and gets the honest answer — the reason it cannot
+/// run, rather than a quiet downgrade to a pipeline that was not asked for.
+#[test]
+fn an_explicit_zero_copy_is_refused_where_it_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+    cfg.encode.zero_copy = Some(true);
+
+    let refused = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (64, 48))
+        .expect_err("an explicit zero_copy with no hardware encoder must refuse");
+    assert!(
+        refused.to_string().contains("hardware encoder"),
+        "the refusal must name what is missing: {refused:#}"
+    );
+}
+
+/// And with the hardware in place, the reason on a platform that cannot do it is the platform.
+#[cfg(not(windows))]
+#[test]
+fn an_explicit_zero_copy_is_refused_off_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+    cfg.encode.zero_copy = Some(true);
+
+    let refused = build_encode_config(
+        &cfg,
+        dir.path(),
+        VideoCodec::H264,
+        Some(localplay_encoder::Vendor::Nvenc),
+        (64, 48),
+    )
+    .expect_err("an explicit zero_copy off Windows must refuse");
+    assert!(
+        refused.to_string().contains("Windows"),
+        "the refusal must name the platform: {refused:#}"
     );
 }

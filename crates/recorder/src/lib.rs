@@ -2619,19 +2619,35 @@ fn build_encode_config(
     // silently ran a different pipeline than the one configured is worse than one that does not
     // start: this project has already paid for a quiet divergence between what was asked for and
     // what ran (issues #1 and #2).
-    if cfg.encode.zero_copy {
-        if vendor.is_none() {
-            bail!(
-                "encode.zero_copy needs a hardware encoder: the whole point is to hand the captured \
-                 texture to the encoder's own MFT, and a software encoder has no MFT to hand it to. \
-                 Set `vendor`, or turn the key off."
-            );
-        }
-        #[cfg(not(windows))]
+    // What the key means, resolved in one place so the guards below and the log lines agree.
+    //
+    // `Some(true)` is a deliberate request: it *requires* the hardware path, and the guards below
+    // refuse the run when the machine cannot provide it. `None` is the default and is not a request
+    // — it is "use it if you can", which on a host without the hardware means the ordinary path
+    // rather than a refusal.
+    let zero_copy_required = cfg.encode.zero_copy == Some(true);
+    let zero_copy = match cfg.encode.zero_copy {
+        Some(explicit) => explicit,
+        None => vendor.is_some() && cfg!(windows),
+    };
+
+    if zero_copy_required && vendor.is_none() {
         bail!(
-            "encode.zero_copy is a Windows path: the texture handover is Media Foundation's encoder \
-             MFT, and there is no equivalent here. Turn the key off."
+            "encode.zero_copy is set, and it needs a hardware encoder: the whole point is to hand \
+             the captured texture to the encoder's own MFT, and a software encoder has no MFT to \
+             hand it to. Set `vendor`, unset the key to let it decide, or turn it off."
         );
+    }
+    #[cfg(not(windows))]
+    if zero_copy_required {
+        bail!(
+            "encode.zero_copy is set, and it is a Windows path: the texture handover is Media \
+             Foundation's encoder MFT, and there is no equivalent here. Unset the key to let it \
+             decide, or turn it off."
+        );
+    }
+
+    if zero_copy {
         #[cfg(windows)]
         {
             encode_cfg.video = localplay_encoder::VideoInput::EncodedBitstream;
@@ -2640,9 +2656,23 @@ fn build_encode_config(
             // to be ffmpeg's is now the MFT's.
             tracing::info!(
                 "zero-copy: captured textures go straight to the hardware encoder, and ffmpeg \
-                 copies the H.264 instead of encoding it"
+                 copies the H.264 instead of encoding it ({})",
+                if zero_copy_required {
+                    "set explicitly"
+                } else {
+                    "chosen by default, because a hardware encoder is present"
+                }
             );
         }
+    } else if cfg.encode.zero_copy.is_none() {
+        // The default, on a machine that cannot run it. Said out loud, because the alternative —
+        // saying nothing — is how a configured pipeline and a running one drift apart, which this
+        // project has already paid for twice (issues #1 and #2).
+        tracing::info!(
+            "zero-copy is off for this run: it needs Windows and a detected hardware encoder, and \
+             one of the two is missing. Frames are read back and encoded as usual; \
+             `encode.zero_copy = true` would make that combination a startup error instead."
+        );
     }
 
     // The rawvideo pipe is declared from `source_size`; if it did not equal the backend's

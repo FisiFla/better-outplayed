@@ -106,8 +106,20 @@ output_size = ""
 # copying the video rather than encoding it, so it cannot scale it, and scaling would mean
 # decoding, which would mean the pixels this mode exists to keep out of memory.
 #
-# It changes the encode path, so it is off until a soak on real hardware says otherwise.
-zero_copy = false
+# **Leaving this unset is the default, and it means "use it when the hardware can"**: a
+# detected hardware `vendor` on Windows gets the hardware path, and anything else gets the
+# ordinary one with a line in the log saying so. That is deliberate — a default that
+# refused to start would be a recorder that does not record on whichever machine it was
+# copied to.
+#
+# Setting it changes that. `true` *requires* the hardware path and refuses to start
+# without it; `false` turns it off everywhere.
+#
+# Measured on the box it was built for: 4.0% of one core against 88.9% on the readback
+# path, 59.6 fps of 60 against 55.5, and no dropped frames against 8. See
+# docs/plans/2026-09-25-localplay-tier-2-zero-copy.md.
+#
+# zero_copy = true
 
 [audio]
 enabled = true

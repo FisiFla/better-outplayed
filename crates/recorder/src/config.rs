@@ -179,17 +179,26 @@ pub struct EncodeSection {
     /// ffmpeg is told to copy the H.264 that comes out — a few hundred kilobytes a second across the
     /// pipe instead of gigabytes.
     ///
-    /// Off by default because it is a **behavioural** change to the shipping encode path, and the
-    /// verification it deserves is a soak on real hardware rather than a test suite: the pieces are
-    /// each proven (the MFT takes 4K ARGB32 from this device, the async loop carries frames, ffmpeg
-    /// reads the bitstream and produces the ring's fragments with a keyframe a second), but no
-    /// recording has been made end to end with it yet.
+    /// **Unset means "use it when the hardware can".** That is the default, and it is resolved
+    /// against the machine: a detected hardware encoder and Windows gets the hardware path, and
+    /// anything else gets the ordinary one with a line saying so. A default that refused to start
+    /// would be a recorder that does not record on the machine it was copied to — and it would take
+    /// the test suite with it, which runs nowhere near this hardware.
+    ///
+    /// `true` is the strict form and means what it says: the hardware path is *required*, and a run
+    /// that cannot have it is refused at startup with the reason rather than silently downgraded.
+    /// That distinction is why this is an `Option` rather than a `bool` — a key that was set on
+    /// purpose deserves a different answer from one that was never mentioned.
+    ///
+    /// `false` turns it off everywhere.
     ///
     /// It needs a hardware encoder — a software one has no MFT to hand a texture to — and the
-    /// texture handover is Media Foundation's, so this is Windows-only. Both are refused at startup
-    /// with the reason rather than silently ignored.
+    /// texture handover is Media Foundation's, so the path is Windows-only. Measured on the box it
+    /// was built for: 4.0% of one core against 88.9% on the readback path, 59.6 fps of 60 against
+    /// 55.5, no dropped frames against 8. See
+    /// `docs/plans/2026-09-25-localplay-tier-2-zero-copy.md`.
     #[serde(default)]
-    pub zero_copy: bool,
+    pub zero_copy: Option<bool>,
     /// Measure the sustainable encode rate at startup and record at the lower of that and
     /// `fps` (default `true`).
     ///
