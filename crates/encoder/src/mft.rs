@@ -40,8 +40,11 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_HARDWARE_URL_Attribute,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER,
     MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
-    eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION, eAVEncH265VLevel5_1, eAVEncH265VProfile_Main_420_8,
+    MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32,
+    MFVideoFormat_YUY2,
+    eAVEncH264VLevel5_1, eAVEncH264VProfile_High, eAVEncH265VLevel4_1, eAVEncH265VLevel5,
+    eAVEncH265VLevel5_1, eAVEncH265VProfile_Main_420_10, eAVEncH265VProfile_Main_420_8,
+    MFVideoInterlace_Progressive, MF_VERSION,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, METransformHaveOutput,
@@ -1309,6 +1312,144 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
         .position(|&unit| unit == 0)
         .unwrap_or(description.Description.len());
     String::from_utf16_lossy(&description.Description[..end])
+}
+
+/// The output-type variants the HEVC matrix tries, in order.
+///
+/// Each is the type this pipeline builds with exactly one thing changed, so that a refusal can be
+/// attributed to something rather than to everything.
+const OUTPUT_TYPE_VARIANTS: [&str; 8] = [
+    "exactly what the pipeline builds",
+    "no profile and no level",
+    "level 5 instead of 5.1",
+    "level 4.1",
+    "no average bitrate",
+    "no keyframe spacing",
+    "MFVideoFormat_HEVC_ES instead of MFVideoFormat_HEVC",
+    "Main_420_10 instead of Main_420_8",
+];
+
+/// Build the output media type the pipeline builds, with variant `index` of [`OUTPUT_TYPE_VARIANTS`]
+/// applied.
+///
+/// SAFETY: the returned type is a COM object owned by the caller.
+unsafe fn build_output_type(
+    codec: VideoCodec,
+    size: (u32, u32),
+    index: usize,
+) -> Result<IMFMediaType> {
+    let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
+    let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
+    let subtype = if index == 6 {
+        MFVideoFormat_HEVC_ES
+    } else {
+        output_subtype(codec)
+    };
+    let (profile, level) = match index {
+        7 => (eAVEncH265VProfile_Main_420_10.0 as u32, eAVEncH265VLevel5_1.0 as u32),
+        2 => (eAVEncH265VProfile_Main_420_8.0 as u32, eAVEncH265VLevel5.0 as u32),
+        3 => (eAVEncH265VProfile_Main_420_8.0 as u32, eAVEncH265VLevel4_1.0 as u32),
+        _ => (eAVEncH265VProfile_Main_420_8.0 as u32, eAVEncH265VLevel5_1.0 as u32),
+    };
+    // SAFETY: every call sets an attribute on a media type this function owns.
+    unsafe {
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        if index != 4 {
+            media_type.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?;
+        }
+        if index != 1 {
+            media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+            media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level)?;
+        }
+        if index != 5 {
+            media_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FRAME_RATE.0)?;
+        }
+    }
+    Ok(media_type)
+}
+
+/// Which output-media-type attribute an encoder is objecting to, asked one at a time.
+///
+/// **A diagnostic, and deliberately one.** The HEVC encoder on the development box accepts the type
+/// this pipeline builds at 640x480 and refuses it at 3840x2160 with `0xC00D6D76` — "the input type is
+/// not supported for D3D device" — which names the device rather than the attribute at fault. Three
+/// guesses have been tried and none moved it: an NV12 input, a video-capable device, and a different
+/// wrapper entirely (ffmpeg's own `hevc_mf`, which cannot open an HEVC encoder at any size here).
+/// Rather than guess a fourth time, ask: build the same type with one thing changed at a time and
+/// report which ones it takes. The device manager is set first, because that is the context the
+/// refusal is about.
+///
+/// Nothing in the pipeline calls this. Returns `(what was tried, what happened)` per candidate.
+pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
+    // Only HEVC has variants worth trying; the H.264 type is measured and working.
+    if codec != VideoCodec::Hevc {
+        return Ok(Vec::new());
+    }
+    // SAFETY: `MFStartup` is refcounted and the matching `MFShutdown` runs on the way out.
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
+    let rows = (|| -> Result<Vec<(String, String)>> {
+        let device = create_capture_kind_device()?;
+        let manager = create_device_manager(&device)?;
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: the out-parameters this call fills, and the matching free below.
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE,
+                None,
+                None,
+                &mut activates,
+                &mut count,
+            )
+        }
+        .context("MFTEnumEx for the output-type matrix")?;
+        if activates.is_null() || count == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `activates` points at `count` initialised entries written by the call above.
+        let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        let mut rows = Vec::new();
+        for candidate in candidates.iter().flatten() {
+            let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string());
+            // Activating is a filter of its own: an encoder this machine lists but cannot instantiate
+            // has nothing to say about media types.
+            // SAFETY: the activation's own method; the transform it returns is dropped with the loop.
+            let Ok(transform) = (unsafe { candidate.ActivateObject::<IMFTransform>() }) else {
+                continue;
+            };
+            if unsafe {
+                transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+            }
+            .is_err()
+            {
+                continue;
+            }
+            for (index, label) in OUTPUT_TYPE_VARIANTS.iter().enumerate() {
+                let verdict = match unsafe { build_output_type(codec, size, index) } {
+                    // SAFETY: the transform is live and the media type outlives the call.
+                    Ok(media_type) => match unsafe { transform.SetOutputType(0, &media_type, 0) } {
+                        Ok(()) => "ACCEPTED".to_string(),
+                        Err(err) => format!("{err}"),
+                    },
+                    Err(err) => format!("could not be built: {err:#}"),
+                };
+                rows.push((format!("{name} :: {label}"), verdict));
+            }
+        }
+        // SAFETY: COM-allocated by `MFTEnumEx`; this is the matching free.
+        unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+        Ok(rows)
+    })();
+    // SAFETY: balances the `MFStartup` above, which succeeded.
+    unsafe { let _ = MFShutdown(); }
+    rows
 }
 
 /// Whether a hardware encoder for `codec` will actually **open** at `size`.

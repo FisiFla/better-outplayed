@@ -100,6 +100,15 @@ fn main() -> anyhow::Result<()> {
         // (`0xC00D6D76`, "the input type is not supported for D3D device"). Both are asked here, of
         // the same device, so the answer is about the format rather than about a guess — and NV12 is
         // what the capture handover will have to produce for the HEVC path to exist at all.
+        // **And if the encoder still will not have it, find out what it objects to.** One attribute
+        // at a time, because three guesses have already failed and a fourth would be luck.
+        if codec == localplay_encoder::VideoCodec::Hevc {
+            println!("\n--- which attribute of the output type it objects to ---");
+            for (what, verdict) in localplay_encoder::mft::probe_output_types(codec, size)? {
+                println!("  {what}\n     -> {verdict}");
+            }
+        }
+
         println!("\n--- what an NV12 texture does ---");
         let nv12 = fake_frame(
             &device,
