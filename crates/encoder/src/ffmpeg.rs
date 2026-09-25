@@ -105,7 +105,7 @@
 //! copied the whole pixel buffer on every frame — 3840x2160 BGRA is 33.2MB, ~1GB/s of
 //! pure memcpy at 30fps — on the path that was already failing to keep up.
 
-use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat};
+use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat, VideoInput};
 use anyhow::{bail, Context, Result};
 use localplay_capture::{AudioBuffer, Frame};
 use localplay_media::FfmpegBinaries;
@@ -387,10 +387,19 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // which would steal raw video frames; `-loglevel error` is why a failure's reason is
     // read out of stderr by `drain_stderr` rather than scraped from a progress line.)
 
-    // Input 0 — video: raw BGRA frames on the child's stdin, at the declared rate. Shared
-    // with the startup throughput probe — see [`video_input_args`], which is also where the
-    // `-framerate`-not-`-r` rule and the arrival timestamps are documented.
-    args.extend(video_input_args(cfg).into_iter().map(OsString::from));
+    // Input 0 — video, in one of two shapes, and which one is the whole of Tier 2. Raw BGRA frames
+    // this process copied out of VRAM ([`video_input_args`], shared with the throughput probe), or
+    // an H.264 elementary stream it encoded *on the GPU* ([`video_input_args_bitstream`]). See
+    // [`VideoInput`] for what each costs — at 4K the difference is ~33 MB per frame against a few
+    // hundred kilobytes a second.
+    args.extend(
+        match cfg.video {
+            VideoInput::RawPixels => video_input_args(cfg),
+            VideoInput::EncodedBitstream => video_input_args_bitstream(),
+        }
+        .into_iter()
+        .map(OsString::from),
+    );
 
     // Input 1 — system/game audio: raw s16le PCM over loopback TCP. This is the transport
     // that works on Windows as well as here — see the module comment.
@@ -419,9 +428,17 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         );
     }
 
-    // The encoder for input 0: scale (when asked for), codec, bitrate and the keyframe
-    // schedule. Shared with the probe for the same reason.
-    args.extend(video_output_args(cfg).into_iter().map(OsString::from));
+    // What to do with input 0: scale (when asked for), codec, bitrate and the keyframe schedule —
+    // or, for a stream that arrived encoded, nothing but a copy. Shared with the probe for the same
+    // reason.
+    args.extend(
+        match cfg.video {
+            VideoInput::RawPixels => video_output_args(cfg),
+            VideoInput::EncodedBitstream => video_output_args_bitstream(),
+        }
+        .into_iter()
+        .map(OsString::from),
+    );
     args.extend(["-c:a", "aac", "-b:a"].iter().map(OsString::from));
     args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
 
@@ -545,6 +562,25 @@ pub struct FfmpegEncoder {
 
 impl FfmpegEncoder {
     pub fn spawn(bin: &FfmpegBinaries, cfg: &EncodeConfig) -> Result<Self> {
+        // Refused before anything is created or launched, because this is a *configuration*
+        // contradiction rather than a runtime failure and the caller should hear about it as one.
+        //
+        // An encoded bitstream cannot be scaled here: scaling means decoding, decoding means the
+        // pixels, and the pixels are the cost [`VideoInput::EncodedBitstream`] exists to remove. The
+        // alternative — quietly ignoring `output_size` and emitting the capture's size — would give
+        // the user a recording of the wrong geometry and no indication of why.
+        if cfg.video == VideoInput::EncodedBitstream && cfg.source_size != cfg.output_size {
+            bail!(
+                "an encoded bitstream cannot be scaled by ffmpeg, and this encoder was asked for \
+                 {}x{} from {}x{} capture: scaling means decoding, and decoding means the pixels \
+                 this mode exists to keep out of this process. Capture at the output size instead, \
+                 or ask for an output of the capture's size.",
+                cfg.output_size.0,
+                cfg.output_size.1,
+                cfg.source_size.0,
+                cfg.source_size.1
+            );
+        }
         std::fs::create_dir_all(&cfg.scratch_dir)
             .with_context(|| format!("creating {}", cfg.scratch_dir.display()))?;
 
@@ -1166,6 +1202,59 @@ mod tests {
                  nothing while looking correct: {output:?}"
             );
         }
+    }
+
+    /// A bitstream input produces the hybrid's pair, and a scaled one is refused.
+    ///
+    /// The absences carry as much as the presences. `-s` and `-framerate` describe a pipe of pixels
+    /// and must be gone; `-b:v` and `-force_key_frames` describe work ffmpeg is no longer doing. And
+    /// the refusal at the end is the point of the guard: a scaled output under this mode is a
+    /// contradiction — scaling means decoding, decoding means the pixels this mode exists to avoid —
+    /// so it has to be an error rather than a silently different geometry in the user's recording.
+    ///
+    /// What must *not* change is as important: the audio input and the output packaging are the same
+    /// arguments, because that is the whole argument for doing it this way.
+    #[test]
+    fn a_bitstream_input_copies_the_video_and_refuses_to_scale_it() {
+        let mut cfg = args_cfg(30, 1000);
+        cfg.video = VideoInput::EncodedBitstream;
+
+        let args = ffmpeg_args(&cfg, "tcp://127.0.0.1:1", None);
+        let text: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(text.windows(2).any(|w| w == ["-f", "h264"]), "{text:?}");
+        assert!(
+            text.windows(2).any(|w| w == ["-use_wallclock_as_timestamps", "1"]),
+            "an elementary stream carries no timestamps of its own: {text:?}"
+        );
+        assert!(text.windows(2).any(|w| w == ["-c:v", "copy"]), "{text:?}");
+        for forbidden in ["-s", "-framerate", "-b:v", "-force_key_frames"] {
+            assert!(
+                !text.iter().any(|a| a == forbidden),
+                "{forbidden} belongs to the rawvideo path and must not survive into this one: \
+                 {text:?}"
+            );
+        }
+        assert!(text.windows(2).any(|w| w == ["-c:a", "aac"]), "audio is unchanged: {text:?}");
+        assert!(text.windows(2).any(|w| w == ["-f", "segment"]), "so is the output: {text:?}");
+
+        // A scaled output is refused, and refused before anything is created or launched — the
+        // binary named here does not exist, which is the point.
+        cfg.source_size = (1280, 720);
+        cfg.output_size = (640, 360);
+        let bin = FfmpegBinaries {
+            ffmpeg: "/nonexistent/ffmpeg".into(),
+            ffprobe: "/nonexistent/ffprobe".into(),
+        };
+        // Matched rather than `expect_err`, which would need `Debug` on an encoder that owns a
+        // child process and has no business deriving it.
+        let refused = match FfmpegEncoder::spawn(&bin, &cfg) {
+            Ok(_) => panic!("a scaled bitstream must be refused, and this one was not"),
+            Err(err) => err,
+        };
+        assert!(
+            refused.to_string().contains("cannot be scaled"),
+            "the refusal must name the reason rather than fail later: {refused}"
+        );
     }
 
     /// The scale filter is added only when the output size differs, and the GOP follows the

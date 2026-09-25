@@ -146,6 +146,11 @@ pub struct EncodeConfig {
     /// Defaults to [`EncodeOutput::Segmented`] everywhere, so every existing caller and test
     /// keeps the behaviour it had. See [`EncodeOutput`] for what the other mode is for.
     pub output: EncodeOutput,
+    /// Where the video comes from: this process's own pixels, or this process's own encoder.
+    ///
+    /// Defaults to [`VideoInput::RawPixels`] everywhere, so every existing caller and test keeps the
+    /// argument list it had, element for element. See [`VideoInput`] for what the other is for.
+    pub video: VideoInput,
 }
 
 /// Where an encoder's output goes.
@@ -154,6 +159,33 @@ pub struct EncodeConfig {
 /// encoder and the same forced-keyframe interval, and both produce footage a clip can be cut
 /// from with `-c copy`. What differs is whether the footage is on disk while it is only being
 /// *buffered*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoInput {
+    /// Raw BGRA frames on the child's stdin, at the declared rate — every configuration this
+    /// project has shipped until now, and what every test and non-Windows build uses.
+    ///
+    /// The cost of it is the reason the other variant exists: at 3840x2160 the capture backend
+    /// copies 33.2 MB out of VRAM per frame to produce these bytes, which is ~97% of what the 4K
+    /// pipeline does (§14 of `docs/verification-status.md`).
+    RawPixels,
+    /// **An H.264 elementary stream this process encoded itself**, on the child's stdin.
+    ///
+    /// The Tier 2 hybrid: a hardware encoder MFT takes the captured texture straight from VRAM
+    /// (`crate::mft`), and what reaches ffmpeg is a few hundred kilobytes a second of H.264 instead
+    /// of gigabytes of raw pixels — measured on the box at 4K: 90 frames in, an elementary stream
+    /// out, no CPU copy. ffmpeg is then told to **copy** the video rather than encode it.
+    ///
+    /// Two consequences the argument list enforces rather than assumes, both measured:
+    ///
+    /// * **The GOP is the encoder's, not ffmpeg's.** `-force_key_frames` cannot apply to a stream
+    ///   ffmpeg is only copying, so the segment boundaries the replay path depends on come from the
+    ///   MFT's own keyframe interval.
+    /// * **The output cannot be scaled here.** Scaling means decoding, and decoding means the
+    ///   pixels, which is the cost this variant exists to remove; a scaled `output_size` is refused
+    ///   at spawn with that explanation rather than silently producing the capture's size.
+    EncodedBitstream,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeOutput {
     /// `-f segment` into [`EncodeConfig::scratch_dir`]: one self-contained file per
@@ -217,6 +249,7 @@ impl EncodeConfig {
             // Files on disk, which is the shipping behaviour and the one that survives a
             // crash. A caller that wants no disk churn sets this to `FragmentedStream`.
             output: EncodeOutput::Segmented,
+            video: VideoInput::RawPixels,
         }
     }
 
@@ -247,6 +280,7 @@ impl EncodeConfig {
             mic_audio: None,
             software_encoder: None,
             output: EncodeOutput::Segmented,
+            video: VideoInput::RawPixels,
         }
     }
 
