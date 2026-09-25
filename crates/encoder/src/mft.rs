@@ -1623,13 +1623,19 @@ pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
         // a repeat either changes the answer or it does not, and either result is worth more than the
         // ladder alone: a first attempt that fails and a second that succeeds is a state problem with
         // a retry as its fix, while two identical answers points somewhere else entirely.
+        // **Rising, with 4K at the end *and* twice.** The order is the variable: a ladder that began
+        // at 3840x2160 refused every size, while the same ladder rising from 640x480 accepted all of
+        // them — including 4K, twice in one run and once in another. If a small size accepted first
+        // is what makes a larger one work, the last two rows here say so; if 4K is refused again on
+        // the second attempt, warm-up is not the mechanism.
         let sizes = [
-            (3840u32, 2160u32),
+            (640u32, 480u32),
+            (1280, 720),
+            (1920, 1080),
+            (2560, 1440),
+            (3200, 1800),
             (3840, 2160),
-            (1920, 1080),
-            (1920, 1080),
-            (640, 480),
-            (640, 480),
+            (3840, 2160),
         ];
         let device = create_capture_kind_device()?;
         let manager = create_device_manager(&device)?;
