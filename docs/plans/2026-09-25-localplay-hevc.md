@@ -180,6 +180,47 @@ change, and the ring holds whatever the encoder puts in it.
    Reading the clip caught what reading the code would not. The tag is on both paths now, with tests
    for the raw one and for H.264 *not* being given it.
 
+## The matrix, and the end of this avenue
+
+The last thing worth trying was the output media type — profile, level, bitrate, keyframe spacing,
+subtype — one attribute at a time. Eight variants, asked of every hardware encoder on the box:
+
+```
+NVIDIA HEVC Encoder MFT :: exactly what the pipeline builds      -> The input type is not supported for D3D device. (0xC00D6D76)
+                        :: no profile and no level                -> 0xC00D6D76
+                        :: level 5 instead of 5.1                 -> 0xC00D6D76
+                        :: level 4.1                              -> 0xC00D6D76
+                        :: no average bitrate                     -> 0xC00D6D76
+                        :: no keyframe spacing                    -> 0xC00D6D76
+                        :: Main_420_10 instead of Main_420_8      -> 0xC00D6D76
+                        :: MFVideoFormat_HEVC_ES                  -> Invalid type. (0xC00D36BD)
+```
+
+**Every variant this pipeline controls is refused identically**, and the H.264 encoder refuses every
+one of them with `Invalid type` because it is an H.264 encoder. So the refusal is invariant under the
+media type: it is not an attribute we are setting wrong.
+
+Put beside the other three results, the conclusion is not a guess:
+
+1. an **NV12** input texture instead of ARGB32 — identical refusal;
+2. **`D3D11_CREATE_DEVICE_VIDEO_SUPPORT`** on the device, since the message names the device — no change;
+3. **ffmpeg's own `hevc_mf`** cannot open an HEVC encoder at *any* size on this machine (`-40`),
+   while `h264_mf` encodes 4K with exit 0;
+4. and now every output-type variant, refused identically.
+
+**The zero-copy HEVC path is not achievable on this machine.** The `NVIDIA HEVC Encoder MFT` will not
+be configured for a D3D11 texture input — at any attribute combination we can offer. The code is in
+place and correct: it enumerates the encoders, carries the codec into the encoder thread, builds the
+HEVC output type, and on a machine whose HEVC encoder accepts a texture it would run. This box's does
+not. The Intel HEVC encoder that might is listed and fails to activate (`0x80004005`), so it is not an
+alternative here either.
+
+**What is left, if this is ever wanted badly enough:** ffmpeg's `hevc_nvenc` *does* work on this box
+(verified, 4K60, exit 0), and ffmpeg can take D3D11 textures directly through a hardware device —
+`-hwaccel d3d11va` with a shared texture, or the CUDA interop path. That is a different architecture
+for the same goal: it would replace the Media Foundation encoder with ffmpeg's own, and it is a design
+decision rather than a bug fix. It is not something to start without being asked.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
