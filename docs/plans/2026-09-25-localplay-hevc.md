@@ -221,6 +221,47 @@ alternative here either.
 for the same goal: it would replace the Media Foundation encoder with ffmpeg's own, and it is a design
 decision rather than a bug fix. It is not something to start without being asked.
 
+## Withdrawn: it is not the hardware. The refusal is state.
+
+The size ladder, run after everything else in the same process:
+
+```
+NVIDIA HEVC Encoder MFT :: 640x480   -> ACCEPTED
+                        :: 1280x720  -> ACCEPTED
+                        :: 1920x1080 -> ACCEPTED
+                        :: 2560x1440 -> ACCEPTED
+                        :: 3200x1800 -> ACCEPTED
+                        :: 3840x2160 -> ACCEPTED      <- the size the pipeline uses
+```
+
+**That is the output type this pipeline builds, at 4K, accepted** — minutes after `probe_output_types`
+reported `0xC00D6D76` for the same type at the same size, and after the real open path reported it too.
+So the earlier conclusion, written down at length above, was wrong: this is not a machine without a
+usable HEVC encoder.
+
+Two things it also rules out, now measured rather than assumed:
+
+* **The order is not the problem.** `probe_ordering` tried all four combinations: output-first gets
+  `0xC00D6D76`, input-first gets `0xC00D6D60` — `MF_E_TRANSFORM_TYPE_NOT_SET`, the encoder saying "you
+  have not given me the output type yet", which is *confirmation* of the rule the pipeline follows
+  rather than a challenge to it. The device manager makes no difference either way.
+* **`0xC00D6D76` is `MF_E_UNSUPPORTED_D3D_TYPE`**, Media Foundation's "the type you asked for is not one
+  this GPU device supports" — and it is the same error, at the same `SetOutputType` call, that OBS users
+  hit with NVENC. The text is the system's name for the HRESULT, not the encoder's own words.
+
+**The one difference between the two attempts is the transform's history.** The ladder activates a
+*fresh* transform for every size; `probe_output_types` activates one and sets eight types on it. That
+is where to look next — and it means the zero-copy HEVC path is probably reachable rather than blocked.
+
+**A second correction, since it was used as evidence:** ffmpeg's own `hevc_mf` failing at every size
+does *not* support "the MediaFoundation HEVC path is broken here". `hevc_mf` is a different encoder —
+Microsoft's — which on Windows normally requires the "HEVC Video Extensions" package, so its failure
+explains itself and says nothing about NVIDIA's MFT.
+
+**And a flaw in the diagnostic worth fixing before it is trusted again:** `probe_available_types`
+skips any encoder whose output type is refused, which is exactly the encoder that needed
+interrogating — so the one transform whose *own* answer matters produced no offerings at all.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
