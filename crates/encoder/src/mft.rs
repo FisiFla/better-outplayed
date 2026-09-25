@@ -1026,20 +1026,7 @@ fn configure_encoder(
     let transform: IMFTransform =
         unsafe { activate.ActivateObject() }.context("IMFActivate::ActivateObject(IMFTransform)")?;
 
-    if attribute_u32(activate, &windows::Win32::Media::MediaFoundation::MF_TRANSFORM_ASYNC)
-        .map(|v| v != 0)
-        .unwrap_or(false)
-    {
-        // SAFETY: reading the transform's own attribute store, then setting the unlock in it.
-        let attributes = unsafe { transform.GetAttributes() }.context("IMFTransform::GetAttributes")?;
-        unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
-            .context("unlocking an asynchronous MFT")?;
-    }
-
-    // SAFETY: the manager outlives the call, and its interface pointer is what the message wants.
-    unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
-        .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
-
+    prepare_transform(activate, &transform, manager)?;
     set_output_type(&transform, size, codec)?;
 
     // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
@@ -1373,6 +1360,37 @@ unsafe fn build_output_type(
     Ok(media_type)
 }
 
+/// Unlock an asynchronous transform and hand it the device manager, in that order.
+///
+/// **The sequence is the thing, and it is easy to lose half of it.** An asynchronous MFT refuses the
+/// device manager with `0xC00D6D77` — "the caller does not appear to support this transform's
+/// asynchronous capabilities" — until `MF_TRANSFORM_ASYNC_UNLOCK` is set on its attributes, and it
+/// will not accept any type before it has the manager.
+///
+/// That is the error the first version of the encoder hit, and then the error the output-type matrix
+/// hit again when it re-typed this and left the unlock out: every candidate refused, the matrix
+/// reported nothing, and the machine's ten encoders looked like none. Two copies of an ordered
+/// sequence is one copy too many, so there is one.
+fn prepare_transform(
+    activate: &IMFActivate,
+    transform: &IMFTransform,
+    manager: &IMFDXGIDeviceManager,
+) -> Result<()> {
+    if attribute_u32(activate, &windows::Win32::Media::MediaFoundation::MF_TRANSFORM_ASYNC)
+        .map(|value| value != 0)
+        .unwrap_or(false)
+    {
+        // SAFETY: reading the transform's own attribute store, then setting the unlock in it.
+        let attributes = unsafe { transform.GetAttributes() }.context("IMFTransform::GetAttributes")?;
+        unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
+            .context("unlocking an asynchronous MFT")?;
+    }
+    // SAFETY: the manager outlives the call, and its interface pointer is what the message wants.
+    unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
+        .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
+    Ok(())
+}
+
 /// Which output-media-type attribute an encoder is objecting to, asked one at a time.
 ///
 /// **A diagnostic, and deliberately one.** The HEVC encoder on the development box accepts the type
@@ -1418,10 +1436,13 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            // **A skip is reported, not swallowed.** The first version of this returned an empty
-            // matrix on a machine with ten encoders and said nothing about why — which is the same
-            // failure this whole task is a story about, so it gets its own rows: a diagnostic that
-            // answers nothing must at least say that it answered nothing.
+            // **A skip is reported, not swallowed, and the preparation is shared.**
+            //
+            // The first version of this returned an empty matrix on a machine with ten encoders and
+            // said nothing about why — because it had re-typed the preparation sequence and left out
+            // the async unlock, so every candidate refused its device manager with `0xC00D6D77` and
+            // the diagnostic blamed the encoders. A sequence that must be in one order belongs in one
+            // place; that is `prepare_transform`, and it is used here and by the encoder proper.
             let transform = match unsafe { candidate.ActivateObject::<IMFTransform>() } {
                 Ok(transform) => transform,
                 Err(err) => {
@@ -1429,13 +1450,8 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
                     continue;
                 }
             };
-            if let Err(err) = unsafe {
-                transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
-            } {
-                rows.push((
-                    format!("{name} :: the D3D device manager"),
-                    format!("{err}"),
-                ));
+            if let Err(err) = prepare_transform(candidate, &transform, &manager) {
+                rows.push((format!("{name} :: preparation"), format!("{err:#}")));
                 continue;
             }
             for (index, label) in OUTPUT_TYPE_VARIANTS.iter().enumerate() {
