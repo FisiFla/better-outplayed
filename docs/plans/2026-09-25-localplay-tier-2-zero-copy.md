@@ -503,12 +503,44 @@ It also means the run never completed, so its clip and its final accounting are 
 why the shipping path's CPU figure for today could not be taken cleanly in the same session. Both
 processes were stopped by hand, and the box now has nothing of this work running.
 
-The likely place is the MFT's drain, which runs at the top of `finish()` — *before* the video
-sender is dropped — and which can therefore block on a full queue while the writer thread it is
-waiting for is still the only thing that could drain it. That is a hypothesis, not a diagnosis: the
-first step is to make the shutdown path bounded, so a drain that cannot complete is reported as a
-failed shutdown rather than sitting there. A recording tool that does not stop when asked is a worse
-defect than a slow one, and this one has not had a single test written for it.
+Three ways to wait for ever turned out to be on that path, and the shutdown took whichever came
+first:
+
+1. **The MFT's tail, sent with a blocking `send`** — written two commits earlier, in a block whose
+   own comment called it best-effort. The only thread that could drain that queue is the one that
+   may be blocked writing to a child that has stopped reading, so "best-effort" could deadlock, and
+   a deadlock there is exactly the shape of the stall that followed. Now `try_send`, with a tail
+   that does not fit reported rather than sat on.
+2. **The order.** The writers were joined *before* the child was waited for, and a writer only ends
+   when its pipe breaks, which only happens when ffmpeg reads or dies — so a child that never exits
+   took the whole shutdown with it, silently, with the logger already stopped. The child is now
+   waited for first, under `SHUTDOWN_BUDGET` (5s), and joined after.
+3. **`std::process::Child::wait` has no timeout.** `wait_bounded` polls `try_wait` and kills at the
+   deadline, and a status that arrives only because of that kill is *reported* as such.
+
+The regression test asserts on **time** rather than output, because the defect was an absence: a
+stub child that never exits and never reads, and an assertion that `finish` comes back. It is
+mutation-checked — with the budget raised to an hour the test hangs, which is precisely the failure
+it exists to catch. Suite: 541, up from 540.
+
+**Verified on the box, which is where it happened.** The same hybrid soak that previously sat alive
+for eight minutes now ends on its own:
+
+```
+CPU 3.1% of one core, RSS 221.1 MB
+EXITED after 39.2s of watching
+no ffmpeg left behind
+buffer session #7 closed: 39 segment(s), 111319305 bytes held in RAM
+CLIENT_EXIT=0
+```
+
+That run also re-measures the headline on a session that **completes** — `capture_copy=0.6%`,
+`capture_wait=61.0%`, CPU **3.1%** of one core — so the figure no longer rests on a run that had to
+be killed, and the CPU criterion is met by a change that starts and stops cleanly.
+
+**What is left is the rate**: `fps=35.0/60` against 56.9 on the shipping path, `dropped=2288`. The
+pump is paced by the MFT instead of by `FramePacer`, and until that is fixed this change is a large
+CPU win that costs 40% of the frame rate — a trade worth making only once it is not a trade.
 
 ## Known constraints to carry
 
