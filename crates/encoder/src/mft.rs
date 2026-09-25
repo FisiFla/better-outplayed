@@ -22,6 +22,9 @@ use localplay_capture::GpuTexture;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
@@ -1128,6 +1131,7 @@ fn encode_loop(
                         encoder = %opened.encoder_name,
                         format = %opened.input_format,
                         size = ?opened.size(),
+                        adapter = %adapter_description(opened.device()),
                         "the hardware encoder is open on its own thread"
                     );
                     encoder = Some(opened);
@@ -1177,4 +1181,49 @@ fn encode_loop(
             Err(err) => tracing::warn!("draining the hardware encoder failed: {err:#}"),
         }
     }
+}
+
+/// The adapter a device is running on, by name.
+///
+/// **"A hardware encoder" is not an answer when the machine has two GPUs.** A device created with a
+/// null adapter gets whichever adapter DXGI calls the default, and on a machine with an integrated
+/// GPU beside a discrete one that is not something to assume — so this is reported at runtime rather
+/// than left to whoever reads the `D3D11CreateDevice` call. The encoder takes its device *from the
+/// captured texture*, so the name printed for it is the adapter the capture is really running on.
+pub fn adapter_description(device: &ID3D11Device) -> String {
+    let Ok(dxgi) = device.cast::<IDXGIDevice>() else {
+        return "<not a DXGI device>".to_string();
+    };
+    let Ok(adapter) = (unsafe { dxgi.GetAdapter() }) else {
+        return "<no adapter>".to_string();
+    };
+    adapter_name(&adapter)
+}
+
+fn adapter_name(adapter: &IDXGIAdapter) -> String {
+    let Ok(description) = (unsafe { adapter.GetDesc() }) else {
+        return "<undescribed adapter>".to_string();
+    };
+    let end = description
+        .Description
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(description.Description.len());
+    String::from_utf16_lossy(&description.Description[..end])
+}
+
+/// Every adapter DXGI lists, in the order it lists them — the first being what a null-adapter device
+/// gets. Printed by the probe so that "which GPU is this using" is a list rather than a guess.
+pub fn describe_adapters() -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return names;
+    };
+    let mut index = 0u32;
+    // `EnumAdapters` fails — rather than returning null — once the index runs off the end.
+    while let Ok(adapter) = unsafe { factory.EnumAdapters(index) } {
+        names.push(adapter_name(&adapter));
+        index += 1;
+    }
+    names
 }

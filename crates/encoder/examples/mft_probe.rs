@@ -75,11 +75,26 @@ fn main() -> anyhow::Result<()> {
         // The device is the *probe's* own here. In the real pipeline it is capture's, and that is
         // the whole reason `MftEncoder::open` takes one rather than making its own.
         let device = localplay_encoder::mft::create_capture_kind_device()?;
+        println!("\n--- which GPU ---");
+        for (index, name) in localplay_encoder::mft::describe_adapters().into_iter().enumerate() {
+            let note = if index == 0 {
+                "   <- what a null-adapter device gets (the default)"
+            } else {
+                ""
+            };
+            println!("  [{index}] {name}{note}");
+        }
+        println!(
+            "  capture-kind device: {}",
+            localplay_encoder::mft::adapter_description(&device)
+        );
         match localplay_encoder::mft::MftEncoder::open(&device, size) {
             Ok(mut encoder) => {
                 println!(
-                    "opened {} for {size:?}, taking {} input",
-                    encoder.encoder_name, encoder.input_format
+                    "opened {} for {size:?}, taking {} input, on adapter {}",
+                    encoder.encoder_name,
+                    encoder.input_format,
+                    localplay_encoder::mft::adapter_description(encoder.device())
                 );
                 if !encoder.input_format.starts_with("RGB32") && !encoder.input_format.starts_with("ARGB32") {
                     println!(
