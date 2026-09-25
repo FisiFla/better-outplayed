@@ -1617,13 +1617,19 @@ pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
     // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
     let rows = (|| -> Result<Vec<(String, String)>> {
+        // **4K twice, and 1080p twice, on purpose.** The ladder is what proved that this encoder does
+        // accept the type the pipeline builds at 4K — after `probe_output_types` had just been refused
+        // the same type at the same size. If the distinguishing factor is the transform's history, then
+        // a repeat either changes the answer or it does not, and either result is worth more than the
+        // ladder alone: a first attempt that fails and a second that succeeds is a state problem with
+        // a retry as its fix, while two identical answers points somewhere else entirely.
         let sizes = [
-            (640u32, 480u32),
-            (1280, 720),
-            (1920, 1080),
-            (2560, 1440),
-            (3200, 1800),
+            (3840u32, 2160u32),
             (3840, 2160),
+            (1920, 1080),
+            (1920, 1080),
+            (640, 480),
+            (640, 480),
         ];
         let device = create_capture_kind_device()?;
         let manager = create_device_manager(&device)?;
