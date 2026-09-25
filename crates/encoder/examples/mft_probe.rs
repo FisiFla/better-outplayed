@@ -108,6 +108,10 @@ fn main() -> anyhow::Result<()> {
             for (what, value) in localplay_encoder::mft::probe_available_types(codec, size)? {
                 println!("  {what}\n     -> {value}");
             }
+            println!("\n--- and at what size it stops accepting a D3D texture ---");
+            for (what, value) in localplay_encoder::mft::probe_size_ceiling(codec)? {
+                println!("  {what}\n     -> {value}");
+            }
             println!("\n--- and whether the order of the two types matters ---");
             for (what, value) in localplay_encoder::mft::probe_ordering(codec, size)? {
                 println!("  {what}\n     -> {value}");

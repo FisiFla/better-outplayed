@@ -1605,6 +1605,80 @@ pub fn probe_ordering(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String
     rows
 }
 
+/// The largest size a codec's hardware encoder will accept a D3D texture input for.
+///
+/// **The last question left, and a size-shaped one.** Everything else about the refusal is invariant:
+/// `prepare_transform`'s order, the attributes of the output type, the input format, and the device
+/// flags all make no difference, while the *same* output type is accepted at 640x480 and refused at
+/// 3840x2160. That leaves the frame size itself, so this walks a ladder of sizes and reports where the
+/// answer changes. A "yes at 1080p, no at 1440p" is a fact about the encoder's D3D path; a "yes
+/// everywhere but 4K" is a fact about 4K.
+pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
+    // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
+    let rows = (|| -> Result<Vec<(String, String)>> {
+        let sizes = [
+            (640u32, 480u32),
+            (1280, 720),
+            (1920, 1080),
+            (2560, 1440),
+            (3200, 1800),
+            (3840, 2160),
+        ];
+        let device = create_capture_kind_device()?;
+        let manager = create_device_manager(&device)?;
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: the out-parameters this call fills, and the matching free below.
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE,
+                None,
+                None,
+                &mut activates,
+                &mut count,
+            )
+        }
+        .context("MFTEnumEx for the size ladder")?;
+        if activates.is_null() || count == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `activates` points at `count` initialised entries written by the call above.
+        let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        let mut rows = Vec::new();
+        for candidate in candidates.iter().flatten() {
+            let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string());
+            for (width, height) in sizes {
+                // A fresh transform per size: an MFT that has refused a type is not required to be
+                // in a state where the next one means anything.
+                let Ok(transform) = (unsafe { candidate.ActivateObject::<IMFTransform>() }) else {
+                    break;
+                };
+                if prepare_transform(candidate, &transform, &manager).is_err() {
+                    break;
+                }
+                let Ok(media_type) = (unsafe { build_output_type(codec, (width, height), 0) }) else {
+                    continue;
+                };
+                // SAFETY: the transform is live and the type outlives the call.
+                let verdict = match unsafe { transform.SetOutputType(0, &media_type, 0) } {
+                    Ok(()) => "ACCEPTED".to_string(),
+                    Err(err) => format!("{err}"),
+                };
+                rows.push((format!("{name} :: {width}x{height}"), verdict));
+            }
+        }
+        // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
+        unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+        Ok(rows)
+    })();
+    // SAFETY: balances the `MFStartup` above.
+    unsafe { let _ = MFShutdown(); }
+    rows
+}
+
 /// Which output-media-type attribute an encoder is objecting to, asked one at a time.
 ///
 /// **A diagnostic, and deliberately one.** The HEVC encoder on the development box accepts the type
