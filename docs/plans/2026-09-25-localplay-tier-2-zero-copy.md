@@ -234,6 +234,53 @@ open risk there is unchanged and named: `-force_key_frames` cannot apply to a co
 GOP has to come from the MFT and the segment muxer has to cut at those keyframes for the
 one-fragment-per-keyframe contract that `MemoryRingBuffer` and the clip path depend on.
 
+### The whole hybrid, end to end, on the box
+
+Everything the design needs is now measured in one run, with no capture session and no input:
+
+```
+opened NVIDIA H.264 Encoder MFT for (3840, 2160), taking ARGB32 input
+90 frames submitted, 28028 bytes of H.264 out
+the stream starts [00, 00, 00, 01, 09, 10, 00, 00]
+ffmpeg produced 29711 bytes of fragmented MP4
+the project's own splitter sees 3 fragment(s):
+  [(0, 0, 997, true), (1, 997, 999, true), (2, 1997, 967, true)]
+```
+
+Read that against the plan's risk list, which is now empty:
+
+| Risk | Outcome |
+|---|---|
+| Does a hardware encoder MFT take a D3D11 device manager? | **yes**, once it is async-unlocked |
+| Does it take the capture's own format at 4K? | **yes** — `ARGB32` |
+| Does the async contract work? | **yes** — the event loop, 90 frames through it |
+| Will ffmpeg take the bitstream with `-c:v copy`? | **yes** — and the project's own `FragmentSplitter` parses what comes out |
+| Do the timestamps survive? | **yes** — 965 ms of container for 990 ms of paced frames, streamed |
+| Can the GOP be imposed without `-force_key_frames`? | **yes** — `MF_MT_MAX_KEYFRAME_SPACING`, and the three fragments above are 1 s apart and all keyframes |
+
+That last row is the one the plan called the place this would hurt, and the fragments are the
+answer: one per second, each a keyframe, which is the contract `MemoryRingBuffer` parses and the
+lossless clip path cuts on.
+
+### One defect of the probe's own, kept because it is a design requirement
+
+The first version of this test collected the whole bitstream and handed it to ffmpeg in one write.
+The result was **196 ms of container for a second of paced frames** — because arrival timestamps
+only mean anything if the bytes arrive when they were made, and a batch write makes every frame
+arrive at once. Streaming each access unit as the encoder produces it gives 965 ms for 990 ms.
+
+So the requirement is not "hand ffmpeg the bitstream" but **"stream it as it is produced"**, and
+that is a property of the pipeline rather than of the test: the recorder's own writer will have to
+do it. Recorded here because a future version that buffers "for efficiency" would silently halve
+the frame rate of every recording it made.
+
+### What is left
+
+**Integration, and then the number.** `MftEncoder` and its ffmpeg sink are written and proven in
+the probe; what remains is wiring them into the recorder behind `cfg(windows)` — capture handing
+over its texture, the pump not reading back — and then the re-soak against §13's
+**88.9% of one core**, which is the number all of this exists to move.
+
 ## Sub-steps, each independently verifiable
 
 1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on

@@ -40,6 +40,7 @@ use windows::Win32::Media::MediaFoundation::{
     METransformNeedInput, MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MF_MT_MAX_KEYFRAME_SPACING,
 };
 
 /// What an encoder asked for, when its events were drained.
@@ -353,6 +354,14 @@ fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()
         // RGB32, all three before these two lines existed.
         media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
         media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel5_1.0 as u32)?;
+        // **The GOP is the MFT's to set, and this is where it is set.**
+        //
+        // The plan named this as the risk that lives in this half of the change: `-force_key_frames`
+        // cannot apply to a stream ffmpeg is only copying, so nothing downstream can impose the
+        // segment boundaries the replay path depends on. It has to come from the encoder, and a
+        // keyframe a second — the segment length — is what makes one fragment per segment, which is
+        // what `MemoryRingBuffer` parses and what the lossless clip path cuts on.
+        media_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FRAME_RATE.0)?;
     }
     // SAFETY: setting the output type on a transform that was just unlocked and given its device
     // manager, with a media type that outlives the call.

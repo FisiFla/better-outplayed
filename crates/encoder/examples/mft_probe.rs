@@ -94,16 +94,26 @@ fn main() -> anyhow::Result<()> {
                 // no CPU copy *and* that the encoder is willing to make a stream of it.
                 let mut total = 0usize;
                 let mut frames = 0usize;
-                let mut first: Option<Vec<u8>> = None;
-                for index in 0..30 {
+                let mut stream: Vec<u8> = Vec::new();
+                // Streamed into ffmpeg *as they are produced*, not collected and handed over at the
+                // end. That distinction is the whole of this test: an H.264 elementary stream has no
+                // timestamps, so the only ones ffmpeg can use are the times the bytes arrive — and a
+                // batch write makes every frame arrive at once. Measured the wrong way first: 30
+                // frames paced over a second produced a 196ms fragment, because the probe had
+                // buffered them. The pipeline streams, so the probe has to as well.
+                let mut sink = FfmpegSink::spawn()?;
+                // Paced at 30fps, deliberately, for the same reason.
+                let pace = std::time::Duration::from_millis(33);
+                // Three seconds, not one: with a keyframe a second this is where the
+                // one-fragment-per-keyframe contract becomes visible rather than assumed.
+                let seconds = 3;
+                for index in 0..(30 * seconds) {
+                    let at = std::time::Instant::now();
                     match encoder.encode_texture(&texture, index * 33, std::time::Duration::from_secs(2)) {
                         Ok(bytes) => {
-                            if !bytes.is_empty() {
-                                if first.is_none() {
-                                    first = Some(bytes.clone());
-                                }
-                                total += bytes.len();
-                            }
+                            total += bytes.len();
+                            stream.extend_from_slice(&bytes);
+                            sink.write(&bytes)?;
                             frames += 1;
                         }
                         Err(err) => {
@@ -111,19 +121,42 @@ fn main() -> anyhow::Result<()> {
                             break;
                         }
                     }
+                    let spent = at.elapsed();
+                    if spent < pace {
+                        std::thread::sleep(pace - spent);
+                    }
                 }
                 match encoder.finish(std::time::Duration::from_secs(2)) {
                     Ok(bytes) => total += bytes.len(),
                     Err(err) => println!("drain failed: {err:#}"),
                 }
                 println!("{frames} frames submitted, {total} bytes of H.264 out");
-                match &first {
-                    Some(bytes) => println!(
-                        "first output chunk: {} bytes, starts {:02x?}",
-                        bytes.len(),
-                        &bytes[..bytes.len().min(8)]
-                    ),
-                    None => println!("no output yet, which is a finding rather than a failure"),
+                println!(
+                    "the stream starts {:02x?}",
+                    &stream[..stream.len().min(8)]
+                );
+                // Step 6's question, asked rather than assumed. An H.264 elementary stream carries
+                // no timestamps of its own, so what ffmpeg does with these bytes — and whether what
+                // comes out is the fragmented MP4 the ring parses — is not something to guess at.
+                println!("\n--- the bitstream into ffmpeg ---");
+                match sink.finish() {
+                    Ok(fmp4) => {
+                        println!("ffmpeg produced {} bytes of fragmented MP4", fmp4.len());
+                        match localplay_media::FragmentSplitter::new().push(&fmp4) {
+                            Ok(fragments) => println!(
+                                "the project's own splitter sees {} fragment(s): {:?}",
+                                fragments.len(),
+                                fragments
+                                    .iter()
+                                    .map(|f| (f.seq, f.start_ms, f.duration_ms, f.keyframe))
+                                    .collect::<Vec<_>>()
+                            ),
+                            Err(err) => println!(
+                                "the splitter could not read it, which is the finding: {err:#}"
+                            ),
+                        }
+                    }
+                    Err(err) => println!("ffmpeg refused it: {err:#}"),
                 }
             }
             Err(err) => println!("could not open one for {size:?}: {err:#}"),
@@ -136,6 +169,111 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("no hardware encoder on this machine accepts the D3D11 handshake");
     }
     Ok(())
+}
+
+/// An ffmpeg child taking an H.264 elementary stream on stdin and writing fragmented MP4 to stdout.
+///
+/// The command line is the project's own fragmented-MP4 shape — the one `EncodeConfig` uses for a
+/// replay buffer, `empty_moov+frag_keyframe+default_base_moof` — because the question is not whether
+/// ffmpeg can make *a* container but whether it can make *this* one out of bytes a hardware MFT
+/// produced.
+///
+/// `-use_wallclock_as_timestamps 1` on the input is load-bearing: an elementary stream carries no
+/// timestamps of its own, and this is what tells ffmpeg to take them from when the bytes arrive
+/// rather than inventing a rigid grid — the lesson of issue #2, which cost an afternoon the first
+/// time round. Which is also why this is a *stream* and not a batch: arrival times only mean
+/// something if the bytes arrive when they were made.
+#[cfg(windows)]
+struct FfmpegSink {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    reading: std::thread::JoinHandle<Vec<u8>>,
+}
+
+#[cfg(windows)]
+impl FfmpegSink {
+    fn spawn() -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let bin = localplay_media::FfmpegBinaries::discover(None).context("ffmpeg on PATH")?;
+        let mut child = Command::new(&bin.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "h264",
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "copy",
+                "-f",
+                "mp4",
+                "-movflags",
+                "empty_moov+frag_keyframe+default_base_moof",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning ffmpeg")?;
+
+        // ffmpeg blocks on a full stdout, so the reading happens on its own thread or the writes
+        // below would deadlock — the same reason the encoder's own reader thread exists.
+        let mut stdout = child.stdout.take().context("ffmpeg's stdout")?;
+        let reading = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = stdout.read_to_end(&mut out);
+            out
+        });
+        let stdin = child.stdin.take().context("ffmpeg's stdin")?;
+        Ok(Self {
+            child,
+            stdin,
+            reading,
+        })
+    }
+
+    /// Hand ffmpeg one access unit's worth of bitstream, as it is produced.
+    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use std::io::Write;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.stdin.write_all(bytes).context("writing the bitstream")?;
+        // Flushed per access unit: buffering here would put the frames back in a batch, which is the
+        // mistake this whole method exists to avoid.
+        self.stdin.flush().context("flushing to ffmpeg")
+    }
+
+    /// Close the stream and collect what ffmpeg made of it.
+    fn finish(self) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context;
+        use std::io::Read;
+
+        let Self {
+            mut child,
+            stdin,
+            reading,
+        } = self;
+        drop(stdin);
+        let fmp4 = reading.join().expect("the reader thread");
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let status = child.wait().context("waiting for ffmpeg")?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg exited {status}: {stderr}");
+        }
+        Ok(fmp4)
+    }
 }
 
 /// A BGRA texture of `size` on `device`, standing in for a captured frame.
