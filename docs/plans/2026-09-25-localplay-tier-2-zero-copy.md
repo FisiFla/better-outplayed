@@ -577,10 +577,60 @@ Two readings worth keeping honest:
   MFT is keeping up with real content at 4K and the two-deep queue has margin. The probe's 82 fps on
   synthetic frames was not representative; the real figure is still comfortably above 60.
 
-**Not done, and not for me to decide alone:** `zero_copy` still defaults to `false`, so the shipping
-path is still the 88.9% one. Flipping it is a real behavioural change to a private-but-shipping tool
-and the evidence for it is now in place, but it is the user's call — as is whether to post this to
-issues #3 and #1, which are the two places the work was asked for.
+**And it is now the default.** `encode.zero_copy` is unset by default and *that* means "use it when
+the hardware can": a detected hardware `vendor` on Windows gets the hybrid, anything else gets the
+ordinary path with a line saying why. `true` is the strict form — it *requires* the hardware path and
+refuses to start without it — and `false` turns it off. The key is an `Option<bool>` for exactly that
+reason: a key set on purpose deserves a different answer from one that was never mentioned.
+
+A plain `bool` defaulted to `true` would have been the wrong implementation, not merely a cruder one:
+an absent key resolving to `true` makes every non-Windows machine, and every machine without an
+NVIDIA or AMD encoder, refuse to start. That is a recorder that does not record on whichever box the
+config was copied to, and it would have taken the test suite with it, since the suite runs on a Mac
+with no encoder MFT anywhere near it.
+
+Verified on the box with the example config **copied and unmodified**, which is the case that matters:
+
+```
+zero_copy in the config as copied:  (unset - which is the default being tested)
+CPU 3.6% of one core
+EXITED after 36.2s
+zero-copy: captured textures go straight to the hardware encoder, and ffmpeg copies the H.264
+  instead of encoding it (chosen by default, because a hardware encoder is present)
+the hardware encoder is open on its own thread encoder=NVIDIA H.264 Encoder MFT format=ARGB32
+  size=(3840, 2160) adapter=NVIDIA GeForce RTX 3090
+CLIENT_EXIT=0
+```
+
+**Which GPU, since that is the question that decides whether any of this is real.** The device is
+created with a null adapter, so it is whichever adapter DXGI calls the default — which on a machine
+with an integrated GPU is not something to assume. Measured, not assumed:
+
+```
+[0] NVIDIA GeForce RTX 3090   <- what a null-adapter device gets (the default)
+[1] NVIDIA GeForce RTX 3090
+[2] Intel(R) UHD Graphics
+[3] NVIDIA GeForce RTX 3090
+[4] Microsoft Basic Render Driver
+capture-kind device: NVIDIA GeForce RTX 3090
+opened NVIDIA H.264 Encoder MFT for (3840, 2160), taking ARGB32 input, on adapter NVIDIA GeForce RTX 3090
+```
+
+The default adapter is the 3090, and because `open_for_texture` takes the device *from the captured
+texture*, the encoder being on the 3090 proves capture is too — they cannot disagree. The Intel QSV
+MFTs are enumerated but report `d3d11=false`, so they cannot accept a D3D11 device and were never
+candidates. The hardware encoder's open line now carries `adapter=` at runtime, so this is visible in
+every recording's log rather than only in a probe.
+
+**Left alone deliberately:** issues #3 and #1 have not been touched, at the user's instruction.
+
+**A note for whoever reads this next, on HEVC.** The box also has the HEVC NVENC MFT and the 3090
+supports it (it does not support AV1 — that is 40-series and later). HEVC is more efficient *per bit*,
+so at equal quality it is a smaller stream, which would roughly halve what the RAM ring holds and what
+clips weigh. It does **not** reduce CPU or GPU on this path, which is worth writing down because it is
+the intuitive expectation and it is wrong here: the CPU saving came from deleting the readback, which
+is codec-independent, and NVENC's HEVC pass costs slightly more per frame than its H.264 one, not
+less. The pipe that would shrink further is already 800x smaller than the raw one — `submit=0.2%`.
 
 ## Known constraints to carry
 
