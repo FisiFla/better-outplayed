@@ -440,6 +440,50 @@ copy, that figure should have fallen to something near the waiting share. It did
 at the handover blit itself, and is the next thing to measure rather than argue about: the same soak
 with `zero_copy = true`, whose `capture_copy` the new instrumentation will now report directly.
 
+### The hybrid's copy is gone: 69.6% to 0.7%, and the CPU is 3.1%
+
+The same soak, same length, same box, `zero_copy = true`, with the split instrumentation now in
+place. Against the shipping path run minutes earlier:
+
+| | shipping path | hybrid |
+|---|---|---|
+| `capture_copy=` | **69.6%** | **0.7%** |
+| `capture_wait=` | 18.9% | 61.1% |
+| `capture=` | 96.7% | 93.0% |
+| `CPU` | 88.9% of one core *(§13's soak)* | **3.1% of one core** |
+
+**The readback is gone.** Ninety-nine percent of the copy vanished, and with it most of the core:
+88.9% to 3.1%. Criterion 6 — under 5% of one core — **passes** for the first time, and it passes by
+a wide margin rather than by a rounding.
+
+Three things this settles, each of which was open an hour ago:
+
+* **The cost was the readback, not idleness.** The shipping path spends 69.6% of wall clock copying
+  pixels and 18.9% waiting for frames; the hybrid spends 0.7% copying and 61.1% waiting. The
+  question that would have redirected the whole effort — "is `capture=` measuring a copy or a
+  refresh interval?" — has a measured answer.
+* **The handover blit is not a copy of the readback's cost.** After the first hybrid soak left
+  `capture=` almost unchanged, the suspicion was that the GPU-side blit cost what the CPU copy did.
+  It does not: 0.7%.
+* **`capture=` staying near 93% in the hybrid is a *waiting* figure, not a working one**, and its
+  cause is the defect below rather than the copy.
+
+**What is still wrong: the rate.** `fps=35.9/60` against 55.5 on the shipping path, with
+`dropped=1908` against 8. That is the known `submit_video` blocking — the pump is paced by the MFT
+instead of by `FramePacer` — and it is now the *only* thing standing between this and a clean
+result. The pump waiting 61% of its time is the same fact seen from capture's side.
+
+So the threaded MFT feed is no longer speculative work to be justified: it is the fix for a
+measured regression in a change that has already delivered its objective. The CPU target is met and
+the frame rate is not, and the plan's next step is the queue-and-thread for the MFT with the two
+constraints already written down (a ring shallower than capture's three, and no two-second wait on
+the pump's thread).
+
+**Honest limits of the comparison.** 88.9% is §13's figure, from an earlier soak; the like-for-like
+evidence is the split, which was taken minutes apart on the same build and the same instruments. The
+hybrid's 3.1% and the shipping path's split have not yet been measured *in one run each*, and that
+is worth doing before either number is quoted alone.
+
 ## Known constraints to carry
 
 * `windows` 0.58: `MFCreateDXGISurfaceBuffer`, `MFCreateDXGIDeviceManager`, `MFCreateSample`,
