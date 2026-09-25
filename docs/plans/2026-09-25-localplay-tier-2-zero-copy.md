@@ -484,6 +484,32 @@ evidence is the split, which was taken minutes apart on the same build and the s
 hybrid's 3.1% and the shipping path's split have not yet been measured *in one run each*, and that
 is worth doing before either number is quoted alone.
 
+### And it hangs at shutdown
+
+Found while looking for something else, and worth more than the measurement it interrupted: the
+hybrid soak was still running on the box **eight minutes after its log stopped**.
+
+```
+Name             Id StartTime                 CPU
+localplay-cli 11712 9/25/2026 3:16:30 PM  4.609375
+ffmpeg        22888 9/25/2026 3:16:33 PM  3.859375
+```
+
+A 90-second run whose last line is at 15:18:10, a `WARN` from the drop reporter, with 4.6 seconds of
+CPU consumed in ten minutes. That is a **blocked** process, not a spinning one, and no log line after
+it: the hybrid does not shut down.
+
+It also means the run never completed, so its clip and its final accounting are missing — which is
+why the shipping path's CPU figure for today could not be taken cleanly in the same session. Both
+processes were stopped by hand, and the box now has nothing of this work running.
+
+The likely place is the MFT's drain, which runs at the top of `finish()` — *before* the video
+sender is dropped — and which can therefore block on a full queue while the writer thread it is
+waiting for is still the only thing that could drain it. That is a hypothesis, not a diagnosis: the
+first step is to make the shutdown path bounded, so a drain that cannot complete is reported as a
+failed shutdown rather than sitting there. A recording tool that does not stop when asked is a worse
+defect than a slow one, and this one has not had a single test written for it.
+
 ## Known constraints to carry
 
 * `windows` 0.58: `MFCreateDXGISurfaceBuffer`, `MFCreateDXGIDeviceManager`, `MFCreateSample`,
