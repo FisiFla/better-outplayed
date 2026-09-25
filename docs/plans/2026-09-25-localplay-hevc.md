@@ -44,23 +44,39 @@ are enumerated but report `d3d11=false` and cannot take a D3D11 device, so they 
    `hevc_nvenc`/`hevc_qsv`/`hevc_amf` for the hardware-vendor raw path) and the MFT for the
    zero-copy path.
 
-## Good news found while checking: the selection already generalises
+## The thing that was wrong, written down plainly
 
-`MFTEnumEx` is called with `None` for the **output**-type filter and `Some(&input)` for the input
-one, so it enumerates every hardware video encoder on the machine — H.264, HEVC, and AV1 on a card
-that has it — and then `configure_encoder` tries each candidate in turn and keeps the first that
-accepts the output type. Nothing selects on the encoder's name; the `bail!("no hardware H.264
-encoder MFT on this machine")` is a message rather than a filter.
+The first version of this work fixed the codec everywhere it was *named* and still failed on the
+box, and the reason is worth keeping because I had confidently written the opposite here first.
 
-That means HEVC needs no new selection logic and no new enumeration: fix the output type and the
-same loop finds the NVIDIA HEVC MFT on its own. It was designed that way by accident — the probe
-needed to know which encoders existed, and enumerating by input rather than output is what made the
-answer complete — and it is worth keeping, because the alternative (matching on "H.264" in the
-friendly name) would have quietly pinned the pipeline to one codec.
+> `MFTEnumEx`'s third argument is `pInputType` and its fourth is `pOutputType`.
 
-Worth considering at the same time, though not required: passing `MFVideoFormat_HEVC` as the output
-filter would stop the probe from offering H.264-only MFTs as if they were candidates. It changes
-only what is reported, since the ones that cannot comply are refused either way.
+The enumeration passed `None` for the third and `MFVideoFormat_H264` for the fourth, and read it as
+"encoders that consume video and produce H.264" — which is right, and is a *filter on the output
+subtype*. So the phrase "nothing matches on a name, and the same loop will find the HEVC MFT
+automatically" was wrong: the loop could never return an HEVC encoder at all, because the question
+asked only for H.264 encoders. `configure_encoder`'s negotiation was never reached for it.
+
+What that looked like on the box, against a machine that very much can do HEVC:
+
+```
+--- asking about Hevc ---
+hardware Hevc encoder MFTs: 3          <- the same three MFTs, all named "...H.264 Encoder MFT"
+  refused: SetOutputType(Hevc): Invalid type. (0xC00D36BD)
+```
+
+And the same machine, from ffmpeg:
+
+```
+hevc_nvenc   NVIDIA NVENC hevc encoder (codec hevc)
+hevc_mf      HEVC via MediaFoundation (codec hevc)
+$ ffmpeg -f lavfi -i testsrc=3840x2160:rate=60 -t 2 -c:v hevc_nvenc -f null -   -> exit 0
+```
+
+So the hardware was never in question; the question was. The fix is one function —
+`output_subtype(codec)`, used by both the enumeration filter and the output media type — and the
+lesson is the same one this project keeps paying for and keeps writing down: a probe that answers
+the wrong question answers it convincingly.
 
 ## Details H.264 let us ignore, which HEVC will not
 

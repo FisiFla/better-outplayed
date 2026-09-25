@@ -118,21 +118,25 @@ pub fn probe_hardware_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>
 }
 
 fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
-    let input = MFT_REGISTER_TYPE_INFO {
+    // **The fourth argument below is `pOutputType`, and this is what an encoder has to be able to
+    // produce** — not what it consumes, whatever the shape of the call suggests. Pinned to H.264, it
+    // made every HEVC encoder on the machine invisible.
+    let output_type = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: output_subtype(codec),
     };
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
 
-    // The type to match is the *input*: which encoders can take video and produce H.264.
+    // The type to match is what the encoder must be able to produce: which hardware encoders can
+    // make this codec out of video.
     // SAFETY: `activates`/`count` are the out-parameters this call fills, and `input` outlives it.
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
             None,
-            Some(&input),
+            Some(&output_type),
             &mut activates,
             &mut count,
         )
@@ -339,6 +343,20 @@ fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32), codec: VideoCod
     Ok(accepted)
 }
 
+/// The media subtype an encoder must be able to *produce* for this codec.
+///
+/// Used twice, and the second use is the one that cost an afternoon: [`MFTEnumEx`]'s fourth argument
+/// is the type an encoder produces, not the one it consumes, and it was pinned to `MFVideoFormat_H264`
+/// — so enumerating "the hardware encoders" could never return an HEVC one, and the probe reported
+/// that this machine had none while `ffmpeg -encoders` listed `hevc_nvenc` and `hevc_mf`, and a 4K60
+/// `hevc_nvenc` encode ran clean. The MFT was there the whole time; the question was wrong.
+fn output_subtype(codec: VideoCodec) -> windows::core::GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::Hevc => MFVideoFormat_HEVC,
+    }
+}
+
 /// Configure the encoder's output, which is what makes it willing to talk about its input at all.
 ///
 fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<()> {
@@ -354,12 +372,12 @@ fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec
     // needs, which is the same one H.264 asked for.
     let (subtype, profile, level) = match codec {
         VideoCodec::H264 => (
-            MFVideoFormat_H264,
+            output_subtype(VideoCodec::H264),
             eAVEncH264VProfile_High.0 as u32,
             eAVEncH264VLevel5_1.0 as u32,
         ),
         VideoCodec::Hevc => (
-            MFVideoFormat_HEVC,
+            output_subtype(VideoCodec::Hevc),
             eAVEncH265VProfile_Main_420_8.0 as u32,
             eAVEncH265VLevel5_1.0 as u32,
         ),
