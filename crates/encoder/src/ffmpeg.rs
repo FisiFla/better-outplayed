@@ -240,6 +240,53 @@ pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
     args
 }
 
+/// The ffmpeg arguments for an **already-encoded** video input: an H.264 elementary stream on a
+/// pipe, produced by this process rather than by ffmpeg.
+///
+/// This is the Tier 2 hybrid's video half. A hardware encoder MFT takes the captured texture
+/// straight from VRAM (`localplay_encoder::mft`), and what crosses the pipe is a few hundred
+/// kilobytes a second of H.264 instead of ~2 GB/s of raw pixels — measured on the box: 90 frames of
+/// 4K `ARGB32` in, an elementary stream out, no CPU copy.
+///
+/// The timeline flag is the same one, for the same reason, as [`video_input_args`]: an elementary
+/// stream carries no timestamps of its own, so ffmpeg has to be told to take them from when the
+/// bytes arrive. Measured on the box, both ways: streaming the encoder's output as it is produced
+/// gives **965 ms of container for 990 ms of paced frames**, and handing the same bytes over in one
+/// batch gives **196 ms**, because a batch makes every frame arrive at once.
+pub fn video_input_args_bitstream() -> Vec<String> {
+    [
+        "-f",
+        "h264",
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-i",
+        "pipe:0",
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+/// The ffmpeg arguments for what to do with that input: **nothing**. The video is copied through,
+/// because the pixels were encoded on the GPU and never reached this process's memory.
+///
+/// Deliberately almost empty, and the absences are the substance:
+///
+/// * no `-c:v h264_*` and no `-b:v` — there is nothing left to encode, and the bitrate belongs to
+///   the MFT.
+/// * no `-g` and no **`-force_key_frames`**: neither can apply to a stream ffmpeg is only copying.
+///   The segment boundaries the replay path depends on therefore have to come from the encoder,
+///   which is why `MftEncoder` sets `MF_MT_MAX_KEYFRAME_SPACING` — measured on the box as three
+///   fragments a second apart, each a keyframe, read back by the project's own `FragmentSplitter`.
+/// * no `-fps_mode`: it describes a conversion onto a grid, and a copied stream has no frames to
+///   convert.
+/// * no `-vf scale`: scaling means decoding, decoding means the pixels, and the pixels are exactly
+///   what this path exists to keep out of this process. **A scaled output therefore has to be asked
+///   of the capture, not of ffmpeg** — so `encode.output_size` below the capture size is a reason to
+///   capture at that size, not to filter here.
+pub fn video_output_args_bitstream() -> Vec<String> {
+    vec!["-c:v".to_string(), "copy".to_string()]
+}
+
 /// The ffmpeg arguments that describe **the encoder for that video input**: how frames are
 /// passed to it, the scale filter when the output differs from the capture, the codec, its
 /// bitrate and its keyframe schedule.
@@ -1082,6 +1129,42 @@ mod tests {
                  {args:?}"
             );
             assert_eq!(at("-use_wallclock_as_timestamps"), "1", "{args:?}");
+        }
+    }
+
+    /// The hybrid's argument pair: what must be there, and — more importantly — what must not.
+    ///
+    /// The absences carry the lessons this project paid for. `-force_key_frames` and `-g` cannot
+    /// apply to a stream ffmpeg is only copying, so a version that included them would look right
+    /// and impose nothing: the segment boundaries the replay path depends on would silently come
+    /// from nowhere. `-r` and `-framerate` on the input would re-grid it, which is the landmine
+    /// issue #2 recorded. And `-vf scale` would mean decoding, which would mean the pixels, which is
+    /// the entire cost this path exists to remove.
+    #[test]
+    fn the_bitstream_args_copy_the_video_and_impose_nothing_on_it() {
+        let input = video_input_args_bitstream();
+        let got: Vec<&str> = input.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            ["-f", "h264", "-use_wallclock_as_timestamps", "1", "-i", "pipe:0"],
+            "the input is an H.264 elementary stream, stamped on arrival"
+        );
+        for forbidden in ["-r", "-framerate"] {
+            assert!(
+                !input.iter().any(|a| a == forbidden),
+                "{forbidden} would re-grid the input, which is the bug issue #2 was: {input:?}"
+            );
+        }
+
+        let output = video_output_args_bitstream();
+        let got: Vec<&str> = output.iter().map(String::as_str).collect();
+        assert_eq!(got, ["-c:v", "copy"], "the video is copied, not encoded again");
+        for forbidden in ["-force_key_frames", "-g", "-b:v", "-fps_mode", "-vf"] {
+            assert!(
+                !output.iter().any(|a| a == forbidden),
+                "{forbidden} cannot apply to a copied stream, and including it would impose \
+                 nothing while looking correct: {output:?}"
+            );
         }
     }
 
