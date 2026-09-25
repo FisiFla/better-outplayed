@@ -539,6 +539,10 @@ pub struct FfmpegEncoder {
     /// the caller that paces capture can pace to exactly the number the child was told
     /// (see `Encoder::input_fps`).
     input_fps: u32,
+    /// Whether this encoder takes GPU textures rather than pixels, carried from the config that
+    /// built it: the answer is what the caller uses to decide whether to ask capture for textures
+    /// at all, and asking an encoder that wants pixels would produce frames it then refuses.
+    accepts_textures: bool,
     /// The loopback port the microphone input was bound to, reported by
     /// `Encoder::mic_port`. `None` when there is no microphone input.
     mic_port: Option<u16>,
@@ -692,6 +696,9 @@ impl FfmpegEncoder {
             encoder_name: cfg.encoder_name(),
             source_size: cfg.source_size,
             input_fps: cfg.fps,
+            // Carried from the config rather than derived from the child's arguments: the answer is
+            // what the caller asks capture for, and it has to be available before a frame exists.
+            accepts_textures: cfg.accepts_textures(),
             mic_port,
             mic_spec: cfg.mic_audio,
             dropped_video: AtomicU64::new(0),
@@ -959,6 +966,10 @@ impl Encoder for FfmpegEncoder {
         Ok(())
     }
 
+    fn accepts_textures(&self) -> bool {
+        self.accepts_textures
+    }
+
     fn active_encoder(&self) -> &'static str {
         self.encoder_name
     }
@@ -1202,6 +1213,27 @@ mod tests {
                  nothing while looking correct: {output:?}"
             );
         }
+    }
+
+    /// The capability the caller asks capture with follows the configuration, both ways.
+    ///
+    /// This is an agreement between two components that never meet: the recorder tells capture to
+    /// hand out textures based on what an encoder says it can take, and a disagreement in either
+    /// direction is a broken recording — one arriving with frames it refuses, or one with no pixels
+    /// at all. `RawPixels` must stay the answer by default, because that is the mode every existing
+    /// caller and every non-Windows build runs.
+    #[test]
+    fn the_reported_texture_capability_follows_the_configuration() {
+        let mut cfg = args_cfg(30, 1000);
+        assert!(
+            !cfg.accepts_textures(),
+            "raw pixels is the default: capture must not be asked for textures by accident"
+        );
+        cfg.video = VideoInput::EncodedBitstream;
+        assert!(
+            cfg.accepts_textures(),
+            "an encoded bitstream can only be produced from a texture, so the caller has to ask for one"
+        );
     }
 
     /// A bitstream input produces the hybrid's pair, and a scaled one is refused.
@@ -1492,6 +1524,7 @@ mod tests {
             encoder_name: "h264_amf",
             source_size: (320, 240),
             input_fps: 30,
+            accepts_textures: false,
             mic_port: None,
             mic_spec: None,
             dropped_video: AtomicU64::new(0),

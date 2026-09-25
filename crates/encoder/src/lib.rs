@@ -159,6 +159,18 @@ pub struct EncodeConfig {
 /// encoder and the same forced-keyframe interval, and both produce footage a clip can be cut
 /// from with `-c copy`. What differs is whether the footage is on disk while it is only being
 /// *buffered*.
+impl EncodeConfig {
+    /// Whether this configuration's encoder takes GPU textures rather than pixels.
+    ///
+    /// One function rather than a `match` at each call site, and the same function the
+    /// [`Encoder::accepts_textures`] default delegates to for the configurations this crate builds:
+    /// a caller deciding whether to ask capture for textures (`CaptureBackend::deliver_textures`)
+    /// and an encoder deciding whether it can consume one must not be able to disagree.
+    pub fn accepts_textures(&self) -> bool {
+        self.video == VideoInput::EncodedBitstream
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoInput {
     /// Raw BGRA frames on the child's stdin, at the declared rate — every configuration this
@@ -342,6 +354,21 @@ pub trait Encoder: Send {
     /// encoder compares each frame against this value and refuses a mismatch out loud
     /// (see `pump_once_counted` in the CLI), because the failure is otherwise silent.
     fn source_size(&self) -> (u32, u32);
+
+    /// Whether this encoder can take a frame whose pixels are a GPU texture rather than bytes.
+    ///
+    /// The caller uses it to decide whether to ask capture for textures ([`VideoInput`]), and it is
+    /// a property of the *configuration* rather than of a running encoder so that the decision can
+    /// be made before anything is spawned: the capture backend is told what to deliver while it is
+    /// being set up, which is before an encoder exists.
+    ///
+    /// Defaulted to `false` on the trait, because "no" is the answer for every encoder that is not
+    /// this one, and because a mistake in the other direction is the dangerous one: a textured frame
+    /// reaching an encoder that wants pixels is refused by name rather than written to a pipe as
+    /// nothing (`FfmpegEncoder::submit_video`).
+    fn accepts_textures(&self) -> bool {
+        false
+    }
 
     /// The frame rate this encoder's raw video input was declared with —
     /// [`EncodeConfig::fps`], which is the `-framerate` the child was spawned with
