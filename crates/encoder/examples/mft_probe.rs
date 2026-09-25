@@ -94,6 +94,26 @@ fn main() -> anyhow::Result<()> {
         // The device is the *probe's* own here. In the real pipeline it is capture's, and that is
         // the whole reason `MftEncoder::open` takes one rather than making its own.
         let device = localplay_encoder::mft::create_capture_kind_device()?;
+
+        // **The format is the question for HEVC, so ask it directly.** The H.264 encoder takes the
+        // BGRA texture below and converts inside itself; the HEVC one refuses that format outright
+        // (`0xC00D6D76`, "the input type is not supported for D3D device"). Both are asked here, of
+        // the same device, so the answer is about the format rather than about a guess — and NV12 is
+        // what the capture handover will have to produce for the HEVC path to exist at all.
+        println!("\n--- what an NV12 texture does ---");
+        let nv12 = fake_frame(
+            &device,
+            size,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+        );
+        match nv12.and_then(|texture| localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec)) {
+            Ok(encoder) => println!(
+                "an NV12 texture opens: {} taking {}",
+                encoder.encoder_name, encoder.input_format
+            ),
+            Err(err) => println!("an NV12 texture does not open: {err:#}"),
+        }
+
         println!("\n--- which GPU ---");
         for (index, name) in localplay_encoder::mft::describe_adapters().into_iter().enumerate() {
             let note = if index == 0 {
@@ -107,7 +127,12 @@ fn main() -> anyhow::Result<()> {
             "  capture-kind device: {}",
             localplay_encoder::mft::adapter_description(&device)
         );
-        match localplay_encoder::mft::MftEncoder::open(&device, size, codec) {
+        match localplay_encoder::mft::MftEncoder::open(
+            &device,
+            size,
+            codec,
+            Some(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM),
+        ) {
             Ok(mut encoder) => {
                 println!(
                     "opened {} for {size:?}, taking {} input, on adapter {}",
@@ -121,7 +146,11 @@ fn main() -> anyhow::Result<()> {
                          GPU-side conversion to reach it"
                     );
                 }
-                let texture = fake_frame(encoder.device(), size)?;
+                let texture = fake_frame(
+                      encoder.device(),
+                      size,
+                      windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                  )?;
                 encoder.start()?;
                 // Feed it a second of frames and collect what comes out. What is being tested is
                 // that H.264 bytes exist at all — that a captured texture reaches the encoder with
@@ -320,20 +349,21 @@ impl FfmpegSink {
 fn fake_frame(
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
     size: (u32, u32),
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 ) -> anyhow::Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> {
     use anyhow::Context;
     use windows::Win32::Graphics::Direct3D11::{
         ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_SAMPLE_DESC};
 
     let description = D3D11_TEXTURE2D_DESC {
         Width: size.0,
         Height: size.1,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,

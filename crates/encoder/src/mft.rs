@@ -23,6 +23,7 @@ use localplay_capture::GpuTexture;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
 };
@@ -313,6 +314,42 @@ const FRAME_RATE: (u32, u32) = (30, 1);
 /// names means the texture can go straight in, with no conversion anywhere. `NV12` last because it
 /// is the format a hardware encoder most often *wants* and the one this pipeline cannot produce
 /// without help — if only it is accepted, the chain needs a Video Processor MFT on the GPU.
+/// The input subtype to offer an encoder **first**, given the texture it will be handed.
+///
+/// **The order is not a preference, it is a correctness requirement.** `accepts_subtype` asks the MFT
+/// whether it will *take* a media type, and an MFT answers that about the type rather than about the
+/// texture that arrives later — so a D3D texture whose real format is NV12 can be offered "RGB32",
+/// accepted, and refused only at `ProcessInput`, with nothing in between left to say why. Measured on
+/// the box: the HEVC encoder refuses an ARGB32 texture outright (`0xC00D6D76`), where the H.264 one
+/// accepts it, so which format capture hands over is the difference between those two encoders
+/// working.
+///
+/// The texture's own format is the only honest answer to what to offer first. The rest of the list
+/// stays as fallbacks.
+fn preferred_input(format: DXGI_FORMAT) -> Option<&'static windows::core::GUID> {
+    match format {
+        // WGC hands over BGRA, which Media Foundation calls RGB32 — same byte order, different name,
+        // and the distinction is why both are in the candidate list at all.
+        DXGI_FORMAT_B8G8R8A8_UNORM => Some(&MFVideoFormat_RGB32),
+        DXGI_FORMAT_NV12 => Some(&MFVideoFormat_NV12),
+        _ => None,
+    }
+}
+
+/// [`CANDIDATE_INPUTS`] with the wanted one moved to the front.
+fn candidate_inputs(
+    preferred: Option<DXGI_FORMAT>,
+) -> Vec<(&'static windows::core::GUID, &'static str)> {
+    let mut candidates = CANDIDATE_INPUTS.to_vec();
+    if let Some(wanted) = preferred.and_then(preferred_input) {
+        if let Some(index) = candidates.iter().position(|(subtype, _)| *subtype == wanted) {
+            let first = candidates.remove(index);
+            candidates.insert(0, first);
+        }
+    }
+    candidates
+}
+
 const CANDIDATE_INPUTS: [(&windows::core::GUID, &str); 3] = [
     (&MFVideoFormat_RGB32, "RGB32 (BGRA byte order — what WGC delivers)"),
     (&MFVideoFormat_ARGB32, "ARGB32"),
@@ -659,11 +696,11 @@ impl MftEncoder {
     /// `device` is the **capture path's** device, deliberately: an MFT given a manager over a
     /// different device cannot be handed the captured texture at all, so the two have to be the
     /// same one. That is why this takes a device rather than creating its own.
-    pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec) -> Result<Self> {
+    pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>) -> Result<Self> {
         // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
         // in one process is a supported sequence.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
-        match Self::open_started(device, size, codec) {
+        match Self::open_started(device, size, codec, preferred) {
             Ok(encoder) => Ok(encoder),
             Err(err) => {
                 // SAFETY: balances the `MFStartup` above, which succeeded.
@@ -675,7 +712,7 @@ impl MftEncoder {
         }
     }
 
-    fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec) -> Result<Self> {
+    fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>) -> Result<Self> {
         let manager = create_device_manager(device)?;
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
@@ -712,7 +749,7 @@ impl MftEncoder {
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            match configure_encoder(candidate, &manager, size, codec) {
+            match configure_encoder(candidate, &manager, size, codec, preferred) {
                 Ok((transform, input_format)) => {
                     chosen = Some((transform, name, input_format));
                     break;
@@ -764,7 +801,7 @@ impl MftEncoder {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `desc` is a valid out-parameter for this texture.
         unsafe { texture.GetDesc(&mut desc) };
-        Self::open(&device, (desc.Width, desc.Height), codec)
+        Self::open(&device, (desc.Width, desc.Height), codec, Some(desc.Format))
     }
 
     /// The geometry this encoder was opened for.
@@ -974,6 +1011,7 @@ fn configure_encoder(
     manager: &IMFDXGIDeviceManager,
     size: (u32, u32),
     codec: VideoCodec,
+    preferred: Option<DXGI_FORMAT>,
 ) -> Result<(IMFTransform, String)> {
     // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
     let transform: IMFTransform =
@@ -1001,7 +1039,7 @@ fn configure_encoder(
     // `ARGB32` means the captured texture goes straight in — is what makes this work at whatever
     // size it is asked for rather than at the size someone happened to test.
     let mut refusals = Vec::new();
-    for (subtype, name) in CANDIDATE_INPUTS {
+    for (subtype, name) in candidate_inputs(preferred) {
         let input = video_type(subtype, size)?;
         // SAFETY: setting the input type on a configured transform, with a media type that outlives
         // the call. A refusal here is expected for some formats at some sizes, not a failure.
