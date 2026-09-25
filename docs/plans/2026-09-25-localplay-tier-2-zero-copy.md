@@ -367,6 +367,51 @@ is its own by definition.
 It also removes an API: no `CaptureBackend::d3d11_device`, no newtype to carry an interface between
 two crates, and nothing to keep in step when capture's device handling changes.
 
+### The first end-to-end soak with the hybrid: the whole path runs, and it is slower
+
+`encode.zero_copy = true`, the same 180 s 4K/60 soak that produced 88.9% of one core, the shipping
+`vendor = "auto"` resolving to `h264_nvenc`. Everything the hybrid needs happened:
+
+```
+zero-copy: captured textures go straight to the hardware encoder, and ffmpeg copies the H.264
+the hardware encoder is open encoder=NVIDIA H.264 Encoder MFT format=ARGB32
+```
+
+— the MFT opened on the capture path's own device at 3840x2160, frames went through it, and
+fragments came out the far end. **And the pipeline is measurably worse for it:**
+
+| | raw path (the 88.9% soak) | hybrid |
+|---|---|---|
+| `fps=` | 56.9/60 | **34.9/60** |
+| `dropped=` | 8 | **3787, still climbing** |
+| `capture=` | 97.1% | 94.5% |
+| `submit=` | 0.1% | 1.0% |
+
+**The diagnosis is the design's, and it is specific: `submit_video` blocks the pump.** A textured
+frame is encoded *inside the pump's call* (`FfmpegEncoder::encode_texture`), and that call waits up
+to two seconds for the asynchronous MFT to ask for input. So the pipeline is no longer paced by
+`FramePacer` — it is paced by whatever rate the MFT happens to consume at, frames pile up behind it,
+and the encoder's bounded queue drops them. That is exactly what `dropped=3787` is, and why the
+achieved rate fell to 58% of the raw path's.
+
+The fix is the shape the ffmpeg side already has, one level earlier: **a queue and a thread for the
+MFT**, so the pump hands over a texture and returns. Two things make that less trivial than it
+sounds and both are worth stating before it is written:
+
+* **The texture lifetime gets tighter.** The handover ring is three deep, so a texture is rewritten
+  three frames after it is handed out. A queue in front of the MFT has to be shallower than the ring,
+  or the encoder will be reading a texture that capture has already reused. Three and two is the
+  obvious arrangement and it needs to be reasoned about rather than picked.
+* **The wait must not become a stall.** A per-frame wait of up to two seconds is a wedge, not a
+  timeout; the pump's own deadline is 5 ms. Whatever replaces this needs its blocking confined to the
+  thread that owns the MFT.
+
+**What is not claimed:** the CPU figure for the hybrid. The measurement landed on the *splicing*
+phase at the end of the soak (0.1%, the parent idle while ffmpeg copies) and is worthless; and with
+the achieved rate wrong, any CPU comparison is confounded anyway — fewer frames per second is less
+work per second. The number that matters can only be taken once the pump is not throttled by the
+encoder, and until then this design has not been shown to reduce CPU at all.
+
 ## Known constraints to carry
 
 * `windows` 0.58: `MFCreateDXGISurfaceBuffer`, `MFCreateDXGIDeviceManager`, `MFCreateSample`,
