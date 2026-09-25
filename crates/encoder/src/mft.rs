@@ -1311,6 +1311,26 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
     String::from_utf16_lossy(&description.Description[..end])
 }
 
+/// Whether a hardware encoder for `codec` will actually **open** at `size`.
+///
+/// **For deciding whether to choose the hardware path, as opposed to insisting on it.** `auto` is the
+/// default for `encode.zero_copy` and it means "use the hardware when the hardware can" — which an
+/// enumeration cannot answer. An encoder MFT that exists, activates, and then refuses this codec at
+/// this size is exactly the case that matters, and this machine has one: its HEVC encoder is
+/// enumerated, activates, and rejects the output type with `0xC00D6D76` at 4K while accepting the same
+/// type at 640x480. Deciding from `MFTEnumEx` would produce a recording with no video in it and a
+/// warning in a log, which is the failure this whole design exists to avoid.
+///
+/// The device is the kind capture creates, because the encoder takes its device *from the captured
+/// texture* and this is asking the same question the recording will ask. It costs one device and one
+/// negotiation, and only while the key is left unset.
+pub fn can_encode_with_textures(codec: VideoCodec, size: (u32, u32)) -> bool {
+    let Ok(device) = create_capture_kind_device() else {
+        return false;
+    };
+    MftEncoder::open(&device, size, codec, None).is_ok()
+}
+
 /// Every hardware video encoder MFT this machine will admit to, with no type filter at all.
 ///
 /// The probe's last resort, and the one that answers a question the filtered enumeration kept

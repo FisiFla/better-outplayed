@@ -2626,9 +2626,20 @@ fn build_encode_config(
     // — it is "use it if you can", which on a host without the hardware means the ordinary path
     // rather than a refusal.
     let zero_copy_required = cfg.encode.zero_copy == Some(true);
+    // **`auto` asks the hardware, not the registry.** `MFTEnumEx` says which encoders exist; it cannot
+    // say whether one will open for this codec at this size, and on this machine those are different
+    // questions — its HEVC encoder MFT is enumerated, activates, and refuses the output type at 4K
+    // (`0xC00D6D76`) while accepting the same one at 640x480. Choosing the path on the strength of the
+    // enumeration would produce a recording with no video in it and a warning in a log.
+    #[cfg(windows)]
+    let openable = vendor.is_some()
+        && localplay_encoder::mft::can_encode_with_textures(codec, native_size);
+    #[cfg(not(windows))]
+    let openable = false;
+
     let zero_copy = match cfg.encode.zero_copy {
         Some(explicit) => explicit,
-        None => vendor.is_some() && cfg!(windows),
+        None => openable,
     };
 
     if zero_copy_required && vendor.is_none() {
@@ -2644,6 +2655,20 @@ fn build_encode_config(
             "encode.zero_copy is set, and it is a Windows path: the texture handover is Media \
              Foundation's encoder MFT, and there is no equivalent here. Unset the key to let it \
              decide, or turn it off."
+        );
+    }
+
+    // An explicit request that the hardware cannot honour is an error, not a quiet downgrade: a
+    // recording that silently used a different pipeline than the one asked for is the failure this
+    // project has already paid for twice (issues #1 and #2).
+    #[cfg(windows)]
+    if zero_copy_required && !openable {
+        bail!(
+            "encode.zero_copy is set, and no hardware encoder here will open for {codec:?} at \
+             {}x{}: the encoders this machine lists do not include one that accepts that codec at \
+             that size. Unset the key to let it decide, or turn it off.",
+            native_size.0,
+            native_size.1
         );
     }
 
@@ -2669,9 +2694,10 @@ fn build_encode_config(
         // saying nothing — is how a configured pipeline and a running one drift apart, which this
         // project has already paid for twice (issues #1 and #2).
         tracing::info!(
-            "zero-copy is off for this run: it needs Windows and a detected hardware encoder, and \
-             one of the two is missing. Frames are read back and encoded as usual; \
-             `encode.zero_copy = true` would make that combination a startup error instead."
+            "zero-copy is off for this run: it needs Windows, a detected hardware encoder, and one \
+             that will open for {codec:?} at this size. One of those is missing, so frames are read \
+             back and encoded as usual; `encode.zero_copy = true` would make that combination a \
+             startup error instead."
         );
     }
 
