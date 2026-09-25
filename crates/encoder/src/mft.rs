@@ -406,9 +406,43 @@ fn output_subtype(codec: VideoCodec) -> windows::core::GUID {
     }
 }
 
+/// A size small enough that this encoder will accept it as a first configuration.
+///
+/// See [`set_output_type`] — a workaround for a measured behaviour, not a preference.
+const WARM_UP_SIZE: (u32, u32) = (640, 480);
+
+/// Configure the encoder's output, warming an HEVC encoder at a small size first.
+///
+/// **That warming is measured, not defensive.** This encoder refuses the pipeline's own output type at
+/// 3840x2160 as the *first* thing it is ever asked for — `0xC00D6D76`, `MF_E_UNSUPPORTED_D3D_TYPE` —
+/// and accepts it once it has accepted a smaller one:
+///
+/// ```text
+/// 640x480 -> ACCEPTED   720p -> ACCEPTED   1080p -> ACCEPTED
+/// 1440p   -> ACCEPTED   1800p -> ACCEPTED   4K -> ACCEPTED, twice
+/// ```
+///
+/// while asking for 4K first, in the same process, is refused. The refusal is *sticky*, too: an encoder
+/// that has just refused 4K goes on to refuse 640x480, which is why a retry after the refusal does not
+/// help and being configured small first does. `probe_size_ceiling` found this and remains the way to
+/// re-check it. The H.264 encoder needs none of it and is not given it.
+fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<()> {
+    if codec == VideoCodec::Hevc && size != WARM_UP_SIZE {
+        // Best effort: the type that matters is the one below, and an encoder that does not need
+        // warming simply accepts both.
+        let _ = set_output_type_once(transform, WARM_UP_SIZE, codec);
+    }
+    set_output_type_once(transform, size, codec)
+}
+
+/// One attempt at configuring the output, with no warming.
 /// Configure the encoder's output, which is what makes it willing to talk about its input at all.
 ///
-fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<()> {
+fn set_output_type_once(
+    transform: &IMFTransform,
+    size: (u32, u32),
+    codec: VideoCodec,
+) -> Result<()> {
     // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
     let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
     let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
