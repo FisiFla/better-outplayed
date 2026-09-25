@@ -963,8 +963,19 @@ impl Encoder for FfmpegEncoder {
         if let Some(mut mft) = self.mft.take() {
             match mft.finish(MFT_TIMEOUT) {
                 Ok(tail) if !tail.is_empty() => {
+                    // **`try_send`, never `send`.** Best-effort has to mean best-effort: this runs
+                    // at shutdown, the queue can be full, and the only thread that could drain it
+                    // is the one that may be blocked writing to a child that has stopped reading.
+                    // A blocking send here deadlocks against that writer, and it is where this
+                    // file's eight-minute hang began.
                     if let Some(tx) = self.video_tx.as_ref() {
-                        let _ = tx.send(tail);
+                        match tx.try_send(tail) {
+                            Ok(()) => {}
+                            Err(err) => tracing::warn!(
+                                "the hardware encoder's last frames did not fit the queue and were \
+                                 dropped: {err}"
+                            ),
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -977,9 +988,25 @@ impl Encoder for FfmpegEncoder {
         self.video_tx.take();
         self.audio_tx.take();
         self.mic_tx.take();
+
+        // **The child is waited for first, and with a deadline.** This order is what makes the
+        // shutdown bounded, and getting it wrong is what this file's eight-minute hang was.
+        //
+        // A writer thread ends when its pipe does, and its pipe only breaks when ffmpeg stops
+        // reading or exits — so joining the writers *before* waiting on the child means a child that
+        // never exits takes the whole shutdown with it, silently, with the logger already stopped.
+        // Closing the inputs, bounding the wait, then joining gives every step a way out: a child
+        // that will not go is killed, its death breaks the pipes, and the writers follow.
+        //
+        // Bounded rather than patient because a recording tool that does not stop when asked is a
+        // worse defect than a slow one, and because a killed ffmpeg is *reported* below rather than
+        // passed over: its status and stderr are how a failed start explains itself.
+        let status = wait_bounded(&mut self.child, SHUTDOWN_BUDGET);
+
         // Join every writer before reporting: an audio thread may still be waiting
         // out its connect deadline, and abandoning it would leave a listener that a
-        // later connection could reach after this encoder is done.
+        // later connection could reach after this encoder is done. Its own deadline bounds it, and
+        // the child's death above bounds the video writer.
         let video_res = join_writer(self.video_writer.take(), "video");
         let audio_res = join_writer(self.audio_writer.take(), GAME_AUDIO_LABEL);
         let mic_res = join_writer(self.mic_writer.take(), MICROPHONE_LABEL);
@@ -995,11 +1022,13 @@ impl Encoder for FfmpegEncoder {
             .flatten()
             .find(|err| is_connect_deadline(err));
         if let Some(err) = deadline {
-            let _ = self.child.kill();
-            let status = self.child.wait().context("reaping ffmpeg")?;
+            // Already waited for, and killed if it would not go: this reports rather than waits.
             let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
             bail!(
-                "{err:#}; ffmpeg status after the deadline was {status}, stderr: {}",
+                "{err:#}; ffmpeg status after the deadline was {}, stderr: {}",
+                status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "no status (it had to be killed)".to_string()),
                 stderr.trim()
             );
         }
@@ -1007,14 +1036,25 @@ impl Encoder for FfmpegEncoder {
         // ffmpeg's own exit status and stderr explain a failed start (a bad encoder
         // name, for instance); the writer threads only ever see the symptom — a broken
         // pipe. Report the cause first, and fall back to the writer errors.
-        let status = self.child.wait().context("waiting for ffmpeg")?;
-        if !status.success() {
-            let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
-            bail!(
-                "ffmpeg exited with {status} using encoder '{}': {}",
-                self.encoder_name,
-                stderr.trim()
-            );
+        match status {
+            Some(status) if status.success() => {}
+            Some(status) => {
+                let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+                bail!(
+                    "ffmpeg exited with {status} using encoder '{}': {}",
+                    self.encoder_name,
+                    stderr.trim()
+                );
+            }
+            None => {
+                let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+                bail!(
+                    "ffmpeg did not exit within {SHUTDOWN_BUDGET:?} and had to be killed, using \
+                     encoder '{}': {}",
+                    self.encoder_name,
+                    stderr.trim()
+                );
+            }
         }
         video_res?;
         audio_res?;
@@ -1202,6 +1242,42 @@ fn enqueue_or_drop<T>(tx: &SyncSender<T>, item: T, dropped: &AtomicU64, what: &s
             Ok(())
         }
         Err(TrySendError::Disconnected(_)) => bail!("{what} writer thread has stopped"),
+    }
+}
+
+/// How long ffmpeg is given to exit on its own before it is killed.
+///
+/// Generous against what it takes in practice — a child whose inputs have closed exits in
+/// milliseconds — and short enough that a wedged one is reported during the shutdown rather than
+/// after it. See [`FfmpegEncoder::finish`] for why this bound exists at all.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wait for a child to exit, for at most `budget`, and kill it if it will not.
+///
+/// `std::process::Child::wait` has no timeout, and a shutdown path that can wait for ever is a hang
+/// rather than a slow exit. This project has one of those on record: a hybrid recording sat alive on
+/// a machine for eight minutes with its logger already stopped, blocked, and had to be killed by
+/// hand. Returns the status if there is one, and `None` when the child had to be killed for not
+/// providing one.
+fn wait_bounded(child: &mut Child, budget: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            // A child that cannot be asked at all is not something to wait on.
+            Err(err) => {
+                tracing::warn!("could not ask ffmpeg whether it had exited: {err}");
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!("ffmpeg did not exit within {budget:?}; killing it so the recording can stop");
+            let _ = child.kill();
+            // Not a wait: the process is gone, and this only reaps it.
+            return child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1633,6 +1709,66 @@ mod tests {
     /// needed, and the path under test — a pump thread noticing the broken pipe, then the
     /// submitter asking the child what happened — is the one the real encoder uses.
     #[cfg(unix)]
+    /// A shutdown is bounded: a child that will not exit is killed rather than waited for.
+    ///
+    /// This is the defect the bounded wait exists for, and it is worth a test because it was
+    /// invisible in every other way. A hybrid recording sat alive on the box for eight minutes
+    /// after its logger had stopped — blocked, with no line saying why and nothing that would ever
+    /// have ended it, until it was killed by hand.
+    ///
+    /// The stub child here never exits and never reads, which is what that wedged ffmpeg looked
+    /// like. So the assertion is about **time**: `finish` has to come back. What it returns is a
+    /// report, and an error naming the kill is the *success* case — the failure this pins is a call
+    /// that never returns at all.
+    ///
+    /// The bound allows for the audio input's own connect deadline, which is the one other fixed
+    /// wait on this path; everything else is bounded by `SHUTDOWN_BUDGET`.
+    #[test]
+    fn a_shutdown_does_not_wait_for_a_child_that_will_not_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("ffmpeg");
+        // `exec` so the process killed is the one that would not exit, rather than a shell
+        // standing in front of it.
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
+        let cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn");
+
+        let ceiling = AUDIO_CONNECT_TIMEOUT + SHUTDOWN_BUDGET + Duration::from_secs(5);
+        let started = Instant::now();
+        let outcome = encoder.finish();
+        let took = started.elapsed();
+
+        assert!(
+            took < ceiling,
+            "a shutdown must end: the bound is {ceiling:?} and this took {took:?}, which is what \
+             an unbounded wait on the child looks like"
+        );
+        // The child never dials the audio socket either, so the *audio* connect deadline is what
+        // reports here — and the status it carries is the bounded wait's doing, which is why this
+        // asserts on the status being named rather than on which of the two paths named it.
+        if let Err(err) = outcome {
+            let text = err.to_string();
+            assert!(
+                text.contains("ffmpeg status") || text.contains("did not exit"),
+                "a shutdown that had to kill the child must say so rather than pass it over: {err:#}"
+            );
+        }
+    }
+
     /// A frame with no pixels is refused rather than written as a zero-length frame.
     ///
     /// This guard is what makes the zero-copy plumbing safe to land *ahead* of the encoder that
