@@ -19,6 +19,7 @@
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
+
     let encoders = localplay_encoder::mft::probe_hardware_encoders()?;
     println!("hardware H.264 encoder MFTs: {}", encoders.len());
     for encoder in &encoders {
@@ -65,12 +66,80 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(err) => println!("video processor MFTs: could not be asked: {err}"),
     }
+    // The encoder core itself, at the resolution that matters. Everything above is a query; this
+    // is the thing: configure a 4K encoder, hand it a GPU texture, and see whether it takes it
+    // without a single pixel crossing the CPU.
+    if usable > 0 {
+        println!("\n--- the encoder core, at 3840x2160 ---");
+        let size = (3840u32, 2160u32);
+        // The device is the *probe's* own here. In the real pipeline it is capture's, and that is
+        // the whole reason `MftEncoder::open` takes one rather than making its own.
+        let device = localplay_encoder::mft::create_capture_kind_device()?;
+        match localplay_encoder::mft::MftEncoder::open(&device, size) {
+            Ok(mut encoder) => {
+                println!(
+                    "opened {} for {size:?}, taking {} input",
+                    encoder.encoder_name, encoder.input_format
+                );
+                if !encoder.input_format.starts_with("RGB32") && !encoder.input_format.starts_with("ARGB32") {
+                    println!(
+                        "  NOTE: that is not the format capture delivers, so this chain needs a \
+                         GPU-side conversion to reach it"
+                    );
+                }
+                let texture = fake_frame(encoder.device(), size)?;
+                match encoder.push_texture(&texture, 0) {
+                    Ok(()) => println!("the encoder accepted a GPU texture with no CPU copy"),
+                    Err(err) => println!("push_texture failed: {err:#}"),
+                }
+            }
+            Err(err) => println!("could not open one for {size:?}: {err:#}"),
+        }
+    }
+
     if usable == 0 {
         // Not an error: it is a finding, and the one the plan most needs. Exit non-zero so a
         // script notices, but print the reason rather than a stack trace.
         anyhow::bail!("no hardware encoder on this machine accepts the D3D11 handshake");
     }
     Ok(())
+}
+
+/// A BGRA texture of `size` on `device`, standing in for a captured frame.
+///
+/// Zero-filled: what is being tested is whether the encoder will take a *surface* of this format at
+/// this size, and the pixels' value has no bearing on that. Created with the bind flags Windows
+/// Graphics Capture's own frames carry, because a texture the encoder refuses on those grounds
+/// would look like a format refusal and is not one.
+#[cfg(windows)]
+fn fake_frame(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    size: (u32, u32),
+) -> anyhow::Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> {
+    use anyhow::Context;
+    use windows::Win32::Graphics::Direct3D11::{
+        ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: size.0,
+        Height: size.1,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture: Option<ID3D11Texture2D> = None;
+    // SAFETY: `texture` is the out-parameter and the description outlives the call.
+    unsafe { device.CreateTexture2D(&description, None, Some(&mut texture)) }
+        .context("ID3D11Device::CreateTexture2D")?;
+    texture.context("CreateTexture2D returned no texture")
 }
 
 #[cfg(not(windows))]

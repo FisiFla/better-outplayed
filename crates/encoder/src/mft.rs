@@ -20,17 +20,21 @@ use anyhow::{bail, Context, Result};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_SDK_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType,
+    IMFActivate, IMFDXGIDeviceManager, IMFMediaType, IMFTransform, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
     MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_URL_Attribute,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
     MFMediaType_Video, MFSTARTUP_FULL, MFVideoFormat_ARGB32, MFVideoFormat_H264,
     MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
-    MFVideoInterlace_Progressive, MF_VERSION, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    eAVEncH264VLevel5_1, eAVEncH264VProfile_High, MFVideoInterlace_Progressive, MF_VERSION,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
     MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -256,6 +260,17 @@ fn ask_one(activate: &IMFActivate, manager: &IMFDXGIDeviceManager) -> HardwareEn
     }
 }
 
+/// The frame rate this probe negotiates, in **both** directions.
+///
+/// One constant and not two, because two of them is what the first version of this had and the two
+/// disagreed — an output type at 30 fps and an input type at 60 — which Media Foundation refused
+/// with `MF_E_INVALIDMEDIATYPE`, whose own text says *"invalid, inconsistent, or not supported"*.
+/// The word doing the work there was "inconsistent": nothing was wrong with either rate on its own.
+/// 30 rather than 60 because 4K at 60 needs H.264 level 5.2 while 4K at 30 fits 5.1, and this
+/// negotiates 5.1 (`eAVEncH264VLevel5_1`) — asking for a rate the declared level cannot carry is
+/// the other way to be refused by a type that is perfectly well formed.
+const FRAME_RATE: (u32, u32) = (30, 1);
+
 /// The formats worth asking about, in the order worth asking.
 ///
 /// `RGB32` and `ARGB32` first because Windows Graphics Capture delivers BGRA8 and either of those
@@ -311,12 +326,20 @@ fn set_h264_output_type(transform: &IMFTransform, size: (u32, u32)) -> Result<()
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
-        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(30, 1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        // A bitrate is not optional for a rate-controlled encoder: without one it has no reason to
-        // accept a producing type at all.
-        media_type.SetUINT32(&MF_MT_AVG_BITRATE, 2_000_000)?;
+        // A bitrate is not optional for a rate-controlled encoder, and this one is the project's own
+        // configured 20 Mbit/s rather than a token value: measured, a token 2 Mbit/s at 4K is not
+        // enough for the encoder to accept the size at all.
+        media_type.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?;
+        // **The profile and the level are the load-bearing attributes at 4K.** Without them this MFT
+        // refuses *every* input format at 3840x2160 — including NV12, which it encodes for ffmpeg
+        // every day — because the level it would have to claim to carry 4K@60 is not one it can
+        // assume on the caller's behalf. Measured: 0xC00D36B4 for ARGB32 and NV12, 0xC00D36BD for
+        // RGB32, all three before these two lines existed.
+        media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel5_1.0 as u32)?;
     }
     // SAFETY: setting the output type on a transform that was just unlocked and given its device
     // manager, with a media type that outlives the call.
@@ -342,7 +365,9 @@ fn accepts_subtype(
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
-        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(30, 1))?;
+        // The same rate as the output type, from the same constant: a probe that guessed a
+        // different one here would be measuring its own inconsistency.
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     }
@@ -444,7 +469,11 @@ fn enumerate_names(category: windows::core::GUID) -> Result<Vec<String>> {
 /// `D3D11_CREATE_DEVICE_BGRA_SUPPORT` is the flag that matters: Windows Graphics Capture requires
 /// it, so a device without it could not receive a captured texture and the handshake would be
 /// answering a question nobody is asking.
-fn create_capture_kind_device() -> Result<ID3D11Device> {
+/// A D3D11 device of the kind the capture backend creates.
+///
+/// Public because the probe needs one: in the real pipeline the device is capture's, and that is why
+/// [`MftEncoder::open`] takes one instead of making its own.
+pub fn create_capture_kind_device() -> Result<ID3D11Device> {
     let mut device: Option<ID3D11Device> = None;
     // SAFETY: `device` is the out-parameter; the adapter and software parameters are null by
     // design (the default hardware adapter), and the feature-level array is empty, which asks for
@@ -503,6 +532,258 @@ fn attribute_string(activate: &IMFActivate, key: &windows::core::GUID) -> Option
 fn attribute_u32(activate: &IMFActivate, key: &windows::core::GUID) -> Option<u32> {
     // SAFETY: `GetUINT32` reads the attribute and returns by value.
     unsafe { activate.GetUINT32(key) }.ok()
+}
+
+/// A hardware encoder MFT, configured for a size and fed one GPU texture at a time.
+///
+/// This is the Tier 2 encoder core, and its whole point is that [`MftEncoder::push_texture`] moves
+/// **no pixels through the CPU**: the captured texture goes to the encoder as a DXGI surface buffer
+/// on the GPU it already lives on. Measured context: the readback this replaces is ~97% of what the
+/// 4K pipeline does (§14 of `docs/verification-status.md`).
+///
+/// Three things about opening it are measured rather than assumed, each of which reported a
+/// confident false negative when done the obvious way — see the module note and the plan:
+///
+/// * an asynchronous MFT must be **unlocked** before it can be configured;
+/// * the **output type must be set before the input**, because an encoder will not negotiate an
+///   input until it knows what it is producing;
+/// * the encoder must be **chosen**, not assumed: the hardware flag enumerates MFTs that cannot be
+///   instantiated on this machine at all.
+pub struct MftEncoder {
+    transform: IMFTransform,
+    /// Held because the manager only borrows it: releasing the device while an MFT holds a manager
+    /// over it is exactly the dangling-association case Media Foundation warns about.
+    device: ID3D11Device,
+    size: (u32, u32),
+    /// Which MFT was selected, for the log and for the record.
+    pub encoder_name: String,
+    /// Which input format it actually took, at this size.
+    ///
+    /// Reported because it decides whether the chain needs anything else in it: `ARGB32` is what
+    /// Windows Graphics Capture delivers, so taking it means the captured texture goes straight in,
+    /// while taking only `NV12` means something has to convert — and that something has to be on the
+    /// GPU or this whole exercise has moved the copy rather than removed it.
+    pub input_format: String,
+}
+
+// SAFETY: the members are COM interfaces the `windows` crate marks `Send`+`Sync` for the ones that
+// are (a D3D11 device and an MFT are both usable from one thread at a time), and this type is moved
+// to the encoder's own thread and used there, never concurrently. The device is additionally
+// expected to be multithread-protected by its owner once capture and this encoder both touch it.
+unsafe impl Send for MftEncoder {}
+
+impl MftEncoder {
+    /// Open a hardware H.264 encoder on `device` for frames of `size`, taking `ARGB32` input.
+    ///
+    /// `device` is the **capture path's** device, deliberately: an MFT given a manager over a
+    /// different device cannot be handed the captured texture at all, so the two have to be the
+    /// same one. That is why this takes a device rather than creating its own.
+    pub fn open(device: &ID3D11Device, size: (u32, u32)) -> Result<Self> {
+        // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
+        // in one process is a supported sequence.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
+        match Self::open_started(device, size) {
+            Ok(encoder) => Ok(encoder),
+            Err(err) => {
+                // SAFETY: balances the `MFStartup` above, which succeeded.
+                unsafe {
+                    let _ = MFShutdown();
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn open_started(device: &ID3D11Device, size: (u32, u32)) -> Result<Self> {
+        let manager = create_device_manager(device)?;
+        let input = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: `activates`/`count` are the out-parameters this call fills; `input` outlives it.
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                None,
+                Some(&input),
+                &mut activates,
+                &mut count,
+            )
+        }
+        .context("MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, hardware)")?;
+        if activates.is_null() || count == 0 {
+            if !activates.is_null() {
+                // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
+                unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+            }
+            bail!("no hardware H.264 encoder MFT on this machine");
+        }
+        // SAFETY: `activates` points at `count` initialised entries written by the call above.
+        let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+
+        let mut refusals = Vec::new();
+        let mut chosen = None;
+        for candidate in candidates.iter().flatten() {
+            let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string());
+            match configure_encoder(candidate, &manager, size) {
+                Ok((transform, input_format)) => {
+                    chosen = Some((transform, name, input_format));
+                    break;
+                }
+                // Not fatal: the hardware flag enumerates encoders this machine cannot instantiate,
+                // which is a fact about the machine rather than a failure of the search.
+                Err(err) => refusals.push(format!("{name}: {err:#}")),
+            }
+        }
+        // SAFETY: as above.
+        unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+
+        let (transform, encoder_name, input_format) = chosen.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no hardware encoder here could be configured for {size:?}: {}",
+                refusals.join("; ")
+            )
+        })?;
+        Ok(Self {
+            transform,
+            device: device.clone(),
+            size,
+            encoder_name,
+            input_format,
+        })
+    }
+
+    /// The geometry this encoder was opened for.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The device this encoder was opened on, which is the capture path's.
+    ///
+    /// Exposed because it is the device a texture handed to [`MftEncoder::push_texture`] has to
+    /// belong to — one the encoder is not managing cannot be wrapped as a media buffer for it. The
+    /// probe uses it to build a synthetic frame; the recorder will have got it from capture.
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// Hand one captured texture to the encoder, with no copy of its pixels.
+    ///
+    /// `pts_ms` is media time, in the same milliseconds the rest of the pipeline uses; the encoder
+    /// wants 100-nanosecond units, so the conversion happens here rather than at every call site.
+    pub fn push_texture(&mut self, texture: &ID3D11Texture2D, pts_ms: i64) -> Result<()> {
+        // The documented way to wrap a DXGI surface as a media buffer. `fbottomupwhenlinear` is
+        // false because a captured texture is top-down, which is what the encoder expects.
+        // SAFETY: `texture` is a live D3D11 texture on this encoder's device, and the IID names the
+        // interface it is being wrapped as.
+        let buffer = unsafe {
+            MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)
+        }
+        .context("MFCreateDXGISurfaceBuffer")?;
+        // SAFETY: `MFCreateSample` returns an empty sample this function owns.
+        let sample = unsafe { MFCreateSample() }.context("MFCreateSample")?;
+        // SAFETY: both calls act on that sample, and the buffer is referenced by it.
+        unsafe { sample.AddBuffer(&buffer) }.context("IMFSample::AddBuffer")?;
+        // SAFETY: setting the sample's timestamps; 100ns units are what Media Foundation counts in.
+        unsafe {
+            sample.SetSampleTime(pts_ms.saturating_mul(10_000))?;
+            sample.SetSampleDuration(10_000_000 / 60)?;
+        }
+        // SAFETY: the encoder's own input stream, with a sample that outlives the call.
+        unsafe { self.transform.ProcessInput(0, &sample, 0) }.context("IMFTransform::ProcessInput")
+    }
+}
+
+impl Drop for MftEncoder {
+    fn drop(&mut self) {
+        // Detach the device manager before the transform goes, as Media Foundation's contract
+        // requires; the transform's own reference then drops with this struct.
+        // SAFETY: the transform is live, and the parameter is the documented detach value.
+        unsafe {
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+        }
+        // SAFETY: refcounted, balancing the `MFStartup` in `open`.
+        unsafe {
+            let _ = MFShutdown();
+        }
+    }
+}
+
+/// Configure one candidate: unlock it, give it the device, set its output type, then its input.
+///
+/// The order is the whole of this function's value. Every step below was learned from a refusal:
+/// an async MFT that is not unlocked will not be configured at all, and an encoder asked for an
+/// input type before an output type refuses — which reads as "this format is unsupported" and is
+/// not that.
+fn configure_encoder(
+    activate: &IMFActivate,
+    manager: &IMFDXGIDeviceManager,
+    size: (u32, u32),
+) -> Result<(IMFTransform, String)> {
+    // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
+    let transform: IMFTransform =
+        unsafe { activate.ActivateObject() }.context("IMFActivate::ActivateObject(IMFTransform)")?;
+
+    if attribute_u32(activate, &windows::Win32::Media::MediaFoundation::MF_TRANSFORM_ASYNC)
+        .map(|v| v != 0)
+        .unwrap_or(false)
+    {
+        // SAFETY: reading the transform's own attribute store, then setting the unlock in it.
+        let attributes = unsafe { transform.GetAttributes() }.context("IMFTransform::GetAttributes")?;
+        unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
+            .context("unlocking an asynchronous MFT")?;
+    }
+
+    // SAFETY: the manager outlives the call, and its interface pointer is what the message wants.
+    unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
+        .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
+
+    set_h264_output_type(&transform, size)?;
+
+    // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
+    // 3840x2160 with `MF_E_INVALIDMEDIATYPE`, so what it will eat is a function of the size as well
+    // as the format. Trying the candidates in order — the *direct* one first, because taking
+    // `ARGB32` means the captured texture goes straight in — is what makes this work at whatever
+    // size it is asked for rather than at the size someone happened to test.
+    let mut refusals = Vec::new();
+    for (subtype, name) in CANDIDATE_INPUTS {
+        let input = video_type(subtype, size)?;
+        // SAFETY: setting the input type on a configured transform, with a media type that outlives
+        // the call. A refusal here is expected for some formats at some sizes, not a failure.
+        match unsafe { transform.SetInputType(0, &input, 0) } {
+            Ok(()) => return Ok((transform, name.to_string())),
+            Err(err) => refusals.push(format!("{name}: {err}")),
+        }
+    }
+    bail!(
+        "no input format it would take at {size:?}, having set an output type first: {}",
+        refusals.join("; ")
+    )
+}
+
+/// A video media type for one subtype and size, with the attributes every encoder insists on.
+///
+/// The frame size, frame rate, pixel aspect ratio and interlace mode are packed the way Media
+/// Foundation packs them — two 32-bit halves in a `u64` — and a type missing any of them is
+/// rejected for the missing attribute rather than for the format under test.
+fn video_type(subtype: &windows::core::GUID, size: (u32, u32)) -> Result<IMFMediaType> {
+    // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
+    let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
+    let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
+    // SAFETY: every call sets an attribute on that type.
+    unsafe {
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    }
+    Ok(media_type)
 }
 
 #[cfg(test)]

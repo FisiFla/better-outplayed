@@ -158,6 +158,47 @@ Neither is a reason to doubt the design; the D3D11 handshake above is the part t
 killed it, and it passed. It is a reason not to write step 5's type negotiation from the assumption
 that a captured texture can go straight in.
 
+### The 4K encoder opens with ARGB32 — the unknown at the top of this section, answered
+
+`MftEncoder::open(&device, (3840, 2160))` now succeeds and selects the encoder rather than assuming
+one:
+
+```
+--- the encoder core, at 3840x2160 ---
+opened NVIDIA H.264 Encoder MFT for (3840, 2160), taking ARGB32 input
+push_texture failed: IMFTransform::ProcessInput: The callee is currently not accepting further
+  input. (0xC00D36B5)
+```
+
+So the chain is what the design wanted: the capture path's own D3D11 device, the capture's own
+format, at full resolution. Three things had to be right at once, and the two that were wrong are
+worth recording because each looked like something else:
+
+* **Two frame rates.** The output type said 30 fps and the input type said 60 — in two functions,
+  from two literals. Media Foundation refused with `MF_E_INVALIDMEDIATYPE`, whose own text is
+  *"invalid, inconsistent, or not supported"*, and the word doing the work was "inconsistent":
+  nothing was wrong with either rate alone. The fix is structural rather than a corrected number —
+  both types now take their rate from one `FRAME_RATE` constant, so they cannot disagree.
+* **No profile, no level.** With neither, this MFT refuses *every* input format at 3840x2160,
+  including NV12 — which it encodes for ffmpeg every day. A level is a claim about what the stream
+  can carry, and 4K at 60 needs 5.2 where 4K at 30 fits 5.1, which is why `FRAME_RATE` is 30 and the
+  type declares `eAVEncH264VLevel5_1` and `eAVEncH264VProfile_High`.
+
+Both were fixed together, so which of them the refusal turned on is not isolated — the rate
+inconsistency was certainly a real defect, and the profile and level are certainly load-bearing at
+4K. What *is* isolated is the answer: **the 4K input format is ARGB32, and the chain needs no
+conversion.**
+
+**`ProcessInput` returning `MF_E_NOTACCEPTING` is not a failure — it is the async contract.** An
+asynchronous MFT takes input only when it has said it wants some, signalled as
+`METransformNeedInput` through the event generator. So the next piece of step 5 is the standard
+async loop, and it is now known work rather than an open question:
+
+1. `MFT_MESSAGE_NOTIFY_BEGIN_STREAMING` before the first frame.
+2. Drain `GetEvent` and answer the messages: `METransformNeedInput` → push the next captured
+   texture, `METransformHaveOutput` → `ProcessOutput` into a sample and take the H.264 bytes.
+3. `MFT_MESSAGE_COMMAND_DRAIN` at the end, then keep draining until the output stops.
+
 ## Sub-steps, each independently verifiable
 
 1. **`Frame` can carry a texture.** ✅ **Done.** `pub texture: Option<GpuTexture>` on
