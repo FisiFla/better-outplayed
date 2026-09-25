@@ -28,6 +28,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         localplay_encoder::VideoCodec::H264
     };
+    // Unfiltered, so that "no encoder for this codec" can be told apart from "the filter is wrong".
+    match localplay_encoder::mft::list_hardware_video_encoders() {
+        Ok(names) => {
+            println!("--- every hardware video encoder MFT here, unfiltered: {} ---", names.len());
+            for name in names {
+                println!("  {name}");
+            }
+        }
+        Err(err) => println!("could not list encoder MFTs: {err:#}"),
+    }
     println!("--- asking about {codec:?} ---");
     let encoders = localplay_encoder::mft::probe_hardware_encoders(codec)?;
     println!("hardware {codec:?} encoder MFTs: {}", encoders.len());

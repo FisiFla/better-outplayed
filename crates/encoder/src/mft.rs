@@ -1257,6 +1257,15 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
     String::from_utf16_lossy(&description.Description[..end])
 }
 
+/// Every hardware video encoder MFT this machine will admit to, with no type filter at all.
+///
+/// The probe's last resort, and the one that answers a question the filtered enumeration kept
+/// answering ambiguously: whether an encoder for a given codec exists here at all, independent of
+/// what it is willing to consume or produce.
+pub fn list_hardware_video_encoders() -> Result<Vec<String>> {
+    enumerate_names(MFT_CATEGORY_VIDEO_ENCODER)
+}
+
 /// Every adapter DXGI lists, in the order it lists them — the first being what a null-adapter device
 /// gets. Printed by the probe so that "which GPU is this using" is a list rather than a guess.
 pub fn describe_adapters() -> Vec<String> {
