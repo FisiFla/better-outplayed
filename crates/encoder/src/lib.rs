@@ -315,7 +315,15 @@ impl EncodeConfig {
     /// (the CLI records it on every clip), which is what lets the replay ring be built
     /// and the segment numbering be reserved before the ffmpeg child exists.
     pub fn encoder_name(&self) -> &'static str {
-        self.software_encoder.unwrap_or("libx264")
+        // **The fallback is per codec, and it used to be `libx264` whatever `codec` said** — so a
+        // software HEVC run produced an H.264 file that claimed to be HEVC, which is exactly the quiet
+        // divergence between what was asked for and what ran that this project has already paid for
+        // twice. `software_encoder` is the *hardware* name and is only set by
+        // [`EncodeConfig::hardware`]; nothing here names a software encoder on purpose.
+        self.software_encoder.unwrap_or(match self.codec {
+            VideoCodec::H264 => "libx264",
+            VideoCodec::Hevc => "libx265",
+        })
     }
 }
 

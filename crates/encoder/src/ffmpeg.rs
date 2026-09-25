@@ -352,6 +352,16 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
         ]);
     }
     args.extend(["-c:v".to_string(), cfg.encoder_name().to_string()]);
+    // **`hvc1`, not ffmpeg's default `hev1`** — and this path needs it as much as the
+    // bitstream one does. Both describe the same stream and differ in where the parameter
+    // sets live, and `hev1` is what some players refuse to open at all. The tag went into
+    // the bitstream arguments first, which is the zero-copy hybrid's path — but that is not
+    // the path HEVC runs on where the hardware encoder refuses, and `ffprobe` on a clip from
+    // the raw path reported `codec_tag_string=hev1`. A test of the argument list would not
+    // have caught that; reading the clip did.
+    if cfg.codec == crate::VideoCodec::Hevc {
+        args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
+    }
     args.extend(["-b:v".to_string(), format!("{}k", cfg.bitrate_kbps)]);
     args.extend(["-g".to_string(), gop_frames(cfg).to_string()]);
     // Forced keyframes are what make segment boundaries cuttable (spec §6.3).
@@ -2021,6 +2031,40 @@ mod tests {
             video_output_args_bitstream(crate::VideoCodec::H264),
             vec!["-c:v".to_string(), "copy".to_string()],
             "H.264's output arguments should be what they always were"
+        );
+    }
+
+    /// The container tag, on the raw path too.
+    ///
+    /// This was written for the bitstream arguments only, and that is the zero-copy hybrid's path —
+    /// which is not the path HEVC runs on where the hardware encoder refuses: there the raw path is
+    /// what a HEVC recording goes through, and `ffprobe` on a real clip from it reported
+    /// `codec_tag_string=hev1`. A test of the arguments would not have caught that; reading the
+    /// clip did. The tag is a muxer option and belongs to both.
+    #[test]
+    fn the_raw_output_args_carry_the_hevc_tag_too() {
+        let dir = std::env::temp_dir();
+        let hevc = video_output_args(&EncodeConfig::for_tests_software(
+            crate::VideoCodec::Hevc,
+            64,
+            48,
+            30,
+            dir.clone(),
+            1_000,
+        ));
+        assert!(hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "{hevc:?}");
+
+        let h264 = video_output_args(&EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            48,
+            30,
+            dir,
+            1_000,
+        ));
+        assert!(
+            !h264.iter().any(|arg| arg == "-tag:v"),
+            "an HEVC tag on an AVC track is a lie about the codec: {h264:?}"
         );
     }
 }
