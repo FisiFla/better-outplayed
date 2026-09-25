@@ -78,6 +78,55 @@ So the hardware was never in question; the question was. The fix is one function
 lesson is the same one this project keeps paying for and keeps writing down: a probe that answers
 the wrong question answers it convincingly.
 
+## Where HEVC actually stands: the encoder is found, and it wants NV12
+
+Fixed and verified on the box. Both enumerations had a type filter pinned to `MFVideoFormat_H264`
+as `pOutputType` — `probe_started_encoders` and, the one that matters, `open_started`, which decides
+what a recording uses. `MFT_ENUM_FLAG_SORTANDFILTER` went with them: it filters against a *preference*
+list, which has nothing to say without a type to prefer for. Measured, with the filter:
+
+```
+--- asking about Hevc ---
+hardware Hevc encoder MFTs: 3        <- the two H.264 encoders and one Quick Sync encoder
+```
+
+and without it, the machine's real inventory:
+
+```
+--- every hardware video encoder MFT here, unfiltered: 10 ---
+  NVIDIA HEVC Encoder MFT              <- the one this task needs
+  NVIDIA H.264 Encoder MFT
+  Intel® Hardware H265 Encoder MFT
+  ... VP9, AV1, Quick Sync
+```
+
+The enumeration's job is now to be *complete* and the asking to be precise — hand it every hardware
+encoder and let each say for itself what it will do, which is what this code already did on the input
+side and explains at length, because the input side learned this lesson first.
+
+**And the answer it gives for HEVC is a real one, not another filter artefact:**
+
+```
+NVIDIA HEVC Encoder MFT: SetOutputType(Hevc): The input type is not supported for D3D device. (0xC00D6D76)
+```
+
+That MFT is found, it is activated, and it **accepts the HEVC output type** — where the H.264 one
+answers `Invalid type (0xC00D36BD)`. It then refuses the *input*: ARGB32 in a D3D11 texture is not
+something it will take, which is what the error says in as many words. HEVC encoders work in NV12 or
+P010; the H.264 MFT is the unusually accommodating one at this size.
+
+**So the next piece of work is an ARGB32 → NV12 conversion on the GPU**, in the capture handover,
+before the texture reaches the encoder — `ID3D11VideoProcessor` with a `VideoProcessorBlt`, which is
+a GPU-side pass and keeps the property that matters: no pixels cross to the CPU. The handover already
+blits with `CopyResource`, which cannot change format, so this replaces that blit rather than adding
+one. Everything downstream of the encoder is unchanged and already verified — `-f hevc`, the `hvc1`
+tag, the fragment splitter, the clip `-c copy`.
+
+**Worth stating plainly because it is easy to lose:** the *raw* path can already do HEVC today, with
+`codec = "hevc"` and ffmpeg's `hevc_nvenc` — verified on the box, 2 s of 4K60, exit 0. It just costs
+the readback, which is the 88.9% of a core this whole line of work exists to delete. So HEVC is
+available now as a trade, and available *without* the trade once the NV12 pass exists.
+
 ## Details H.264 let us ignore, which HEVC will not
 
 * **The MP4 tag.** ffmpeg writes HEVC into MP4 as `hev1` by default, which some players refuse;
