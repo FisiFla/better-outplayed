@@ -127,6 +127,19 @@ const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// we re-check instead of sitting in a blocking `accept()` that could never return.
 const AUDIO_CONNECT_POLL: Duration = Duration::from_millis(20);
 
+/// How long a hardware encoder is waited on: for its next request for input, and for its tail
+/// after a drain.
+///
+/// One constant for both because they are the same question asked at opposite ends — "is the
+/// encoder still working?" — and because a timeout here is a *report* rather than a hang: an
+/// encoding frame that never comes asks for input no more, and a drain that never completes has
+/// already given the recording everything it is going to. Two seconds is far longer than either
+/// takes when the machine is healthy (measured on the box: 90 frames of 4K through the loop in
+/// three seconds) and short enough that a wedged encoder is reported during the recording rather
+/// than after it.
+#[cfg(windows)]
+const MFT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a failure report waits for ffmpeg's stderr before giving up on including it.
 /// The text is normally already sitting in the pipe buffer, so this is a ceiling on a
 /// pathological case, not a delay on the ordinary one (see `drain_stderr`).
@@ -543,6 +556,13 @@ pub struct FfmpegEncoder {
     /// built it: the answer is what the caller uses to decide whether to ask capture for textures
     /// at all, and asking an encoder that wants pixels would produce frames it then refuses.
     accepts_textures: bool,
+    /// The hardware encoder MFT, when this is a [`VideoInput::EncodedBitstream`] encoder.
+    ///
+    /// Opened lazily from the first frame rather than at construction, because it takes its device
+    /// from a frame (`MftEncoder::open_for_texture`): the device is the capture path's, and asking
+    /// the texture is how that is guaranteed rather than promised.
+    #[cfg(windows)]
+    mft: Option<crate::mft::MftEncoder>,
     /// The loopback port the microphone input was bound to, reported by
     /// `Encoder::mic_port`. `None` when there is no microphone input.
     mic_port: Option<u16>,
@@ -699,6 +719,9 @@ impl FfmpegEncoder {
             // Carried from the config rather than derived from the child's arguments: the answer is
             // what the caller asks capture for, and it has to be available before a frame exists.
             accepts_textures: cfg.accepts_textures(),
+            // Opened on the first frame — see the field.
+            #[cfg(windows)]
+            mft: None,
             mic_port,
             mic_spec: cfg.mic_audio,
             dropped_video: AtomicU64::new(0),
@@ -849,6 +872,21 @@ impl Encoder for FfmpegEncoder {
         // The frame's geometry is checked by the caller (`pump_once_counted`), which is
         // the only place that holds both the frame and the pipe's declared size.
         //
+        // A frame whose pixels are a GPU texture is encoded **here**, by the hardware MFT, and what
+        // reaches the queue is the H.264 it produced: a few kilobytes where the pixels would have
+        // been tens of megabytes. That is the whole of the hybrid from this function's point of
+        // view — the queue below, the writer thread behind it and the child's arguments are all
+        // unchanged, which is why the video input and codec are the only things that differ.
+        #[cfg(windows)]
+        if let Some(texture) = frame.texture {
+            let bytes = self.encode_texture(texture, frame.pts)?;
+            let queued = match self.video_tx.as_ref() {
+                Some(tx) => enqueue_or_drop(tx, bytes, &self.dropped_video, "video"),
+                None => bail!("encoder already finished"),
+            };
+            return queued.map_err(|e| self.explain_dead_writer(e));
+        }
+
         // What the caller cannot check is whether the frame has **pixels** at all. A frame whose
         // pixels stayed in VRAM has an empty `data` by design (`localplay_capture::Frame`), and
         // this encoder writes `data` to the child's stdin — so accepting one would feed ffmpeg a
@@ -916,6 +954,24 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn finish(&mut self) -> Result<()> {
+        // The hardware encoder's tail goes into the queue **before** the senders are dropped: a
+        // drain is what makes the last frames of a stream real, and after this line the pipe they
+        // belong in is closing. Best-effort with a warning rather than a failure — a recording
+        // missing its last few frames is worth more than one the user never gets because a drain
+        // timed out at the end of it.
+        #[cfg(windows)]
+        if let Some(mut mft) = self.mft.take() {
+            match mft.finish(MFT_TIMEOUT) {
+                Ok(tail) if !tail.is_empty() => {
+                    if let Some(tx) = self.video_tx.as_ref() {
+                        let _ = tx.send(tail);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("draining the hardware encoder failed: {err:#}"),
+            }
+        }
+
         // Dropping the senders ends each pump loop, closing the video pipe and the
         // audio sockets — which is what tells ffmpeg the inputs have ended.
         self.video_tx.take();
@@ -1004,6 +1060,34 @@ impl Encoder for FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
+    /// Run one captured texture through the hardware encoder and return its H.264.
+    ///
+    /// `Ok` with an empty vector is normal: an asynchronous MFT produces output when *it* decides
+    /// to, not once per frame, so some frames yield nothing and the bytes arrive with a later one.
+    /// The stream is still complete — that is why `finish` drains.
+    #[cfg(windows)]
+    fn encode_texture(
+        &mut self,
+        texture: localplay_capture::GpuTexture,
+        pts: Duration,
+    ) -> Result<Vec<u8>> {
+        let mft = match self.mft.as_mut() {
+            Some(mft) => mft,
+            None => {
+                let opened = crate::mft::MftEncoder::open_for_texture(texture.as_raw())
+                    .context("opening a hardware encoder for this frame")?;
+                let mut opened = opened;
+                opened.start().context("starting the hardware encoder")?;
+                tracing::info!(encoder = %opened.encoder_name, format = %opened.input_format,
+                    "the hardware encoder is open");
+                self.mft.insert(opened)
+            }
+        };
+        // Milliseconds because that is the unit the rest of this pipeline counts media time in;
+        // Media Foundation wants 100-nanosecond units, which `MftEncoder::push_texture` converts.
+        mft.encode_texture(texture.as_raw(), pts.as_millis() as i64, MFT_TIMEOUT)
+    }
+
     /// Complete a writer failure with ffmpeg's own exit status and stderr, if it has died.
     ///
     /// The writer thread can only report the symptom: its `write` to the child's stdin

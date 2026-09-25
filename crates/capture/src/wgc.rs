@@ -74,7 +74,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE,
-    D3D11_USAGE_DEFAULT,};
+    D3D11_USAGE_DEFAULT,
+    ID3D11Multithread,};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
@@ -750,6 +751,33 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     }
     let device = device.context("D3D11CreateDevice returned no device")?;
     let context = context.context("D3D11CreateDevice returned no immediate context")?;
+
+    // **Thread-safe use of this device, which more than one thing now does.** Windows Graphics
+    // Capture drives its own internals against it, this process issues the frame copies on its pump
+    // thread, and — since Tier 2 — an asynchronous hardware encoder MFT reads the frames on threads
+    // of its own. D3D11's documented behaviour without this call is that concurrent use from more
+    // than one thread is the caller's problem to solve; with it, the runtime serialises and the
+    // whole arrangement is defined. The cost is a lock on submission, which at this frame rate is
+    // nothing beside a 33 MB copy, and the alternative is a class of bug that appears as torn
+    // frames on one machine and never on another.
+    // SAFETY: `device` is a live D3D11 device and `ID3D11Multithread` is the interface D3D11
+    // exposes for exactly this setting. A device that does not implement it is not a failure worth
+    // failing capture over, so the cast's error is reported and stepped over.
+    match device.cast::<ID3D11Multithread>() {
+        Ok(multithread) => {
+            // The return value is the *previous* setting, which this device has never had a
+            // reason to set — informational, and deliberately dropped.
+            // SAFETY: `multithread` belongs to this device.
+            unsafe {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+        }
+        Err(err) => tracing::warn!(
+            "this D3D11 device does not expose ID3D11Multithread ({err}), so concurrent use \
+             of it is not protected"
+        ),
+    }
+
     Ok((device, context))
 }
 
