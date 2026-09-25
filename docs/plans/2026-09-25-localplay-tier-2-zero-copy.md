@@ -538,9 +538,49 @@ That run also re-measures the headline on a session that **completes** — `capt
 `capture_wait=61.0%`, CPU **3.1%** of one core — so the figure no longer rests on a run that had to
 be killed, and the CPU criterion is met by a change that starts and stops cleanly.
 
-**What is left is the rate**: `fps=35.0/60` against 56.9 on the shipping path, `dropped=2288`. The
-pump is paced by the MFT instead of by `FramePacer`, and until that is fixed this change is a large
-CPU win that costs 40% of the frame rate — a trade worth making only once it is not a trade.
+**What was left was the rate** — `fps=35.0/60` against 56.9, `dropped=2288` — because the pump was
+paced by the MFT instead of by `FramePacer`, and the encoder has since been moved onto its own
+thread (`MftFeed`, queue depth 2, derived from capture's three-deep handover ring). Measured after
+that change, same soak, same box:
+
+| | shipping path | hybrid inline | hybrid threaded |
+|---|---|---|---|
+| `capture_copy=` | 69.6% | 0.7% | **0.7%** |
+| `CPU` | 88.9% | 3.1% | **4.0%** |
+| `fps=` | 55.5–56.9/60 | 35.0/60 | **59.6/60** |
+| `dropped=` | 8 | 2288 | **0** |
+| exits on its own | yes | **no** *(eight minutes, then killed)* | **yes** |
+
+```
+CPU 4.0% of one core, RSS 278.9 MB
+EXITED after 36.2s of watching
+no ffmpeg left behind
+frames=5710 segments=72 ... dropped=0 ... fps=59.6/60 capture=93.1% submit=0.2%
+capture_wait=61.3% capture_copy=0.7%
+buffer session #8 closed: 72 segment(s), 178668538 bytes held in RAM
+CLIENT_EXIT=0
+```
+
+**The hybrid now beats the shipping path on every axis that was measured for this work** — a
+seventeenth of the CPU, a higher frame rate, no dropped frames, and a clean shutdown. Criterion 6
+(under 5% of one core) is met, and so is issue #3's premise inverted: the cost was the readback, and
+removing it removed 95% of the core.
+
+Two readings worth keeping honest:
+
+* **`capture_wait=` is not a back-pressure signal.** It reads 61.1% when the inline encoder was
+  throttling the pump to 35 fps and 61.3% when a threaded encoder is keeping up at 59.6 — the same
+  number for opposite situations. Most of it is simply the pump idling between frames, which is what
+  a correctly paced 60 Hz capture does. The number that settled the design question was
+  `capture_copy=`, and that one means what it says.
+* **The queue's drop counter never fired.** `dropped=0` includes the encoder's own queue now, so the
+  MFT is keeping up with real content at 4K and the two-deep queue has margin. The probe's 82 fps on
+  synthetic frames was not representative; the real figure is still comfortably above 60.
+
+**Not done, and not for me to decide alone:** `zero_copy` still defaults to `false`, so the shipping
+path is still the 88.9% one. Flipping it is a real behavioural change to a private-but-shipping tool
+and the evidence for it is now in place, but it is the user's call — as is whether to post this to
+issues #3 and #1, which are the two places the work was asked for.
 
 ## Known constraints to carry
 
