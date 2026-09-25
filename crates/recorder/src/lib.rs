@@ -1897,9 +1897,30 @@ impl Engine {
         // a glance instead of inferred from a counter's slope. `configured=` carries what
         // `encode.fps` asked for, which differs from that rate exactly when the startup
         // probe measured less and adaptation is on (the startup line says so in words).
+        // `capture=` is one number for the whole of the backend's `next_frame`, and one number
+        // cannot answer the question the zero-copy work turns on: is that time spent copying a frame
+        // out of VRAM, or waiting for the display to produce one? A backend that measures it says
+        // both, as shares of wall clock like the numbers around them. `unmeasured` is the honest
+        // answer for one that does not, and a placeholder zero would not be.
+        let split = match self.capture.frame_timings() {
+            Some(timings) => {
+                let elapsed = self.pump_started.elapsed().as_secs_f64();
+                if elapsed <= 0.0 {
+                    "capture_split=unmeasured".to_string()
+                } else {
+                    format!(
+                        "capture_wait={:.1}% capture_copy={:.1}%",
+                        100.0 * timings.waiting.as_secs_f64() / elapsed,
+                        100.0 * timings.copying.as_secs_f64() / elapsed
+                    )
+                }
+            }
+            None => "capture_split=unmeasured".to_string(),
+        };
+
         tracing::debug!(
             "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} \
-             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}%",
+             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}% {}",
             self.frames,
             stats.segments,
             // The bytes the ring is holding, wherever it holds them — RAM for a replay buffer,
@@ -1919,6 +1940,7 @@ impl Engine {
             // waiting for ffmpeg, and what is left is the audio drains, the tick and the loop.
             Self::share(self.capture_time, self.pump_started.elapsed()),
             Self::share(self.submit_time, self.pump_started.elapsed()),
+            split,
         );
         // The cap the ring is held to is **RAM**, not scratch (spec §8.1): a rolling buffer
         // holds unclipped footage in memory, so a bounded window that overruns its budget is the

@@ -125,6 +125,11 @@ pub struct WgcCapture {
     /// session so the answer survives a `stop`/`start` cycle — and so it can be given *before*
     /// `start`, which is when an encoder decides whether it can take a texture.
     want_textures: bool,
+    /// Time spent inside `poll_frame` — the copy — accumulated across calls. See
+    /// [`localplay_capture::FrameTimings`].
+    copying: Duration,
+    /// Time inside `next_frame` that was *not* inside `poll_frame`: the polling loop's sleeps.
+    waiting: Duration,
     /// Whether `start` has been called and `stop` has not.
     ///
     /// Tracked separately from `session` because the session is built in [`Self::new`]
@@ -258,6 +263,8 @@ impl WgcCapture {
             size: (0, 0),
             session: None,
             want_textures: false,
+            copying: Duration::ZERO,
+            waiting: Duration::ZERO,
             started: false,
             com_owned: false,
         };
@@ -332,8 +339,17 @@ impl CaptureBackend for WgcCapture {
         Ok(())
     }
 
-    /// Polls for the next frame. Returns `Ok(None)` when no frame arrives within
-    /// `timeout`, per the `CaptureBackend` contract.
+    /// Polls for the next frame, splitting the time it spends into **copying** and **waiting**.
+    /// Returns `Ok(None)` when no frame arrives within `timeout`, per the `CaptureBackend`
+    /// contract.
+    ///
+    /// The two are timed at their own places rather than by timing the whole call and subtracting,
+    /// because there are exactly two things this loop does and each is cheap to attribute:
+    /// `poll_frame` either copies a frame or finds none, and everything else here is a sleep. What
+    /// the loop's own clock reads cost is nanoseconds and is deliberately left out of both — a
+    /// number that claimed to account for the last nanosecond would be a worse number.
+    ///
+    /// See [`crate::FrameTimings`] for why the split decides the design.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         if !self.started {
             bail!("WGC capture is not started");
@@ -344,14 +360,19 @@ impl CaptureBackend for WgcCapture {
             .context("WGC capture has no session (already stopped)")?;
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(frame) = session.poll_frame()? {
+            let before = Instant::now();
+            let polled = session.poll_frame()?;
+            self.copying += before.elapsed();
+            if let Some(frame) = polled {
                 return Ok(Some(frame));
             }
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(POLL_INTERVAL.min(deadline - now));
+            let slept = POLL_INTERVAL.min(deadline - now);
+            std::thread::sleep(slept);
+            self.waiting += slept;
         }
     }
 
@@ -381,6 +402,13 @@ impl CaptureBackend for WgcCapture {
         if let Some(session) = self.session.as_mut() {
             session.deliver_textures(textures);
         }
+    }
+
+    fn frame_timings(&self) -> Option<crate::FrameTimings> {
+        Some(crate::FrameTimings {
+            waiting: self.waiting,
+            copying: self.copying,
+        })
     }
 
     fn native_size(&self) -> (u32, u32) {

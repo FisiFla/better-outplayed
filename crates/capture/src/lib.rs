@@ -140,6 +140,21 @@ impl Frame {
     }
 }
 
+/// Where a capture backend's time has gone, in total, since it started.
+///
+/// See [`CaptureBackend::frame_timings`] for why the two are separated rather than summed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameTimings {
+    /// Time spent with no frame to work on: polling the frame pool and sleeping between polls.
+    ///
+    /// This is *not* work. It is the display's refresh interval showing up as idle time inside a
+    /// blocking call, and it is the number that must be subtracted before any claim about the cost
+    /// of capture means anything.
+    pub waiting: Duration,
+    /// Time spent actually converting a frame: the readback and its copy, or the handover blit.
+    pub copying: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioFormat {
     pub sample_rate: u32,
@@ -363,6 +378,22 @@ pub trait CaptureBackend: Send {
     /// paced source, and WGC overrides it to close the frames its pool is holding.
     fn discard_pending(&mut self) -> anyhow::Result<usize> {
         Ok(0)
+    }
+
+    /// How this backend has spent its time since it started: **waiting** for frames, and
+    /// **copying** them.
+    ///
+    /// [`CaptureBackend::next_frame`] is one number to its caller, and one number cannot answer the
+    /// question the whole of Tier 2 rests on: *is the readback the cost?* A backend that spends its
+    /// time waiting for a 60 Hz display reports the same figure as one that spends it copying 33 MB
+    /// out of VRAM, and those two have opposite remedies — one is fixed by removing the copy, the
+    /// other is not fixed by removing anything.
+    ///
+    /// `None` for a backend that does not measure it. A backend that does is expected to account
+    /// for the whole of the time it spends inside `next_frame`: waiting plus copying, with nothing
+    /// unaccounted between them.
+    fn frame_timings(&self) -> Option<FrameTimings> {
+        None
     }
 
     /// Ask this backend to hand frames over as GPU textures instead of copying their pixels to
