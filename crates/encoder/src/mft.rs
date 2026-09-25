@@ -1418,17 +1418,24 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            // Activating is a filter of its own: an encoder this machine lists but cannot instantiate
-            // has nothing to say about media types.
-            // SAFETY: the activation's own method; the transform it returns is dropped with the loop.
-            let Ok(transform) = (unsafe { candidate.ActivateObject::<IMFTransform>() }) else {
-                continue;
+            // **A skip is reported, not swallowed.** The first version of this returned an empty
+            // matrix on a machine with ten encoders and said nothing about why — which is the same
+            // failure this whole task is a story about, so it gets its own rows: a diagnostic that
+            // answers nothing must at least say that it answered nothing.
+            let transform = match unsafe { candidate.ActivateObject::<IMFTransform>() } {
+                Ok(transform) => transform,
+                Err(err) => {
+                    rows.push((format!("{name} :: activation"), format!("{err}")));
+                    continue;
+                }
             };
-            if unsafe {
+            if let Err(err) = unsafe {
                 transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
-            }
-            .is_err()
-            {
+            } {
+                rows.push((
+                    format!("{name} :: the D3D device manager"),
+                    format!("{err}"),
+                ));
                 continue;
             }
             for (index, label) in OUTPUT_TYPE_VARIANTS.iter().enumerate() {
