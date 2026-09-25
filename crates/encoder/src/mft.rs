@@ -16,7 +16,9 @@
 //! A refusal in that handshake is not a detail: it is the answer to whether this design is
 //! viable, and it is far cheaper to learn here than after the encoder is written.
 
+use crate::ffmpeg::MFT_TIMEOUT;
 use anyhow::{bail, Context, Result};
+use localplay_capture::GpuTexture;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -1012,6 +1014,167 @@ mod tests {
                  answer unusable either way",
                 encoder.name
             );
+        }
+    }
+}
+
+
+/// How many textures may be waiting for the hardware encoder.
+///
+/// **Two, and it is derived rather than chosen.** Capture hands out each of its three handover
+/// textures in turn, so the texture given to frame *n* is blitted into again at frame *n + 3*. A
+/// queue of two means the encoder is never more than two frames behind what it was handed, so by
+/// the time capture wants that texture back, the encoder is done with it.
+///
+/// Deepening it would not buy throughput, because the encoder is slower than 60 Hz: the queue fills
+/// and frames are dropped either way. What it would buy is tearing — a texture blitted into while
+/// the encoder is still reading it, which is a corruption that would show up as a torn picture
+/// rather than as an error. Half the ring is what keeps the guarantee true instead of likely.
+const QUEUE_DEPTH: usize = 2;
+
+/// The hardware encoder on its own thread, fed through a queue that never blocks.
+///
+/// `submit` is called from the capture pump, and the encoder is a Media Foundation transform whose
+/// synchronous calls take ~30 ms at 4K. Running it inline — which is what this did first — makes the
+/// pump wait for it, and the pump is what paces capture: measured, that turned a 56.9 fps recording
+/// into 35.0 and dropped 2288 frames of 5700, while the copy it removed was worth 70% of the loop.
+/// So the encoder gets a thread of its own and the pump only hands over textures.
+///
+/// What crosses the boundary is a texture we own, not a frame of pixels: no copy happens here, and
+/// nothing is read back.
+pub struct MftFeed {
+    /// `None` once shut down. Dropping it is the shutdown signal — see [`MftFeed::shutdown`].
+    tx: Option<std::sync::mpsc::SyncSender<GpuTexture>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MftFeed {
+    /// Start the encoder's thread, whose output goes into `out` — the same video queue the pump
+    /// used to write to, so the depth accounting stays in one place.
+    pub fn spawn(out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = std::sync::Arc::clone(&dropped);
+        let handle = std::thread::Builder::new()
+            .name("localplay-mft".to_string())
+            .spawn(move || encode_loop(rx, out, counter))
+            .expect("spawning the hardware encoder thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            dropped,
+        }
+    }
+
+    /// Hand a frame to the encoder. Never blocks, and never queues deeper than [`QUEUE_DEPTH`]: a
+    /// full queue drops the frame and counts it, which is the same bargain the video queue strikes
+    /// when it cannot keep up with ffmpeg.
+    pub fn submit(&self, texture: GpuTexture) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        match tx.try_send(texture) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // The thread is gone, which its own log line explains; the frame is simply not encoded.
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Frames that did not fit the queue and were never encoded.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close the queue and wait for the thread to encode what is already in it, then drain.
+    ///
+    /// **Dropping the sender is the shutdown signal, rather than a message sent down the queue**,
+    /// because a message can be refused by a full queue and a shutdown that can be refused is a
+    /// hang. Closing the sender ends the `recv` loop after the frames already queued have been
+    /// taken, so nothing in flight is lost.
+    pub fn shutdown(&mut self) {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::warn!("the hardware encoder thread panicked");
+            }
+        }
+    }
+}
+
+/// The encoder thread's body.
+fn encode_loop(
+    rx: std::sync::mpsc::Receiver<GpuTexture>,
+    out: std::sync::mpsc::SyncSender<Vec<u8>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    // Opened on the first texture rather than up front, because both the device and the size come
+    // from that texture — and opening it here rather than on the pump takes the open off the
+    // capture path as well.
+    let mut encoder: Option<MftEncoder> = None;
+    let mut pts_ms: i64 = 0;
+
+    while let Ok(texture) = rx.recv() {
+        if encoder.is_none() {
+            match MftEncoder::open_for_texture(texture.as_raw()) {
+                Ok(mut opened) => {
+                    if let Err(err) = opened.start() {
+                        tracing::error!("could not start the hardware encoder: {err:#}");
+                        break;
+                    }
+                    tracing::info!(
+                        encoder = %opened.encoder_name,
+                        format = %opened.input_format,
+                        size = ?opened.size(),
+                        "the hardware encoder is open on its own thread"
+                    );
+                    encoder = Some(opened);
+                }
+                Err(err) => {
+                    // Counted as a drop so the reporting stays honest about frames that reached this
+                    // stage and did not become video.
+                    tracing::error!("could not open the hardware encoder: {err:#}");
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
+        let mft = encoder.as_mut().expect("just opened");
+        // Media time is counted per frame handed over rather than taken from the caller's clock:
+        // what the encoder is being asked to produce is a stream at the configured frame rate, and
+        // the timestamps have to march at that rate whether or not frames were dropped on the way
+        // here. `MftEncoder::push_texture` converts to the 100-nanosecond units Media Foundation
+        // wants.
+        pts_ms += (1000 / FRAME_RATE.0 as i64).max(1);
+        match mft.encode_texture(texture.as_raw(), pts_ms, MFT_TIMEOUT) {
+            Ok(units) if units.is_empty() => {}
+            Ok(units) => {
+                // Blocking, unlike the handover above: this queue is drained by a thread whose job
+                // is to write to ffmpeg, and the pump is no longer waiting behind it.
+                if out.send(units).is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                tracing::warn!("the hardware encoder refused a frame: {err:#}");
+                break;
+            }
+        }
+    }
+
+    // The tail. An asynchronous MFT produces output when it decides to, so the last frames of a
+    // stream only become real when it is drained.
+    if let Some(mut mft) = encoder {
+        match mft.finish(MFT_TIMEOUT) {
+            Ok(tail) if !tail.is_empty() => {
+                if let Err(err) = out.try_send(tail) {
+                    tracing::warn!("the hardware encoder's last frames did not fit the queue: {err}");
+                }
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("draining the hardware encoder failed: {err:#}"),
         }
     }
 }
