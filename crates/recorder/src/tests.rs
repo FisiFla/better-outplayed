@@ -79,6 +79,9 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             vendor: "auto".to_string(),
             codec: "h264".to_string(),
             bitrate_kbps: 2_000,
+            // Off: the pipeline tests drive the rawvideo path, and the hybrid needs
+            // a hardware encoder MFT this host does not have.
+            zero_copy: false,
             fps: FPS,
             // The shipping default. At 64x48 libx264 measures far above 10fps, so the probe
             // cannot reduce the rate here — which is what the plain end-to-end test wants

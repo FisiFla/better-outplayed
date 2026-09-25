@@ -170,6 +170,26 @@ pub struct EncodeSection {
     /// the machine can actually sustain is measured at startup (see `adapt_fps`) and the
     /// lower of the two is used for both the pacer and the encoder child.
     pub fps: u32,
+    /// Hand captured frames to the hardware encoder **as GPU textures**, so their pixels never
+    /// reach this process's memory (default `false`).
+    ///
+    /// What it removes, measured on the 4K box: the capture backend copies 33.2 MB out of VRAM per
+    /// frame for ffmpeg to read back in, and that copy is ~97% of what the pipeline does (`capture=`
+    /// on the periodic line). With this on, a hardware encoder MFT takes the texture directly and
+    /// ffmpeg is told to copy the H.264 that comes out — a few hundred kilobytes a second across the
+    /// pipe instead of gigabytes.
+    ///
+    /// Off by default because it is a **behavioural** change to the shipping encode path, and the
+    /// verification it deserves is a soak on real hardware rather than a test suite: the pieces are
+    /// each proven (the MFT takes 4K ARGB32 from this device, the async loop carries frames, ffmpeg
+    /// reads the bitstream and produces the ring's fragments with a keyframe a second), but no
+    /// recording has been made end to end with it yet.
+    ///
+    /// It needs a hardware encoder — a software one has no MFT to hand a texture to — and the
+    /// texture handover is Media Foundation's, so this is Windows-only. Both are refused at startup
+    /// with the reason rather than silently ignored.
+    #[serde(default)]
+    pub zero_copy: bool,
     /// Measure the sustainable encode rate at startup and record at the lower of that and
     /// `fps` (default `true`).
     ///

@@ -1782,6 +1782,14 @@ impl Engine {
     /// the sources stopped, the `sessions` row ended and (in full-session mode) the session
     /// file written.
     fn run(mut self, commands: Receiver<Command>) -> Store {
+        // What the encoder needs, told to capture before it is started. **One question with one
+        // answer**, because the two halves cannot be allowed to disagree about a recording: an
+        // encoder handed pixels it cannot use refuses them by name, and one expecting a texture and
+        // given none has nothing to encode at all. Asked here rather than at construction because
+        // this is where both exist, and given before `start` because capture remembers the answer
+        // and carries it into the session it builds.
+        self.capture.deliver_textures(self.encoder.accepts_textures());
+
         let mut last_scan = Instant::now();
         // Next storage-policy pass. Measured in wall clock from the last one, because the
         // policy is about a directory that fills at whatever rate the user clips.
@@ -2538,7 +2546,10 @@ fn build_encode_config(
     let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
     let segment_ms = cfg.buffer.segment_time * 1000;
 
-    let encode_cfg = match vendor {
+    // Mutable only on Windows, where the hybrid sets `video` below; the guard is unconditional so
+    // that a configuration this platform cannot honour is refused here rather than at capture time.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut encode_cfg = match vendor {
         Some(vendor) => EncodeConfig::hardware(
             codec,
             vendor,
@@ -2580,6 +2591,37 @@ fn build_encode_config(
             }
         }
     };
+
+    // The hybrid, when it was asked for and this machine can do it. Both refusals happen here
+    // rather than later, because both are *configuration* contradictions and a recording that
+    // silently ran a different pipeline than the one configured is worse than one that does not
+    // start: this project has already paid for a quiet divergence between what was asked for and
+    // what ran (issues #1 and #2).
+    if cfg.encode.zero_copy {
+        if vendor.is_none() {
+            bail!(
+                "encode.zero_copy needs a hardware encoder: the whole point is to hand the captured \
+                 texture to the encoder's own MFT, and a software encoder has no MFT to hand it to. \
+                 Set `vendor`, or turn the key off."
+            );
+        }
+        #[cfg(not(windows))]
+        bail!(
+            "encode.zero_copy is a Windows path: the texture handover is Media Foundation's encoder \
+             MFT, and there is no equivalent here. Turn the key off."
+        );
+        #[cfg(windows)]
+        {
+            encode_cfg.video = localplay_encoder::VideoInput::EncodedBitstream;
+            // Said out loud, with the consequence, because this changes what the child is told to
+            // do with the video: it copies rather than encodes, and the keyframe interval that used
+            // to be ffmpeg's is now the MFT's.
+            tracing::info!(
+                "zero-copy: captured textures go straight to the hardware encoder, and ffmpeg \
+                 copies the H.264 instead of encoding it"
+            );
+        }
+    }
 
     // The rawvideo pipe is declared from `source_size`; if it did not equal the backend's
     // native size ffmpeg would mis-read every frame. This derives it from `native_size`,

@@ -91,6 +91,24 @@ adapt_fps = true
 # 33 MB, at 1080p it is 8 MB.
 output_size = ""
 
+# Hand captured frames to the hardware encoder as GPU textures, so their pixels never
+# reach this process's memory. Default: false.
+#
+# What it removes, measured on this project's 4K box: the capture path copies 33.2 MB out
+# of VRAM for every frame, which is about 97% of what the pipeline does while recording
+# (`capture=` on the debug line). With this on, a hardware encoder MFT takes the captured
+# texture directly and ffmpeg is told to copy the H.264 that comes out - a few hundred
+# kilobytes a second across the pipe instead of gigabytes.
+#
+# Two things it needs, both refused at startup rather than ignored: a hardware `vendor`
+# (a software encoder has no MFT to hand a texture to), and Windows (the handover is
+# Media Foundation's). It also requires `output_size` to be the capture size: ffmpeg is
+# copying the video rather than encoding it, so it cannot scale it, and scaling would mean
+# decoding, which would mean the pixels this mode exists to keep out of memory.
+#
+# It changes the encode path, so it is off until a soak on real hardware says otherwise.
+zero_copy = false
+
 [audio]
 enabled = true
 source = "loopback"
