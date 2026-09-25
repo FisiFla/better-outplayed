@@ -523,13 +523,15 @@ fn input_subtypes(transform: &IMFTransform) -> Vec<String> {
 /// is the *same byte order* Windows Graphics Capture delivers as BGRA8, so an encoder that lists it
 /// can take a captured texture without a colour conversion — which is not obvious from the name.
 fn describe_subtype(guid: &windows::core::GUID) -> String {
-    let known: [(&windows::core::GUID, &str); 6] = [
+    let known: [(&windows::core::GUID, &str); 8] = [
         (&MFVideoFormat_NV12, "NV12"),
         (&MFVideoFormat_ARGB32, "ARGB32"),
         (&MFVideoFormat_RGB32, "RGB32 (BGRA byte order — what WGC delivers)"),
         (&MFVideoFormat_YUY2, "YUY2"),
         (&MFVideoFormat_P010, "P010"),
         (&MFVideoFormat_H264, "H264"),
+        (&MFVideoFormat_HEVC, "HEVC"),
+        (&MFVideoFormat_HEVC_ES, "HEVC_ES"),
     ];
     for (candidate, name) in known {
         if candidate == guid {
@@ -1389,6 +1391,218 @@ fn prepare_transform(
     unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
         .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
     Ok(())
+}
+
+/// The attributes of a media type that matter here, as one line.
+fn describe_media_type(media_type: &IMFMediaType) -> String {
+    // SAFETY: each call reads one attribute from a type this function does not own and does not free.
+    let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }
+        .map(|guid| describe_subtype(&guid))
+        .unwrap_or_else(|_| "<no subtype>".to_string());
+    let size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .map(|packed| format!("{}x{}", packed >> 32, packed & 0xffff_ffff))
+        .unwrap_or_else(|_| "-".to_string());
+    let rate = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) }
+        .map(|packed| format!("{}fps", packed >> 32))
+        .unwrap_or_else(|_| "-".to_string());
+    let profile = unsafe { media_type.GetUINT32(&MF_MT_MPEG2_PROFILE) }
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "-".to_string());
+    let level = unsafe { media_type.GetUINT32(&MF_MT_MPEG2_LEVEL) }
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "-".to_string());
+    let bitrate = unsafe { media_type.GetUINT32(&MF_MT_AVG_BITRATE) }
+        .map(|value| format!("{}kbps", value / 1000))
+        .unwrap_or_else(|_| "-".to_string());
+    format!("{subtype}  {size}  {rate}  profile={profile} level={level} bitrate={bitrate}")
+}
+
+/// What an encoder says its own output and input types are.
+///
+/// **The direct question, and the one to ask before guessing at attributes.** `0xC00D6D76` is
+/// `MF_E_UNSUPPORTED_D3D_TYPE` — Media Foundation's "the type you asked for is not one this GPU device
+/// supports" — and it is the same error, at the same `SetOutputType` call, that OBS users hit with
+/// NVENC. The documented way to find out what it accepts is to ask it: `GetOutputAvailableType`
+/// returns the types the transform offers, *with the attributes it wants on them*, rather than a
+/// caller's idea of what a 4K HEVC type looks like.
+///
+/// An asynchronous MFT refuses to enumerate *input* types — which is why the input negotiation
+/// elsewhere is done by trying `SetInputType` — so an input failure here is expected and is reported
+/// as such rather than treated as a finding. Encoders that refuse this codec's output type at all are
+/// skipped: the matrix above has already said so.
+pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
+    // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
+    let rows = (|| -> Result<Vec<(String, String)>> {
+        let device = create_capture_kind_device()?;
+        let manager = create_device_manager(&device)?;
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: the out-parameters this call fills, and the matching free below.
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE,
+                None,
+                None,
+                &mut activates,
+                &mut count,
+            )
+        }
+        .context("MFTEnumEx for the available types")?;
+        if activates.is_null() || count == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `activates` points at `count` initialised entries written by the call above.
+        let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        let mut rows = Vec::new();
+        for candidate in candidates.iter().flatten() {
+            let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string());
+            let transform = match unsafe { candidate.ActivateObject::<IMFTransform>() } {
+                Ok(transform) => transform,
+                Err(err) => {
+                    rows.push((format!("{name} :: activation"), format!("{err}")));
+                    continue;
+                }
+            };
+            if let Err(err) = prepare_transform(candidate, &transform, &manager) {
+                rows.push((format!("{name} :: preparation"), format!("{err:#}")));
+                continue;
+            }
+            let Ok(media_type) = (unsafe { build_output_type(codec, size, 0) }) else {
+                continue;
+            };
+            // SAFETY: the transform is live and the type outlives the call. A refusal here means this
+            // encoder is not a candidate for this codec, which the matrix already reported.
+            if unsafe { transform.SetOutputType(0, &media_type, 0) }.is_err() {
+                continue;
+            }
+            for output in [true, false] {
+                let label = if output { "output" } else { "input" };
+                for index in 0..12u32 {
+                    // SAFETY: both are the transform's own enumeration methods.
+                    let next = if output {
+                        unsafe { transform.GetOutputAvailableType(0, index) }
+                    } else {
+                        unsafe { transform.GetInputAvailableType(0, index) }
+                    };
+                    match next {
+                        Ok(offered) => rows.push((
+                            format!("{name} :: {label} #{index}"),
+                            describe_media_type(&offered),
+                        )),
+                        Err(err) => {
+                            // Index 0 failing is the whole answer for that direction.
+                            if index == 0 {
+                                rows.push((format!("{name} :: {label} types"), format!("{err}")));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
+        unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+        Ok(rows)
+    })();
+    // SAFETY: balances the `MFStartup` above.
+    unsafe { let _ = MFShutdown(); }
+    rows
+}
+
+/// Whether an encoder wants its **input** type declared before its **output** type.
+///
+/// The rule this project followed — output first, because an encoder will not negotiate an input type
+/// until it knows what it is producing — was measured on the H.264 encoder. But the error being chased
+/// names the *input* type, and one NVENC report of the same `0xC00D6D76` describes fixing it by
+/// configuring the source, then the transform, then the codec. So the order is a variable, not an
+/// assumption: this tries all four combinations of order and device manager and reports each.
+pub fn probe_ordering(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
+    // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
+    let rows = (|| -> Result<Vec<(String, String)>> {
+        let device = create_capture_kind_device()?;
+        let manager = create_device_manager(&device)?;
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: the out-parameters this call fills, and the matching free below.
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE,
+                None,
+                None,
+                &mut activates,
+                &mut count,
+            )
+        }
+        .context("MFTEnumEx for the ordering test")?;
+        if activates.is_null() || count == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `activates` points at `count` initialised entries written by the call above.
+        let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        let mut rows = Vec::new();
+        for candidate in candidates.iter().flatten() {
+            let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unnamed MFT>".to_string());
+            for (use_manager, input_first) in
+                [(true, false), (true, true), (false, false), (false, true)]
+            {
+                let label = format!(
+                    "{name} :: {} manager, {} first",
+                    if use_manager { "with the D3D" } else { "with no" },
+                    if input_first { "input" } else { "output" }
+                );
+                let Ok(transform) = (unsafe { candidate.ActivateObject::<IMFTransform>() }) else {
+                    rows.push((label, "could not be activated".to_string()));
+                    continue;
+                };
+                if use_manager {
+                    if let Err(err) = prepare_transform(candidate, &transform, &manager) {
+                        rows.push((label, format!("preparation failed: {err}")));
+                        continue;
+                    }
+                } else {
+                    // An asynchronous transform must be unlocked whether or not it is given a device,
+                    // and setting the attribute on a synchronous one is harmless.
+                    if let Ok(attributes) = unsafe { transform.GetAttributes() } {
+                        let _ = unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) };
+                    }
+                }
+                let verdict = (|| -> Result<()> {
+                    if input_first {
+                        let input = video_type(&MFVideoFormat_NV12, size)?;
+                        unsafe { transform.SetInputType(0, &input, 0) }
+                            .context("SetInputType(NV12)")?;
+                    }
+                    let output = unsafe { build_output_type(codec, size, 0)? };
+                    unsafe { transform.SetOutputType(0, &output, 0) }.context("SetOutputType")?;
+                    if !input_first {
+                        let input = video_type(&MFVideoFormat_NV12, size)?;
+                        unsafe { transform.SetInputType(0, &input, 0) }
+                            .context("SetInputType(NV12)")?;
+                    }
+                    Ok(())
+                })();
+                rows.push((
+                    label,
+                    match verdict {
+                        Ok(()) => "ACCEPTED".to_string(),
+                        Err(err) => format!("{err:#}"),
+                    },
+                ));
+            }
+        }
+        // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
+        unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
+        Ok(rows)
+    })();
+    // SAFETY: balances the `MFStartup` above.
+    unsafe { let _ = MFShutdown(); }
+    rows
 }
 
 /// Which output-media-type attribute an encoder is objecting to, asked one at a time.

@@ -100,6 +100,20 @@ fn main() -> anyhow::Result<()> {
         // (`0xC00D6D76`, "the input type is not supported for D3D device"). Both are asked here, of
         // the same device, so the answer is about the format rather than about a guess — and NV12 is
         // what the capture handover will have to produce for the HEVC path to exist at all.
+        // **The question that should have come first: what does the encoder say it wants?**
+        // 0xC00D6D76 is MF_E_UNSUPPORTED_D3D_TYPE, and the documented way to find out which type it
+        // will take is to ask it rather than to guess at attributes.
+        if codec == localplay_encoder::VideoCodec::Hevc {
+            println!("\n--- what the encoder says it offers ---");
+            for (what, value) in localplay_encoder::mft::probe_available_types(codec, size)? {
+                println!("  {what}\n     -> {value}");
+            }
+            println!("\n--- and whether the order of the two types matters ---");
+            for (what, value) in localplay_encoder::mft::probe_ordering(codec, size)? {
+                println!("  {what}\n     -> {value}");
+            }
+        }
+
         // **And if the encoder still will not have it, find out what it objects to.** One attribute
         // at a time, because three guesses have already failed and a fourth would be luck.
         if codec == localplay_encoder::VideoCodec::Hevc {
