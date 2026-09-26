@@ -58,7 +58,12 @@
     "windows": {
       "webviewInstallMode": {
         "type": "offlineInstaller"
-      }
+      },
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    },
+    "macOS": {
+      "hardenedRuntime": true
     }
   }
 }

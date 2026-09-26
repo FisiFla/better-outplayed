@@ -413,8 +413,8 @@ signing step. **The app was not launched to find out what Gatekeeper does with i
 
 | # | Gap | Consequence | Where it has to be fixed |
 |---|---|---|---|
-| 5.1 | **No code signing.** Neither the Windows installer nor the macOS app is signed with a code-signing certificate | Windows SmartScreen shows "unknown publisher" and hides the app behind *More info → Run anyway*; macOS Gatekeeper refuses the `.app` outright (§4.4) | a Windows Authenticode certificate for NSIS/MSI, an Apple Developer ID + notarisation for macOS (`bundle.macOS.signingIdentity`, `APPLE_CERTIFICATE`/`APPLE_ID` for notarisation) |
-| 5.2 | **No notarisation**, macOS-only, and the same certificate work | an unsigned `.app` cannot be distributed at all, only run locally | the macOS signing flow in Tauri's documentation; needs a paid Apple Developer account |
+| 5.1 | **No code signing.** Neither the Windows installer nor the macOS app is signed with a code-signing certificate | Windows SmartScreen shows "unknown publisher" and hides the app behind *More info → Run anyway*; macOS Gatekeeper refuses the `.app` outright (§4.4) | a Windows Authenticode certificate for NSIS/MSI, an Apple Developer ID + notarisation for macOS (`bundle.macOS.signingIdentity`, `APPLE_CERTIFICATE`/`APPLE_ID` for notarisation)  §5.9 has the exact keys and variables, verified against the schema |
+| 5.2 | **No notarisation**, macOS-only, and the same certificate work | an unsigned `.app` cannot be distributed at all, only run locally | the macOS signing flow in Tauri's documentation; needs a paid Apple Developer account  §5.9 has the credential names |
 | 5.3 | **No auto-update mechanism** — *deferred, not forgotten.* Decided 2026-09-26: it is not part of phase 5 and becomes its own later phase, with GitHub Releases as the intended mechanism rather than a hosted service. `bundle.createUpdaterArtifacts` is off and the plugin is not installed | every release is a manual download until then; a signed updater is also *not possible* before 5.1–5.2, since an unsigned update is exactly the attack the signature exists to prevent | `@tauri-apps/plugin-updater`, a signing keypair, and GitHub Releases |
 | 5.4 | ~~**The installer may need the network.**~~ *Decided and set 2026-09-26:* `bundle.windows.webviewInstallMode` is now `offlineInstaller`, so the installer embeds the WebView2 runtime and the install touches no network at all. Resolved, and deliberately at the cost of size — the installer carries ~127 MB more on top of the ~201 MiB of ffmpeg sidecars, which principle 1 is worth | — | — |
 | 5.5 | **The icon is a placeholder** (§6) | it is a teal play triangle on near-black, generated at scaffold time; shipping it would look unfinished | real artwork, then `npm run tauri -- icon` |
@@ -424,6 +424,37 @@ signing step. **The app was not launched to find out what Gatekeeper does with i
 
 Not on this list, because it is done: the sidecars *are* bundled, and discovery *does* look
 where they land (§2, §4.1–4.2).
+
+---
+
+## 5.9 The signing path, ready for a certificate
+
+**Nothing below is active.** No certificate exists, so the build is unsigned and §5.1/5.2 stay open.
+This is the shape to reach for on the day one does — the keys are taken from the schema `tauri build`
+itself validates against (`node_modules/@tauri-apps/cli/config.schema.json`) and the variables from
+Tauri's own signing guide, not from memory, because a wrong key here fails silently rather than
+loudly.
+
+| | macOS | Windows |
+|---|---|---|
+| what is needed | a **Developer ID Application** certificate, and a paid Apple Developer account for notarisation | an **Authenticode** certificate |
+| the config key | `bundle.macOS.signingIdentity` — the name of the certificate's keychain entry | `bundle.windows.certificateThumbprint` — the certificate, in the Windows store |
+| already set here | `bundle.macOS.hardenedRuntime = true` | `bundle.windows.digestAlgorithm = "sha256"`, `timestampUrl` |
+| CI variables | `APPLE_CERTIFICATE` (base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`; to notarise, `APPLE_ID` + `APPLE_PASSWORD` (an *app-specific* password) + `APPLE_TEAM_ID`, or the more CI-stable `APPLE_API_ISSUER` / `APPLE_API_KEY` / `APPLE_API_KEY_PATH` | the certificate in the store, selected by thumbprint |
+| how to check it worked | `security find-identity -v -p codesigning` to find the identity; then `codesign -dv --verbose=4 <app>` and `spctl -a -vvv <app>`, which must answer *accepted, source=Notarized Developer ID* | `signtool verify /pa /v <installer>`, and SmartScreen stops hiding it behind *unknown publisher* |
+
+**Nothing about the build command changes.** Tauri signs and, given the Apple credentials, notarises
+automatically once those variables are in the environment — and since `@tauri-apps/cli@2.0.0-rc.4` it
+also infers the identity from `APPLE_CERTIFICATE`, so a CI job needs no `signingIdentity` at all.
+
+**A free half-measure worth knowing about.** `signingIdentity: "-"` signs *ad-hoc*: no Apple account,
+no cost, and it prevents the *"app is damaged and can't be opened"* error that a wholly unsigned
+`.app` produces on some macOS versions. It is **not** notarisation, so the "unidentified developer"
+prompt remains. Worth enabling only if that prompt turns out to be worse than nothing — since it is a
+one-line change either way, it is not made here.
+
+The reference for all of it is [macOS Code
+Signing](https://v2.tauri.app/distribute/sign/macos/).
 
 ---
 
