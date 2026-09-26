@@ -1635,12 +1635,15 @@ mod tests {
             Deps { bins: None, ..self.deps() }
         }
 
-        /// Index a clip whose file is never opened. Enough for the list, favourite, policy
-        /// and validation tests.
+        /// Index a clip whose file exists on disk but is never opened or decoded — an
+        /// empty stand-in. Enough for the list, favourite, policy and validation
+        /// tests. A test about a *missing* file removes it explicitly after this.
         fn add_row(&self, name: &str, started_at_ms: u64, duration_ms: u64, size_bytes: u64) -> i64 {
+            let path = self.paths.clips_dir.join(name);
+            std::fs::write(&path, b"").unwrap();
             self.store
                 .insert_clip(&NewClip {
-                    path: self.paths.clips_dir.join(name),
+                    path,
                     started_at_ms,
                     duration_ms,
                     size_bytes,
@@ -1800,6 +1803,33 @@ mod tests {
     #[test]
     fn an_empty_index_lists_nothing() {
         assert!(list_clips(&Fixture::new().deps()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_clips_leaves_out_rows_whose_files_are_gone_but_keeps_the_rows() {
+        // The state the first instrumented run found on a real install: a cleanup
+        // had removed files without their rows, and the listing handed every dead
+        // row to the window — one asset-protocol error and one ffmpeg thumbnail
+        // process per dead clip. The listing must not name a file that is gone.
+        let f = Fixture::new();
+        let live = f.add_row("here.mp4", 0, 1_000, 10);
+        let gone = f.add_row("gone.mp4", 0, 1_000, 10);
+        std::fs::remove_file(f.paths.clips_dir.join("gone.mp4")).unwrap();
+
+        let clips = list_clips(&f.deps()).unwrap();
+
+        assert_eq!(clips.len(), 1, "a row whose file is gone is not a clip");
+        assert_eq!(clips[0].id, live, "the row whose file is there still lists");
+        assert_eq!(
+            f.store.list_clips().unwrap().len(),
+            2,
+            "skipped, not deleted: a file can be temporarily unavailable, and \
+             silently rewriting the library is not the listing's business"
+        );
+        assert!(
+            find_clip(&f.store, gone).is_ok(),
+            "the gone row is still in the index for when its file comes back"
+        );
     }
 
     #[test]
@@ -2185,6 +2215,31 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_refuses_a_clip_whose_file_is_gone_before_anything_is_spawned() {
+        // A dead row must never reach ffmpeg: the UI asks per clip and retries, so
+        // one missing file used to mean a process per attempt. No-ffmpeg deps prove
+        // the guard runs before the binaries are even consulted — nothing can be
+        // spawned for a clip that cannot produce a frame.
+        let f = Fixture::new();
+        let id = f.add_row("vanished.mp4", 0, 2_000, 10);
+        std::fs::remove_file(f.paths.clips_dir.join("vanished.mp4")).unwrap();
+
+        let err = thumbnail(&f.deps_without_ffmpeg(), id, 100).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains(&format!("clip #{id}")),
+            "the message must name the clip: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("is gone"),
+            "the message must say the file is gone: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn a_thumbnail_ffmpeg_cannot_produce_names_the_clip_and_the_timestamp() {
         // A row pointing at something that is not a video: ffmpeg fails, and the message has
         // to say which clip and which frame — "ffmpeg had nothing to read" is otherwise
@@ -2287,6 +2342,10 @@ mod tests {
     fn delete_reports_a_row_whose_file_was_already_gone() {
         let f = Fixture::new();
         let id = f.add_row("missing.mp4", 0, 1_000, 10);
+        // The state under test: the file was removed without its row — a cleanup
+        // that deleted files but left the index alone did exactly this on a real
+        // install, which is what the missing-file guards elsewhere are for.
+        std::fs::remove_file(f.paths.clips_dir.join("missing.mp4")).unwrap();
 
         let outcome = delete_clip(&f.deps(), id).unwrap();
 

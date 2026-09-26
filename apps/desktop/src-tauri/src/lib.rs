@@ -1133,6 +1133,9 @@ mod tests {
         let app_dir = dir.path().join("localplay");
 
         let first = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        // The listing only names files that are there, so the row needs its file —
+        // an empty stand-in, never opened, like the commands tests' `add_row`.
+        std::fs::write(app_dir.join("clips").join("kept.mp4"), b"").unwrap();
         let id = {
             let store = first.store.lock().unwrap();
             store
