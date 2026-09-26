@@ -303,9 +303,11 @@ stays manual.
       default), the session IPC and a desktop session view that plots the markers and cuts a
       clip out of a finished session. What keeps the box unticked is **packaging**: bundling
       and the sidecar resource mapping are configured and a macOS `.app` was built and
-      inspected, but **code signing, notarisation and a Windows install are still missing** —
-      see [`docs/packaging.md`](docs/packaging.md). The auto-updater is **deferred to a later
-      phase** with GitHub Releases as the intended mechanism, not missing from this one.
+      inspected, and the **Windows installer now builds, installs, uninstalls and reinstalls on
+      real hardware** ([`docs/packaging.md`](docs/packaging.md) §3.5 — measured 2026-09-26, first
+      time any of it was observed rather than inferred). What is still missing is **code signing
+      and notarisation**; the auto-updater is **deferred to a later phase** with GitHub Releases
+      as the intended mechanism, not missing from this one.
 
 > **Caveat on every `[x]` above.** The Windows-only surface has now run on Windows: on
 > 2026-09-24 the whole Rust workspace was built **and its test suite executed** on the box,

@@ -202,7 +202,7 @@ not from a run:
 
 ### 3.3 Two Windows-specific things a release has to decide
 
-Both are read out of the NSIS template; neither has been observed on Windows.
+Both *were* read out of the NSIS template; §3.5 records what they actually did when the installer was first built and run on 2026-09-26.
 
 1. ~~**The install directory is also the application's data directory.**~~ *Decided and set
    2026-09-26:* the installer gets its own directory. `productName` is now `better-outplayed`
@@ -225,6 +225,39 @@ On the Windows box, the installer's contents can be listed without running eithe
 app (`7z l localplay_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
 first-pass check that `binaries\ffmpeg.exe` is inside. `npm run sidecars:check` already prints
 what was embedded at build time, and that *is* verified here (§4.2).
+
+
+### 3.5 What building and installing actually did
+
+Run on the Windows box on 2026-09-26 — the first time any of §3.1–3.3 was observed rather than read
+out of a template. The working directory was `C:\Users\Flavio\localplay-ram`, and the machine
+belongs to the maintainer, so the install was real and left installed at the end.
+
+* **The build.** The machine had no node at all. It was fetched as a *portable zip* rather than
+  installed — `node-v22.12.0-win-x64` extracted into the working directory, `PATH` and npm's cache
+  set per run — so nothing was added to the system. Then `cargo xtask sidecars fetch --target
+  x86_64-pc-windows-msvc` verified and extracted both sidecars, `npm ci` installed the frontend,
+  and the bundle produced **`better-outplayed_0.1.0_x64-setup.exe`, 262.6 MB**. That size is the
+  ~201 MiB of sidecars plus the embedded WebView2 that §5.4's `offlineInstaller` decision buys, and
+  it is the first Windows installer this project has ever produced.
+* **The installer.** Silent, per-user, **no UAC prompt**, 21 seconds. It landed in
+  `%LOCALAPPDATA%\better-outplayed` — the separate directory §3.3 decided on — holding
+  `localplay.exe` (13989 KB), `uninstall.exe` (77 KB) and `binaries\{ffmpeg,ffprobe}.exe`
+  (100.5 MB and 100.3 MB). So `productName` really does move the install directory while
+  `mainBinaryName` keeps the executable's name, and the §2 resource mapping really does put the
+  sidecars where discovery looks for them.
+* **The application.** Launched through `schtasks /it`, because it is a tray application and needs
+  a real session: pid 23320, 37.5 MB working set, still running at 30 seconds. Killed afterwards.
+* **The uninstall.** Silent. The installation directory was gone afterwards, and the Start Menu
+  shortcut (`better-outplayed.lnk`) with it.
+* **The user's data.** Untouched by all of it. `clips\`, `thumbnails\`, `scratch\`, `config.toml`
+  and a 28 KB `localplay.db` all survived the uninstall, and the one recording in `clips\` was
+  still there. §3.2 called the "delete app data" checkbox misleading *in the safe direction*; it is,
+  and now it is measured rather than reasoned.
+* **Reinstall** after the silent uninstall reproduced all of the above with the data still intact.
+
+What this still does not cover: an **upgrade** over a *different* version (only the same build was
+reinstalled), and the macOS `.app`, which remains unlaunched (§5.8).
 
 ---
 
@@ -385,9 +418,9 @@ signing step. **The app was not launched to find out what Gatekeeper does with i
 | 5.3 | **No auto-update mechanism** — *deferred, not forgotten.* Decided 2026-09-26: it is not part of phase 5 and becomes its own later phase, with GitHub Releases as the intended mechanism rather than a hosted service. `bundle.createUpdaterArtifacts` is off and the plugin is not installed | every release is a manual download until then; a signed updater is also *not possible* before 5.1–5.2, since an unsigned update is exactly the attack the signature exists to prevent | `@tauri-apps/plugin-updater`, a signing keypair, and GitHub Releases |
 | 5.4 | ~~**The installer may need the network.**~~ *Decided and set 2026-09-26:* `bundle.windows.webviewInstallMode` is now `offlineInstaller`, so the installer embeds the WebView2 runtime and the install touches no network at all. Resolved, and deliberately at the cost of size — the installer carries ~127 MB more on top of the ~201 MiB of ffmpeg sidecars, which principle 1 is worth | — | — |
 | 5.5 | **The icon is a placeholder** (§6) | it is a teal play triangle on near-black, generated at scaffold time; shipping it would look unfinished | real artwork, then `npm run tauri -- icon` |
-| 5.6 | **No uninstaller verification on Windows** — nobody has installed, upgraded or uninstalled localplay | §3.1–3.3 are read out of the template, not observed: a broken uninstaller, a file left in `$INSTDIR`, a Start Menu shortcut that survives, or a data-deleting bug would all be found by the first user | install → run → uninstall → reinstall on the Windows box, and correct §3.3 |
+| 5.6 | **No uninstaller verification on Windows** — *done 2026-09-26, see §3.5.* Installed, run, uninstalled and reinstalled silently on the box | the install lands where §3.3 said, both sidecars are inside it, the app launches and stays up, the uninstall removes the installation and the shortcut, and **the user's clips and index survive throughout** — the misleading checkbox errs in the safe direction, as §3.2 inferred | still open: an upgrade across *different* versions, and MSI |
 | 5.7 | **No CI packaging job** — *half done 2026-09-26.* A `package` job on `macos-latest` now fetches the sidecars, builds the frontend, runs `tauri build --bundles app` and asserts the bundle actually carries the ffmpeg sidecar | bundling is exercised on every push, and the bundle configuration — the identifier, `webviewInstallMode`, the resource mapping — is read by something rather than only by hand. Still open: the same for the NSIS installer, which needs a Windows runner and is its own decision | — |
-| 5.8 | **The `.app` has never been launched**, and the installer has never been run | everything in §4 is a statement about the artifact as *files* | a normal login session on the two platforms, which is out of scope for a headless task (§7) |
+| 5.8 | **The `.app` has never been launched** — *the installer half is done 2026-09-26*: built on Windows and run in a real session 1, where it stayed up for 30 seconds (§3.5) | the macOS half of this row remains a statement about the artifact as *files* | a login session on macOS, which is out of scope for a headless task (§7) |
 
 Not on this list, because it is done: the sidecars *are* bundled, and discovery *does* look
 where they land (§2, §4.1–4.2).
