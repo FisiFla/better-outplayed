@@ -46,9 +46,18 @@ on the box became harmless — **no database surgery was needed**.
 
 ## What is left
 
-1. **Verify the fix on the box** — the run was started but its log was never read (the box appeared
-   unresponsive to SSH at the end). Expected: **no `ERROR ...asset` lines**, one `warn` naming how
-   many clips are missing, `debug` lines per missing file, and a quiet run.
+1. ~~**Verify the fix on the box**~~ — **done, and it holds.** With the box awake, the log from the
+   rebuilt app reads exactly as predicted:
+
+   ```
+   INFO  clip index ...: 13 clips, 1325281741 bytes
+   DEBUG skipping clip #13 ... is gone          (x12)
+   WARN  12 of 13 indexed clips are missing from disk and were left out of the listing
+   ```
+
+   **No `ERROR tauri::protocol::asset` lines at all**, where the previous run had one per dead clip.
+   With the listing filtered the window never asks for those assets or thumbnails, so no ffmpeg is
+   spawned and the storm cannot happen. The app ran (pid 24728, 28 MB, down from 37 MB).
 2. **Two tests** — the debugging skill wants a failing test *before* a fix and both fixes were
    written first. `commands.rs`'s own test module is the home: it drives real command bodies against
    a real SQLite store (see its module docs).
