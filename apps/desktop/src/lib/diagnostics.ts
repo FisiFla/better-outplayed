@@ -10,7 +10,7 @@
  * Best effort by construction: `invoke` can be the very thing that is failing, so nothing here
  * throws, and a failure while reporting a failure does not recurse.
  */
-import { invoke } from '@tauri-apps/api/core';
+import { tauriIpc } from './ipc';
 
 let reporting = false;
 
@@ -19,7 +19,7 @@ function report(level: 'error' | 'warn' | 'info', message: string, detail: strin
     return;
   }
   reporting = true;
-  void Promise.resolve(invoke('log_from_frontend', { level, message, detail }))
+  void Promise.resolve(tauriIpc.logFromFrontend(level, message, detail))
     .catch(() => {})
     .finally(() => {
       reporting = false;

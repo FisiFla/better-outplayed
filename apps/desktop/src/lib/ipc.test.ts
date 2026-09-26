@@ -111,6 +111,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.recordingStatus()),
       await wireName(() => tauriIpc.clipNow()),
       await wireName(() => tauriIpc.appStatus()),
+      await wireName(() => tauriIpc.logFromFrontend('info', 'a message', 'a detail')),
     ];
 
     expect([...reached].sort()).toEqual([...registeredCommands()].sort());

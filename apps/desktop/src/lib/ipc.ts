@@ -73,6 +73,14 @@ export interface ClipSource {
    * window does. Read once when the window opens — none of it changes while it runs.
    */
   appStatus(): Promise<AppStatus>;
+  /**
+   * Write a frontend error into the application's log, beside the backend's own.
+   *
+   * It is on this surface rather than called through `invoke` directly because the suite below
+   * cross-checks these methods against the handler list in `lib.rs`: a command reached one way on
+   * one side and another way on the other is exactly what that guard exists to catch.
+   */
+  logFromFrontend(level: 'error' | 'warn' | 'info', message: string, detail: string): Promise<void>;
   /** An `asset:` URL for an absolute path, for `<video>` and `<img>`. */
   assetUrl(path: string): string;
 }
@@ -101,6 +109,8 @@ export const tauriIpc: ClipSource = {
   recordingStatus: () => invoke<RecordingStatus>('recording_status'),
   clipNow: () => invoke<RecordedClip>('clip_now'),
   appStatus: () => invoke<AppStatus>('app_status'),
+  logFromFrontend: (level, message, detail) =>
+    invoke<void>('log_from_frontend', { level, message, detail }),
   assetUrl: (path) => convertFileSrc(path),
 };
 
