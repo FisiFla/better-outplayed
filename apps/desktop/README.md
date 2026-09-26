@@ -45,7 +45,10 @@ apps/desktop/
         ├── background.rs     # the tray menu, the hotkey status, the close rule, autostart —
         │                     #   all of it plain functions, plus their tests
         ├── commands.rs       # everything the commands actually do, plus its tests
-        └── config.rs         # the `[storage]` / `[hotkeys]` / `[app]` half of config.toml
+        └── config.rs         # the desktop half of config.toml: the `[storage]` /
+                              #   `[hotkeys]` / `[app]` reader, the settings panel's
+                              #   `[storage]` / `[encode]` / `[mic]` / `[games]` reader,
+                              #   and the comment-preserving writer
 ```
 
 ## The IPC commands
@@ -58,14 +61,16 @@ with **no Tauri runtime and no window**.
 
 | command | delegates to | notes |
 |---|---|---|
-| `list_clips()` | `Store::list_clips` | Re-ordered by `created_at` (wall clock), not the store's `started_at` (media time, not comparable across captures). Newest first, id breaks ties. |
-| `storage_stats()` | `Store`, `plan_cleanup` | Usage, the cap and age limit, and the policy's verdict — including whether the favourites alone exceed the cap. |
+| `list_clips()` | `Store::list_clips` | Re-ordered by `created_at` (wall clock), not the store's `started_at` (media time, not comparable across captures). Newest first, id breaks ties. **Rows whose file is gone are left out** — the index is a cache and the filesystem is the truth; the rows stay, so a temporarily unavailable file comes back. |
+| `storage_stats()` | `Store`, `plan_cleanup` | Usage, the cap and age limit, and the policy's verdict — including whether the favourites alone exceed the cap. Counted over the clips **on disk**, from the same function `list_clips` uses, with `missing_count` naming the rows that leaves out. |
 | `set_favourite(id, favourite)` | `Store::set_favourite` | Rejects an id with no row rather than reporting a no-op as success. |
 | `trim_clip(id, start_ms, end_ms)` | `localplay_media::edit::trim_lossless` | A **stream copy** (`-c copy`), never a re-encode. Writes `<name>.trim-<start>-<end>.<ext>` beside the original, probes the result and indexes it. |
 | `thumbnail(id, at_ms)` | `localplay_media::edit::thumbnail` | One JPEG in the thumbnails cache, reused on the next request. |
 | `delete_clip(id)` | `Store::delete_clip_returning_path` | Row first, then the file (spec §8.2). Reports an orphan rather than hiding a failed unlink. |
 
 | `start_recording`, `stop_recording`, `recording_status`, `clip_now` | `RecorderHost` | The recording engine the CLI also drives. `clip_now` waits for the post-roll, so it — like a start — runs off the webview thread. |
+| `get_settings()` | `config::read_effective_settings` | The settings panel's values, with per-key provenance for the ones that fell back to the example. Applies **the engine's rules and nothing more**: a value the recorder loads has to render, or the panel that repairs the file cannot open. |
+| `update_settings(update)` | `config::write_settings` | Every field optional. Validates, proves the new clips directory usable **before** writing it, then returns `applied` / `restart_required`. The panel's own stricter policy (the fps band, the clips-dir hygiene) lives here; engine keys take effect on the next start. |
 | `app_status()` | `AppState` | The clip hotkey (the chord, and whether a listener is really installed), where `config.toml` was read from, and the sentence that explains closing the window. Read once; none of it changes while the process runs. |
 
 Failures are a serialisable `CommandError { code, message }` with a machine-readable code
@@ -84,7 +89,7 @@ agree on which index and which clips directory they are working with:
 | `<app data>/localplay.db` | the clip index (spec §5.5), written by the recorder, read here |
 | `<app data>/clips/` | clips; a trim's new file lands beside its parent |
 | `<app data>/thumbnails/` | the thumbnail cache, created on first use |
-| `<app data>/config.toml` | `[storage]` only; the values fall back to `config.example.toml` |
+| `<app data>/config.toml` | read by the recorder and by the settings panel, and **written** by the panel: `[storage]`, `[encode]`, `[mic]`, `[games]`. Values fall back per key to `config.example.toml`, and the panel says which ones did. |
 
 ## Playback and the asset protocol
 

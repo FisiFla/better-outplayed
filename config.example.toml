@@ -212,10 +212,11 @@ clip = "Ctrl+F8"
 # `false` = that value is removed, if this app put it there. Nothing else in the Run key is
 #           ever touched: the value name is localplay's own.
 #
-# The file is the only switch: this project has no settings UI, and an autostart entry that
-# disagreed with the file would be a second, invisible source of truth. It is applied at
-# startup, so a change needs a restart. Windows only — off Windows the app says so and does
-# nothing.
+# The file is the only switch **for this key**: the settings panel edits the clips
+# directory, the capture rate, the resolution, the microphone and auto-record, and
+# deliberately not this — and an autostart entry that disagreed with the file would be a
+# second, invisible source of truth. It is applied at startup, so a change needs a restart.
+# Windows only — off Windows the app says so and does nothing.
 start_with_system = false
 
 [events]
