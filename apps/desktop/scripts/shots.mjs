@@ -1903,6 +1903,19 @@ const states = [
         'and cannot be applied',
       );
 
+      // The native picker has no Tauri runtime here: Browse must fail silent, not loud.
+      await panel.getByRole('button', { name: 'Browse' }).click();
+      check(
+        this.name,
+        (await page.locator('.banner.error').count()) === 0,
+        'browsing without a runtime reports no error',
+      );
+      check(
+        this.name,
+        (await panel.locator('input[type="text"]').inputValue()) === '',
+        'and leaves the draft alone',
+      );
+
       await auditContrast(page, this.name, {
         '.settings summary': 'settings disclosure',
         '.settings input[type="text"]': 'settings field',

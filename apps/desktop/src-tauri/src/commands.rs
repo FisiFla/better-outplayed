@@ -21,7 +21,7 @@
 //! event markers are Phase 4 and the timeline draws none (see `src/lib/components/
 //! Timeline.svelte`).
 
-use crate::config::{EngineOptionsConfig, RecordingConfig};
+use crate::config::{EngineOptionsConfig, RecordingConfig, SettingEdit};
 #[cfg(test)]
 use localplay_capture::stub::StubConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
@@ -1711,31 +1711,24 @@ pub fn update_settings_file(
     update: &SettingsUpdate,
     recorder_running: bool,
 ) -> Result<UpdateSettingsOutcome, CommandError> {
-    use crate::config::SettingEdit;
-
     let before = crate::config::read_effective_settings(config_path)?;
     let mut edits = Vec::new();
-    let mut applied = Vec::new();
     if let Some(dir) = &update.clips_dir {
         edits.push(SettingEdit::ClipsDir(dir.clone()));
-        applied.push("storage.clips_dir".to_string());
     }
     if let Some(fps) = update.fps {
         edits.push(SettingEdit::Fps(fps));
-        applied.push("encode.fps".to_string());
     }
     if let Some(size) = &update.output_size {
         edits.push(SettingEdit::OutputSize(size.clone()));
-        applied.push("encode.output_size".to_string());
     }
     if let Some(enabled) = update.mic_enabled {
         edits.push(SettingEdit::MicEnabled(enabled));
-        applied.push("mic.enabled".to_string());
     }
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
-        applied.push("games.auto_record".to_string());
     }
+    let applied: Vec<String> = edits.iter().map(|edit| edit.key().to_string()).collect();
 
     if !edits.is_empty() {
         crate::config::write_settings(config_path, &edits)?;

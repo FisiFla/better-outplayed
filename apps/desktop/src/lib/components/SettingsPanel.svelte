@@ -10,6 +10,7 @@
    * The panel says which is which instead of pretending everything is live.
    */
   import type { RecordingStatus, SettingsDto, SettingsUpdate } from '../types';
+  import { open } from '@tauri-apps/plugin-dialog';
 
   interface Props {
     /** `null` until the first read answers; the panel is hidden meanwhile. */
@@ -57,6 +58,20 @@
     onApply({ clips_dir: clipsDir });
   }
 
+  /**
+   * The native folder picker. Cancelling — or running somewhere with no Tauri
+   * runtime, like the screenshot harness — resolves to no directory, and the draft
+   * is left alone rather than cleared.
+   */
+  async function browseClipsDir() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: 'Choose the clips directory',
+    }).catch(() => null);
+    if (typeof selected === 'string') clipsDir = selected;
+  }
+
   function applyCapture() {
     if (!fpsValid || fps === null) return;
     onApply({ fps, output_size: outputSize, mic_enabled: micEnabled });
@@ -84,13 +99,16 @@
       <h3>Library</h3>
       <label class="field">
         <span>Clips directory {#if isDefault('storage.clips_dir')}<span class="muted">(default)</span>{/if}</span>
-        <input
-          type="text"
-          value={clipsDir}
-          oninput={(event) => (clipsDir = event.currentTarget.value)}
-          disabled={busy}
-          spellcheck={false}
-        />
+        <span class="dir-row">
+          <input
+            type="text"
+            value={clipsDir}
+            oninput={(event) => (clipsDir = event.currentTarget.value)}
+            disabled={busy}
+            spellcheck={false}
+          />
+          <button type="button" onclick={browseClipsDir} disabled={busy}>Browse</button>
+        </span>
       </label>
       <p class="muted footnote">Empty resets to the default. Applies immediately to new clips.</p>
       <button type="button" onclick={applyLibrary} disabled={busy}>Apply library</button>
@@ -210,6 +228,16 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
+  }
+
+  .dir-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+  }
+
+  .dir-row input {
+    min-width: 0;
   }
 
   input[type='text'],

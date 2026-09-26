@@ -332,7 +332,7 @@ pub enum SettingEdit {
 }
 
 impl SettingEdit {
-    fn key(&self) -> &'static str {
+    pub(crate) fn key(&self) -> &'static str {
         match self {
             SettingEdit::ClipsDir(_) => "storage.clips_dir",
             SettingEdit::Fps(_) => "encode.fps",

@@ -509,6 +509,9 @@ pub fn run() {
     let asset_roots = state.asset_roots();
 
     tauri::Builder::default()
+        // The settings panel's folder picker (open dialogs only — see
+        // capabilities/default.json).
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Playback is served by Tauri's asset protocol, scoped to the clips directory
             // (spec §9) — there is no file server in this application. `tauri.conf.json`

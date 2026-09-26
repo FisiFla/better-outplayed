@@ -25,6 +25,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `include_image!`'s raw RGBA at build time. Nothing else is enabled — no dialog, no shell,
 # no filesystem plugin — and no capability grants the webview anything new.
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
+# The folder picker for the settings panel's clips directory (`dialog:allow-open` in
+# capabilities/default.json — open dialogs only, which return a path and grant no
+# filesystem access beyond it).
+tauri-plugin-dialog = "2"
 # The Phase 1 crates are reused as-is. Nothing here re-implements them: the shell reads
 # the index, edits clips and probes them, and it *records* through the same engine the CLI
 # drives (`localplay-recorder`), which owns capture, audio, the encoder and the ring.
