@@ -195,14 +195,14 @@ not from a run:
 
 Both are read out of the NSIS template; neither has been observed on Windows.
 
-1. **The install directory is also the application's data directory** in the default per-user
-   mode: `%LOCALAPPDATA%\localplay` holds the release binary *and* `localplay.db`, `clips\` and
-   `thumbnails\`. Nothing breaks — the app never writes into the installation directory, the
-   installer only owns the exe and `binaries\`, and uninstall cannot delete a non-empty
-   directory — but mixing product files with a user's recordings in one folder is a wart. Fix
-   by either moving the app's data under a subdirectory of `%LOCALAPPDATA%\localplay` (a
-   `localplay-recorder`/`store` change, and a migration for any existing install), or by giving
-   the installer a distinct install directory.
+1. ~~**The install directory is also the application's data directory.**~~ *Decided and set
+   2026-09-26:* the installer gets its own directory. `productName` is now `better-outplayed`
+   while `mainBinaryName` stays `localplay`, and Tauri derives the per-user install path from
+   the former and the installed binary's name from the latter — so an install lands in
+   `%LOCALAPPDATA%\better-outplayed` with the exe still called `localplay.exe`, while the
+   app's data stays at `%LOCALAPPDATA%\localplay` exactly where it was and **no migration is
+   needed**. The alternative — moving the data into a subdirectory — would have been a
+   recorder/store change plus a migration for the existing install, for the same result.
 2. **The uninstaller's "delete app data" checkbox does not delete localplay's data.** It
    removes `%APPDATA%\<identifier>` and `%LOCALAPPDATA%\<identifier>` — Tauri's directories,
    which this app does not use. The checkbox is therefore misleading in the *safe* direction:
