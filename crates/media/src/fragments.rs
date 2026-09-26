@@ -424,7 +424,7 @@ mod tests {
     /// module is that it agrees with the muxer.
     fn stream(seconds: u32) -> Vec<u8> {
         let bin = localplay_media_ffmpeg();
-        let out = std::process::Command::new(&bin.ffmpeg)
+        let out = std::process::crate::sidecar_command(&bin.ffmpeg)
             .args([
                 "-v",
                 "error",

@@ -1,5 +1,6 @@
 //! localplay media drivers: locating ffmpeg and performing lossless edits.
 
+pub use binaries::sidecar_command;
 pub mod binaries;
 pub mod edit;
 pub mod fragments;

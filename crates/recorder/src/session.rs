@@ -444,7 +444,7 @@ pub fn finalise(
 /// stream, which is exactly the shape that cannot distinguish "the microphone survived" from
 /// "it did not". Used only for a session that recorded a microphone.
 fn audio_stream_count(bin: &FfmpegBinaries, path: &Path) -> Option<usize> {
-    let output = Command::new(&bin.ffprobe)
+    let output = localplay_media::sidecar_command(&bin.ffprobe)
         .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -732,7 +732,7 @@ pub(crate) fn layout_test_segments(dir: &Path, audio: usize) -> Result<Vec<Segme
     std::fs::create_dir_all(dir)?;
     for seq in 0..2u64 {
         let out = dir.join(format!("seg-{seq:06}.mp4"));
-        let mut cmd = Command::new(&bin.ffmpeg);
+        let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
         cmd.args([
             "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",

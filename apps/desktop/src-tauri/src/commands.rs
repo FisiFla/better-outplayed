@@ -1694,7 +1694,7 @@ mod tests {
     /// `-g 10` at 10 fps puts a keyframe every second, so the file has the keyframe
     /// structure a real clip has and a stream-copy cut has something to work with.
     fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32) {
-        let mut cmd = Command::new(&bins.ffmpeg);
+        let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
         cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=size=320x180:rate=10:duration={seconds}"))
             .args(["-c:v", "mpeg4", "-q:v", "5", "-g", "10", "-pix_fmt", "yuv420p"])
@@ -1714,7 +1714,7 @@ mod tests {
     /// streams. Nothing is decoded or encoded on either side of the comparison, which is
     /// what makes it evidence about a stream copy rather than a proxy for one.
     fn stream_md5(bins: &FfmpegBinaries, src: &Path, seek_ms: u64, dur_ms: Option<u64>) -> String {
-        let mut cmd = Command::new(&bins.ffmpeg);
+        let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
         cmd.args(["-v", "error", "-y", "-ss"])
             .arg(format!("{:.3}", seek_ms as f64 / 1000.0))
             .arg("-i")
@@ -1940,7 +1940,7 @@ mod tests {
 
         // Negative control: the same span, re-encoded, is a different byte stream.
         let re_encoded = f.paths.clips_dir.join("re-encoded.mp4");
-        let mut cmd = Command::new(&f.bins.ffmpeg);
+        let mut cmd = localplay_media::sidecar_command(&f.bins.ffmpeg);
         cmd.args(["-v", "error", "-y", "-ss", "1.500", "-i"])
             .arg(&src)
             .args(["-t", "1.500", "-c:v", "mpeg4", "-q:v", "5", "-g", "10"])

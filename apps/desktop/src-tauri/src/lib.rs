@@ -655,7 +655,7 @@ impl Shell for AppShell {
             .ok_or_else(|| "the application state is not available yet".to_string())?;
         let path = state.config_path();
         let (program, args) = background::reveal_command(&path, background::FileManager::current());
-        std::process::Command::new(&program)
+        std::process::localplay_media::sidecar_command(&program)
             .args(&args)
             .spawn()
             .map_err(|err| format!("could not run {program}: {err}"))?;

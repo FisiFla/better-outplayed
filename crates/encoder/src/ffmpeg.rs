@@ -112,7 +112,7 @@ use localplay_media::FfmpegBinaries;
 use std::ffi::OsString;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
@@ -660,7 +660,7 @@ impl FfmpegEncoder {
         };
         let mic_url = mic.as_ref().map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
 
-        let mut cmd = Command::new(&bin.ffmpeg);
+        let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
         cmd
             // The whole argument list, built in one place so that what a test asserts is
             // what the child is spawned with — see [`ffmpeg_args`], which is also where the
@@ -1317,6 +1317,7 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use super::*;
 
     /// A configuration the argument builders can be exercised with. Small on purpose: these
@@ -1936,7 +1937,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
         let port = listener.local_addr().expect("the listener's address").port();
 
-        let mut client = Command::new(&bin.ffmpeg)
+        let mut client = localplay_media::sidecar_command(&bin.ffmpeg)
             .args([
                 "-hide_banner", "-loglevel", "error", "-nostdin",
                 // Real-time pacing: the reader takes the transport at the rate the PCM

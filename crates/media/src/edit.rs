@@ -33,7 +33,7 @@ pub fn copy_budget(bytes: u64) -> Duration {
 
 /// Remux without re-encoding, moving the index to the front for fast seeking.
 pub fn remux_lossless(bin: &FfmpegBinaries, src: &Path, dst: &Path) -> Result<()> {
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-i"])
         .arg(src)
         .args(["-c", "copy", "-movflags", "+faststart"])
@@ -55,7 +55,7 @@ pub fn trim_lossless(
     if end_ms <= start_ms {
         bail!("trim range is empty: start={start_ms}ms end={end_ms}ms");
     }
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])
         .arg(format!("{:.3}", start_ms as f64 / 1000.0))
         .arg("-i")
@@ -69,7 +69,7 @@ pub fn trim_lossless(
 
 /// Single-frame JPEG at `at_ms`, for Phase 2 timelines.
 pub fn thumbnail(bin: &FfmpegBinaries, src: &Path, at_ms: u64, dst: &Path) -> Result<()> {
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])
         .arg(format!("{:.3}", at_ms as f64 / 1000.0))
         .arg("-i")
@@ -124,7 +124,7 @@ pub fn remux_stream_lossless(
     // The budget is derived from the bytes actually being moved, like the concat's: this is the
     // same copy, from a pipe instead of a list of files.
     let budget = copy_budget(bytes.len() as u64);
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-i", "pipe:0", "-map", "0", "-c", "copy"]);
     for (index, title) in audio_titles(audio_streams).iter().enumerate() {
         cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
@@ -201,7 +201,7 @@ pub fn concat_lossless_sized(
     total_bytes: u64,
     audio_streams: usize,
 ) -> Result<()> {
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(list_file)
         .args(["-map", "0", "-c", "copy"]);

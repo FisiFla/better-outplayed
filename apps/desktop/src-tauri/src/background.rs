@@ -599,7 +599,7 @@ pub fn sync_autostart(
 #[cfg(windows)]
 pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, String> {
     let mut run = |argv: &[String]| -> Result<String, String> {
-        let output = std::process::Command::new("reg")
+        let output = std::process::localplay_media::sidecar_command("reg")
             .args(argv)
             .output()
             .map_err(|err| format!("reg.exe could not be run: {err}"))?;

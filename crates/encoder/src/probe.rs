@@ -3,7 +3,6 @@
 use crate::{VideoCodec, Vendor};
 use anyhow::{bail, Context, Result};
 use localplay_media::{smoke_test_encoder, FfmpegBinaries};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 /// Vendors tried, in order, for `vendor = "auto"`.
@@ -95,7 +94,7 @@ fn select_usable(
 /// Encoder names ffmpeg advertises. `-encoders` lines look like:
 /// ` V....D h264_nvenc  NVIDIA NVENC H.264 encoder (codec h264)`.
 fn advertised_encoders(bin: &FfmpegBinaries) -> Result<Vec<String>> {
-    let out = Command::new(&bin.ffmpeg)
+    let out = localplay_media::sidecar_command(&bin.ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
         .with_context(|| format!("running {}", bin.ffmpeg.display()))?;

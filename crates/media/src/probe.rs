@@ -4,7 +4,6 @@ use crate::binaries::{run_with_stdin, run_with_timeout, FfmpegBinaries};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -134,7 +133,7 @@ impl StreamLayout {
 
 /// Probe the full stream layout of a file on disk.
 pub fn stream_layout(bin: &FfmpegBinaries, path: &Path) -> Result<StreamLayout> {
-    let mut cmd = Command::new(&bin.ffprobe);
+    let mut cmd = crate::sidecar_command(&bin.ffprobe);
     cmd.args(["-v", "error", "-print_format", "json", "-show_streams"])
         .arg(path);
     let out = run_with_timeout(cmd, PROBE_TIMEOUT)?;
@@ -241,7 +240,7 @@ impl MediaInfo {
 
     /// Run `ffprobe` against a file on disk.
     pub fn probe(bin: &FfmpegBinaries, path: &Path) -> Result<Self> {
-        let mut cmd = Command::new(&bin.ffprobe);
+        let mut cmd = crate::sidecar_command(&bin.ffprobe);
         cmd.args([
             "-v", "error",
             "-print_format", "json",
@@ -313,7 +312,7 @@ impl MediaInfo {
 /// capture.
 pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), String> {
     let size = format!("{}x{}", SMOKE_SIZE.0, SMOKE_SIZE.1);
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args([
         "-hide_banner",
         // Keeps ffmpeg from reading the probe's own stdin for interactive commands; the

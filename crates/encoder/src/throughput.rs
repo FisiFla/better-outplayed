@@ -61,7 +61,7 @@ use crate::EncodeConfig;
 use anyhow::{bail, Context, Result};
 use localplay_media::{ffmpeg_reason, wait_with_deadline, FfmpegBinaries};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// How long frames are fed to the encoder before the rate is computed.
@@ -147,7 +147,7 @@ fn measure_with_drain(
         budget.as_secs_f64()
     );
 
-    let mut cmd = Command::new(&bin.ffmpeg);
+    let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(video_input_args(cfg))
         .args(video_output_args(cfg))

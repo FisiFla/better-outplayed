@@ -333,7 +333,7 @@ mod tests {
     /// against my idea of the format instead.
     fn stream(seconds: u32) -> Vec<u8> {
         let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-        let out = Command::new(&bin.ffmpeg)
+        let out = localplay_media::sidecar_command(&bin.ffmpeg)
             .args([
                 "-v",
                 "error",

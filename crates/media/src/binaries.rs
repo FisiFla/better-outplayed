@@ -147,6 +147,30 @@ fn dedupe(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
+/// A `Command` for one of the sidecars, with no console window on Windows.
+///
+/// **Load-bearing on Windows, and it was missing.** A GUI process — which `localplay.exe` is —
+/// allocates a console for every child it spawns unless the child is created with
+/// `CREATE_NO_WINDOW`. So each ffmpeg, ffprobe or `reg` call put a terminal window on screen, and
+/// the application makes a dozen of them while drawing a screen. Measured by the first person to
+/// install it: *"terminal windows opening and closing"*, a machine that nearly fell over, and a
+/// window that could not be resized or dragged — because the storm was holding the main thread.
+/// The window config was never at fault; it has always said `resizable: true`.
+///
+/// Every subprocess in this workspace goes through here. The flag is a no-op off Windows.
+pub fn sidecar_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// No console is allocated for the child. `CREATE_NO_WINDOW`.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegBinaries {
     pub ffmpeg: PathBuf,
