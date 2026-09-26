@@ -28,8 +28,12 @@ export interface ClipDto {
 
 /** The storage panel's data. */
 export interface StorageStats {
+  /** Clips whose file is on disk — not the number of rows in the index. */
   clip_count: number;
+  /** Bytes those clips occupy, not the total the index's rows claim. */
   total_bytes: number;
+  /** Indexed rows whose file is gone: not counted above, and named so the panel can say so. */
+  missing_count: number;
   favourite_count: number;
   favourite_bytes: number;
   cap_bytes: number;

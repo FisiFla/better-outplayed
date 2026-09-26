@@ -167,6 +167,9 @@ function statsFor(clips, overrides = {}) {
   return {
     clip_count: clips.length,
     total_bytes: totalBytes(clips),
+    // Every fixture's clips are on disk; the one state that is about rows without files
+    // overrides this.
+    missing_count: 0,
     favourite_count: favourites.length,
     favourite_bytes: totalBytes(favourites),
     cap_bytes: 50 * GIB,
@@ -265,6 +268,21 @@ const FAVOURITES_OVER_CAP_FIXTURE = {
     // "favourite bytes" line above it, or the panel contradicts itself on screen.
     over_cap_by_bytes: totalBytes(TWO_MATCHES.filter((c) => c.favourite)) - 50 * GIB,
   },
+};
+
+// The state the first instrumented run found on the box: the index still held rows whose
+// files a cleanup had deleted. The clips list filtered them out and the storage panel did
+// not, so the panel read "Indexed clips 12 (0 favourite), In use 1.2 GiB" directly above
+// "No clips are indexed yet". Both count the clips that are on disk now, and the rows they
+// leave out are named rather than dropped.
+const MISSING_FILES_FIXTURE = {
+  clips: listClips.slice(0, 2),
+  clipsDir: CLIPS_DIR,
+  thumbsDir: THUMBS_DIR,
+  thumbnails: 'ok',
+  nextTrimId: 43,
+  trimmedAtMs: NEWEST_MS,
+  stats: statsFor(listClips.slice(0, 2), { missing_count: 9 }),
 };
 
 /**
@@ -1956,6 +1974,29 @@ const states = [
         this.name,
         await page.locator('.sidebar .storage').isVisible(),
         'the storage panel is reachable without fullscreening',
+      );
+    },
+  },
+  {
+    name: '16-storage-missing-files',
+    title: 'storage panel: rows whose files are gone are named, not counted',
+    group: 'missingfiles',
+    fixture: MISSING_FILES_FIXTURE,
+    extraShots: [{ name: '16-storage-missing-closeup', selector: '.sidebar .storage' }],
+    async verify(page) {
+      await waitForThumbnails(page, 2);
+      const panel = page.locator('.sidebar .storage');
+      const text = ((await panel.locator('dl').textContent()) ?? '').replace(/\s+/g, ' ').trim();
+      report(this.name, `storage figures: ${JSON.stringify(text)}`);
+      check(this.name, /Clips on disk\s*2/.test(text), 'the count is the clips that are on disk');
+      check(this.name, /Missing files\s*9/.test(text), 'and the rows left out are named');
+      check(this.name, text.includes('whose file is gone'), 'with what became of them');
+      // The other half of the contradiction: the clips list must show the same set the
+      // storage panel counted, or the two panels are disagreeing again.
+      check(
+        this.name,
+        (await page.locator('.sidebar ul li').count()) === 2,
+        'the clips list shows the same two clips the panel counted',
       );
     },
   },

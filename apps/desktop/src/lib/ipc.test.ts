@@ -193,6 +193,46 @@ describe('the argument keys', () => {
   });
 });
 
+describe('a command that fails', () => {
+  it('is written to the application log, named, before the rejection reaches the caller', async () => {
+    // The banner is for the person in front of the window; the log is for the maintainer who
+    // is not. Every command failure used to stop at the component's own `catch`, so
+    // `get_settings` failing blanked the settings panel and left the log completely silent —
+    // and that is the one failure where the log is the only witness there is.
+    mockedInvoke.mockRejectedValueOnce({ code: 'invalid_input', message: 'encode.fps is 0' });
+
+    await expect(tauriIpc.getSettings()).rejects.toEqual({
+      code: 'invalid_input',
+      message: 'encode.fps is 0',
+    });
+
+    expect(mockedInvoke).toHaveBeenLastCalledWith('log_from_frontend', {
+      level: 'error',
+      message: 'get_settings failed',
+      detail: 'encode.fps is 0',
+    });
+  });
+
+  it('still rejects, so the caller can put it in front of the user as well', async () => {
+    mockedInvoke.mockRejectedValueOnce('Command not found');
+
+    await expect(tauriIpc.listClips()).rejects.toBe('Command not found');
+  });
+
+  it('does not try to report a failure of the log itself through the log', async () => {
+    // `log_from_frontend` is the last resort: if it fails there is nowhere left to say so,
+    // and reporting *that* through itself would be a rejection loop.
+    mockedInvoke.mockClear();
+    mockedInvoke.mockRejectedValueOnce('Command not found');
+
+    await expect(tauriIpc.logFromFrontend('error', 'a message', 'a detail')).rejects.toBe(
+      'Command not found',
+    );
+
+    expect(mockedInvoke).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('assetUrl', () => {
   it('turns a path into an asset-protocol URL rather than a file URL', () => {
     const path = 'C:\\Users\\player\\AppData\\Local\\localplay\\clips\\clip-1.mp4';

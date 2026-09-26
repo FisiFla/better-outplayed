@@ -14,9 +14,13 @@
  *    protocol handler checks it against the scope configured in `tauri.conf.json` (and
  *    extended at runtime in `src/lib.rs`). There is no file server in this application,
  *    and no command returns file contents.
+ * 3. **Every failed command is written to the application's log here**, by the one wrapper
+ *    below, before the rejection reaches the caller. The components turn failures into a
+ *    banner for whoever is in front of the window; the log is for whoever is not, and a
+ *    shipped window has no console anyone can read.
  */
 
-import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type {
   AppStatus,
   ClipDto,
@@ -98,6 +102,37 @@ export interface ClipSource {
   logFromFrontend(level: 'error' | 'warn' | 'info', message: string, detail: string): Promise<void>;
   /** An `asset:` URL for an absolute path, for `<video>` and `<img>`. */
   assetUrl(path: string): string;
+}
+
+/**
+ * `invoke`, with every failure named in the application's log as it goes past.
+ *
+ * One wrapper rather than a `logFromFrontend` call at each `catch` in the components, and
+ * for the reason this file exists at all: the boundary is the only place every command
+ * passes through. `App.svelte` alone has sixteen `catch` blocks that turn a rejection into
+ * a banner, the settings panel has another, and a `catch` written next month would have to
+ * remember to log. Here it cannot be forgotten, and the command's own name goes with it.
+ *
+ * It still rejects. The banner belongs to the user, the log line to the maintainer, and a
+ * failed command has to reach the code that decides what to say about it.
+ */
+async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    // Same arity as a direct `invoke`: `ipc.test.ts` asserts which commands are called with
+    // no arguments at all, and passing a stray `undefined` would blur that.
+    return args === undefined ? await tauriInvoke<T>(command) : await tauriInvoke<T>(command, args);
+  } catch (err) {
+    // Not through the log's own command: if `log_from_frontend` fails there is nowhere left
+    // to say so, and reporting it through itself is a rejection loop.
+    if (command !== 'log_from_frontend') {
+      void tauriInvoke('log_from_frontend', {
+        level: 'error',
+        message: `${command} failed`,
+        detail: errorMessage(err),
+      }).catch(() => {});
+    }
+    throw err;
+  }
 }
 
 /** The real IPC, backed by the Tauri runtime. */

@@ -32,9 +32,24 @@
 
   <dl>
     <div>
-      <dt>Indexed clips</dt>
+      <dt>Clips on disk</dt>
       <dd>{stats.clip_count} <span class="muted">({stats.favourite_count} favourite)</span></dd>
     </div>
+    {#if stats.missing_count > 0}
+      <!-- Counted nowhere above, so the panel says so here: the clips list filters rows
+           whose file is gone, and a storage number that did not would contradict it. -->
+      <div class="wide">
+        <dt>Missing files</dt>
+        <dd>
+          {stats.missing_count}
+          {stats.missing_count === 1 ? 'indexed clip' : 'indexed clips'} whose file is gone
+          <span class="muted">
+            — not counted or measured above; the rows stay in the index in case the file
+            comes back
+          </span>
+        </dd>
+      </div>
+    {/if}
     <div>
       <dt>In use</dt>
       <dd>{formatBytes(stats.total_bytes)} <span class="muted">of {formatBytes(stats.cap_bytes)}</span></dd>
