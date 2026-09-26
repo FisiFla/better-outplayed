@@ -1,7 +1,11 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
+import { installDiagnostics } from './lib/diagnostics';
 import type { ClipSource } from './lib/ipc';
+
+// Before anything else, so a failure while mounting reaches the log rather than only devtools.
+installDiagnostics();
 
 const target = document.getElementById('app');
 if (!target) {

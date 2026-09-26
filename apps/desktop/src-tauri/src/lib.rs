@@ -482,10 +482,32 @@ pub fn run() {
             stop_recording,
             recording_status,
             clip_now,
-            app_status
+            app_status,
+            log_from_frontend
         ])
         .run(tauri::generate_context!())
         .expect("error while running the localplay desktop shell");
+}
+
+/// Record an error the frontend hit, on the same stream as the backend's own.
+///
+/// **The last blind spot, and the one the first installer saw.** The backend's `warn!` and
+/// `error!` now reach the log file, but a JavaScript error — a failed `invoke`, an exception while
+/// rendering, a rejected promise — lived only in a console nobody can open on a windowed app
+/// started from the Start Menu. That is exactly the class of failure reported as "lots of errors
+/// in the UI", and it is why this exists rather than a screenshot.
+///
+/// Deliberately trivial: it takes strings and writes them. What arrives from the webview is
+/// untrusted text, so it is only ever logged, never parsed or acted on.
+#[tauri::command]
+fn log_from_frontend(level: String, message: String, detail: Option<String>) {
+    let detail = detail.unwrap_or_default();
+    let detail = detail.trim();
+    match level.as_str() {
+        "error" => tracing::error!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
+        "warn" => tracing::warn!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
+        _ => tracing::info!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
+    }
 }
 
 /// Install the tray and start the two threads that keep it (and the hotkey) live.
