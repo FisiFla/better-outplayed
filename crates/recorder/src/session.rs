@@ -45,7 +45,6 @@ use localplay_replay::window;
 use localplay_replay::splice::{ClipMetadata, ClipSplicer};
 use localplay_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// How many whole-session concatenations were attempted before giving up on a name.
 const MAX_SESSION_DIR_ATTEMPTS: u32 = 100;

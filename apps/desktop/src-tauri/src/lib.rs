@@ -655,7 +655,7 @@ impl Shell for AppShell {
             .ok_or_else(|| "the application state is not available yet".to_string())?;
         let path = state.config_path();
         let (program, args) = background::reveal_command(&path, background::FileManager::current());
-        std::process::localplay_media::sidecar_command(&program)
+        localplay_media::sidecar_command(&program)
             .args(&args)
             .spawn()
             .map_err(|err| format!("could not run {program}: {err}"))?;
@@ -843,12 +843,56 @@ impl TrayWiring {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    // `try_init` rather than `init`: a second initialisation (a test harness, an embedding
-    // process) must not panic the application.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .try_init();
+    // **A windowed application has no stderr, and that is why nobody could read the errors.**
+    // `fmt()` writes to stderr by default, Windows gives a GUI process nowhere for it to go, so
+    // every `warn!` and `error!` this backend has ever written was discarded — including the ones
+    // that would have explained "lots of errors in the UI" to the first person to install it. The
+    // file is the point of this function, not a nicety: it is what makes the app diagnosable over
+    // SSH instead of by screenshot.
+    //
+    // It sits beside the data — the same directory as clips and the index — so one path answers
+    // "where are the logs" on every platform. `RUST_LOG` still overrides the level.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,localplay_desktop=debug".into());
+
+    let log_dir = crate::config::app_data_dir().join("logs");
+    // Only when that path is real: `app_data_dir` falls back to `.` when neither LOCALAPPDATA nor
+    // XDG_DATA_HOME is set, and a test writing ./logs into the checkout is a mess nobody asked for.
+    let log_file = log_dir
+        .is_absolute()
+        .then(|| std::fs::create_dir_all(&log_dir).ok())
+        .flatten()
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("better-outplayed.log"))
+                .ok()
+        });
+
+    // A panic is silent in a windowed process for the same reason, and a panic is the one event
+    // that explains a window which stops answering to being dragged. Record it, then let the
+    // previous hook do whatever it did.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        previous(info);
+    }));
+
+    // `try_init` rather than `init`: a second initialisation (a test harness, an embedding process)
+    // must not panic the application.
+    match log_file {
+        Some(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        }
+    }
 }
 
 #[cfg(test)]
