@@ -980,8 +980,19 @@ mod tests {
         let config = config("tauri.conf.json");
         let bundle = &config["bundle"];
 
-        assert_eq!(config["productName"], "localplay");
-        assert_eq!(config["mainBinaryName"], "localplay", "the installed exe is localplay");
+        // These two differ on purpose, and the pairing is load-bearing: Tauri derives
+        // the per-user install directory from `productName` and the installed binary's
+        // name from `mainBinaryName`, so a mismatch is what keeps the installation out
+        // of %LOCALAPPDATA%\localplay — the directory holding the user's clips and index.
+        // Changing either one alone moves something the other should not. §3.3, §3.5.
+        assert_eq!(
+            config["productName"], "better-outplayed",
+            "the install directory's name, and the bundle's"
+        );
+        assert_eq!(
+            config["mainBinaryName"], "localplay",
+            "the installed exe is localplay, as the crates and the CLI are"
+        );
         assert_eq!(config["version"], "0.1.0", "in step with the workspace version");
 
         let identifier = config["identifier"].as_str().expect("identifier");

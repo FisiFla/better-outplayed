@@ -183,7 +183,13 @@ jobs:
       - name: Fetch the ffmpeg sidecars
         # Pinned and checksum-verified, extracted into binaries/ (gitignored). Bundling refuses
         # to run without them, deliberately, so this step also proves the fetch works.
-        run: cargo xtask sidecars fetch
+        #
+        # `--target` is not optional here. sidecars.toml pins a Windows entry only, so asking for
+        # the host's fails with "no sidecar entry for aarch64-apple-darwin" — which is what this
+        # step did on its first run. The bundle this job produces therefore carries the Windows
+        # sidecars, which is consistent with what macOS bundling already is: checked, not shipped
+        # (see docs/packaging.md §4.4).
+        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
 
       - name: Install the frontend dependencies
         working-directory: apps/desktop
