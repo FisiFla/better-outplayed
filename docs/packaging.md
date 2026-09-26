@@ -142,8 +142,17 @@ cd apps\desktop
 npm ci
 
 # 3. Compile and bundle. `-t/--target` is optional on a native x64 host.
-npm run tauri -- build --target x86_64-pc-windows-msvc
+.\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
 ```
+
+> **Call the CLI directly in PowerShell, and this is not a style preference.** `npm run tauri --
+> build --bundles nsis` *loses the flags on Windows*: PowerShell treats `--` as end-of-parameters
+> and strips it, so npm never sees the separator, swallows `--bundles` itself, and the CLI ends up
+> running `tauri build nsis` — which forwards the stray `nsis` to cargo, which fails with
+> `error: unexpected argument 'nsis' found`. Measured on 2026-09-26 while building the first
+> installer: the bundle failed at exactly this, having already succeeded at fetching node, the
+> sidecars and the npm dependencies. The `npm run tauri` form is fine with no flags after it, and
+> the `--` form is correct in bash, which is why CI uses it.
 
 Expected artifacts (the paths and names follow Tauri's conventions; **neither was produced
 here**, because the installer cannot be built from macOS):
@@ -155,7 +164,7 @@ apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\localpla
 
 **This is a compile-and-bundle step and nothing else. It does not launch the application.**
 
-For an MSI as well, build with `npm run tauri -- build --bundles nsis,msi` (or add `"msi"` to
+For an MSI as well, build with `.\node_modules\.bin\tauri build --bundles nsis,msi` (or add `"msi"` to
 `tauri.windows.conf.json`). MSI is opt-in because WiX v3 can only run on Windows, the build needs
 the Windows VBSCRIPT optional feature, and the result is a per-machine install that prompts for
 elevation — none of which suits a consumer clipping utility. NSIS gives a single `.exe`
