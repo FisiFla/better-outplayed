@@ -186,10 +186,26 @@ jobs:
         #
         # `--target` is not optional here. sidecars.toml pins a Windows entry only, so asking for
         # the host's fails with "no sidecar entry for aarch64-apple-darwin" — which is what this
-        # step did on its first run. The bundle this job produces therefore carries the Windows
-        # sidecars, which is consistent with what macOS bundling already is: checked, not shipped
-        # (see docs/packaging.md §4.4).
+        # step did on its first run.
         run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+
+      - name: Stage the host pair for the check bundle
+        # `sidecars:check` (and the bundle itself) need the *host* pair —
+        # `binaries/ffmpeg` and `binaries/ffprobe` — and sidecars.toml pins no darwin
+        # archive, so there is nothing to fetch for this host. Homebrew's ffmpeg stands
+        # in for the hand-placed arm64 LGPL pair the check's error message asks for.
+        # License and fitness note: brew's build carries libx264 (GPL) and links
+        # Cellar dylibs, so it must never be *distributed* and would not run outside
+        # this machine; this bundle is never distributed — the job uploads no artifact
+        # ("checked, not shipped", docs/packaging.md §4.4) — so a checksum-verified
+        # fetch plus the host pair's names, sizes and resource mapping exercises
+        # everything this job needs.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install ffmpeg
+          cp "$(brew --prefix)/bin/ffmpeg" binaries/ffmpeg
+          cp "$(brew --prefix)/bin/ffprobe" binaries/ffprobe
 
       - name: Install the frontend dependencies
         working-directory: apps/desktop
