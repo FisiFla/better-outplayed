@@ -146,3 +146,63 @@ jobs:
         # test bodies, so a hard deny would fail on the intentional `unwrap()`s in
         # tests. This step exists to make lints visible in the log, not to gate on them.
         run: cargo clippy --workspace --all-targets
+
+  # Gap 5.7 in docs/packaging.md: bundling was never exercised by CI, so a change that broke it
+  # was caught by hand or not at all. This job builds a real bundle — the ffmpeg sidecars fetched
+  # and checksum-verified, the frontend built, Tauri bundling — and then asserts that what came out
+  # actually carries the sidecar. It also validates the bundle configuration, which nothing else
+  # reads: `bundle.windows.webviewInstallMode`, the identifier and the resource mapping are only
+  # ever interpreted by `tauri build`.
+  #
+  # macOS, because that is the artifact that can be built here; the Windows installer needs a
+  # Windows runner, which docs/packaging.md §5.7 lists as a separate decision.
+  package:
+    name: Bundle (sidecars, frontend, Tauri)
+    runs-on: macos-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Fetch the ffmpeg sidecars
+        # Pinned and checksum-verified, extracted into binaries/ (gitignored). Bundling refuses
+        # to run without them, deliberately, so this step also proves the fetch works.
+        run: cargo xtask sidecars fetch
+
+      - name: Install the frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Bundle the application
+        working-directory: apps/desktop
+        run: npm run tauri -- build --bundles app
+
+      - name: Check the bundle carries the sidecar
+        run: |
+          set -euo pipefail
+          app=$(find apps/desktop/src-tauri/target/release/bundle -maxdepth 2 -name '*.app' | head -1)
+          test -n "$app" || { echo "no .app was bundled"; exit 1; }
+          echo "bundled: $app"
+          ffmpeg=$(find "$app" -type f -name 'ffmpeg' | head -1)
+          test -n "$ffmpeg" || {
+            echo "the bundle carries no ffmpeg sidecar; it contains:"
+            find "$app" -type f | head -40
+            exit 1
+          }
+          echo "sidecar: $ffmpeg"
