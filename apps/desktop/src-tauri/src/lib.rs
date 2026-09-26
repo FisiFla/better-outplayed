@@ -391,12 +391,18 @@ fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, Com
     commands::read_settings(&state.app_data_dir, &state.config_path())
 }
 
-/// Edit settings: validate, write the file, apply what applies live.
+/// Edit settings: validate, prove the clips directory usable, write the file, apply what
+/// applies live.
 ///
 /// `storage.clips_dir` moves the shell's directories immediately (future writes only);
 /// fps, output size, mic and auto-record persist and take effect on the next recorder
 /// start — `restart_required` says so exactly when a recording is running and one of
 /// them changed. Never an implicit restart.
+///
+/// The clips directory is created *before* the file is written, and that order is load
+/// bearing rather than incidental: the next launch reads the file before it can open a
+/// window, so a directory that cannot be made must never get that far. See
+/// `commands::update_settings_and_prepare`.
 #[tauri::command(rename_all = "snake_case")]
 fn update_settings(
     state: State<'_, AppState>,
@@ -404,32 +410,37 @@ fn update_settings(
     update: commands::SettingsUpdate,
 ) -> Result<commands::UpdateSettingsOutcome, CommandError> {
     let running = state.recorder().is_running()?;
-    let outcome =
-        commands::update_settings_file(&state.app_data_dir, &state.config_path(), &update, running)?;
-    if outcome.applied.iter().any(|key| key == "storage.clips_dir") {
-        apply_clips_dir(&state, &app, &outcome.settings.clips_dir)?;
+    // `update_settings_and_prepare` resolves and creates the new clips directory *before*
+    // it writes anything, so the two things left here — committing it to the running shell
+    // and re-scoping the asset protocol — are the only ones that need a window.
+    let (outcome, prepared) = commands::update_settings_and_prepare(
+        &state.app_data_dir,
+        &state.config_path(),
+        &update,
+        running,
+    )?;
+    if let Some(paths) = prepared {
+        commit_clips_dir(&state, &app, paths, &outcome.settings.clips_dir)?;
     }
     Ok(outcome)
 }
 
-/// Point the shell at a new clips directory: resolve, create, re-scope, remember.
+/// Point the running shell at a clips directory that exists and is already persisted.
 ///
 /// The index and the store handle are untouched (the database lives at the application
 /// data root regardless); only future writes go to the new directory. A scope failure
 /// is a warning rather than a rollback — `setup` treats it the same way, and the config
 /// already names the directory either way.
-fn apply_clips_dir(
+///
+/// There is no directory to create here and no error to report from one: by the time this
+/// runs, `prepare_clips_dir` has already made it, and the value is in the file. A failure
+/// at this point must not look like a failed update, because it is not one.
+fn commit_clips_dir(
     state: &AppState,
     app: &AppHandle,
+    paths: AppPaths,
     clips_dir: &str,
 ) -> Result<(), CommandError> {
-    let paths = AppPaths::resolve(&state.app_data_dir, clips_dir);
-    std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
-        CommandError::new(
-            ErrorCode::Io,
-            format!("could not create the clips directory {}: {e}", paths.clips_dir.display()),
-        )
-    })?;
     *state.paths.lock().map_err(|_| AppState::poisoned("the paths lock"))? = paths.clone();
     state.storage.lock().map_err(|_| AppState::poisoned("the storage lock"))?.clips_dir =
         clips_dir.to_string();

@@ -337,10 +337,21 @@ impl From<&SessionEvent> for SessionEventDto {
 
 /// The storage panel's data: what is on disk, what the cap is, and what the policy makes
 /// of it (spec §8.1).
+///
+/// Every count and every byte here is about the clips **that are on disk** — the same set
+/// the listing shows, from the same function (`clips_on_disk`). `missing_count` is how many
+/// indexed rows that leaves out, and it exists so the panel can *say* so: a number smaller
+/// than the index, unexplained, is the kind of quiet discrepancy this replaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StorageStats {
+    /// Clips whose file is there. Not the number of rows in the index.
     pub clip_count: usize,
+    /// Bytes those clips actually occupy. Summed from the clips, not from what the rows
+    /// recorded — see `clips_on_disk` for why that distinction cost a wrong screen.
     pub total_bytes: u64,
+    /// Indexed rows whose file is gone: not counted above, and named here rather than
+    /// silently dropped.
+    pub missing_count: usize,
     pub favourite_count: usize,
     pub favourite_bytes: u64,
     pub cap_bytes: u64,
@@ -398,50 +409,76 @@ pub struct DeleteOutcome {
 // Commands
 // ---------------------------------------------------------------------------------------
 
-/// Every clip in the index, newest first.
+/// The clips whose files are actually on disk, and the indexed rows that are not.
+struct LiveClips {
+    /// Newest first, ties broken by id (see `clips_on_disk`).
+    clips: Vec<Clip>,
+    /// `(id, path)` for each row left out, in the same order — enough for a caller to say
+    /// which ones went and where they used to be.
+    missing: Vec<(i64, PathBuf)>,
+}
+
+/// **The index is a cache and the filesystem is the truth** — and this is the single place
+/// that says so.
+///
+/// Every surface that speaks about clips goes through here: the listing and the storage
+/// panel. When the two read the index differently they contradict each other on screen,
+/// which is exactly what happened — the listing said "No clips are indexed yet" while the
+/// storage panel said "Indexed clips 12 (0 favourite)", "In use 1.2 GiB", for twelve rows
+/// whose files had been deleted. That `1.2 GiB in use` was the *recorded* size summed from
+/// rows with not one byte of it on disk.
+///
+/// It is not only a display bug. Handing a dead row to the window costs more than a wrong
+/// list: the UI asks the asset protocol for each one (which is where Tauri logs `File does
+/// not exist at path`), then asks for a thumbnail of each, and every thumbnail is an ffmpeg
+/// process. Measured on the first real install, where a cleanup had removed files without
+/// their rows: thirteen dead clips meant a burst of ffmpeg children, terminal windows
+/// appearing and vanishing, a machine that nearly fell over, and a window too busy to be
+/// dragged.
+///
+/// Skipped rather than deleted, deliberately: a file can be temporarily unavailable (a
+/// network directory, an antivirus quarantine), and silently rewriting a user's library is
+/// not a read's business. The rows stay, and `missing` says how many there are so a caller
+/// can tell the user instead of quietly showing less.
 ///
 /// Ordered by `created_at_ms` (the wall clock the store stamps), **not** by
 /// `clips.started_at`, which is what `Store::list_clips` orders by. `started_at` is media
-/// time on the ring's own timeline: it restarts with the scratch directory, so two runs
-/// can produce the same value and a comparison across them is meaningless — the store's own
+/// time on the ring's own timeline: it restarts with the scratch directory, so two runs can
+/// produce the same value and a comparison across them is meaningless — the store's own
 /// docs say as much. `created_at` is the one comparable instant in the row, and it is also
 /// what the storage policy evicts by, so the list the user sees and the order the manager
-/// deletes in agree. Ties (a burst indexed in the same millisecond) are broken by id, so
-/// the order is total and stable.
-pub fn list_clips(deps: &Deps<'_>) -> Result<Vec<ClipDto>, CommandError> {
+/// deletes in agree. Ties (a burst indexed in the same millisecond) are broken by id, so the
+/// order is total and stable.
+fn clips_on_disk(deps: &Deps<'_>) -> Result<LiveClips, CommandError> {
     let mut clips = deps.store.list_clips().map_err(|e| CommandError::store("listing clips", e))?;
-    // Newest first, id breaking ties — so a burst indexed within one millisecond still has
-    // a total, stable order.
     clips.sort_by_key(|clip| std::cmp::Reverse((clip.created_at_ms, clip.id)));
 
-    // **The index is a cache and the filesystem is the truth.** A row whose file is gone is not a
-    // clip, and handing one to the window costs more than a wrong list: the UI asks the asset
-    // protocol for each one (which is where Tauri logs `File does not exist at path`), then asks
-    // for a thumbnail of each, and every thumbnail is an ffmpeg process. Measured on the first
-    // real install, where a cleanup had removed files without their rows: thirteen dead clips
-    // meant a burst of ffmpeg children, terminal windows appearing and vanishing, a machine that
-    // nearly fell over, and a window too busy to be dragged.
-    //
-    // Skipped rather than deleted — a file can be temporarily unavailable, and silently rewriting
-    // a user's library is not this function's business. `debug!` because it repeats on every
-    // refresh and the level filter turns it on where it is wanted.
-    let before = clips.len();
+    let mut missing = Vec::new();
     clips.retain(|clip| {
         let present = clip.path.exists();
         if !present {
-            tracing::debug!(
-                "skipping clip #{} from the listing: {} is gone",
-                clip.id,
-                clip.path.display()
-            );
+            missing.push((clip.id, clip.path.clone()));
         }
         present
     });
-    if clips.len() != before {
+    Ok(LiveClips { clips, missing })
+}
+
+/// Every clip on disk, newest first.
+pub fn list_clips(deps: &Deps<'_>) -> Result<Vec<ClipDto>, CommandError> {
+    let LiveClips { clips, missing } = clips_on_disk(deps)?;
+
+    // Reported here rather than in `clips_on_disk`, so that a refresh that is not a listing
+    // cannot double the log. `debug!` because it repeats on every refresh and the level
+    // filter turns it on where it is wanted.
+    for (id, path) in &missing {
+        tracing::debug!("skipping clip #{id} from the listing: {} is gone", path.display());
+    }
+    if !missing.is_empty() {
         tracing::warn!(
             "{} of {} indexed clips are missing from disk and were left out of the listing",
-            before - clips.len(),
-            before
+            missing.len(),
+            missing.len() + clips.len()
         );
     }
 
@@ -459,10 +496,21 @@ pub fn storage_stats(deps: &Deps<'_>) -> Result<StorageStats, CommandError> {
 /// otherwise have to backdate rows through SQL (the store deliberately has no API for
 /// that) or sleep for a day. Taking `now_ms` as a parameter keeps the command deterministic
 /// and the production wrapper a one-liner.
+///
+/// Every figure here is about the clips **that are on disk** (`clips_on_disk`), including
+/// the bytes and the eviction plan. `Store::total_bytes` sums what the *rows* recorded, so
+/// a library whose files had been deleted reported gigabytes in use with nothing on disk;
+/// and a row with no file has no bytes to reclaim, so counting one in the cap arithmetic
+/// asks for an eviction that frees nothing.
+///
+/// That last point is the reason this reads the filesystem where `plan_cleanup`'s other
+/// caller does not: the recorder's own retention pass still plans on rows, so a cap inflated
+/// by dead rows can currently make it evict a *live* clip. Same principle, different
+/// module — see `crates/store/src/cleanup.rs` and `crates/recorder/src/index.rs`, which are
+/// out of this file's scope.
 pub fn storage_stats_at(deps: &Deps<'_>, now_ms: i64) -> Result<StorageStats, CommandError> {
-    let clips = deps.store.list_clips().map_err(|e| CommandError::store("listing clips", e))?;
-    let total_bytes =
-        deps.store.total_bytes().map_err(|e| CommandError::store("summing clip bytes", e))?;
+    let LiveClips { clips, missing } = clips_on_disk(deps)?;
+    let total_bytes: u64 = clips.iter().map(|clip| clip.size_bytes).sum();
 
     let policy = CleanupPolicy {
         max_total_bytes: deps.storage.max_total_bytes,
@@ -477,6 +525,7 @@ pub fn storage_stats_at(deps: &Deps<'_>, now_ms: i64) -> Result<StorageStats, Co
         total_bytes,
         favourite_count: favourites.len(),
         favourite_bytes: favourites.iter().map(|c| c.size_bytes).sum(),
+        missing_count: missing.len(),
         cap_bytes: policy.max_total_bytes,
         max_age_days: policy.max_age_days,
         cap_met: plan.cap_met(),
@@ -1761,6 +1810,54 @@ pub fn update_settings_file(
     Ok(UpdateSettingsOutcome { settings: after, applied, restart_required, restart_reason })
 }
 
+/// Resolve the clips directory a configuration names, and create it on disk.
+///
+/// Split out so that the ordering which matters can be tested without a window: this is
+/// the step that has to succeed **before** `[storage] clips_dir` is written. The next
+/// launch reads that value before it can open a window, and when the directory cannot be
+/// made, `AppState::open` logs and calls `std::process::exit(1)` — so a directory
+/// persisted before it is proved usable is an application with no UI left to repair it.
+pub fn prepare_clips_dir(app_data_dir: &Path, clips_dir: &str) -> Result<AppPaths, CommandError> {
+    let paths = AppPaths::resolve(app_data_dir, clips_dir);
+    std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
+        CommandError::new(
+            ErrorCode::Io,
+            format!("could not create the clips directory {}: {e}", paths.clips_dir.display()),
+        )
+    })?;
+    Ok(paths)
+}
+
+/// [`update_settings_file`], plus the directory the shell has to move to.
+///
+/// Returns the resolved (and already created) paths when the update carried a
+/// `clips_dir`, so the caller can commit them to the running shell and re-scope the asset
+/// protocol with them. The ordering is the reason this function exists at all:
+/// `prepare_clips_dir` runs **first**, so a directory that cannot be made never reaches
+/// the file, and the write never persists a value the next launch would die on.
+///
+/// The reverse order is what shipped: the file was written, then the directory was
+/// created, so a failed create left `config.toml` naming a directory that does not exist
+/// while the running shell kept the old one. Nothing failed loudly at the time; the
+/// failure was deferred to the next launch, which exits before it can show a window.
+///
+/// Creating the directory even when the write is then rejected is harmless — an empty
+/// directory, at worst, and the alternative (checking without creating) is a race with
+/// nothing to win.
+pub fn update_settings_and_prepare(
+    app_data_dir: &Path,
+    config_path: &Path,
+    update: &SettingsUpdate,
+    recorder_running: bool,
+) -> Result<(UpdateSettingsOutcome, Option<AppPaths>), CommandError> {
+    let prepared = match update.clips_dir.as_deref() {
+        Some(dir) => Some(prepare_clips_dir(app_data_dir, dir)?),
+        None => None,
+    };
+    let outcome = update_settings_file(app_data_dir, config_path, update, recorder_running)?;
+    Ok((outcome, prepared))
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------
@@ -2025,6 +2122,40 @@ mod tests {
     }
 
     #[test]
+    fn every_surface_counts_the_clips_that_are_actually_there() {
+        // What the box showed: the listing filtered out rows whose files were gone and the
+        // storage panel did not, so one panel read "No clips are indexed yet" directly
+        // above "Indexed clips 12 (0 favourite), In use 1.2 GiB of 50 GiB" — twelve rows
+        // whose files had been deleted. That "1.2 GiB in use" was the library's *recorded*
+        // size, summed from rows, with not one byte of it on disk.
+        //
+        // Both surfaces read one rule now, so they cannot drift apart again: the storage
+        // panel counts exactly what the listing shows, and (next test) names what it is
+        // not counting instead of quietly showing less.
+        let f = Fixture::new();
+        f.add_row("here.mp4", 0, 1_000, 4_000);
+        f.add_row("also-here.mp4", 0, 1_000, 6_000);
+        f.add_row("gone.mp4", 0, 1_000, 999_000);
+        std::fs::remove_file(f.paths.clips_dir.join("gone.mp4")).unwrap();
+
+        let clips = list_clips(&f.deps()).unwrap();
+        let stats = storage_stats(&f.deps()).unwrap();
+
+        assert_eq!(clips.len(), 2);
+        assert_eq!(stats.clip_count, clips.len(), "the two panels agree on the count");
+        assert_eq!(
+            stats.total_bytes, 10_000,
+            "and on the bytes: only what is on disk, not what the rows claim"
+        );
+        assert_eq!(stats.missing_count, 1, "the hidden row is named, not silently dropped");
+        assert_eq!(
+            f.store.list_clips().unwrap().len(),
+            3,
+            "still skipped rather than deleted — a file can be temporarily unavailable"
+        );
+    }
+
+    #[test]
     fn a_clip_dto_carries_every_field_the_frontend_reads() {
         let f = Fixture::new();
         let id = f.add_row("fields.mp4", 1_234, 5_678, 9_101);
@@ -2082,6 +2213,7 @@ mod tests {
                 "favourite_bytes",
                 "favourite_count",
                 "max_age_days",
+                "missing_count",
                 "over_cap_by_bytes",
                 "planned_deletions",
                 "total_bytes",
@@ -3061,6 +3193,103 @@ mod tests {
             dir.path().join("clips").to_string_lossy(),
             "empty means the clips directory under the application data directory"
         );
+    }
+
+    // -- the ordering that keeps an unusable clips_dir out of the file -----------------
+
+    #[test]
+    fn a_clips_dir_that_cannot_be_created_is_never_written_to_the_config() {
+        // The blocker this guards. The file used to be written first and the directory
+        // created second, so `clips_dir = "Z:\\clips"` was persisted and the *next*
+        // launch failed in `AppState::open` — `std::process::exit(1)`, no window, no tray,
+        // nothing to click and no way back except hand-editing the file.
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[storage]\nclips_dir = \"\"\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // A regular file standing where a directory must go: `create_dir_all` cannot
+        // succeed here on any platform, as any user — which a permissions trick could not
+        // promise without running the tests as root.
+        let blocked = dir.path().join("a-file");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let wanted = blocked.join("clips").to_string_lossy().into_owned();
+
+        let err = update_settings_and_prepare(
+            dir.path(),
+            &path,
+            &SettingsUpdate { clips_dir: Some(wanted.clone()), ..Default::default() },
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("a-file"), "the path is named: {}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an unusable directory must not reach the file the next launch reads"
+        );
+    }
+
+    #[test]
+    fn a_settings_update_hands_back_the_directory_it_created() {
+        // The caller commits these paths to the running shell and re-scopes the asset
+        // protocol with them. What matters here is that the directory exists by then.
+        let (dir, path) = settings_case();
+        let wanted = dir.path().join("clips-here");
+
+        let (outcome, prepared) = update_settings_and_prepare(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                clips_dir: Some(wanted.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(wanted.is_dir(), "created before the write returned");
+        assert_eq!(prepared.expect("a clips_dir moved").clips_dir, wanted);
+        assert_eq!(outcome.settings.clips_dir, wanted.to_string_lossy());
+    }
+
+    #[test]
+    fn an_update_without_a_clips_dir_prepares_nothing() {
+        // The shell's paths and the asset scope are only touched when the directory
+        // actually moved: editing fps must not re-create or re-scope anything.
+        let (dir, path) = settings_case();
+
+        let (outcome, prepared) = update_settings_and_prepare(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(30), ..Default::default() },
+            false,
+        )
+        .unwrap();
+
+        assert!(prepared.is_none());
+        assert_eq!(outcome.applied, vec!["encode.fps"]);
+    }
+
+    #[test]
+    fn an_empty_clips_dir_reset_prepares_the_default_directory_too() {
+        // "Empty resets to the default" is a clips_dir move like any other, so it goes
+        // through the same create: the default directory has to exist as well, or the reset
+        // would persist a path the next launch cannot open a window on.
+        let (dir, path) = settings_case();
+
+        let (_, prepared) = update_settings_and_prepare(
+            dir.path(),
+            &path,
+            &SettingsUpdate { clips_dir: Some(String::new()), ..Default::default() },
+            false,
+        )
+        .unwrap();
+
+        let paths = prepared.expect("a clips_dir moved");
+        assert_eq!(paths.clips_dir, dir.path().join("clips"));
+        assert!(paths.clips_dir.is_dir(), "the default directory was created");
     }
 
     #[test]
