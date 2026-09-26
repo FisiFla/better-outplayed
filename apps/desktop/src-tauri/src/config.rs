@@ -5,13 +5,30 @@
 //! The CLI owns the full configuration model (spec §10) and this module deliberately does
 //! not duplicate it. Two reasons, both load-bearing:
 //!
-//! 1. The desktop shell needs exactly one section, `[storage]`. It captures nothing, so
-//!    `[buffer]`, `[encode]`, `[audio]`, `[hotkeys]` and `[events]` are none of its
-//!    business — and re-validating them here would let a capture-only mistake (say
-//!    `vendor = "software"`) refuse to open the review UI, which has no encoder in it.
+//! 1. The desktop shell reads only what the review window needs: `[storage]`, plus
+//!    `[encode]`, `[mic]` and `[games]` for the settings panel and for the options a start
+//!    is built with. It captures nothing, so `[buffer]`, `[audio]`, `[hotkeys]` and
+//!    `[events]` are none of its business — and re-validating them here would let a
+//!    capture-only mistake (say `vendor = "software"`) refuse to open the review UI, which
+//!    has no encoder in it.
 //! 2. Depending on `localplay-cli` to borrow its `Config` would pull the whole capture
 //!    stack — `wgc`, `wasapi`, the ffmpeg encoder child — into the GUI binary for the sake
-//!    of three fields.
+//!    of a handful of fields.
+//!
+//! # The one invariant that keeps the window usable
+//!
+//! **Reading applies the engine's rules; writing may add the panel's own.**
+//! [`read_effective_settings`] has to accept every value a start accepts, because the
+//! settings panel renders only once it succeeds: a reader stricter than the engine is a
+//! panel that will not open, and so cannot repair the file that stopped it. The panel is
+//! still allowed stricter refusals of its own on the way *in* (`validate_edit`: the fps
+//! band, and the `clips_dir` hygiene that keeps the asset-protocol scope off whole
+//! volumes), because those refuse a value the user already has on screen to look at.
+//!
+//! That asymmetry is not decoration; getting it wrong shipped. The panel's own copy of the
+//! `output_size` rule added a frame bound the engine does not have and trimmed nothing, so
+//! a file carrying `" 1920x1080"` recorded perfectly while leaving the settings panel
+//! permanently blank, unrepairable and silent.
 //!
 //! What must NOT drift is the *location* the two binaries agree on, which is why
 //! [`app_data_dir`] repeats the CLI's rule verbatim instead of inventing one: the CLI
@@ -21,7 +38,9 @@
 //!
 //! A full adapter that reads the whole file through the CLI's own type would be the better
 //! end state; it is a bigger change than this pass should make to a crate that already
-//! works, and it is named here rather than done.
+//! works, and it is named here rather than done. It is also the honest way to close the gap
+//! the invariant above describes: the engine's rules would then be *borrowed* rather than
+//! mirrored by hand, and the two could not drift at all.
 
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
@@ -296,6 +315,12 @@ impl EngineOptionsConfig {
 
     pub fn load(path: &Path) -> Result<Self, CommandError> {
         if !path.is_file() {
+            // The siblings all say so on this path — see `read_effective_settings` for why
+            // this one stopped being quiet.
+            tracing::info!(
+                "no config file at {}: starting with the example's [mic] and [games]",
+                path.display()
+            );
             return Self::example();
         }
         let text = std::fs::read_to_string(path).map_err(|err| {
@@ -308,12 +333,16 @@ impl EngineOptionsConfig {
     }
 }
 
-/// Bounds for the keys the settings panel edits. The engine would refuse worse at
-/// start; refusing here names the key while the user's hand is still on it.
+/// Bounds for `[encode] fps`, and **the panel's own policy rather than the engine's**:
+/// nothing anywhere in the engine bounds `fps` (it is a bare `u32`, and the capture
+/// rate is adapted to what the machine measures), so these apply on the *write* path
+/// only — refusing a value while the user's hand is still on it.
+///
+/// They deliberately do **not** apply to [`read_effective_settings`]. A reader stricter
+/// than a start is a settings panel that never renders, and with no panel there is no
+/// way to repair the file from the UI — see that function's docs.
 pub const FPS_MIN: u32 = 1;
 pub const FPS_MAX: u32 = 240;
-pub const FRAME_DIM_MIN: u32 = 16;
-pub const FRAME_DIM_MAX: u32 = 16_384;
 
 /// One edited key. Typed by construction: a caller cannot smuggle a string into a bool,
 /// so the writer never parses user text into TOML values.
@@ -347,9 +376,13 @@ impl SettingEdit {
 ///
 /// Values come from the file when it sets them and from the compiled-in example
 /// otherwise; `defaulted` names the keys that fell back (e.g. `"encode.fps"`), so the
-/// panel can say so instead of presenting example values as configured ones. A key
-/// that is present but mis-typed is an error naming it — the same contract a start
-/// keeps — and setting that key through the panel repairs the file.
+/// panel can say so instead of presenting example values as configured ones.
+///
+/// A key that is present but mis-typed is an error naming it, and so is an
+/// `output_size` the engine's parser refuses — both are contracts a start keeps too.
+/// Anything else is reported as the file has it, including values the *panel* would
+/// refuse to write (an out-of-band fps, a relative clips_dir): the panel has to render
+/// to be able to repair them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveSettings {
     pub clips_dir: String,
@@ -364,6 +397,11 @@ pub struct EffectiveSettings {
     pub config_exists: bool,
 }
 
+/// The message for a key that is present but the wrong shape.
+///
+/// `what` names the shape the key *should* have been: a bool for the two switches, a
+/// string for the two paths, an integer for the rate, and an array of tables for
+/// `games.watch` — which is not a bool and used to say it was.
 fn mistyped(key: &'static str) -> CommandError {
     CommandError::new(
         ErrorCode::InvalidInput,
@@ -373,7 +411,9 @@ fn mistyped(key: &'static str) -> CommandError {
             what = match key {
                 "storage.clips_dir" | "encode.output_size" => "string",
                 "encode.fps" => "integer",
-                _ => "true/false value",
+                "mic.enabled" | "games.auto_record" => "true/false value",
+                "games.watch" => "list of [[games.watch]] tables",
+                _ => "value of the shape this key takes",
             },
         ),
     )
@@ -437,6 +477,7 @@ fn is_absolute_either(s: &str) -> bool {
     }
 }
 
+/// The panel's own ergonomic band on `[encode] fps` — see `FPS_MIN`. Write-path only.
 fn validate_fps(fps: u32) -> Result<(), CommandError> {
     if (FPS_MIN..=FPS_MAX).contains(&fps) {
         Ok(())
@@ -451,44 +492,101 @@ fn validate_fps(fps: u32) -> Result<(), CommandError> {
     }
 }
 
+/// `[encode] output_size`, decided by **the engine's own parser** so the panel refuses
+/// exactly what a start refuses and accepts exactly what it accepts.
+///
+/// Reused rather than re-implemented, and that is the whole point. The copy that used to
+/// live here trimmed nothing and added a `16..=16384` bound the engine does not have, so
+/// `output_size = " 1920x1080"` recorded perfectly while `get_settings` failed on it —
+/// and a failed `get_settings` is a settings panel that never renders.
 fn validate_output_size(size: &str) -> Result<(), CommandError> {
-    if size.is_empty() {
+    localplay_recorder::parse_output_size(size).map(|_| ()).map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the config file's encode.output_size is not usable: {err:#}"),
+        )
+    })
+}
+
+/// Why a clips directory is refused, or `None` when it is acceptable.
+///
+/// `[storage] clips_dir` is user-supplied and is then handed to
+/// `allow_directory(&dir, true)`, which widens the asset protocol's scope — the window's
+/// only read channel, since `capabilities/default.json` grants it no filesystem
+/// permission. A filesystem root, a share with nothing inside it, or a `..` segment
+/// would widen that scope far past the directory the user named: `clips_dir = "C:\\"`
+/// serves the whole drive to the webview.
+///
+/// So it must be absolute, and then something *inside* a volume:
+///   * no `..` segment anywhere — the scope is resolved, not canonicalised, so a path
+///     that climbs back out is not the directory it appears to be;
+///   * not a root — `/`, `\`, `C:/`, and (behind its prefix) `\\?\C:/`;
+///   * for a share, not the bare `\\server\share`: it must name a directory inside one.
+///
+/// What this is **not** is the engine's rule. `resolve_dir` takes the string as given and
+/// validates nothing, so this — like the fps band — belongs to the write path alone.
+/// Applying it on read would make the panel unrenderable for a file the recorder runs.
+fn clips_dir_problem(dir: &str) -> Option<&'static str> {
+    // One shape to reason about: both platforms separate with these, and which one the
+    // string used says nothing about whether it names a whole volume.
+    let slashed = dir.replace('\\', "/");
+    // `\\?\C:\...` is the extended-length spelling of the same path; the root hiding
+    // behind the prefix must not slip past the check below.
+    let stripped = slashed.strip_prefix("//?/").unwrap_or(slashed.as_str());
+    let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.iter().any(|segment| *segment == "..") {
+        return Some("names a parent-directory segment");
+    }
+    // A UNC path is `//server/share/...`; fewer than three segments names a host, or a
+    // share, rather than a directory inside one.
+    let is_share = stripped.starts_with("//");
+    let is_root = if is_share {
+        segments.len() < 3
+    } else {
+        // `/` leaves no segment at all; `C:/` leaves the drive designator alone.
+        segments.is_empty() || (segments.len() == 1 && segments[0].ends_with(':'))
+    };
+    if is_root {
+        return Some(if is_share {
+            "a share with no directory inside it"
+        } else {
+            "a filesystem root"
+        });
+    }
+    None
+}
+
+/// `[storage] clips_dir` as the panel will *write* it: empty (the default), or an
+/// absolute path to a directory inside a volume. See `clips_dir_problem` for why the
+/// roots, the bare shares and the parent-directory segments are refused.
+fn validate_clips_dir(dir: &str) -> Result<(), CommandError> {
+    if dir.is_empty() {
         return Ok(());
     }
-    let mut parts = size.split('x');
-    let ok = match (parts.next(), parts.next(), parts.next()) {
-        (Some(w), Some(h), None) => [w, h].iter().all(|dim| {
-            dim.parse::<u32>().is_ok_and(|d| (FRAME_DIM_MIN..=FRAME_DIM_MAX).contains(&d))
-        }),
-        _ => false,
+    let problem = if is_absolute_either(dir) {
+        clips_dir_problem(dir)
+    } else {
+        Some("a relative path")
     };
-    if ok {
-        Ok(())
-    } else {
-        Err(CommandError::new(
+    match problem {
+        None => Ok(()),
+        Some(what) => Err(CommandError::new(
             ErrorCode::InvalidInput,
             format!(
-                "encode.output_size is {size:?}, but it must be empty (the native capture \
-                 size) or WIDTHxHEIGHT"
+                "storage.clips_dir is {dir:?}, but it {what}: it must be empty (the clips \
+                 directory under the application data directory) or an absolute path to a \
+                 directory below a filesystem root"
             ),
-        ))
+        )),
     }
 }
 
-fn validate_clips_dir(dir: &str) -> Result<(), CommandError> {
-    if dir.is_empty() || is_absolute_either(dir) {
-        Ok(())
-    } else {
-        Err(CommandError::new(
-            ErrorCode::InvalidInput,
-            format!(
-                "storage.clips_dir is {dir:?}, but it must be empty (the clips directory \
-                 under the application data directory) or an absolute path"
-            ),
-        ))
-    }
-}
-
+/// Everything the *writer* refuses.
+///
+/// The reader applies only the engine's own rules — see `read_effective_settings` — so
+/// any value refused here is still readable: the panel can always show what the file
+/// says, and refuse to write something worse.
 fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
     match edit {
         SettingEdit::ClipsDir(dir) => validate_clips_dir(dir),
@@ -504,6 +602,16 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
 /// A file that is not TOML at all is an error, like everywhere else in this module.
 /// Absent keys fall back per key (recorded in `defaulted`); present-but-mistyped keys
 /// are errors naming the key.
+///
+/// **It applies the engine's rules and nothing more.** A value the recorder loads is a
+/// value this must return, however odd it looks, because the settings panel renders only
+/// once this succeeds: a reader that is stricter than a start takes the only surface that
+/// could repair the file away from the user. That is not hypothetical — it shipped. The
+/// panel's own copy of the `output_size` rule bound the frame at `16..=16384` and trimmed
+/// nothing while the engine's parser did neither, so a file carrying `" 1920x1080"`
+/// recorded perfectly and left the panel permanently blank, unrepairable, and silent.
+/// The panel's stricter policy therefore lives on the write path (`validate_edit`), where
+/// it is a helpful refusal rather than a lockout.
 pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, CommandError> {
     let config_exists = path.is_file();
     let text = if config_exists {
@@ -514,6 +622,13 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             )
         })?
     } else {
+        // The siblings say so on this path (`StorageConfig::load`, `RecordingConfig::load`,
+        // `BackgroundConfig::load`) and this one was quiet, which made "the panel is
+        // showing example values" invisible in the log exactly when it matters.
+        tracing::info!(
+            "no config file at {}: showing the example's values",
+            path.display()
+        );
         EXAMPLE_CONFIG.to_string()
     };
     let doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
@@ -530,13 +645,15 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
     })?;
 
     let mut defaulted = Vec::new();
-    // A key from the file when present (validated — the panel must not show a value a
-    // start would refuse), else the example's, recording the fallback.
+    // A key from the file when present, else the example's, recording the fallback.
+    //
+    // **Only the engine's own rules run here.** A mistyped value is an error, and
+    // `output_size` goes through the parser a start uses. The panel's own stricter policy
+    // (the fps band, clips_dir hygiene) is deliberately absent: a reader stricter than a
+    // start refuses a file the recorder runs happily, and a panel that will not render is
+    // a panel that cannot repair anything.
     let clips_dir = match get_str(&doc, "storage", "clips_dir", "storage.clips_dir")? {
-        Some(dir) => {
-            validate_clips_dir(&dir)?;
-            dir
-        }
+        Some(dir) => dir,
         None => {
             if config_exists {
                 defaulted.push("storage.clips_dir");
@@ -548,7 +665,6 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
     let fps = match get_int(&doc, "encode", "fps", "encode.fps")? {
         Some(raw) => {
             let fps: u32 = raw.try_into().map_err(|_| mistyped("encode.fps"))?;
-            validate_fps(fps)?;
             fps
         }
         None => {
@@ -638,6 +754,17 @@ fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, Comman
 /// before anything is written, and a validation failure writes nothing. A missing file
 /// is created from the example first, so the write changes exactly what was asked.
 /// An empty edit list is a no-op.
+///
+/// **This is where the panel's stricter policy belongs** (`validate_edit`): the fps band
+/// and the clips_dir hygiene are refusals aimed at a user with their hand still on the
+/// value, and they may be stricter than the engine exactly because the *reader* is not —
+/// a value refused here has already rendered in the panel, so the user can see what they
+/// are being asked to change.
+///
+/// The temp file is named uniquely per call. Two overlapping applies are unlikely (the
+/// window serialises them behind its `busy` flag) but the runtime does dispatch invokes
+/// concurrently, and a shared name would let the surviving rename publish a
+/// half-overwritten document.
 pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandError> {
     for edit in edits {
         validate_edit(edit)?;
@@ -695,22 +822,39 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
         doc[table_key][value_key] = value;
     }
 
-    // Same directory, then rename: either the new file is there whole or the old one
-    // is, never half of either.
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string()).map_err(|err| {
+    // A uniquely-named temp beside the target, written, flushed to disk, then renamed over
+    // it: either the new file is there whole or the old one is, never half of either.
+    //
+    // The name carries the pid and a counter so that overlapping applies cannot share it —
+    // the window serialises its own, but the runtime does dispatch invokes concurrently.
+    // `sync_all` is what makes that promise hold against a power loss rather than only
+    // against a crash of this process: without it a rename can publish a zero-length file,
+    // which is precisely the "half of either" this is written to avoid.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("toml.{}.{seq}.tmp", std::process::id()));
+    /// The same failure for both steps, and it clears the temp on the way out: a partial
+    /// file left behind is a misleading file the next run would have to explain.
+    fn could_not_write(path: &Path, tmp: &Path, err: std::io::Error) -> CommandError {
+        let _ = std::fs::remove_file(tmp);
         CommandError::new(
             ErrorCode::Io,
             format!("could not write the config file {}: {err}", path.display()),
         )
-    })?;
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        CommandError::new(
-            ErrorCode::Io,
-            format!("could not write the config file {}: {err}", path.display()),
-        )
-    })?;
+    }
+    let mut file = std::fs::File::create(&tmp).map_err(|e| could_not_write(path, &tmp, e))?;
+    std::io::Write::write_all(&mut file, doc.to_string().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| could_not_write(path, &tmp, e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| could_not_write(path, &tmp, e))?;
+    // A settings write that leaves no trace is a support question nobody can answer;
+    // this is the line that says one happened, and to which keys.
+    tracing::info!(
+        "settings written to {}: {}",
+        path.display(),
+        edits.iter().map(SettingEdit::key).collect::<Vec<_>>().join(", ")
+    );
     Ok(())
 }
 
@@ -1048,15 +1192,59 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_range_key_is_an_error_too() {
+    fn the_reader_accepts_every_value_the_recorder_accepts() {
+        // A reader stricter than the engine is a settings panel that never renders — and
+        // with no panel there is no way to repair the file from the UI, so the one failure
+        // the user cannot fix is the one the reader invents. `resolve_dir` takes
+        // `[storage] clips_dir` exactly as written and nothing anywhere bounds `fps`, so a
+        // relative directory and `fps = 1000` are both values a start accepts.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[encode]\nfps = 1000\n").unwrap();
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"clips\"\n\n\
+             [encode]\nfps = 1000\noutput_size = \" 1920 x 1080\"\n",
+        )
+        .unwrap();
+
+        let settings = read_effective_settings(&path).unwrap();
+
+        assert_eq!(settings.fps, 1000, "the engine bounds nothing");
+        assert_eq!(settings.clips_dir, "clips", "the engine takes the string as given");
+        assert_eq!(settings.output_size, " 1920 x 1080", "the engine's parser trims");
+    }
+
+    #[test]
+    fn the_reader_still_refuses_an_output_size_the_recorder_refuses() {
+        // The one key the engine *does* validate, so the reader keeps refusing it: the
+        // panel must not show a value a start would reject.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[encode]\noutput_size = \"wide\"\n").unwrap();
 
         let err = read_effective_settings(&path).unwrap_err();
 
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(err.message.contains("encode.fps"), "got: {}", err.message);
+        assert!(err.message.contains("encode.output_size"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn a_mistyped_watch_list_says_what_it_should_have_been() {
+        // `games.watch` is an array of tables. Reporting it as "not a true/false value"
+        // names the wrong shape and sends the reader looking at the wrong key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[games]\nwatch = \"Dota 2\"\n").unwrap();
+
+        let err = read_effective_settings(&path).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("games.watch"), "got: {}", err.message);
+        assert!(
+            !err.message.contains("true/false"),
+            "the message must not name a bool: {}",
+            err.message
+        );
     }
 
     // -- the writer ---------------------------------------------------------------------
@@ -1117,9 +1305,21 @@ mod tests {
         assert_eq!(settings.output_size, "1920x1080");
     }
 
+    /// Everything in the config's directory except the config itself — i.e. any temp file
+    /// a write failed to clear.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.toml")
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn a_rejected_edit_writes_nothing() {
-        let (_dir, path) = settings_file();
+        let (dir, path) = settings_file();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = write_settings(
@@ -1131,10 +1331,22 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("encode.fps"), "got: {}", err.message);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "all or nothing");
-        assert!(
-            !path.with_extension("toml.tmp").exists(),
+        assert_eq!(
+            leftovers(dir.path()),
+            Vec::<String>::new(),
             "no temp file is left behind"
         );
+    }
+
+    #[test]
+    fn a_write_that_worked_leaves_no_temp_file_either() {
+        // The temp name carries the pid and a counter now, so it is not the fixed
+        // `config.toml.tmp` a test could guess by name — it has to be looked for.
+        let (dir, path) = settings_file();
+
+        write_settings(&path, &[SettingEdit::Fps(60)]).unwrap();
+
+        assert_eq!(leftovers(dir.path()), Vec::<String>::new());
     }
 
     #[test]
@@ -1160,12 +1372,27 @@ mod tests {
     }
 
     #[test]
-    fn clips_dir_accepts_empty_an_either_platform_absolute_and_nothing_else() {
+    fn the_fps_band_is_the_panels_own_and_applies_only_when_writing() {
+        // Nothing in the engine bounds `fps`, so this band is the panel's ergonomics, not a
+        // shared rule — which is why it lives on the write path, where the user's hand is
+        // still on the value, and not on the reader above, where a bound would refuse a
+        // file the recorder runs.
+        for bad in [0, 241, 1000] {
+            let err = validate_edit(&SettingEdit::Fps(bad)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "fps {bad}");
+            assert!(err.message.contains("encode.fps"), "got: {}", err.message);
+        }
+        assert!(validate_edit(&SettingEdit::Fps(1)).is_ok());
+        assert!(validate_edit(&SettingEdit::Fps(240)).is_ok());
+    }
+
+    #[test]
+    fn clips_dir_accepts_empty_or_an_absolute_directory_with_something_in_it() {
         assert!(validate_clips_dir("").is_ok(), "empty resets to the default");
         assert!(validate_clips_dir("/media/clips").is_ok());
         assert!(validate_clips_dir("C:\\clips").is_ok());
         assert!(validate_clips_dir("C:/clips").is_ok());
-        assert!(validate_clips_dir("\\\\server\\clips").is_ok());
+        assert!(validate_clips_dir("\\\\server\\share\\clips").is_ok());
 
         for bad in ["clips", "localplay/clips", "C:clips"] {
             assert!(
@@ -1176,12 +1403,39 @@ mod tests {
     }
 
     #[test]
-    fn output_size_accepts_empty_and_sane_dimensions() {
+    fn clips_dir_is_refused_when_it_would_widen_the_asset_scope_to_a_whole_volume() {
+        // The directory is handed to `allow_directory(.., true)` — the webview's only read
+        // channel — so a root, a share that names nothing inside itself, or a path that
+        // climbs back out would expose far more than the clips the user meant to share.
+        for bad in [
+            "/",
+            "\\",
+            "C:\\",
+            "C:/",
+            "\\\\server",
+            "\\\\server\\share",
+            "C:\\clips\\..\\..\\Windows",
+            "/media/../etc",
+        ] {
+            let err = validate_clips_dir(bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{bad:?} must be refused");
+            assert!(err.message.contains("storage.clips_dir"), "got: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn output_size_follows_the_engines_own_parser() {
+        // Reused rather than re-invented: `localplay_recorder::parse_output_size` trims
+        // each component and sets no bounds, so the panel accepts exactly what a start
+        // accepts. The copy that used to live here did neither, which is how
+        // `output_size = " 1920x1080"` came to record fine while `get_settings` refused it.
         assert!(validate_output_size("").is_ok(), "empty is the native size");
         assert!(validate_output_size("1920x1080").is_ok());
         assert!(validate_output_size("640x480").is_ok());
+        assert!(validate_output_size("1920 x 1080").is_ok(), "the engine trims");
+        assert!(validate_output_size("99999x1080").is_ok(), "the engine bounds nothing");
 
-        for bad in ["wide", "1920x", "x1080", "1920x1080x2", "0x1080", "99999x1080", "1920 x 1080"] {
+        for bad in ["wide", "1920x", "x1080", "1920x1080x2"] {
             assert!(
                 validate_output_size(bad).is_err(),
                 "{bad:?} must be refused"
