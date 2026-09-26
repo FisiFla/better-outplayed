@@ -141,6 +141,7 @@
   .panel {
     border-top: none;
     border-bottom: 1px solid var(--line);
+    flex: none;
   }
 
   .head {

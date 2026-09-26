@@ -85,6 +85,10 @@
 </section>
 
 <style>
+  .storage {
+    flex: none;
+  }
+
   .bar {
     display: flex;
     height: 8px;

@@ -103,6 +103,9 @@ code,
   justify-content: space-between;
   gap: 8px;
   padding: 10px 16px 8px;
+  /* Section chrome never squeezes below its content: all deficit lands on the two
+     lists, which scroll, instead of spilling buttons and verdicts over each other. */
+  flex: none;
 }
 
 /* -- primitives ---------------------------------------------------------------------- */

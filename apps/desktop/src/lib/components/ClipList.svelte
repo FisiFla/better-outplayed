@@ -95,7 +95,13 @@
 
 <style>
   ul {
-    flex: 1;
+    /*
+     * The primary list: basis `auto` (not 0) so it shares surplus and deficit fairly
+     * with the session list below instead of collapsing to nothing the moment the
+     * fixed chrome fills the sidebar — with thirty clips the content basis is the big
+     * one, so it keeps the lion's share and scrolls the rest.
+     */
+    flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     margin: 0;

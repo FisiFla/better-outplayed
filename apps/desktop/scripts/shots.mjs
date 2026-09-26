@@ -391,6 +391,60 @@ const SESSION_FIXTURE = {
 };
 
 /**
+ * A library after months of play: thirty clips and ten sessions. The sidebar has to stay
+ * usable — both lists scroll inside their own space, and the storage panel stays reachable
+ * instead of being pushed below the fold.
+ */
+const LONG_CLIPS = Array.from({ length: 30 }, (_, i) => {
+  const id = 200 + i;
+  const long = i === 7;
+  // The newest row is selected on load, so its file has to be one the mock's static
+  // server can actually play — otherwise the player 404s and the state fails on noise.
+  const file =
+    i === 0
+      ? 'clip-2026-09-23_19-22-04_ace_clutch.webm'
+      : long
+        ? 'clip-2026-08-02_17-11-53_ranked_overtime_loss_with_a_name_that_keeps_going_and_going.mp4'
+        : `clip-2026-09-${String(23 - (i % 9)).padStart(2, '0')}_19-${String(i % 60).padStart(2, '0')}-00_play_${i}.mp4`;
+  return clip(
+    id,
+    file,
+    5_000 + i * 1_000,
+    50_000_000 + i * 10_000_000,
+    ['h264', 'h265', 'vp8', 'vp9'][i % 4],
+    i % 5 === 0,
+    i * 37 * MINUTE,
+  );
+});
+const LONG_SESSIONS = Array.from({ length: 10 }, (_, i) => {
+  const running = i === 9;
+  return {
+    id: 300 + i,
+    game: i % 3 === 0 ? null : ['Dota 2', 'Counter-Strike 2'][i % 2],
+    mode: i % 4 === 0 ? 'buffer' : 'session',
+    started_at_ms: NEWEST_MS - (i + 1) * 5 * 60 * MINUTE,
+    ended_at_ms: running ? null : NEWEST_MS - i * 5 * 60 * MINUTE,
+    final_path: running || i % 4 === 0 ? null : `C:\\Users\\player\\AppData\\Local\\localplay\\sessions-out\\session-${300 + i}.mp4`,
+    size_bytes: 500_000_000 + i * 100_000_000,
+    favourite: i === 2,
+    scratch_dir: `C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-${300 + i}`,
+    duration_ms: running ? 0 : 3_000_000 + i * 60_000,
+  };
+});
+const LONG_FIXTURE = {
+  clips: LONG_CLIPS,
+  sessions: LONG_SESSIONS,
+  sessionEvents: {},
+  appStatus: APP_STATUS,
+  clipsDir: CLIPS_DIR,
+  thumbsDir: THUMBS_DIR,
+  thumbnails: 'ok',
+  nextTrimId: 400,
+  trimmedAtMs: NEWEST_MS,
+  stats: statsFor(LONG_CLIPS),
+};
+
+/**
  * The mock: an implementation of `ClipSource` that lives entirely in the page.
  *
  * It is serialised into the browser by `page.addInitScript`, so it may not close over
@@ -636,6 +690,7 @@ function buildMedia() {
   const ids = new Set([
     ...listClips.map((c) => c.id),
     ...TWO_MATCHES.map((c) => c.id),
+    ...LONG_CLIPS.map((c) => c.id),
     LIST_FIXTURE.nextTrimId,
   ]);
   for (const id of ids) {
@@ -886,6 +941,19 @@ async function layoutAudit(page) {
       main: rect('.main'),
       mainScroll: scroller('.main'),
       clipList: scroller('.sidebar ul'),
+      sessionList: (() => {
+        const lists = document.querySelectorAll('.sidebar ul');
+        const el = lists.length > 1 ? lists[1] : null;
+        if (!el) return null;
+        return {
+          clientHeight: el.clientHeight,
+          scrollHeight: el.scrollHeight,
+          clientWidth: el.clientWidth,
+          scrollWidth: el.scrollWidth,
+          scrollsVertically: el.scrollHeight > el.clientHeight + 1,
+          scrollsHorizontally: el.scrollWidth > el.clientWidth + 1,
+        };
+      })(),
       // `.storage`, not `.panel`: the sidebar's first panel is the recorder (added with
       // the recording UI), and this audit is about the storage panel's arithmetic.
       storage: rect('.sidebar .storage'),
@@ -1598,25 +1666,6 @@ const states = [
         await page.locator('.sidebar ul li.selected .actions').first().isVisible(),
         'the selected row reveals its actions once the fade settles',
       );
-      report(this.name, await page.evaluate(() => {
-        const sel = document.querySelector('.sidebar ul li.svelte-1h8243g.selected');
-        const clip1 = document.querySelector('.sidebar ul li.svelte-1trbi2a');
-        const out = [];
-        if (sel) {
-          out.push(`session-li-bg=${getComputedStyle(sel).backgroundColor}`);
-          const actions = sel.querySelector('.actions');
-          if (actions) {
-            out.push(`session-actions-op=${getComputedStyle(actions).opacity}`);
-            actions.style.setProperty('opacity', '1', 'important');
-            out.push(`session-actions-forced-op=${getComputedStyle(actions).opacity}`);
-          }
-        }
-        if (clip1) {
-          const actions = clip1.querySelector('.actions');
-          if (actions) out.push(`clip1-actions-op=${getComputedStyle(actions).opacity}`);
-        }
-        return out.join(' | ');
-      }));
       check(
         this.name,
         await page.getByRole('heading', { name: 'Dota 2' }).isVisible(),
@@ -1643,6 +1692,42 @@ const states = [
         this.name,
         layout.storage.bottom <= layout.viewport.height + 0.5,
         `the storage panel is still inside the window with sessions listed (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
+    },
+  },
+  {
+    name: '13-long-lists',
+    title: 'long library: thirty clips and ten sessions stay inside the sidebar',
+    group: 'long',
+    fixture: LONG_FIXTURE,
+    async verify(page) {
+      await waitForThumbnails(page, 30);
+      check(this.name, (await page.locator('.name').count()) === 30, 'all thirty clip rows render');
+      const layout = await layoutAudit(page);
+      check(
+        this.name,
+        layout.document.scrollWidth <= layout.viewport.width,
+        `nothing overflows horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`,
+      );
+      check(
+        this.name,
+        layout.storage.bottom <= layout.viewport.height + 0.5,
+        `the storage panel stays reachable (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
+      if (layout.clipList.scrollsVertically) {
+        report(this.name, `the clip list scrolls (${layout.clipList.scrollHeight}px of rows in ${layout.clipList.clientHeight}px)`);
+      } else {
+        report(this.name, 'the clip list fits without scrolling');
+      }
+      check(
+        this.name,
+        layout.sessionList !== null && layout.sessionList.clientHeight <= layout.viewport.height * 0.3 + 1,
+        `the session list respects its cap (${layout.sessionList.clientHeight.toFixed(0)}px of ${layout.viewport.height}px)`,
+      );
+      check(
+        this.name,
+        !layout.sessionList.scrollsHorizontally,
+        'session rows do not scroll sideways',
       );
     },
   },

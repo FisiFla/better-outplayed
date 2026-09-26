@@ -76,8 +76,12 @@
     /*
      * The sidebar's second scroll area. Without a cap this sizes to its content and
      * pushes the storage panel below the fold — with no way to reach it, since the
-     * sidebar itself does not scroll. The clip list stays the flexible one.
+     * sidebar itself does not scroll. The clip list stays the flexible one: this one
+     * neither grows (0) nor holds space beyond its cap, keeps one row visible at
+     * minimum, and yields the rest to clips.
      */
+    flex: 0 1 auto;
+    min-height: 80px;
     max-height: 30vh;
   }
 
