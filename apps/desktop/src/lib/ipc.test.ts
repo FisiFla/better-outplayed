@@ -37,12 +37,16 @@ function registeredCommands(): string[] {
     .filter((name) => name.length > 0);
 }
 
-/** The parameter names of a `#[tauri::command]` function, without its `State` argument. */
+/** The parameter names of a `#[tauri::command]` function, without the ones the
+ * runtime injects: `State` (the application state) and `AppHandle` (for the asset
+ * scope) are not sent over `invoke`, so the frontend must not send them either. */
 function rustParameters(command: string): string[] {
   const body = new RegExp(`fn ${command}\\(([\\s\\S]*?)\\)\\s*->`).exec(LIB_RS)?.[1] ?? '';
-  return [...body.matchAll(/(\w+)\s*:/g)]
+  // `:[^:]` — a path like `commands::SettingsUpdate` must not read as a parameter
+  // named `commands`.
+  return [...body.matchAll(/(\w+)\s*:(?!:)/g)]
     .map((match) => match[1] ?? '')
-    .filter((name) => name !== 'state');
+    .filter((name) => name !== 'state' && name !== 'app');
 }
 
 /** Run one IPC call and return the first argument `invoke` was handed. */
@@ -87,6 +91,8 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.recordingStatus())).toBe('recording_status');
     expect(await wireName(() => tauriIpc.clipNow())).toBe('clip_now');
     expect(await wireName(() => tauriIpc.appStatus())).toBe('app_status');
+    expect(await wireName(() => tauriIpc.getSettings())).toBe('get_settings');
+    expect(await wireName(() => tauriIpc.updateSettings({ fps: 30 }))).toBe('update_settings');
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
@@ -111,6 +117,8 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.recordingStatus()),
       await wireName(() => tauriIpc.clipNow()),
       await wireName(() => tauriIpc.appStatus()),
+      await wireName(() => tauriIpc.getSettings()),
+      await wireName(() => tauriIpc.updateSettings({ fps: 30 })),
       await wireName(() => tauriIpc.logFromFrontend('info', 'a message', 'a detail')),
     ];
 
@@ -153,6 +161,8 @@ describe('the argument keys', () => {
       stop_recording: await wireArgs(() => tauriIpc.stopRecording()),
       recording_status: await wireArgs(() => tauriIpc.recordingStatus()),
       clip_now: await wireArgs(() => tauriIpc.clipNow()),
+      get_settings: await wireArgs(() => tauriIpc.getSettings()),
+      update_settings: await wireArgs(() => tauriIpc.updateSettings({ fps: 30 })),
     };
 
     for (const [command, args] of Object.entries(sent)) {

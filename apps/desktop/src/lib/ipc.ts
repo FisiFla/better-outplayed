@@ -28,8 +28,11 @@ import type {
   RecordingStatus,
   SessionDto,
   SessionEvent,
+  SettingsDto,
+  SettingsUpdate,
   StorageStats,
   ThumbnailRef,
+  UpdateSettingsOutcome,
 } from './types';
 
 /** The commands this window can call, as an interface. */
@@ -58,6 +61,18 @@ export interface ClipSource {
   deleteSession(sessionId: number): Promise<DeleteSessionOutcome>;
   /** Cut a clip out of a **finished** session, losslessly. Refused while it is recording. */
   extractClip(sessionId: number, startMs: number, endMs: number): Promise<ClipDto>;
+  /**
+   * The settings the window shows and edits (`config.toml`, read at startup everywhere
+   * else). Read-only apart from `updateSettings` — the engine that writes a session is
+   * the recorder, not this window.
+   */
+  getSettings(): Promise<SettingsDto>;
+  /**
+   * Validate and write edited keys. Every field optional; absent fields are left alone.
+   * `storage.clips_dir` applies immediately (future writes); fps, output size, mic and
+   * auto-record persist and take effect on the next recorder start.
+   */
+  updateSettings(update: SettingsUpdate): Promise<UpdateSettingsOutcome>;
   /**
    * Recording, through the same engine the CLI drives (`localplay-recorder`). These four
    * are the only commands that make the shell capture anything, and none of them is
@@ -109,6 +124,9 @@ export const tauriIpc: ClipSource = {
   recordingStatus: () => invoke<RecordingStatus>('recording_status'),
   clipNow: () => invoke<RecordedClip>('clip_now'),
   appStatus: () => invoke<AppStatus>('app_status'),
+  getSettings: () => invoke<SettingsDto>('get_settings'),
+  updateSettings: (update: SettingsUpdate) =>
+    invoke<UpdateSettingsOutcome>('update_settings', { update }),
   logFromFrontend: (level, message, detail) =>
     invoke<void>('log_from_frontend', { level, message, detail }),
   assetUrl: (path) => convertFileSrc(path),

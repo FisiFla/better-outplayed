@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  describeAutoRecord,
   describeConfig,
   describeFrames,
   describeHotkey,
@@ -38,6 +39,10 @@ function status(overrides: Partial<RecordingStatus> = {}): RecordingStatus {
     drift_ms: 1_258,
     clips: 1,
     error: null,
+    watching_games: false,
+    matched_game: null,
+    recorder_mode: 'buffer',
+    mic_enabled: false,
     ...overrides,
   };
 }
@@ -234,5 +239,27 @@ describe('the config line', () => {
 
   it('says nothing before the shell has answered', () => {
     expect(describeConfig(null)).toBeNull();
+  });
+});
+
+describe('the automatic-recording line', () => {
+  it('says nothing before the first status arrives', () => {
+    expect(describeAutoRecord(null)).toBeNull();
+  });
+
+  it('says automatic recording is off when no watcher is armed', () => {
+    expect(describeAutoRecord(status())).toBe('Automatic recording is off.');
+  });
+
+  it('says it is watching once auto-record is on', () => {
+    expect(describeAutoRecord(status({ watching_games: true }))).toBe(
+      'Watching for a game — recording starts on match.',
+    );
+  });
+
+  it('names the game that triggered the recording', () => {
+    expect(
+      describeAutoRecord(status({ watching_games: true, matched_game: 'Dota 2' })),
+    ).toBe('Dota 2 detected — recording.');
   });
 });

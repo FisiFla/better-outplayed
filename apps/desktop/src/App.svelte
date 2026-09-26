@@ -14,12 +14,14 @@
   import RecordingPanel from './lib/components/RecordingPanel.svelte';
   import SessionDetail from './lib/components/SessionDetail.svelte';
   import SessionList from './lib/components/SessionList.svelte';
+  import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import StoragePanel from './lib/components/StoragePanel.svelte';
   import { describeDelete, describeTrim, resolveSelection, thumbnailAtMs, toClipViews } from './lib/clips';
   import type { ClipView } from './lib/clips';
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
   import { describeRecordedClip } from './lib/recording';
+  import { describeSettingsUpdate } from './lib/settings';
   import {
     describeExtraction,
     describeSessionDelete,
@@ -30,6 +32,8 @@
     AppStatus,
     RecordingStatus,
     SessionEvent,
+    SettingsDto,
+    SettingsUpdate,
     StorageStats,
     TrimRange,
   } from './lib/types';
@@ -59,6 +63,8 @@
   let stats = $state<StorageStats | null>(null);
   /** The engine's live counters; `null` until the first poll answers. */
   let recording = $state<RecordingStatus | null>(null);
+  /** The effective settings; `null` until the first read answers. */
+  let settings = $state<SettingsDto | null>(null);
   /** The clip hotkey and where the config came from; `null` until the first read answers. */
   let app = $state<AppStatus | null>(null);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
@@ -157,6 +163,14 @@
   async function refreshApp() {
     try {
       app = await source.appStatus();
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function refreshSettings() {
+    try {
+      settings = await source.getSettings();
     } catch (err) {
       error = errorMessage(err);
     }
@@ -267,6 +281,27 @@
   }
 
   /**
+   * Save edited settings.
+   *
+   * The outcome carries the settings read back after the write, so the panel
+   * refreshes from it; the library is refreshed too, because a clips-directory move
+   * changes what the storage panel reports.
+   */
+  async function updateSettings(update: SettingsUpdate) {
+    busy = true;
+    try {
+      const outcome = await source.updateSettings(update);
+      notice = describeSettingsUpdate(outcome);
+      await refresh();
+      await refreshSettings();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
    * Show a session's timeline in the main pane.
    *
    * The two selections are exclusive because there is one main pane, and a session's timeline
@@ -322,8 +357,7 @@
     }
   }
 
-  async function deleteSession(id: number) {
-    const title = sessions.find((session) => session.id === id)?.title ?? `session #${id}`;
+  async function deleteSession(id: number) {    const title = sessions.find((session) => session.id === id)?.title ?? `session #${id}`;
     busy = true;
     try {
       const outcome = await source.deleteSession(id);
@@ -354,6 +388,8 @@
     // Read once: a chord cannot change while the process runs (it is registered at startup),
     // and neither can the path the config came from.
     void refreshApp();
+    // The settings panel's values; re-read after every apply, which returns them anyway.
+    void refreshSettings();
     const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
     return () => clearInterval(poll);
   });
@@ -399,6 +435,14 @@
     />
     {#if stats !== null}
       <StoragePanel {stats} />
+    {/if}
+    {#if settings !== null}
+      <SettingsPanel
+        {settings}
+        {recording}
+        {busy}
+        onApply={updateSettings}
+      />
     {/if}
   </aside>
 

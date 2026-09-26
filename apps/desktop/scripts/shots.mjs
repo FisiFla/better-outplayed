@@ -376,6 +376,39 @@ const SESSION_EVENTS = {
   ],
 };
 
+/** The library as the settings states see it: clips, plus armed-but-idle watching. */
+const SETTINGS_FIXTURE = {
+  ...LIST_FIXTURE,
+  recording: {
+    running: false,
+    frames: 0,
+    segments: 0,
+    bytes: 0,
+    span_ms: 0,
+    dropped: 0,
+    dropped_audio: 0,
+    skipped: 0,
+    fps: 0,
+    configured_fps: 0,
+    effective_fps: 0,
+    drift_ms: 0,
+    clips: 0,
+    error: null,
+    watching_games: false,
+    matched_game: null,
+    recorder_mode: 'buffer',
+    mic_enabled: false,
+  },
+  settings: {
+    fps: 30,
+    output_size: '',
+    mic_enabled: false,
+    auto_record: false,
+    watch_titles: ['League of Legends', 'Counter-Strike 2', 'Dota 2'],
+    defaulted: ['encode.output_size'],
+    config_exists: true,
+  },
+};
 /** The library as the session-review states see it: two clips, two sessions. */
 const SESSION_FIXTURE = {
   clips: listClips.slice(0, 2),
@@ -457,7 +490,7 @@ function installMockSource(fixture) {
   const eventsBySession = fixture.sessionEvents ?? {};
   // The recorder's status is state, not a constant: `save_clip` bumps the clip counter and
   // a stop flips `running`, exactly as the engine's own counters would.
-  let recording = fixture.recording ?? {
+  let recording = {
     running: false,
     frames: 0,
     segments: 0,
@@ -468,9 +501,32 @@ function installMockSource(fixture) {
     skipped: 0,
     fps: 0,
     configured_fps: 0,
+    effective_fps: 0,
     drift_ms: 0,
     clips: 0,
     error: null,
+    watching_games: false,
+    matched_game: null,
+    recorder_mode: 'buffer',
+    mic_enabled: false,
+    ...(fixture.recording ?? {}),
+  };
+  // The effective settings, mutated by `updateSettings` the way the file would be.
+  // (The install scope forbids closing over module constants, so the default clips
+  // directory comes from the fixture's own stats, which every fixture carries.)
+  const defaultClipsDir = (fixture.stats ?? {}).clips_dir ?? '';
+  const settings = {
+    clips_dir: '',
+    clips_dir_resolved: defaultClipsDir,
+    fps: 60,
+    output_size: '',
+    mic_enabled: false,
+    auto_record: false,
+    watch_titles: ['League of Legends', 'Counter-Strike 2', 'Dota 2'],
+    defaulted: [],
+    config_exists: true,
+    config_path: 'C:\\Users\\player\\localplay\\config.toml',
+    ...(fixture.settings ?? {}),
   };
   const find = (id) => clips.find((c) => c.id === id);
   const notFound = (id) => ({ code: 'clip_not_found', message: `clip #${id} is not in the index` });
@@ -611,6 +667,52 @@ function installMockSource(fixture) {
     // path does not move while the process runs.
     async appStatus() {
       return { ...fixture.appStatus, hotkey: { ...fixture.appStatus.hotkey } };
+    },
+    async getSettings() {
+      return { ...settings, watch_titles: [...settings.watch_titles], defaulted: [...settings.defaulted] };
+    },
+    async updateSettings(update) {
+      // Mirror the backend's contract: validation first (a rejection writes nothing),
+      // then the merge, then the restart verdict for a running recorder.
+      if (update.fps !== undefined && !(Number.isInteger(update.fps) && update.fps >= 1 && update.fps <= 240)) {
+        throw { code: 'invalid_input', message: `encode.fps is ${update.fps}, but the capture rate must be between 1 and 240` };
+      }
+      const before = { ...settings };
+      const applied = [];
+      for (const [field, key] of [['clips_dir', 'storage.clips_dir'], ['fps', 'encode.fps'], ['output_size', 'encode.output_size'], ['mic_enabled', 'mic.enabled'], ['auto_record', 'games.auto_record']]) {
+        if (update[field] !== undefined) {
+          settings[field] = update[field];
+          applied.push(key);
+        }
+      }
+      if (settings.clips_dir === '') {
+        settings.clips_dir_resolved = defaultClipsDir;
+      } else {
+        settings.clips_dir_resolved = settings.clips_dir;
+      }
+      const engineChanged = [];
+      if (update.fps !== undefined && settings.fps !== before.fps) engineChanged.push('encode.fps');
+      if (update.output_size !== undefined && settings.output_size !== before.output_size) {
+        engineChanged.push('encode.output_size');
+      }
+      if (update.mic_enabled !== undefined && settings.mic_enabled !== before.mic_enabled) {
+        engineChanged.push('mic.enabled');
+      }
+      if (update.auto_record !== undefined && settings.auto_record !== before.auto_record) {
+        engineChanged.push('games.auto_record');
+      }
+      const restartRequired = recording.running && engineChanged.length > 0;
+      // The idle mock has no engine restart to wait for: the next start would arm what
+      // was saved, so mirror it straight away and the recorder line stays truthful.
+      recording.watching_games = settings.auto_record;
+      return {
+        settings: await this.getSettings(),
+        applied,
+        restart_required: restartRequired,
+        restart_reason: restartRequired
+          ? `a recording is running: ${engineChanged.join(', ')} takes effect when the next recording starts`
+          : null,
+      };
     },
     async clipNow() {
       const written = { ...fixture.clipNow };
@@ -1729,6 +1831,82 @@ const states = [
         !layout.sessionList.scrollsHorizontally,
         'session rows do not scroll sideways',
       );
+    },
+  },
+  {
+    name: '14-settings',
+    title: 'settings: values, the auto-record toggle, and a rejected framerate',
+    group: 'settings',
+    fixture: SETTINGS_FIXTURE,
+    async verify(page) {
+      await waitForThumbnails(page, 6);
+      check(
+        this.name,
+        ((await page.locator('.recorder .auto').textContent()) ?? '').includes('Automatic recording is off.'),
+        'the recorder says nothing is armed while auto-record is off',
+      );
+
+      const layout = await layoutAudit(page);
+      check(
+        this.name,
+        layout.storage.bottom <= layout.viewport.height + 0.5,
+        `the closed settings panel costs almost no space (storage bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
+
+      await page.locator('.settings summary').click();
+      const panel = page.locator('.settings');
+      check(this.name, await panel.getByRole('heading', { name: 'Library' }).isVisible(), 'the library section opens');
+      check(
+        this.name,
+        (await panel.locator('input[type="number"]').inputValue()) === '30',
+        'the framerate shows the configured value',
+      );
+      check(
+        this.name,
+        ((await panel.textContent()) ?? '').includes('League of Legends'),
+        'the watched titles are listed',
+      );
+
+      await panel.getByLabel(/Record watched games automatically/).check();
+      await panel.getByRole('button', { name: 'Apply automatic' }).click();
+      const notice = page.locator('.banner.notice');
+      await notice.waitFor({ state: 'visible', timeout: 10_000 });
+      check(
+        this.name,
+        ((await notice.textContent()) ?? '').includes('Saved games.auto_record.'),
+        'the notice names the key that was saved',
+      );
+      // The recorder line follows on the status poll, not on the apply call.
+      await page.waitForFunction(
+        () =>
+          (document.querySelector('.recorder .auto')?.textContent ?? '').includes(
+            'Watching for a game',
+          ),
+        null,
+        { timeout: 5_000 },
+      );
+      check(
+        this.name,
+        true,
+        'the recorder line follows the toggle once it settles',
+      );
+
+      await panel.locator('input[type="number"]').fill('999');
+      check(
+        this.name,
+        await panel.getByText('Framerate must be 1–240.').isVisible(),
+        'an out-of-range framerate is refused inline',
+      );
+      check(
+        this.name,
+        await panel.getByRole('button', { name: 'Apply capture' }).isDisabled(),
+        'and cannot be applied',
+      );
+
+      await auditContrast(page, this.name, {
+        '.settings summary': 'settings disclosure',
+        '.settings input[type="text"]': 'settings field',
+      });
     },
   },
 ];

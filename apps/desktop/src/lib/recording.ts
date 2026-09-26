@@ -157,11 +157,23 @@ export function describeHotkey(
 }
 
 /**
+ * The automatic-recording line: whether the recorder is armed for games, and what it
+ * caught. `null` until the first status arrives — the panel shows nothing rather than a
+ * verdict about a recorder it has not heard from.
+ */
+export function describeAutoRecord(status: RecordingStatus | null): string | null {
+  if (status === null) return null;
+  if (!status.watching_games) return 'Automatic recording is off.';
+  if (status.matched_game !== null) return `${status.matched_game} detected — recording.`;
+  return 'Watching for a game — recording starts on match.';
+}
+
+/**
  * One line naming the configuration file this process read.
  *
- * The file is the only settings surface this application has, so the window says which one
- * it found — and says plainly when there was none, rather than presenting the example's
- * defaults as if they had been configured.
+ * The file is where the window's settings are persisted, so the panel says which one
+ * it found — and says plainly when there was none, rather than presenting the
+ * example's defaults as if they had been configured.
  */
 export function describeConfig(status: AppStatus | null): string | null {
   if (status === null) return null;

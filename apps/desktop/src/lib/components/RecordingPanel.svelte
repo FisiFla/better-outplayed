@@ -15,6 +15,7 @@
    * a disabled-looking control that cannot work is worse than no control.
    */
   import {
+    describeAutoRecord,
     describeConfig,
     describeFrames,
     describeHotkey,
@@ -44,6 +45,7 @@
   const frames = $derived(describeFrames(status));
   const hotkey = $derived(describeHotkey(app?.hotkey ?? null));
   const config = $derived(describeConfig(app));
+  const autoRecord = $derived(describeAutoRecord(status));
 </script>
 
 <section class="panel recorder">
@@ -81,6 +83,10 @@
       {status.clips}
       {status.clips === 1 ? 'clip' : 'clips'} saved
     </p>
+  {/if}
+
+  {#if autoRecord !== null}
+    <p class="muted auto">{autoRecord}</p>
   {/if}
 
   <details class="engine">
@@ -252,6 +258,11 @@
   .live {
     margin: 0;
     font-size: 12px;
+  }
+
+  .auto {
+    margin: 0;
+    font-size: 11px;
   }
 
   .engine {

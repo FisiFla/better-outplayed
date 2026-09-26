@@ -175,8 +175,63 @@ export interface RecordingStatus {
   clips: number;
   /** Why the engine stopped, when it stopped for a failure. */
   error: string | null;
+  /**
+   * Whether a game watcher is armed: false unless `[games] auto_record` was on at
+   * start. While true and `running` is false, the recorder is armed and waiting.
+   */
+  watching_games: boolean;
+  /** The game being recorded, when a watched game triggered it; else null. */
+  matched_game: string | null;
+  /** The mode this recorder was started in (`"buffer"` or `"session"`). */
+  recorder_mode: string;
+  /** Whether this recording carries a microphone track (`[mic] enabled`). */
+  mic_enabled: boolean;
 }
 
+/** The settings the window shows, as `get_settings` returns them. */
+export interface SettingsDto {
+  /** `[storage] clips_dir`, verbatim — empty means the default. */
+  clips_dir: string;
+  /** Where that resolves: the clips directory itself, for display. */
+  clips_dir_resolved: string;
+  /** `[encode] fps`. */
+  fps: number;
+  /** `[encode] output_size` — empty is the native capture size. */
+  output_size: string;
+  /** `[mic] enabled`. */
+  mic_enabled: boolean;
+  /** `[games] auto_record`. */
+  auto_record: boolean;
+  /** Display names from `[[games.watch]]`, or the default titles. */
+  watch_titles: string[];
+  /** Keys that fell back to the example because the file does not set them. */
+  defaulted: string[];
+  /** False when no file exists and every value is the example's. */
+  config_exists: boolean;
+  /** The file that was read. */
+  config_path: string;
+}
+
+/** A partial settings update: every field optional, absent fields are left alone. */
+export interface SettingsUpdate {
+  clips_dir?: string;
+  fps?: number;
+  output_size?: string;
+  mic_enabled?: boolean;
+  auto_record?: boolean;
+}
+
+/** What writing settings did, and what it means for a running recorder. */
+export interface UpdateSettingsOutcome {
+  /** Read back after the write, so the window refreshes from this. */
+  settings: SettingsDto;
+  /** The keys that changed, e.g. `"encode.fps"`. */
+  applied: string[];
+  /** True only when a recording is running and an engine key changed value. */
+  restart_required: boolean;
+  /** Names the changed engine keys when a restart is required, else null. */
+  restart_reason: string | null;
+}
 /** What a clip trigger produced, as `clip_now` returns it. */
 export interface RecordedClip {
   /**
