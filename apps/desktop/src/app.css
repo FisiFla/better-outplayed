@@ -14,6 +14,7 @@
   --accent: #5eead4;
   --accent-dim: #2b6f64;
   --danger: #f87171;
+  --danger-soft: #fca5a5;
   --warn: #fbbf24;
   --star: #fbbf24;
 
@@ -101,7 +102,7 @@ code,
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  padding: 14px 16px 10px;
+  padding: 10px 16px 8px;
 }
 
 /* -- primitives ---------------------------------------------------------------------- */
@@ -126,6 +127,18 @@ button {
 
 button:hover:not(:disabled) {
   border-color: var(--accent-dim);
+  background: #20242e;
+}
+
+button:active:not(:disabled) {
+  border-color: var(--accent-dim);
+  background: #242935;
+}
+
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 button:disabled {
@@ -141,7 +154,11 @@ button.primary {
 }
 
 button.danger {
-  color: var(--danger);
+  color: var(--danger-soft);
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
 }
 
 .banner {

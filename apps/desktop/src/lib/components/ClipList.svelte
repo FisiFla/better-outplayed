@@ -28,8 +28,7 @@
 
 {#if clips.length === 0}
   <p class="empty">
-    No clips are indexed yet. Record one with <code class="mono">localplay-cli buffer</code>
-    — this window reads the same index the recorder writes.
+    No clips are indexed yet. Record one with <code class="mono">localplay-cli buffer</code>.
   </p>
 {:else}
   <ul>
@@ -49,10 +48,7 @@
           {/if}
           <span class="meta">
             <span class="name">{clip.name}</span>
-            <span class="sub muted">
-              {clip.durationLabel} · {clip.sizeLabel} · {clip.codec}
-            </span>
-            <span class="sub muted">{clip.createdAtLabel}</span>
+            <span class="sub muted">{clip.durationLabel} · {clip.sizeLabel} · {clip.codec} · {clip.createdAtLabel}</span>
           </span>
         </button>
 
@@ -145,13 +141,7 @@
 
   .thumb.placeholder {
     display: block;
-    background: repeating-linear-gradient(
-      45deg,
-      #16181f,
-      #16181f 6px,
-      #1d2029 6px,
-      #1d2029 12px
-    );
+    background: #16181f;
   }
 
   .meta {
@@ -168,13 +158,49 @@
 
   .sub {
     font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
+  /*
+   * The star and the delete live behind the row until they are needed: a list where every
+   * row shows two buttons is mostly buttons. They appear for the row under the pointer,
+   * the selected row, and — always — for keyboard and touch users, whose focus lands on
+   * them: `:focus-within` keeps the focused control painted, and hiding is by opacity so
+   * nothing leaves the tab order or the accessibility tree.
+   */
   .actions {
     display: flex;
     align-items: center;
     gap: 2px;
     padding-right: 6px;
+    opacity: 0;
+    transition: opacity 150ms ease-out;
+  }
+
+  li:hover .actions {
+    opacity: 1;
+  }
+
+  li:focus-within .actions {
+    opacity: 1;
+  }
+
+  li.selected .actions {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .actions {
+      transition: none;
+    }
+  }
+
+  @media (hover: none) {
+    .actions {
+      opacity: 1;
+    }
   }
 
   .actions button {

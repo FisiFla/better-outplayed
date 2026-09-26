@@ -87,7 +87,6 @@
   <span class="chip">{clip.sizeLabel}</span>
   <span class="chip">{clip.codec}</span>
   <span class="chip">{formatDateTime(clip.createdAtMs)}</span>
-  <span class="chip mono">row {clip.id}</span>
 </div>
 
 <!--
@@ -148,16 +147,12 @@
   {/if}
 
   <p class="lossless">
-    <strong>Lossless.</strong> The selection is cut with an ffmpeg <em>stream copy</em>
-    (<code>-c copy</code>) — the same encoded frames, remuxed. Nothing is re-encoded, so the
-    new clip costs no quality. A stream copy can only cut where the stream allows, so the
-    file's length can differ by a fraction of a second from the selection above; the report
-    after a trim gives both numbers rather than rounding them into agreement.
-  </p>
-  <p class="muted note">
-    The trimmed file is written next to the original as
-    <code>{clip.name.replace(/\.[^.]+$/, '')}.trim-START-END.&lt;ext&gt;</code> and indexed as
-    a clip of its own. The original is never modified.
+    <strong>Lossless.</strong> The selection is cut with an ffmpeg stream copy
+    (<code>-c copy</code>), so nothing is re-encoded — but the cut can only land where the
+    stream allows, and the file can differ by a fraction of a second from the selection.
+    It is written next to the original as
+    <code>{clip.name.replace(/\.[^.]+$/, '')}.trim-START-END.&lt;ext&gt;</code>; the
+    original is never modified.
   </p>
 </section>
 
@@ -235,13 +230,8 @@
     font-size: 12px;
     color: var(--text);
     background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-left: 3px solid var(--accent);
+    border: 1px solid var(--accent-dim);
     border-radius: 4px;
     padding: 8px 10px;
-  }
-
-  .note {
-    font-size: 11px;
   }
 </style>

@@ -214,10 +214,8 @@
     font-weight: 600;
   }
 
-  .danger {
+  .controls > .danger {
     margin-left: auto;
-    border-color: #f87171;
-    color: #fca5a5;
   }
 
   .blocked {

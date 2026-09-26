@@ -79,8 +79,7 @@
   {/each}
 
   <p class="muted footnote">
-    Read-only. The cleanup pass runs in the recorder while it is capturing; this window
-    reads the same index it manages and reports the policy's verdict, but deletes only the
+    Read-only: the recorder cleans up while it is capturing; this window deletes only the
     clip you ask it to.
   </p>
 </section>
@@ -149,11 +148,13 @@
   }
 
   .verdict.ok {
-    border-left: 3px solid var(--accent);
+    border-color: var(--accent-dim);
+    background: rgba(94, 234, 212, 0.06);
   }
 
   .verdict.bad {
-    border-left: 3px solid var(--warn);
+    border-color: var(--warn);
+    background: rgba(251, 191, 36, 0.07);
   }
 
   .footnote {

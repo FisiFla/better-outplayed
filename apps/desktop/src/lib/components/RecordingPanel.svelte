@@ -75,59 +75,66 @@
     </p>
   {/if}
 
-  {#if status !== null}
-    <dl>
-      <div>
-        <dt>Buffered</dt>
-        <dd>{formatDuration(status.span_ms)} <span class="muted">of media</span></dd>
-      </div>
-      <div>
-        <dt>Segments</dt>
-        <dd>{status.segments} <span class="muted">({formatBytes(status.bytes)})</span></dd>
-      </div>
-      <div>
-        <dt>Frames</dt>
-        <dd>{status.frames}</dd>
-      </div>
-      <div>
-        <dt>Rate</dt>
-        <dd>{formatRate(status)}</dd>
-      </div>
-      <div>
-        <dt>Clips saved</dt>
-        <dd>{status.clips}</dd>
-      </div>
-      <div>
-        <dt>Media drift</dt>
-        <dd>{formatDrift(status)}</dd>
-      </div>
-    </dl>
+  {#if state === 'recording' && status !== null}
+    <p class="live">
+      {formatDuration(status.span_ms)} of media · {formatRate(status)} ·
+      {status.clips}
+      {status.clips === 1 ? 'clip' : 'clips'} saved
+    </p>
+  {/if}
 
-    {#if frames !== null}
-      <p class="muted footnote">{frames}</p>
-    {/if}
+  <details class="engine">
+    <summary>Engine counters</summary>
+    {#if status !== null}
+      <dl>
+        <div>
+          <dt>Buffered</dt>
+          <dd>{formatDuration(status.span_ms)} <span class="muted">of media</span></dd>
+        </div>
+        <div>
+          <dt>Segments</dt>
+          <dd>{status.segments} <span class="muted">({formatBytes(status.bytes)})</span></dd>
+        </div>
+        <div>
+          <dt>Frames</dt>
+          <dd>{status.frames}</dd>
+        </div>
+        <div>
+          <dt>Rate</dt>
+          <dd>{formatRate(status)}</dd>
+        </div>
+        <div>
+          <dt>Clips saved</dt>
+          <dd>{status.clips}</dd>
+        </div>
+        <div>
+          <dt>Media drift</dt>
+          <dd>{formatDrift(status)}</dd>
+        </div>
+      </dl>
 
-    {#if state === 'idle'}
+      {#if frames !== null}
+        <p class="muted footnote">{frames}</p>
+      {/if}
+    {:else}
       <p class="muted footnote">
-        Nothing is being captured. Recording needs a GPU encoder (NVENC, Quick Sync or AMF)
-        and writes to the same clips directory this window lists — the CLI records through
-        this same engine.
+        No status has arrived yet — the readout above says which read failed, if one did.
       </p>
     {/if}
-  {:else}
-    <p class="muted footnote">
-      Nothing is being captured, and the recorder has not been asked yet (or the last status
-      read failed — the banner above says which). Recording needs a GPU encoder (NVENC,
-      Quick Sync or AMF) and writes to the same clips directory this window lists; the CLI
-      records through this same engine.
-    </p>
-  {/if}
 
-  {#if app !== null}
-    <p class="muted footnote shell-notes">
-      {app.close_hint}{#if config !== null}<span class="config">{' '}{config}</span>{/if}
-    </p>
-  {/if}
+    {#if state !== 'recording'}
+      <p class="muted footnote">
+        Nothing is being captured. Recording needs a GPU encoder (NVENC, Quick Sync or
+        AMF); the CLI records through this same engine.
+      </p>
+    {/if}
+
+    {#if app !== null}
+      <p class="muted footnote shell-notes">
+        {app.close_hint}{#if config !== null}<span class="config">{' '}{config}</span>{/if}
+      </p>
+    {/if}
+  </details>
 </section>
 
 <style>
@@ -170,6 +177,25 @@
     height: 7px;
     border-radius: 50%;
     background: var(--danger);
+    animation: rec-pulse 1.6s ease-out infinite;
+  }
+
+  @keyframes rec-pulse {
+    0% {
+      box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.55);
+    }
+    70% {
+      box-shadow: 0 0 0 6px rgba(248, 113, 113, 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .dot {
+      animation: none;
+    }
   }
 
   .controls {
@@ -213,7 +239,37 @@
   }
 
   .verdict.bad {
-    border-left: 3px solid var(--warn);
+    border-color: var(--warn);
+    background: rgba(251, 191, 36, 0.07);
+  }
+
+  /*
+   * The one line a recording shows: how much media the ring holds, at what rate, and how
+   * many clips it produced. The full counters live in the disclosure below; this is the
+   * line a glance is for.
+   */
+  .live {
+    margin: 0;
+    font-size: 12px;
+  }
+
+  .engine {
+    font-size: 12px;
+  }
+
+  .engine summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 11px;
+    padding: 2px 0;
+  }
+
+  .engine summary:hover {
+    color: var(--text);
+  }
+
+  .engine .footnote {
+    margin-top: 8px;
   }
 
   /*
@@ -224,14 +280,15 @@
   .hotkey {
     margin: 0;
     padding: 4px 8px;
-    border-left: 3px solid var(--line);
+    border: 1px solid var(--line);
     background: var(--panel-2);
     border-radius: 4px;
     font-size: 12px;
   }
 
   .hotkey.bad {
-    border-left-color: var(--warn);
+    border-color: var(--warn);
+    background: rgba(251, 191, 36, 0.07);
   }
 
   .footnote {

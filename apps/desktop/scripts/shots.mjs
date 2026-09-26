@@ -287,6 +287,7 @@ const RECORDING_STATUS = {
   skipped: 320,
   fps: 29.83,
   configured_fps: 30,
+  effective_fps: 30,
   drift_ms: 1_258,
   clips: 1,
   error: null,
@@ -335,6 +336,61 @@ const NO_FFMPEG_FIXTURE = {
 };
 
 /**
+ * Two sessions for the review UI: a finished full-session recording with markers, and a
+ * buffer-mode session that is still running — the row that reads "length unknown".
+ *
+ * The clips are the first two of the list fixture, so their thumbnails are generated media
+ * rather than 404s, and the bookmark points at the clip the hotkey press wrote.
+ */
+const SESSION_SESSIONS = [
+  {
+    id: 7,
+    game: 'Dota 2',
+    mode: 'session',
+    started_at_ms: NEWEST_MS - 125 * MINUTE,
+    ended_at_ms: NEWEST_MS - 63 * MINUTE,
+    final_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions-out\\session-7.mp4',
+    size_bytes: 2_254_000_000,
+    favourite: false,
+    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-7',
+    duration_ms: 3_723_000,
+  },
+  {
+    id: 8,
+    game: null,
+    mode: 'buffer',
+    started_at_ms: NEWEST_MS - 20 * MINUTE,
+    ended_at_ms: null,
+    final_path: null,
+    size_bytes: 41_943_040,
+    favourite: false,
+    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-8',
+    duration_ms: 0,
+  },
+];
+const SESSION_EVENTS = {
+  7: [
+    { id: 11, kind: 'round_start', offset_ms: 0, payload: null, clip_id: null },
+    { id: 12, kind: 'death', offset_ms: 184_000, payload: '{"mentees":["axe"]}', clip_id: null },
+    { id: 13, kind: 'bookmark', offset_ms: 402_000, payload: null, clip_id: 42 },
+  ],
+};
+
+/** The library as the session-review states see it: two clips, two sessions. */
+const SESSION_FIXTURE = {
+  clips: listClips.slice(0, 2),
+  sessions: SESSION_SESSIONS,
+  sessionEvents: SESSION_EVENTS,
+  appStatus: APP_STATUS,
+  clipsDir: CLIPS_DIR,
+  thumbsDir: THUMBS_DIR,
+  thumbnails: 'ok',
+  nextTrimId: 43,
+  trimmedAtMs: NEWEST_MS,
+  stats: statsFor(listClips.slice(0, 2)),
+};
+
+/**
  * The mock: an implementation of `ClipSource` that lives entirely in the page.
  *
  * It is serialised into the browser by `page.addInitScript`, so it may not close over
@@ -343,6 +399,8 @@ const NO_FFMPEG_FIXTURE = {
  */
 function installMockSource(fixture) {
   const clips = fixture.clips.map((c) => ({ ...c }));
+  const sessions = (fixture.sessions ?? []).map((s) => ({ ...s }));
+  const eventsBySession = fixture.sessionEvents ?? {};
   // The recorder's status is state, not a constant: `save_clip` bumps the clip counter and
   // a stop flips `running`, exactly as the engine's own counters would.
   let recording = fixture.recording ?? {
@@ -423,6 +481,63 @@ function installMockSource(fixture) {
         bytes_reclaimed: removed ? removed.size_bytes : 0,
         thumbnails_removed: removed ? 1 : 0,
       };
+    },
+    // Sessions: the review UI the `d356b9b` feature added after this mock was written —
+    // without these, `refresh()` rejects and every state photographs an error banner.
+    async listSessions() {
+      return sessions.map((s) => ({ ...s }));
+    },
+    async sessionDetail(id) {
+      const session = sessions.find((s) => s.id === id);
+      if (!session) throw { code: 'session_not_found', message: `no session with id ${id} is in the index` };
+      return { ...session };
+    },
+    async sessionEvents(id) {
+      return [...(eventsBySession[id] ?? [])];
+    },
+    async setSessionFavourite(id, favourite) {
+      const session = sessions.find((s) => s.id === id);
+      if (!session) throw { code: 'session_not_found', message: `no session with id ${id} is in the index` };
+      session.favourite = favourite;
+      return { ...session };
+    },
+    async deleteSession(id) {
+      const index = sessions.findIndex((s) => s.id === id);
+      const [removed] = index >= 0 ? sessions.splice(index, 1) : [];
+      return {
+        id,
+        row_deleted: index >= 0,
+        scratch_removed: index >= 0,
+        final_file_removed: index >= 0 && removed.final_path !== null,
+        bytes_reclaimed: removed ? removed.size_bytes : 0,
+        orphaned: [],
+      };
+    },
+    async extractClip(sessionId, startMs, endMs) {
+      const session = sessions.find((s) => s.id === sessionId);
+      if (!session) throw { code: 'session_not_found', message: `no session with id ${sessionId} is in the index` };
+      if (session.ended_at_ms === null || session.final_path === null) {
+        throw { code: 'invalid_input', message: `session #${sessionId} has no finished file to cut from` };
+      }
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+        throw { code: 'invalid_range', message: 'The selection is empty.' };
+      }
+      const written = {
+        id: fixture.nextTrimId,
+        path: `${fixture.clipsDir}\\${basename(session.final_path).replace(/\.[^.]+$/, '')}.extract-${startMs}-${endMs}.mp4`,
+        started_at_ms: startMs,
+        duration_ms: endMs - startMs,
+        size_bytes: 12_000_000,
+        codec: 'h264',
+        favourite: false,
+        created_at_ms: fixture.trimmedAtMs,
+      };
+      fixture.nextTrimId += 1;
+      clips.unshift(written);
+      return { ...written };
+    },
+    async logFromFrontend() {
+      return;
     },
     async startRecording() {
       // Nothing here starts a capture — a fixture cannot, and must not: the real
@@ -668,21 +783,36 @@ async function contrastAudit(page, labels) {
       if (parts.length < 3 || parts.some((n) => Number.isNaN(n))) return null;
       return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
     };
-    // A gradient stop is what actually paints when `background` is a gradient and
-    // `background-color` is therefore transparent — which is the case for the timeline
-    // track (`linear-gradient(var(--panel-2), var(--panel-2))`).
+    // What actually paints behind the text: every translucent layer composited down to
+    // the first opaque one. Reading only the nearest layer with alpha > 0 would grade a
+    // 7%-tint verdict as white-on-amber, when the eye sees near-white on near-black.
     const effectiveBackground = (el) => {
+      const paints = [];
       for (let node = el; node; node = node.parentElement) {
         const style = getComputedStyle(node);
-        const flat = parse(style.backgroundColor);
-        if (flat && flat.a > 0) return flat;
+        // background-image paints above background-color, so within one node the image
+        // comes later in paint order.
         const gradient = /gradient\(([^)]+)\)/.exec(style.backgroundImage ?? '');
         if (gradient) {
           const stop = parse(gradient[1]);
-          if (stop) return stop;
+          if (stop) paints.push(stop);
         }
+        const flat = parse(style.backgroundColor);
+        if (flat && flat.a > 0) paints.push(flat);
       }
-      return { r: 255, g: 255, b: 255, a: 1 };
+      // Collected leaf-first; composite root-first over transparency.
+      let out = { r: 0, g: 0, b: 0, a: 0 };
+      for (let i = paints.length - 1; i >= 0; i--) {
+        const layer = paints[i];
+        const a = layer.a ?? 1;
+        out = {
+          r: layer.r * a + out.r * (1 - a),
+          g: layer.g * a + out.g * (1 - a),
+          b: layer.b * a + out.b * (1 - a),
+          a: a + out.a * (1 - a),
+        };
+      }
+      return out.a <= 0 ? { r: 255, g: 255, b: 255, a: 1 } : out;
     };
     const luminance = ({ r, g, b }) => {
       const channel = (v) => {
@@ -826,13 +956,13 @@ const states = [
     fixture: EMPTY_FIXTURE,
     async verify(page) {
       check(this.name, await page.getByText('No clips are indexed yet').isVisible(), 'the list explains how to record a clip');
-      check(this.name, await page.getByText('0 indexed').isVisible(), 'the pane header counts zero clips');
+      check(this.name, (await page.getByText('0 indexed').count()) === 2, 'both pane headers count zero');
       check(
         this.name,
         await page.getByText('Select a clip on the left').isVisible(),
         'the main pane says what to do instead of showing a blank pane',
       );
-      check(this.name, await page.getByText('0 B').first().isVisible(), 'the storage panel reports 0 B in use');
+      check(this.name, await page.locator('.storage').getByText('0 B of 50 GiB').isVisible(), 'the storage panel reports 0 B in use');
       check(this.name, await page.getByText('50 GiB').first().isVisible(), 'the storage panel names the cap');
     },
   },
@@ -905,7 +1035,7 @@ const states = [
       await waitForMedia(page);
       check(this.name, await page.getByRole('heading', { name: featureName }).isVisible(), 'the detail header names the clip');
       const chips = await page.locator('.facts .chip').allTextContents();
-      check(this.name, chips.length === 5, `five fact chips are rendered (${chips.join(' | ')})`);
+      check(this.name, chips.length === 4, `four fact chips are rendered (${chips.join(' | ')})`);
 
       const geometry = await timelineGeometry(page);
       context.geometry = geometry;
@@ -1148,7 +1278,7 @@ const states = [
       const heading = (await page.getByRole('heading', { level: 1 }).textContent()) ?? '';
       check(this.name, heading.includes('.trim-'), `the detail view switched to the new clip (${heading})`);
       const chips = await page.locator('.facts .chip').allTextContents();
-      check(this.name, chips.some((c) => /^row \d+$/.test(c.trim())), `the new clip has its own index row (${chips.at(-1)})`);
+      check(this.name, chips.every((c) => !/^row \d+$/.test(c.trim())), 'no chip names the index row: that was a debugging leftover, not clip metadata');
       const trimmedRange = await timelineGeometry(page);
       check(
         this.name,
@@ -1434,6 +1564,86 @@ const states = [
         '.recorder .hotkey': 'hotkey alert',
         '.recorder .shell-notes .config': 'config path',
       });
+    },
+  },
+  {
+    name: '12-session-review',
+    title: 'session review: a finished session with markers, and one still recording',
+    group: 'session',
+    fixture: SESSION_FIXTURE,
+    async verify(page) {
+      await waitForThumbnails(page, 2);
+      check(
+        this.name,
+        await page.getByText('No sessions are indexed yet').isHidden(),
+        'the sessions list is populated, not empty',
+      );
+      const running = await page.getByRole('button', { name: /Manual recording/ }).textContent();
+      check(this.name, (running ?? '').includes('recording'), 'the running session says it is recording');
+      check(this.name, (running ?? '').includes('length unknown'), 'and that its length is unknown, not zero');
+
+      await page.getByRole('button', { name: /Dota 2/ }).click();
+      // The row actions fade in over 150ms; wait for them settled rather than reading
+      // mid-transition (an opacity read during the fade is a fraction, not the verdict).
+      await page.waitForFunction(
+        () => {
+          const actions = document.querySelector('.sidebar ul li.selected .actions');
+          return actions !== null && getComputedStyle(actions).opacity === '1';
+        },
+        null,
+        { timeout: 5_000 },
+      );
+      check(
+        this.name,
+        await page.locator('.sidebar ul li.selected .actions').first().isVisible(),
+        'the selected row reveals its actions once the fade settles',
+      );
+      report(this.name, await page.evaluate(() => {
+        const sel = document.querySelector('.sidebar ul li.svelte-1h8243g.selected');
+        const clip1 = document.querySelector('.sidebar ul li.svelte-1trbi2a');
+        const out = [];
+        if (sel) {
+          out.push(`session-li-bg=${getComputedStyle(sel).backgroundColor}`);
+          const actions = sel.querySelector('.actions');
+          if (actions) {
+            out.push(`session-actions-op=${getComputedStyle(actions).opacity}`);
+            actions.style.setProperty('opacity', '1', 'important');
+            out.push(`session-actions-forced-op=${getComputedStyle(actions).opacity}`);
+          }
+        }
+        if (clip1) {
+          const actions = clip1.querySelector('.actions');
+          if (actions) out.push(`clip1-actions-op=${getComputedStyle(actions).opacity}`);
+        }
+        return out.join(' | ');
+      }));
+      check(
+        this.name,
+        await page.getByRole('heading', { name: 'Dota 2' }).isVisible(),
+        'selecting the session shows its detail, not a clip',
+      );
+      check(
+        this.name,
+        (await page.locator('.markers tbody tr').count()) === 3,
+        'all three markers are tabled in media time',
+      );
+      check(
+        this.name,
+        ((await page.locator('.markers').textContent()) ?? '').includes('#42'),
+        'the bookmark names the clip it produced',
+      );
+      check(
+        this.name,
+        await page.getByRole('button', { name: 'Extract clip' }).isEnabled(),
+        'a finished session offers the extract',
+      );
+
+      const layout = await layoutAudit(page);
+      check(
+        this.name,
+        layout.storage.bottom <= layout.viewport.height + 0.5,
+        `the storage panel is still inside the window with sessions listed (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
     },
   },
 ];
@@ -1737,7 +1947,6 @@ const CONTRAST_LABELS = {
   '.timeline .hint': 'timeline hint',
   '.panel.trim .selection .mono': 'trim range',
   '.panel.trim .lossless': 'lossless note',
-  '.panel.trim .note': 'trim footnote',
 };
 
 /** Print the contrast table and fail on anything that is not readable. */

@@ -26,10 +26,7 @@
 </script>
 
 {#if sessions.length === 0}
-  <p class="empty">
-    No sessions are indexed yet. Record one in full-session mode — this window reads the same
-    index the recorder writes.
-  </p>
+  <p class="empty">No sessions yet — full-session recordings appear here.</p>
 {:else}
   <ul>
     {#each sessions as session (session.id)}
@@ -76,6 +73,12 @@
     padding: 0;
     list-style: none;
     overflow-y: auto;
+    /*
+     * The sidebar's second scroll area. Without a cap this sizes to its content and
+     * pushes the storage panel below the fold — with no way to reach it, since the
+     * sidebar itself does not scroll. The clip list stays the flexible one.
+     */
+    max-height: 30vh;
   }
 
   li {
@@ -125,6 +128,32 @@
     gap: 6px;
     align-items: center;
     margin-top: 5px;
+    opacity: 0;
+    transition: opacity 150ms ease-out;
+  }
+
+  li:hover .actions {
+    opacity: 1;
+  }
+
+  li:focus-within .actions {
+    opacity: 1;
+  }
+
+  li.selected .actions {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .actions {
+      transition: none;
+    }
+  }
+
+  @media (hover: none) {
+    .actions {
+      opacity: 1;
+    }
   }
 
   .actions button {
@@ -133,11 +162,11 @@
   }
 
   .star {
-    color: var(--accent);
+    color: var(--muted);
   }
 
-  .danger {
-    border-color: #f87171;
-    color: #fca5a5;
+  .star[aria-pressed='true'] {
+    color: var(--star);
+    border-color: var(--star);
   }
 </style>
