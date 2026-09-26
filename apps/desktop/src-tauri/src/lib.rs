@@ -55,8 +55,16 @@ pub struct AppState {
     /// `None` when ffmpeg could not be found: the list and the storage panel still work,
     /// and the two commands that need ffmpeg report why they cannot.
     bins: Option<FfmpegBinaries>,
-    paths: AppPaths,
-    storage: StorageConfig,
+    /// Where clips, thumbnails and the index live. Behind a `Mutex` for one reason:
+    /// `update_settings` can move the clips directory while the app runs, and the state
+    /// Tauri hands commands is shared by reference.
+    paths: Mutex<AppPaths>,
+    /// The storage policy — and the clips directory setting it carries. Same lock story
+    /// as `paths`: the settings command rewrites the directory, everything else reads.
+    storage: Mutex<StorageConfig>,
+    /// The application data directory the paths resolve against (and `config.toml` lives
+    /// in). The recorder host holds its own copy for starts; this one is for settings.
+    app_data_dir: PathBuf,
     warnings: Vec<String>,
     /// The recording this window started, if any — the engine the CLI also drives
     /// (`localplay-recorder`). It is a host rather than a bare handle because a start has
@@ -140,7 +148,16 @@ impl AppState {
         );
 
         let recorder = RecorderHost::new(app_data_dir.to_path_buf(), bins.clone());
-        Ok(Self { store: Mutex::new(store), bins, paths, storage, warnings, recorder, hotkey })
+        Ok(Self {
+            store: Mutex::new(store),
+            bins,
+            paths: Mutex::new(paths),
+            storage: Mutex::new(storage),
+            app_data_dir: app_data_dir.to_path_buf(),
+            warnings,
+            recorder,
+            hotkey,
+        })
     }
 
     /// The recording engine this window drives. No UI is built unless it can record.
@@ -162,28 +179,38 @@ impl AppState {
 
     /// The paths the asset protocol has to be allowed to serve (spec §9).
     pub fn asset_roots(&self) -> Vec<PathBuf> {
-        self.paths.asset_roots().iter().map(|p| p.to_path_buf()).collect()
+        self.paths
+            .lock()
+            .map(|paths| paths.asset_roots().iter().map(|p| p.to_path_buf()).collect())
+            .unwrap_or_default()
+    }
+
+    fn poisoned(what: &str) -> CommandError {
+        CommandError::new(
+            ErrorCode::Store,
+            format!("the clip index is unusable: an earlier command panicked while holding {what}"),
+        )
     }
 
     /// Build the explicit dependencies for one command call and run it.
     ///
     /// The guard lives for the whole call, so the store cannot be mutated by a concurrent
     /// command halfway through one; no command awaits anything, so holding it is cheap.
+    /// Lock order is store, then paths, then storage — the settings command takes the
+    /// latter two in the same order and never touches the store, so nothing can deadlock.
     fn with_deps<T>(
         &self,
         run: impl FnOnce(&Deps<'_>) -> Result<T, CommandError>,
     ) -> Result<T, CommandError> {
-        let store = self.store.lock().map_err(|_| {
-            CommandError::new(
-                ErrorCode::Store,
-                "the clip index is unusable: an earlier command panicked while holding it",
-            )
-        })?;
-        let storage = StorageConfigView::from(&self.storage);
+        let store = self.store.lock().map_err(|_| Self::poisoned("the store lock"))?;
+        let paths = self.paths.lock().map_err(|_| Self::poisoned("the paths lock"))?;
+        let storage = StorageConfigView::from(&*self.storage.lock().map_err(|_| {
+            Self::poisoned("the storage lock")
+        })?);
         let deps = Deps {
             store: &store,
             bins: self.bins.as_ref(),
-            paths: &self.paths,
+            paths: &paths,
             storage: &storage,
             warnings: &self.warnings,
         };
@@ -357,6 +384,65 @@ fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
     })
 }
 
+/// The effective settings, for the settings panel: the file's values where it sets them,
+/// the example's where it does not.
+#[tauri::command(rename_all = "snake_case")]
+fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, CommandError> {
+    commands::read_settings(&state.app_data_dir, &state.config_path())
+}
+
+/// Edit settings: validate, write the file, apply what applies live.
+///
+/// `storage.clips_dir` moves the shell's directories immediately (future writes only);
+/// fps, output size, mic and auto-record persist and take effect on the next recorder
+/// start — `restart_required` says so exactly when a recording is running and one of
+/// them changed. Never an implicit restart.
+#[tauri::command(rename_all = "snake_case")]
+fn update_settings(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    update: commands::SettingsUpdate,
+) -> Result<commands::UpdateSettingsOutcome, CommandError> {
+    let running = state.recorder().is_running()?;
+    let outcome =
+        commands::update_settings_file(&state.app_data_dir, &state.config_path(), &update, running)?;
+    if outcome.applied.iter().any(|key| key == "storage.clips_dir") {
+        apply_clips_dir(&state, &app, &outcome.settings.clips_dir)?;
+    }
+    Ok(outcome)
+}
+
+/// Point the shell at a new clips directory: resolve, create, re-scope, remember.
+///
+/// The index and the store handle are untouched (the database lives at the application
+/// data root regardless); only future writes go to the new directory. A scope failure
+/// is a warning rather than a rollback — `setup` treats it the same way, and the config
+/// already names the directory either way.
+fn apply_clips_dir(
+    state: &AppState,
+    app: &AppHandle,
+    clips_dir: &str,
+) -> Result<(), CommandError> {
+    let paths = AppPaths::resolve(&state.app_data_dir, clips_dir);
+    std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
+        CommandError::new(
+            ErrorCode::Io,
+            format!("could not create the clips directory {}: {e}", paths.clips_dir.display()),
+        )
+    })?;
+    *state.paths.lock().map_err(|_| AppState::poisoned("the paths lock"))? = paths.clone();
+    state.storage.lock().map_err(|_| AppState::poisoned("the storage lock"))?.clips_dir =
+        clips_dir.to_string();
+    if let Err(err) = app.asset_protocol_scope().allow_directory(&paths.clips_dir, true) {
+        tracing::warn!(
+            "the asset protocol was not scoped to {}: {err}. Clips in that directory will \
+             not play.",
+            paths.clips_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Start the desktop application.
 ///
 /// Nothing in this crate calls this in a test: it opens a window, and neither this
@@ -483,6 +569,8 @@ pub fn run() {
             recording_status,
             clip_now,
             app_status,
+            get_settings,
+            update_settings,
             log_from_frontend
         ])
         .run(tauri::generate_context!())
@@ -991,7 +1079,7 @@ mod tests {
 
         assert_eq!(state.config_path(), app_dir.join("config.toml"));
         assert!(!state.config_path().is_file(), "nothing has written it in this test");
-        assert!(state.asset_roots().contains(&state.paths.clips_dir));
+        assert!(state.asset_roots().contains(&state.paths.lock().unwrap().clips_dir));
     }
 
     /// The half of the packaging contract that `crates/media` cannot check by itself.
@@ -1177,7 +1265,7 @@ mod tests {
 
         assert!(elsewhere.is_dir(), "the configured directory is created");
         assert_eq!(state.asset_roots()[0], elsewhere, "and it is what playback is scoped to");
-        assert_eq!(state.paths.db_path, app_dir.join("localplay.db"), "the index stays put");
+        assert_eq!(state.paths.lock().unwrap().db_path, app_dir.join("localplay.db"), "the index stays put");
     }
 
     #[test]

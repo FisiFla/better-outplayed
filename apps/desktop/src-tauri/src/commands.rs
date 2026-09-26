@@ -21,13 +21,13 @@
 //! event markers are Phase 4 and the timeline draws none (see `src/lib/components/
 //! Timeline.svelte`).
 
-use crate::config::RecordingConfig;
+use crate::config::{EngineOptionsConfig, RecordingConfig};
 #[cfg(test)]
 use localplay_capture::stub::StubConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
-use localplay_recorder::{Recorder, RecorderConfig, RecorderStatus, Sources};
+use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Session, SessionEvent, Store};
 use serde::{Deserialize, Serialize};
@@ -1337,6 +1337,17 @@ pub struct RecordingStatusDto {
     pub clips: u64,
     /// Why the engine stopped, when it stopped for a failure rather than a `stop`.
     pub error: Option<String>,
+    /// Whether a game watcher is armed for this recorder: `false` unless `[games]
+    /// auto_record` was on at start. While this is true and `running` is false, the
+    /// recorder is armed and waiting for a game — "is it going to?" is this.
+    pub watching_games: bool,
+    /// The game being recorded, when a watched game triggered it. `None` while nothing
+    /// is being recorded, and for a recording a person started.
+    pub matched_game: Option<String>,
+    /// The mode this recorder was started in (`"buffer"` or `"session"`).
+    pub recorder_mode: String,
+    /// Whether this recording carries a microphone track (`[mic] enabled`).
+    pub mic_enabled: bool,
 }
 
 impl From<RecorderStatus> for RecordingStatusDto {
@@ -1356,6 +1367,10 @@ impl From<RecorderStatus> for RecordingStatusDto {
             drift_ms: status.drift_ms,
             clips: status.clips,
             error: status.error,
+            watching_games: status.watching_games,
+            matched_game: status.game,
+            recorder_mode: status.mode.as_str().to_string(),
+            mic_enabled: status.mic,
         }
     }
 }
@@ -1494,7 +1509,12 @@ impl RecorderHost {
             dev_software_encoder,
         };
 
-        let recorder = Recorder::start(cfg).map_err(|err| {
+        // The file's [mic] and [games], not defaults: a start that ignored them would
+        // record without the microphone and without the watcher the user configured.
+        // Malformed sections refuse the start, like the capture sections do — a typo'd
+        // mic flag must not record silently without it.
+        let engine = EngineOptionsConfig::load(&self.config_path())?;
+        let recorder = Recorder::start_with_options(cfg, recorder_options(&engine)).map_err(|err| {
             CommandError::new(ErrorCode::Recording, format!("could not start recording: {err:#}"))
         })?;
         let status = RecordingStatusDto::from(recorder.status());
@@ -1567,6 +1587,185 @@ impl RecorderHost {
             started_at_ms: clip.started_at_ms,
         })
     }
+
+    /// Whether a recording currently holds the slot (and the engine says it is running).
+    pub fn is_running(&self) -> Result<bool, CommandError> {
+        Ok(self.handle()?.is_some_and(|recorder| recorder.is_running()))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------
+//
+// The settings the window shows and edits (`config.toml`, read at startup everywhere
+// else). Two commands: one reads the effective values, one writes edited keys and says
+// what the write means for a running recorder. Both are plain functions over explicit
+// paths — no `State`, no `AppHandle` — so the suite below drives them against temporary
+// directories. The one thing they cannot do headless is re-scope the asset protocol
+// after a clips-directory change; that three-line call lives in the `lib.rs` wrapper.
+
+/// The settings the window shows, as the frontend sees them.
+///
+/// Mirrored by hand in `src/lib/types.ts`, and pinned by a test below that asserts the
+/// exact JSON keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsDto {
+    /// `[storage] clips_dir`, verbatim — empty means the default.
+    pub clips_dir: String,
+    /// Where that resolves: the clips directory itself, for display.
+    pub clips_dir_resolved: String,
+    /// `[encode] fps`.
+    pub fps: u32,
+    /// `[encode] output_size` — empty is the native capture size.
+    pub output_size: String,
+    /// `[mic] enabled`.
+    pub mic_enabled: bool,
+    /// `[games] auto_record`.
+    pub auto_record: bool,
+    /// Display names from `[[games.watch]]`, or the default titles when the file names
+    /// none (which is what the engine watches then, too).
+    pub watch_titles: Vec<String>,
+    /// Keys that fell back to the example because the file does not set them, e.g.
+    /// `"encode.fps"` — the panel says so rather than presenting defaults as configured.
+    pub defaulted: Vec<String>,
+    /// False when no file exists and every value is the example's.
+    pub config_exists: bool,
+    /// The file that was read.
+    pub config_path: String,
+}
+
+/// A partial settings update from the window: every field optional, absent fields are
+/// left alone.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SettingsUpdate {
+    pub clips_dir: Option<String>,
+    pub fps: Option<u32>,
+    pub output_size: Option<String>,
+    pub mic_enabled: Option<bool>,
+    pub auto_record: Option<bool>,
+}
+
+/// What writing settings did, and what it means for a running recorder.
+///
+/// `settings` is read back after the write, so the window refreshes from this rather
+/// than issuing a second call against a file that may have changed under it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSettingsOutcome {
+    pub settings: SettingsDto,
+    /// The keys that changed, e.g. `"encode.fps"`.
+    pub applied: Vec<String>,
+    /// True only when a recording holds the slot and an engine key changed: fps,
+    /// output size, mic and auto-record are baked in per start, so they take effect on
+    /// the next one. Never an implicit restart (option A): the window offers Stop.
+    pub restart_required: bool,
+    /// Names the changed engine keys when a restart is required, else null.
+    pub restart_reason: Option<String>,
+}
+
+/// The engine options a start is built with: the file's `[mic]` and `[games]`, not
+/// defaults.
+///
+/// A start that ignored them would record without the microphone and without the
+/// watcher the user configured — silently, since both just look like an idle
+/// recorder. Mode stays the default (replay buffer); the window has no mode switch.
+fn recorder_options(engine: &EngineOptionsConfig) -> RecorderOptions {
+    RecorderOptions {
+        mode: Default::default(),
+        mic: engine.mic.clone(),
+        games: engine.games.clone(),
+        game: None,
+    }
+}
+
+/// Read the effective settings for display.
+pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<SettingsDto, CommandError> {
+    let effective = crate::config::read_effective_settings(config_path)?;
+    Ok(SettingsDto {
+        clips_dir_resolved: AppPaths::resolve(app_data_dir, &effective.clips_dir)
+            .clips_dir
+            .to_string_lossy()
+            .into_owned(),
+        clips_dir: effective.clips_dir,
+        fps: effective.fps,
+        output_size: effective.output_size,
+        mic_enabled: effective.mic_enabled,
+        auto_record: effective.auto_record,
+        watch_titles: effective.watch_titles,
+        defaulted: effective.defaulted.iter().map(|s| s.to_string()).collect(),
+        config_exists: effective.config_exists,
+        config_path: config_path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Validate and write edited keys, then report what the write means.
+///
+/// A validation failure writes nothing. Engine keys (fps, output size, mic,
+/// auto-record) persist immediately but take effect on the next recorder start;
+/// `restart_required` says so exactly when a recording is running and one of them
+/// changed value. `storage.clips_dir` is applied by the caller (paths rebuild, asset
+/// scope) — this function reports it in `applied` but touches no state.
+pub fn update_settings_file(
+    app_data_dir: &Path,
+    config_path: &Path,
+    update: &SettingsUpdate,
+    recorder_running: bool,
+) -> Result<UpdateSettingsOutcome, CommandError> {
+    use crate::config::SettingEdit;
+
+    let before = crate::config::read_effective_settings(config_path)?;
+    let mut edits = Vec::new();
+    let mut applied = Vec::new();
+    if let Some(dir) = &update.clips_dir {
+        edits.push(SettingEdit::ClipsDir(dir.clone()));
+        applied.push("storage.clips_dir".to_string());
+    }
+    if let Some(fps) = update.fps {
+        edits.push(SettingEdit::Fps(fps));
+        applied.push("encode.fps".to_string());
+    }
+    if let Some(size) = &update.output_size {
+        edits.push(SettingEdit::OutputSize(size.clone()));
+        applied.push("encode.output_size".to_string());
+    }
+    if let Some(enabled) = update.mic_enabled {
+        edits.push(SettingEdit::MicEnabled(enabled));
+        applied.push("mic.enabled".to_string());
+    }
+    if let Some(auto) = update.auto_record {
+        edits.push(SettingEdit::AutoRecord(auto));
+        applied.push("games.auto_record".to_string());
+    }
+
+    if !edits.is_empty() {
+        crate::config::write_settings(config_path, &edits)?;
+    }
+    let after = read_settings(app_data_dir, config_path)?;
+
+    // Only a value that actually changed can demand a restart: re-applying the same
+    // fps the file already had is a no-op, not a reason to stop a recording.
+    let mut engine_changed = Vec::new();
+    if update.fps.is_some() && after.fps != before.fps {
+        engine_changed.push("encode.fps");
+    }
+    if update.output_size.is_some() && after.output_size != before.output_size {
+        engine_changed.push("encode.output_size");
+    }
+    if update.mic_enabled.is_some() && after.mic_enabled != before.mic_enabled {
+        engine_changed.push("mic.enabled");
+    }
+    if update.auto_record.is_some() && after.auto_record != before.auto_record {
+        engine_changed.push("games.auto_record");
+    }
+    let restart_required = recorder_running && !engine_changed.is_empty();
+    let restart_reason = restart_required.then(|| {
+        format!(
+            "a recording is running: {} takes effect when the next recording starts",
+            engine_changed.join(", ")
+        )
+    });
+
+    Ok(UpdateSettingsOutcome { settings: after, applied, restart_required, restart_reason })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2648,10 +2847,14 @@ mod tests {
                 "error",
                 "fps",
                 "frames",
+                "matched_game",
+                "mic_enabled",
+                "recorder_mode",
                 "running",
                 "segments",
                 "skipped",
-                "span_ms"
+                "span_ms",
+                "watching_games"
             ]
         );
 
@@ -2671,6 +2874,217 @@ mod tests {
             ["codec", "duration_ms", "id", "path", "size_bytes", "started_at_ms"]
         );
         assert_eq!(clip["id"], 3, "an indexed clip carries its row id");
+    }
+
+    #[test]
+    fn the_status_dto_carries_the_watcher_the_game_and_the_microphone() {
+        // The engine tracks all four; the mapping used to drop them, which is why the
+        // window could never say whether anything was being watched.
+        let status = RecorderStatus {
+            watching_games: true,
+            game: Some("Dota 2".to_string()),
+            mode: localplay_recorder::RecordingMode::FullSession,
+            mic: true,
+            ..RecorderStatus::stopped()
+        };
+
+        let dto = RecordingStatusDto::from(status);
+
+        assert!(dto.watching_games);
+        assert_eq!(dto.matched_game.as_deref(), Some("Dota 2"));
+        assert_eq!(dto.recorder_mode, "session");
+        assert!(dto.mic_enabled);
+
+        let idle = RecordingStatusDto::from(RecorderStatus::stopped());
+        assert!(!idle.watching_games);
+        assert_eq!(idle.matched_game, None);
+        assert_eq!(idle.recorder_mode, "buffer");
+        assert!(!idle.mic_enabled);
+    }
+
+    // -- settings ----------------------------------------------------------------------
+
+    fn settings_case() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        (dir, path)
+    }
+
+    #[test]
+    fn the_settings_dto_json_matches_the_typescript_interface() {
+        // Like the clip, storage and status DTOs: a rename on either side is discovered
+        // here, not by a settings panel that silently shows nothing.
+        let (dir, path) = settings_case();
+        let dto = read_settings(dir.path(), &path).unwrap();
+        let dto_value = serde_json::to_value(&dto).unwrap();
+        let mut keys: Vec<&str> =
+            dto_value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "auto_record",
+                "clips_dir",
+                "clips_dir_resolved",
+                "config_exists",
+                "config_path",
+                "defaulted",
+                "fps",
+                "mic_enabled",
+                "output_size",
+                "watch_titles"
+            ]
+        );
+        assert!(!dto.config_exists, "no file: everything is the example's");
+        assert_eq!(dto.fps, 60);
+        assert!(!dto.auto_record);
+
+        let outcome = UpdateSettingsOutcome {
+            settings: dto,
+            applied: vec!["encode.fps".to_string()],
+            restart_required: true,
+            restart_reason: Some("a recording is running".to_string()),
+        };
+        let outcome_value = serde_json::to_value(&outcome).unwrap();
+        let mut keys: Vec<&str> = outcome_value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["applied", "restart_reason", "restart_required", "settings"]);
+    }
+
+    #[test]
+    fn update_settings_applies_a_subset_and_leaves_the_rest() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[encode]\nfps = 30\n").unwrap();
+
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(60), mic_enabled: Some(true), ..Default::default() },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied, vec!["encode.fps", "mic.enabled"]);
+        assert!(!outcome.restart_required, "nothing is recording");
+        assert_eq!(outcome.restart_reason, None);
+        assert_eq!(outcome.settings.fps, 60);
+        assert!(outcome.settings.mic_enabled);
+        // Untouched keys survive, from the file where set and the example elsewhere.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fps = 60"));
+        assert!(text.contains("enabled = true"));
+    }
+
+    #[test]
+    fn restart_is_required_only_for_a_running_recorder_with_changed_engine_keys() {
+        let (dir, path) = settings_case();
+        let clips = SettingsUpdate {
+            clips_dir: Some("/tmp/clips".to_string()),
+            ..Default::default()
+        };
+
+        let idle = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(30), ..Default::default() },
+            false,
+        )
+        .unwrap();
+        assert!(!idle.restart_required, "idle: the next start picks it up");
+        assert_eq!(idle.restart_reason, None);
+
+        let running = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(60), ..Default::default() },
+            true,
+        )
+        .unwrap();
+        assert!(running.restart_required);
+        assert!(
+            running.restart_reason.as_deref().unwrap().contains("encode.fps"),
+            "the reason names the key: {:?}",
+            running.restart_reason
+        );
+
+        let storage_only = update_settings_file(dir.path(), &path, &clips, true).unwrap();
+        assert!(
+            !storage_only.restart_required,
+            "the clips directory applies without the engine"
+        );
+
+        // Re-applying the value already on disk changes nothing, so it demands nothing.
+        let same = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(60), ..Default::default() },
+            true,
+        )
+        .unwrap();
+        assert_eq!(same.applied, vec!["encode.fps"], "applied still says what was written");
+        assert!(!same.restart_required, "same value: no restart to demand");
+    }
+
+    #[test]
+    fn a_rejected_update_writes_nothing_and_names_the_key() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[encode]\nfps = 30\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { fps: Some(0), ..Default::default() },
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("encode.fps"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn an_empty_clips_dir_resets_to_the_app_data_default() {
+        let (dir, path) = settings_case();
+        let custom = SettingsUpdate {
+            clips_dir: Some("/tmp/clips".to_string()),
+            ..Default::default()
+        };
+        let outcome = update_settings_file(dir.path(), &path, &custom, false).unwrap();
+        assert_eq!(outcome.settings.clips_dir, "/tmp/clips");
+        assert_eq!(outcome.settings.clips_dir_resolved, "/tmp/clips");
+
+        let reset = SettingsUpdate { clips_dir: Some(String::new()), ..Default::default() };
+        let outcome = update_settings_file(dir.path(), &path, &reset, false).unwrap();
+        assert_eq!(outcome.settings.clips_dir, "");
+        assert_eq!(
+            outcome.settings.clips_dir_resolved,
+            dir.path().join("clips").to_string_lossy(),
+            "empty means the clips directory under the application data directory"
+        );
+    }
+
+    #[test]
+    fn a_start_is_built_with_the_files_microphone_and_watcher() {
+        // The window's Start used to pass `RecorderOptions::default()` — no mic, nothing
+        // watched — whatever the file said. These are the options a start is built with.
+        let engine = EngineOptionsConfig::from_toml(
+            "[mic]\nenabled = true\n[games]\nauto_record = true\n",
+        )
+        .unwrap();
+
+        let opts = recorder_options(&engine);
+
+        assert!(opts.mic.enabled, "the configured microphone is passed through");
+        assert!(opts.games.auto_record, "and the configured watcher");
+        assert!(opts.game.is_none(), "a person starting a recording is no detected game");
+        assert_eq!(opts.mode.as_str(), "buffer", "the window has no mode switch");
     }
 
     #[test]

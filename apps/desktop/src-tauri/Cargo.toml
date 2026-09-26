@@ -31,6 +31,9 @@ tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"]
 localplay-media = { path = "../../../crates/media" }
 localplay-store = { path = "../../../crates/store" }
 localplay-recorder = { path = "../../../crates/recorder" }
+# The settings writer edits keys in place with their comments and formatting intact
+# (`toml_edit`), rather than re-serialising structs and destroying a hand-edited file.
+toml_edit = "0.22"
 # The global clip hotkey (spec §7.4). The desktop shell installs the *same* `RegisterHotKey`
 # listener the CLI does, from the same `[hotkeys] clip` key — there is one hotkey
 # implementation in this repository, and this is the dependency that makes that true.
