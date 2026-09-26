@@ -1909,6 +1909,43 @@ const states = [
       });
     },
   },
+  {
+    name: '15-short-window',
+    title: 'short window: the sidebar scrolls instead of losing storage',
+    group: 'short',
+    fixture: LONG_FIXTURE,
+    async verify(page) {
+      await page.setViewportSize({ width: 1280, height: 600 });
+      await page.waitForTimeout(150);
+      await waitForThumbnails(page, 30);
+      const layout = await layoutAudit(page);
+      check(
+        this.name,
+        layout.document.scrollWidth <= layout.viewport.width,
+        `nothing overflows horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`,
+      );
+      check(
+        this.name,
+        (await page.locator('.name').count()) === 30,
+        'the clip rows still render in a short window',
+      );
+      const sidebar = await page.locator('.sidebar').evaluate((el) => ({
+        scrolls: el.scrollHeight > el.clientHeight + 1,
+        storageBelowFold:
+          (document.querySelector('.sidebar .storage')?.getBoundingClientRect().bottom ?? 0) >
+          window.innerHeight + 0.5,
+      }));
+      if (sidebar.storageBelowFold) {
+        check(this.name, sidebar.scrolls, 'storage below the fold means the sidebar scrolls');
+        await page.locator('.sidebar .storage').scrollIntoViewIfNeeded();
+      }
+      check(
+        this.name,
+        await page.locator('.sidebar .storage').isVisible(),
+        'the storage panel is reachable without fullscreening',
+      );
+    },
+  },
 ];
 
 /**

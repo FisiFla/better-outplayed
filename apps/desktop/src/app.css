@@ -87,6 +87,14 @@ code,
   min-height: 0;
   border-right: 1px solid var(--line);
   background: var(--panel);
+  /*
+   * Last resort only: at the default height the lists absorb every deficit by
+   * scrolling themselves, so this never engages there (the layout audits pin
+   * that). In a short window the fixed chrome plus the lists' minimums can still
+   * exceed the viewport, and then the sidebar scrolls instead of pushing storage
+   * and settings somewhere unreachable with no way to get to them.
+   */
+  overflow-y: auto;
 }
 
 .main {

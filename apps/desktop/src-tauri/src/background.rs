@@ -199,20 +199,20 @@ impl TrayView<'_> {
     pub fn tooltip(&self) -> String {
         let mut text = match self.tray_state() {
             TrayState::Attention if !self.hotkey.installed => format!(
-                "localplay — the clip hotkey {} is NOT installed. Open the window for why; \
+                "better-outplayed — the clip hotkey {} is NOT installed. Open the window for why; \
                  the tray menu still records and saves clips.",
                 self.hotkey.chord
             ),
             TrayState::Attention => format!(
-                "localplay — the recorder stopped: {}",
+                "better-outplayed — the recorder stopped: {}",
                 self.status.error.as_deref().unwrap_or("no reason was reported")
             ),
             TrayState::Recording => format!(
-                "localplay — recording. Press {} to take a clip.",
+                "better-outplayed — recording. Press {} to take a clip.",
                 self.hotkey.chord
             ),
             TrayState::Idle => format!(
-                "localplay — not recording. Press {} for a clip once recording is on.",
+                "better-outplayed — not recording. Press {} for a clip once recording is on.",
                 self.hotkey.chord
             ),
         };
@@ -296,7 +296,7 @@ impl MenuAction {
             MenuAction::SaveClip => "Save clip now".to_string(),
             MenuAction::OpenConfig if view.config_exists => "Open config file".to_string(),
             MenuAction::OpenConfig => "Open the config folder".to_string(),
-            MenuAction::Quit => "Quit localplay".to_string(),
+            MenuAction::Quit => "Quit better-outplayed".to_string(),
         }
     }
 
@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(MenuAction::ToggleRecording.label(&recording), "Stop recording");
 
         assert_eq!(MenuAction::SaveClip.label(&recording), "Save clip now");
-        assert_eq!(MenuAction::Quit.label(&shown), "Quit localplay");
+        assert_eq!(MenuAction::Quit.label(&shown), "Quit better-outplayed");
         assert!(MenuAction::Quit.separator_before(), "quit is set apart from the rest");
         assert!(!MenuAction::SaveClip.separator_before());
     }
@@ -1210,11 +1210,11 @@ mod tests {
 
         assert_eq!(
             view(&idle, &hotkey, true).tooltip(),
-            "localplay — not recording. Press Ctrl+F8 for a clip once recording is on."
+            "better-outplayed — not recording. Press Ctrl+F8 for a clip once recording is on."
         );
         assert_eq!(
             view(&recording, &hotkey, true).tooltip(),
-            "localplay — recording. Press Ctrl+F8 to take a clip."
+            "better-outplayed — recording. Press Ctrl+F8 to take a clip."
         );
         let stopped = view(&broken, &hotkey, true).tooltip();
         assert!(stopped.contains("the encoder exited"), "{stopped}");

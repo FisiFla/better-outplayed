@@ -15,9 +15,9 @@
     "windows": [
       {
         "label": "main",
-        "title": "localplay",
+        "title": "better-outplayed",
         "width": 1280,
-        "height": 820,
+        "height": 880,
         "minWidth": 940,
         "minHeight": 600,
         "resizable": true,
