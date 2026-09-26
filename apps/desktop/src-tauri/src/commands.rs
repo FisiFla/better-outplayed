@@ -413,6 +413,38 @@ pub fn list_clips(deps: &Deps<'_>) -> Result<Vec<ClipDto>, CommandError> {
     // Newest first, id breaking ties — so a burst indexed within one millisecond still has
     // a total, stable order.
     clips.sort_by_key(|clip| std::cmp::Reverse((clip.created_at_ms, clip.id)));
+
+    // **The index is a cache and the filesystem is the truth.** A row whose file is gone is not a
+    // clip, and handing one to the window costs more than a wrong list: the UI asks the asset
+    // protocol for each one (which is where Tauri logs `File does not exist at path`), then asks
+    // for a thumbnail of each, and every thumbnail is an ffmpeg process. Measured on the first
+    // real install, where a cleanup had removed files without their rows: thirteen dead clips
+    // meant a burst of ffmpeg children, terminal windows appearing and vanishing, a machine that
+    // nearly fell over, and a window too busy to be dragged.
+    //
+    // Skipped rather than deleted — a file can be temporarily unavailable, and silently rewriting
+    // a user's library is not this function's business. `debug!` because it repeats on every
+    // refresh and the level filter turns it on where it is wanted.
+    let before = clips.len();
+    clips.retain(|clip| {
+        let present = clip.path.exists();
+        if !present {
+            tracing::debug!(
+                "skipping clip #{} from the listing: {} is gone",
+                clip.id,
+                clip.path.display()
+            );
+        }
+        present
+    });
+    if clips.len() != before {
+        tracing::warn!(
+            "{} of {} indexed clips are missing from disk and were left out of the listing",
+            before - clips.len(),
+            before
+        );
+    }
+
     Ok(clips.iter().map(ClipDto::from).collect())
 }
 
@@ -637,6 +669,20 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
             format!(
                 "a thumbnail was requested at {at_ms}ms but clip #{id} is only {}ms long",
                 clip.duration_ms
+            ),
+        ));
+    }
+
+    // **Before anything is spawned.** A dead clip used to reach ffmpeg, which failed, which the UI
+    // retried — a process per attempt. The row is still here so the message can say which file is
+    // missing, but nothing is executed for it.
+    if !clip.path.exists() {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "clip #{id} is indexed at {} and that file is gone, so there is nothing to read a \
+                 thumbnail from",
+                clip.path.display()
             ),
         ));
     }
