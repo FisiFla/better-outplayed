@@ -304,19 +304,56 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
 /// `t` below is therefore `span - post`, which is where that wait leaves the timeline, and the
 /// assertion is that the ring then covers the whole request. The recorder's half of the
 /// invariant — that it really waits — is the recorder's own test's business.
+///
+/// # The front is the ring's, not an assumed `0`
+///
+/// The fixture is a real-time capture, so how much footage the ring holds — and, in particular,
+/// where its *earliest* held fragment starts — is a function of what the encoder managed to
+/// deliver, not of the wall time the feeding loop ran for. A window measured back from `span`
+/// alone therefore rests on an assumption the ring never promised: that its front is `0`. When
+/// it is not, the request starts before the footage the ring can actually cut from and comes
+/// back `truncated_front` — which is exactly how this test failed once on a CI run whose commit
+/// changed only documentation (§20 of `docs/verification-status.md`). The window below is
+/// therefore built against the front the ring reports through `segments()`, the same
+/// closed-fragment set `window` itself selects from, rather than against an assumed zero.
 #[test]
 fn a_window_inside_the_held_footage_covers_the_whole_request() {
     const PRE: u64 = 2_000;
     const POST: u64 = 1_000;
-    let (ring, _dir) = ring_of_stub_capture(6);
+    // 8s rather than the 6s the first version asked for: the assertion below needs the ring to
+    // hold PRE + POST = 3s of footage measured from whatever front it reports, and this fixture
+    // is a real-time capture whose yield depends on the host. The extra seconds are margin so a
+    // loaded runner still holds comfortably more than the one window the test needs.
+    let (ring, _dir) = ring_of_stub_capture(8);
+
+    let span = ring.span_ms();
+    // The oldest footage the ring can still cut from — asked of the ring rather than assumed to
+    // be `0`. `window` selects only *closed* fragments, so this is the front of that same set.
+    let front = ring
+        .segments()
+        .find(|s| s.is_closed())
+        .expect("the ring ingested at least one closed fragment")
+        .start_ms;
+
+    // The fixture must hold more than a whole window measured from the front the ring reports,
+    // or no window can sit wholly inside the footage and the test is asking the ring a question
+    // it cannot answer. Stated against the ring's own numbers, this is the same precondition the
+    // old `t > PRE` was for a ring whose front happened to be zero.
+    assert!(
+        span - front >= PRE + POST,
+        "the fixture holds {}ms of footage ({front}..{span}), less than one {}-ms window",
+        span - front,
+        PRE + POST
+    );
 
     // As the post-roll wait leaves it: the ring holds footage up to `span`, and the trigger
-    // instant sits `post` behind that.
-    let t = ring.span_ms() - POST;
-    assert!(t > PRE, "the fixture must hold more than one window, got span {}", ring.span_ms());
-
+    // instant sits `post` behind that. The window start is `span - post - pre`, which the
+    // assertion above places at or after `front`; the end is `span` itself. The request is
+    // wholly inside the held footage by construction.
+    let t = span - POST;
+    let start = t - PRE;
     let window = ring
-        .window(t - PRE, t + POST)
+        .window(start, t + POST)
         .expect("the ring can serve a window inside its own footage");
 
     assert!(
