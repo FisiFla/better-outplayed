@@ -1260,10 +1260,18 @@ than discovered later:
   saying so out loud (`the encoder cannot sustain the 60fps it was told`). Not a regression from
   zero-copy — `capture_copy` and the CPU are what that change moved — but the predicted cost of the
   codec, and the reason the default stays H.264.
-- **The bitrate is ignored.** The clip came out at **37 Mbps** against a `bitrate_kbps = 20000`
-  setting, where the H.264 path honours the same setting. `MF_MT_AVG_BITRATE` is set on the output
-  type either way, so this is HEVC-side rate control rather than a wiring mistake — and it matters,
-  because smaller files at the same picture is the whole reason HEVC was wanted.
+- **~~The bitrate is ignored.~~ Fixed 2026-10-15, and it was never HEVC-specific.** The clip came out
+  at 37 Mbps against a `bitrate_kbps = 20000` setting, and this section read that as HEVC-side rate
+  control because the H.264 path "honours the same setting". That was an artifact of the two numbers
+  being the same one: the path was told a hardcoded 20 Mbit/s and never received `bitrate_kbps`, so at
+  the default 20000 an inert path and a working one look identical. Eight interleaved cases at 4K60,
+  one run per build, separate them — h264 at 4000 **23,218 kbps → 4,979**, hevc at 4000 **22,261 →
+  8,151**, while the ffmpeg pairs (3,935 and 17,635 before, 4,096 and 19,554 after) were already
+  right. What is left is smaller and honest: the MFT aims near the setting rather than pinning it
+  (1.2× at 4000 for h264, 2.0× for hevc, 1.6–1.8× at 20000) where the ffmpeg path lands within 3%,
+  because `MF_MT_AVG_BITRATE` is a mean for the encoder's rate control rather than a ceiling. Making
+  it exact wants ICodecAPI's rate-control mode, which is a further measurement and has not been
+  taken. See `7971dc7`.
 - **A diagnostic that hides the interesting answer:** `probe_available_types` skips any encoder whose
   output type is refused, which is exactly the encoder that needed interrogating.
 

@@ -284,10 +284,19 @@ says so: the pixels never came back to the CPU.
   cost the work predicted: NVENC's HEVC pass is slightly more expensive per frame than its H.264 one,
   and the recorder says so out loud (`the encoder cannot sustain the 60fps it was told`). It is not a
   regression from the zero-copy change; `capture_copy` and the CPU are what that change moved.
-* **The bitrate.** The clip came out at 37 Mbps against a `bitrate_kbps = 20000` setting, where the
+* **The bitrate.** ~~The clip came out at 37 Mbps against a `bitrate_kbps = 20000` setting, where the
   H.264 path honours the same setting. `MF_MT_AVG_BITRATE` is set on the output type either way, so
-  this is an HEVC-specific rate-control difference rather than a wiring mistake — and it matters,
-  because "smaller files for the same picture" is the whole reason HEVC was wanted.
+  this is an HEVC-specific rate-control difference rather than a wiring mistake~~
+  **Corrected 2026-10-15: it was a wiring mistake, and it was never about the codec.** The Media
+  Foundation path was told a hardcoded 20 Mbit/s and never received `encode.bitrate_kbps` at all, so
+  "the H.264 path honours the same setting" was never true either — the example config's default
+  (`20000`) and the constant (`20_000_000`) were the same number, and a path that ignores the setting
+  cannot be told from one that honours it until a different value is asked for. Measured properly —
+  eight interleaved cases at 4K60 in one run per build, h264 and hevc, `--self-test-clip-after 12` —
+  both codecs move with the setting once it is sent: h264 at 4000 went from 23,218 kbps to 4,979, hevc
+  at 4000 from 22,261 to 8,151. What survives of the original note is the weaker and more useful
+  claim: the MFT aims *near* the number rather than pinning it (1.2× at 4000 for h264, 2.0× at 4000
+  for hevc, 1.6–1.8× at 20000), where the ffmpeg path lands within 3% of it. See `7971dc7`.
 
 ## The blocker was mine, and so was the wrong conclusion
 
