@@ -1675,3 +1675,71 @@ not distinguish them, and the honest reading is that **the test's margin is the 
 not `window`/`truncated_front` — which is why the next person to touch this fixture should make
 the window a function of the ring's reported front rather than of an assumed `0`, instead of
 re-running it until it passes.
+
+---
+
+## 21. `xtask verify` on Windows, run for the first time (2026-10-15)
+
+§7 and §9 have carried the same caveat since 2026-09-25: the harness's Windows half — the
+`GetProcessTimes` + `K32GetProcessMemoryInfo` sampler, `scripts/verify-in-interactive-session.ps1`,
+and everything it says about a *real* capture path — was **compiled and never run**. It ran on
+2026-10-15, on the box, in Session 1, against the released CLI at the tip:
+
+```
+xtask.exe verify --seconds 60 --report … --cli target\release\localplay-cli.exe
+```
+
+The harness wrote its own `RUN_CONFIG` into `%LOCALAPPDATA%\localplay\config.toml` (the user's
+file was backed up and restored around the run), captured the primary monitor at 3840x2160/30fps
+through Windows Graphics Capture, encoded with `h264_nvenc` and wrote its report. **The sampler
+ran for the whole run, on Windows, for the first time**: samples every 2 s from t = 2.0 s to
+52.5 s, the CLI's cumulative CPU time 0.906 s → 2.484 s, RSS 120.5 MB → ~162 MB. The numbers
+this ledger has been reading off macOS stubs now exist for the platform the project ships to.
+
+**26 of 30 rows passed**, including the ones nothing had exercised: the toolchain and ffmpeg
+discovery; `WORKS: h264_nvenc, hevc_nvenc, h264_qsv`; `capture geometry 3840x2160 at 30fps` with
+`WGC capture started on the primary monitor width=3840 height=2160`; `frames=1955 segments=10`;
+29.9 fps achieved against 30 declared; the span growing 64,962 ms over 65,000 ms (0.999x); the
+byte cap holding (max 11,514,871 against 16,777,216, over 302 samples); the 48000Hz/2ch/F32 →
+s16 conversion; **CPU 2.92% of one core** over a 46.5 s window; **RSS 164.9 MB peak**; the clip
+written inside its post-roll budget (4000 ms of 5000); one h264 video and one aac audio stream in
+it; the splice being a copy; A/V drift −18 ms (log) with ffprobe agreeing; audio not silent
+(mean −44.6 dB); video not black (6710 distinct colours); and the criterion-7 refusal verified by
+a real startup failure naming `h264_amf`.
+
+**Three rows failed**, and they are the useful part of the report:
+
+| row | what it saw | reading |
+|---|---|---|
+| 12 `dropped` | `dropped=1 dropped_audio=0` of 1955 frames | one frame refused at the capture→encoder handover over 65 s at 30fps — §18's handover finding in miniature, and on a run that is otherwise clean. |
+| 16 `eviction` | "no seg-*.mp4 under `…\target/verify/work\appdata\localplay\scratch`", while the status line reported `segments=10` | the check wants the lowest *surviving* segment number to be greater than 0; it found no segment files at all. Either the harness looks in the wrong directory or the CLI resolved its scratch elsewhere — the run's own `segments=10` says the segments existed. Unresolved, and a harness defect until shown otherwise. |
+| 23 `clip_duration` | 9020 ms against 8000 ms ± 500, "off by 1020ms" | the clip's own video is 9002 ms and its audio 9003 ms (row 27), so the file is ~1 s longer than the 5 s pre + 3 s post window asks for. §16 established that a container's duration is not the window and moved the *desktop* clip test onto the video stream; this harness row still bounds the duration, so it is measuring what §16 says not to measure — and the ~1 s itself is worth understanding separately, because §13 measured only ~190 ms of padding on the stub path. |
+
+**One row was not performed**: 18 `silence_detector` — the warning it looks for fires only on a
+converted *and* silent endpoint, which needs a machine whose default playback device is not
+48 kHz; a setup condition rather than a defect, and the row says so.
+
+## 22. The `ram_clip` fixture is still load-dependent (2026-10-15)
+
+`crates/replay/tests/ram_clip.rs`'s `ring_of_stub_capture` feeds a real-time stub capture to a
+real ffmpeg for `seconds` of wall clock, so what the ring holds is a function of how fast the host
+is. Two of its four tests failed in a loaded workspace run on 2026-10-15, in two different ways:
+
+- `a_clip_saved_from_ram_is_playable_and_leaves_the_scratch_directory_empty` panicked inside the
+  shared helper at `enc.finish()`, with `ffmpeg exited with signal: 9 (SIGKILL)` — the encoder's
+  own bounded shutdown (`SHUTDOWN_BUDGET`, 5 s) killing a child that would not exit in time under
+  the load of the rest of the suite. The product did what it says it does; the fixture asked a
+  loaded machine to flush on a deadline meant for a quiet one.
+- `a_window_inside_the_held_footage_covers_the_whole_request` failed on `!window.truncated_front`
+  — the same assertion §20 recorded from CI — **after** the fixture was changed to take the window
+  from the ring's own reported front. Asking for the front is necessary and not sufficient: a
+  starved ffmpeg can leave a *gap* in the ring's closed fragments, and `window()` then rightly
+  reports the request as truncated where the footage really is missing.
+
+The change that came out of that investigation (commit `3e6334c`) removes the silent `0`
+assumption and states the precondition in the ring's own numbers, and says in as many words that
+it is not the fix. **What a real fix needs** is a deterministic fixture — a fixed synthetic
+fragment stream, or a stub whose frames are produced by count rather than by the wall clock —
+because a test whose subject is ring arithmetic should not also be a test of how busy the machine
+is. Until then this file's tests are quiet when run alone and can fail under load, which is worth
+knowing before a red CI run on this file is read as a regression.
