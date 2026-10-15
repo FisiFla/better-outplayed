@@ -1234,6 +1234,26 @@ Three ways to wait for ever were on that path at once, and the shutdown took whi
 3. **`std::process::Child::wait` has no timeout.** `wait_bounded` polls `try_wait` and kills at the
    deadline, and a status that arrives only because of that kill is reported as such.
 
+Those three were fixed and the story still was not over, because the same mistake was one line
+further up. The MFT's **per-frame** handover was a blocking `send` too, and that is the one the box
+keeps hitting: five of six zero-copy runs on a later soak, two of eight after that, and two of four
+in a probe built to ask. Every one of them was *after* the clip was written and indexed, so the
+recording was never at risk — only the exit was, which is why it read as a soak that would not end
+rather than as a clip that was wrong. Instrumented (`MFT-DIAG`) and read back, the thread was inside
+that send when the join was reached, with its reader — the thread that writes to ffmpeg — stalled
+behind a child that had stopped reading; and the step that could break that loose, `wait_bounded`
+killing ffmpeg, sits *below* the join that was waiting. It is the tail's bug one nesting level in,
+with the same consequence and none of the credit, because the tail is sent once and this is sent
+once a frame.
+
+The handover now has a deadline of its own, `HANDOVER_BUDGET` — 2 s, the budget the encoder calls in
+that thread already use, because it answers the same question. It waits for room by polling
+`try_send`, stops waiting the moment shutdown is asked for, and drops and counts the frame it could
+not queue: `N encoded frames were dropped instead of queued: the video queue stayed full for 2s,
+which is the ffmpeg writer thread not keeping up`. Four runs of the shipped hardware path, four
+clean exits at ~22 s each, with that warning firing in exactly the run the old build hung on.
+`c5cd703`.
+
 The regression test asserts on **time** rather than output, because the defect was an absence, and it
 is mutation-checked: raise the budget to an hour and it hangs. Suite at the time: 541, from 540
 (546 in the workspace since, after later work).
