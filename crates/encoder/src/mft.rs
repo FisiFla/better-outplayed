@@ -52,6 +52,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MF_MT_MAX_KEYFRAME_SPACING,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    eAVEncCommonRateControlMode_CBR, ICodecAPI,
 };
 
 /// What an encoder asked for, when its events were drained.
@@ -519,6 +521,64 @@ fn set_output_type_once(
     // is refused here, and a reader has to be able to tell that from a refusal of the size.
     unsafe { transform.SetOutputType(0, &media_type, 0) }
         .with_context(|| format!("SetOutputType({codec:?}, {bitrate_kbps} kbps)"))
+}
+
+/// Set one `ICodecAPI` value and report it — set, or refused in the encoder's own words.
+///
+/// The reporting is the point rather than a courtesy: a rate this pipeline asks for and an
+/// encoder that declines to be told are indistinguishable from the outside, and the difference
+/// is exactly what a clip whose size does not follow `encode.bitrate_kbps` would otherwise leave
+/// a reader to guess at.
+fn set_codec_api_value(api: &ICodecAPI, key: &windows::core::GUID, value: u32, what: &str) {
+    // SAFETY: `SetValue` is the interface's own method on a transform this process owns; the
+    // `VT_UI4` variant is created here and outlives the call.
+    let variant: windows::core::VARIANT = value.into();
+    match unsafe { api.SetValue(key, &variant) } {
+        Ok(()) => tracing::info!("the encoder accepted {what} = {value}"),
+        Err(err) => tracing::warn!(
+            "the encoder refused {what} = {value} ({err}); it is rate-controlling from its own \
+             default, so a clip's size will not follow encode.bitrate_kbps"
+        ),
+    }
+}
+
+/// Pin the rate through the encoder's own control surface — `ICodecAPI` — instead of only asking
+/// for it on the output type.
+///
+/// `MF_MT_AVG_BITRATE` is what the stream is *described* as, and every MFT measured here accepts
+/// it and then treats it as a target: §18's paired runs asked for 20,000 kbps and wrote
+/// 39,564,433 bit/s with the H.264 MFT and 35,747,208 with the HEVC one — 1.98x and 1.79x.
+/// `CODECAPI_AVEncCommonMeanBitRate` is the number those encoders rate-control from, and
+/// `CODECAPI_AVEncCommonRateControlMode` is what "mean" means to them: an average to aim near
+/// (the default, roughly VBR) or a rate to hold (CBR). This sets the mode first and then the
+/// rate, because that is the order an encoder expects to be configured in.
+///
+/// An MFT with no `ICodecAPI` is not a failure — the recording is still made, at the encoder's
+/// own default, which is what this pipeline did before this function existed — but it is said out
+/// loud rather than left to be inferred from a file's size.
+fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
+    let api: ICodecAPI = match transform.cast() {
+        Ok(api) => api,
+        Err(err) => {
+            tracing::debug!(
+                "this encoder has no ICodecAPI ({err}): it is told the rate on the output type \
+                 and nothing else, so the clip's size follows its own default"
+            );
+            return;
+        }
+    };
+    set_codec_api_value(
+        &api,
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+        "rate control mode (CBR)",
+    );
+    set_codec_api_value(
+        &api,
+        &CODECAPI_AVEncCommonMeanBitRate,
+        bitrate_kbps.saturating_mul(1_000),
+        "mean bitrate (bit/s)",
+    );
 }
 
 /// Try to set `subtype` as the transform's input type at `size`.
@@ -1090,6 +1150,9 @@ fn configure_encoder(
 
     prepare_transform(activate, &transform, manager)?;
     set_output_type(&transform, size, codec, bitrate_kbps)?;
+    // **The number is set here, not only described.** See `pin_bitrate`: the output type above
+    // carries `MF_MT_AVG_BITRATE`, which these encoders accept as a target rather than a limit.
+    pin_bitrate(&transform, bitrate_kbps);
 
     // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
     // 3840x2160 with `MF_E_INVALIDMEDIATYPE`, so what it will eat is a function of the size as well
