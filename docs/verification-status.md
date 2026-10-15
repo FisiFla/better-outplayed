@@ -1604,3 +1604,38 @@ wrote far more of it — H.264 39,564,433 bit/s (1.98x), HEVC 35,747,208 (1.79x)
 control is a suggestion the encoder aims near rather than a number it holds. That is the
 `ICodecAPI` workstream's motivating measurement, and it is what §15's "tracks the setting with
 1.2-2.0x overshoot" looks like as a paired number rather than a range.
+
+---
+
+## 19. The encoder accepts the rate and does not obey it (2026-10-15)
+
+§18 left the overshoot as "a suggestion the encoder aims near", and the obvious way to make it a
+number it holds is `ICodecAPI` — the transform's own control surface rather than the
+`MF_MT_AVG_BITRATE` attribute on the output type. `crates/encoder/src/mft.rs` (commit
+`f4dbf10`) casts the transform to `ICodecAPI` and sets `CODECAPI_AVEncCommonRateControlMode` to
+CBR and `CODECAPI_AVEncCommonMeanBitRate` to `encode.bitrate_kbps * 1000`, logging the
+encoder's answer either way and saying so out loud when a transform has no `ICodecAPI` at all.
+
+The encoder answers yes, and the file does not move:
+
+| H.264, `encode.bitrate_kbps = 20000` | the clip's `bit_rate` | against the setting |
+|---|---|---|
+| before any `ICodecAPI` call (§18) | 39,564,433 | 1.98x |
+| `ICodecAPI` set **after** `SetOutputType` (`f4dbf10`) | 39,314,725 | 1.97x |
+| `ICodecAPI` set **before** `SetOutputType`, plus a maximum | 39,124,625 | 1.96x |
+
+Both calls return `Ok` — the debug log carries `the encoder accepted rate control mode (CBR) = 0`
+and `the encoder accepted mean bitrate (bit/s) = 20000000`, twice per run (the warm-up output
+type and the real one) — and the third row set `CODECAPI_AVEncCommonMaxBitRate` as well as the
+mean, which moved the file by half a percent. So on this stack (Windows 11, RTX 3090, the NVENC
+H.264 MFT) the property is advertised, accepted and ignored, and the order of the calls against
+`SetOutputType` is not the reason, because moving them earlier changed nothing.
+
+What ships is the first of the three, `f4dbf10`: the encoder is asked through its own interface
+and its answer is logged. It does not claim to have pinned anything, because the measurement says
+it has not. `MF_MT_AVG_BITRATE` still describes what the stream is.
+
+**Not tried, and the honest edge of this thread:** a rate-control mode other than CBR (an encoder
+that ignores CBR may obey VBR or a quality mode), `CODECAPI_AVEncCommonBufferSize`, and a
+driver-side preset. None was measured, and each would be another experiment for a number a reader
+of a clip's `ffprobe` output can already see is not being held.
