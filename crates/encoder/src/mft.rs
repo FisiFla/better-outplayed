@@ -1567,8 +1567,9 @@ fn describe_media_type(media_type: &IMFMediaType) -> String {
 ///
 /// An asynchronous MFT refuses to enumerate *input* types — which is why the input negotiation
 /// elsewhere is done by trying `SetInputType` — so an input failure here is expected and is reported
-/// as such rather than treated as a finding. Encoders that refuse this codec's output type at all are
-/// skipped: the matrix above has already said so.
+/// as such rather than treated as a finding. An encoder that refuses this codec's output type is
+/// **not** skipped: the refusal is a row of its own, and its available output types are still
+/// enumerated, because those are what say which type it would have taken instead.
 pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
     // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
@@ -1609,15 +1610,43 @@ pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<
                 rows.push((format!("{name} :: preparation"), format!("{err:#}")));
                 continue;
             }
-            let Ok(media_type) = (unsafe { build_output_type(codec, size, 0) }) else {
-                continue;
+            let media_type = match unsafe { build_output_type(codec, size, 0) } {
+                Ok(media_type) => media_type,
+                Err(err) => {
+                    rows.push((format!("{name} :: the type to ask with"), format!("{err:#}")));
+                    continue;
+                }
             };
-            // SAFETY: the transform is live and the type outlives the call. A refusal here means this
-            // encoder is not a candidate for this codec, which the matrix already reported.
-            if unsafe { transform.SetOutputType(0, &media_type, 0) }.is_err() {
-                continue;
+            // **A refusal is a row, not a skip.** This used to `continue`, and that dropped the one
+            // case the function exists for: `GetOutputAvailableType` is what says *which* type the
+            // encoder would take, and an MFT answers that whether or not it took the caller's type.
+            // The matrix above does say that this encoder refuses this codec — but not why, and the
+            // encoder that refuses is the one a reader came here to interrogate. So the error is
+            // reported with its code, at the call that produced it, like every other failure here,
+            // and the enumeration below still runs.
+            //
+            // SAFETY: the transform is live and the type outlives the call.
+            let refused = match unsafe { transform.SetOutputType(0, &media_type, 0) } {
+                Ok(()) => None,
+                Err(err) => Some(format!("{err}")),
+            };
+            if let Some(err) = &refused {
+                rows.push((
+                    format!(
+                        "{name} :: refused the {codec:?} type at {}x{}",
+                        size.0, size.1
+                    ),
+                    err.clone(),
+                ));
             }
             for output in [true, false] {
+                // The input side needs an output type to have been *accepted* — an asynchronous MFT
+                // will not talk about its inputs until it knows what it is producing — so when the
+                // type was refused there is nothing to ask there, and the output side is exactly the
+                // side that answers the question.
+                if !output && refused.is_some() {
+                    continue;
+                }
                 let label = if output { "output" } else { "input" };
                 for index in 0..12u32 {
                     // SAFETY: both are the transform's own enumeration methods.

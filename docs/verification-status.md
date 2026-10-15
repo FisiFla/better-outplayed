@@ -1393,8 +1393,25 @@ than discovered later:
   because `MF_MT_AVG_BITRATE` is a mean for the encoder's rate control rather than a ceiling. Making
   it exact wants ICodecAPI's rate-control mode, which is a further measurement and has not been
   taken. See `7971dc7`.
-- **A diagnostic that hides the interesting answer:** `probe_available_types` skips any encoder whose
-  output type is refused, which is exactly the encoder that needed interrogating.
+- **~~A diagnostic that hides the interesting answer.~~ Fixed 2026-10-15.** `probe_available_types`
+  used to `continue` past any encoder whose output type it could not set, and that is exactly the
+  encoder whose *answer* was the point: `GetOutputAvailableType` says which type it would have taken
+  instead, and an MFT offers that whether or not it accepted the caller's. The refusal is now a row
+  of its own, carrying the call's error, and its available output types are enumerated anyway — the
+  input side is not asked, because an async MFT will not talk about its inputs until an output type
+  has been accepted. Measured on the box, old code against new, same build, same throwaway caller, at
+  a size every encoder has to refuse (`probe_available_types(Hevc, (16384, 16384))`): the old report
+  names the eight Intel MFTs (which cannot be activated at all) and **both NVIDIA encoders are simply
+  absent from it**; the new one names them, their refusals — `Invalid type. (0xC00D36BD)` for H.264,
+  `The input type is not supported for D3D device. (0xC00D6D76)` for HEVC, the same error the
+  ordering probe reports — and what each would have taken: exactly two output types, one under the
+  friendly subtype and one under the vendor's private GUID (`5D0CE9DD-…` for H.264, the four-CC
+  `'HEVC'` GUID for the HEVC MFT), each carrying a profile and the sentinel level `0xFFFFFFFF`, and
+  **no frame size, no rate and no bitrate**. That is an encoder answering with its own defaults, and
+  it is the answer the pipeline's type — 4K at level 5.1 — was being refused against. The refusal
+  itself is the size/state puzzle the size-ceiling probe documents (the same type is accepted on a
+  ladder that *rises* to 4K rather than starting there) and is **not** what this change fixed: what
+  changed is that the diagnostic now reports it instead of hiding it.
 
 ### What this does not say
 
