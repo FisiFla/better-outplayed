@@ -1566,3 +1566,41 @@ with exit code 0, and:
 - the clip it wrote, `clip-1792082573.mp4`, is **174,455,585 bytes** and `ffprobe` reports one
   stream, `0,h264,video`. **There is no audio stream in the container at all** — not an empty
   one, not a silent one.
+
+---
+
+## 18. HEVC on the hybrid: the throughput gap does not reproduce, and both codecs overshoot (2026-10-15)
+
+§15 recorded a gap between the two codecs on the zero-copy hybrid — HEVC at 56.9 fps with 9
+frames dropped against H.264's 59.6 and 0 — and left it open, because the two figures came from
+different runs. On 2026-10-15 they were paired: one run of the released CLI per codec, in one
+interactive session, same display, same 4K/60 capture, same `--self-test-clip-after 45`, both
+with `[encode] zero_copy = true` and nothing else different between them.
+
+| | H.264 (`h264_nvenc`) | HEVC (`hevc_nvenc`) |
+|---|---|---|
+| the probe's own ceiling | 74.2 fps | 77.7 fps |
+| `fps=` | 58.8/60 | 59.0/60 |
+| `dropped=` | 3 | 10 |
+| `skipped=` | 14 | 17 |
+| frames / media | 2979 / 50,322 ms | 3016 / 51,006 ms |
+| bytes written | 181,128,764 | 165,825,260 |
+| the clip's `bit_rate` | 39,564,433 — **1.98x** the 20 Mbps asked for | 35,747,208 — **1.79x** |
+| the clip's `avg_frame_rate` | 59.3 fps | 58.6 fps |
+| frames that never reached the encoder | 3 | 10 |
+
+**The rate gap does not reproduce.** In one session on this box, HEVC holds the same frame rate
+as H.264 — 59.0 against 58.8, both inside the spread §15 already published. What does reproduce
+is a smaller and more specific difference: HEVC sheds about three times as many frames at the
+handover (10 against 3, out of ~3000), and both codecs report the same warning — "its queue is
+two deep because capture's handover ring is three, and the encoder is slower than the frame rate
+it is being fed". So the mechanism behind the earlier 9-dropped figure is the handover rather
+than one codec being unable to reach 60 fps, and the media timeline is intact in both runs
+(50,322 ms and 51,006 ms of frames for ~51 s of capture) — which is what dropping at the
+handover means: the frames are refused at the ring, not lost from the recording.
+
+**What the pair does show plainly is the bitrate.** Both codecs were asked for 20,000 kbps and
+wrote far more of it — H.264 39,564,433 bit/s (1.98x), HEVC 35,747,208 (1.79x) — so the rate
+control is a suggestion the encoder aims near rather than a number it holds. That is the
+`ICodecAPI` workstream's motivating measurement, and it is what §15's "tracks the setting with
+1.2-2.0x overshoot" looks like as a paired number rather than a range.
