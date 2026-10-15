@@ -32,6 +32,14 @@ pub struct Config {
     pub games: GamesSection,
 }
 
+/// `[audio]` — the game-audio track.
+///
+/// Of the four keys, **only `bitrate_kbps` is honoured**. `source` and `codec` have exactly
+/// one implemented value each (`"loopback"`, `"aac"`) and anything else is refused in
+/// [`Config::validate`]. `enabled = false` cannot be honoured — the engine has no path that
+/// runs the encoder without the game-audio track — so the CLI says so at startup rather than
+/// recording audio a user asked not to have (a refusal here would block the very recording
+/// that user asked for).
 #[derive(Debug, Deserialize)]
 pub struct AudioSection {
     pub enabled: bool,
@@ -107,6 +115,26 @@ impl Config {
                  pipeline paces to (it measures itself against this — see encode.adapt_fps)"
             );
         }
+        // The pipeline records aac over the system loopback and nothing else: ffmpeg's input 1
+        // is a loopback PCM stream and its audio codec is fixed to aac
+        // (`localplay_encoder::ffmpeg`). A config asking for anything else would be recorded
+        // as aac-over-loopback while claiming otherwise — the quiet divergence between what
+        // was asked for and what ran that this project has already paid for — so it is
+        // refused, naming what is implemented.
+        if self.audio.codec != "aac" {
+            bail!(
+                "audio.codec = {:?} is not implemented: this build records the game audio as \
+                 aac only",
+                self.audio.codec
+            );
+        }
+        if self.audio.source != "loopback" {
+            bail!(
+                "audio.source = {:?} is not implemented: this build captures the system \
+                 loopback only",
+                self.audio.source
+            );
+        }
         Ok(())
     }
 }
@@ -122,6 +150,9 @@ mod tests {
         assert_eq!(cfg.buffer.pre_seconds, 30);
         assert_eq!(cfg.buffer.post_seconds, 5);
         assert!(cfg.audio.enabled);
+        assert_eq!(cfg.audio.source, "loopback", "the example names the implemented source");
+        assert_eq!(cfg.audio.codec, "aac", "and the implemented codec");
+        assert_eq!(cfg.audio.bitrate_kbps, 192, "and the shipped default bitrate");
         assert_eq!(cfg.hotkeys.clip, "Ctrl+F8");
         // The Phase 5 sections, in the file a fresh install runs: the replay buffer (the
         // mode every existing configuration already had), no microphone, and nothing
@@ -211,6 +242,34 @@ gsi_port = 45671
         assert!(
             err.to_string().contains("software"),
             "must explain that CPU encoding is not available: {err}"
+        );
+    }
+
+    /// `audio.codec` and `audio.source` have one implemented value each, and anything else has
+    /// to fail rather than be recorded as the aac-over-loopback the pipeline actually runs —
+    /// a config that says one thing and a file that does another is the class of defect this
+    /// project has already paid for. The messages name what is implemented.
+    #[test]
+    fn rejects_an_audio_codec_that_is_not_aac() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("codec = \"aac\"", "codec = \"opus\"");
+        assert!(text.contains("codec = \"opus\""), "the substitution must apply");
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("audio.codec") && err.to_string().contains("aac"),
+            "the refusal must name the key and the implemented codec: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_audio_source_that_is_not_loopback() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("source = \"loopback\"", "source = \"microphone\"");
+        assert!(text.contains("source = \"microphone\""), "the substitution must apply");
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("audio.source") && err.to_string().contains("loopback"),
+            "the refusal must name the key and the implemented source: {err}"
         );
     }
 

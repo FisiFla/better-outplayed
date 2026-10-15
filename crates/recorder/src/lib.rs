@@ -76,10 +76,11 @@
 //! [`Recorder::start`] is [`Recorder::start_with_options`] with [`RecorderOptions::default`]
 //! (replay buffer, no microphone, nothing watched), which is what both front-ends' existing
 //! code means; the options struct carries the Phase 5 settings. The configuration struct
-//! [`RecorderConfig`] itself was not widened, for a reason worth stating: the desktop shell
-//! is a separate workspace that constructs `RecorderConfig` field by field, so a new
-//! required field there would break a crate this work may not touch. The settings that are
-//! not part of the recorder's own sections travel in [`RecorderOptions`] instead.
+//! [`RecorderConfig`] carries the recorder's own sections plus one defaulted field,
+//! [`RecorderConfig::audio_bitrate_kbps`]: the desktop shell is a separate workspace that
+//! constructs `RecorderConfig` field by field, so a *required* field there would break a
+//! crate this work may not touch, while an `Option` it sets to `None` cannot. Every other
+//! setting that is not part of the recorder's own sections travels in [`RecorderOptions`].
 //!
 //! [`Recorder::clip_now`] hands the trigger to that thread, because the trigger has to
 //! pump the encoder — it is the same capture/encoder/ring the loop owns, and it may wait
@@ -231,6 +232,16 @@ pub struct RecorderConfig {
     pub buffer: BufferSection,
     pub encode: EncodeSection,
     pub storage: StorageSection,
+    /// `[audio] bitrate_kbps` — the game-audio track's bitrate, in kbps, as the CLI read it
+    /// out of `config.toml`.
+    ///
+    /// It rides here rather than in [`EncodeSection`] because `[audio]` is that setting's one
+    /// home in the file: a second key under `[encode]` would be a second source of truth for
+    /// one number. `None` means the front-end carries no value — the desktop shell does not
+    /// parse `[audio]` — and resolves to
+    /// [`localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] (192 kbps) in
+    /// [`build_encode_config`], which is what this pipeline recorded before the key was read.
+    pub audio_bitrate_kbps: Option<u32>,
     pub sources: Sources,
     /// Encode with libx264 instead of a hardware vendor. This is the CLI's
     /// `--dev-software-encoder`: it exists for pipeline smoke tests on a host with no GPU
@@ -2620,6 +2631,13 @@ fn build_encode_config(
             }
         }
     };
+
+    // The game track's bitrate. `[audio] bitrate_kbps` is the setting and the CLI carries it
+    // here; `None` — the desktop shell, which does not parse `[audio]` — is the default this
+    // pipeline has always recorded at. Set on every path (hardware and test software) so the
+    // file records what the config says rather than what a constructor happened to pick.
+    encode_cfg.audio_bitrate_kbps =
+        cfg.audio_bitrate_kbps.unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
 
     // The hybrid, when it was asked for and this machine can do it. Both refusals happen here
     // rather than later, because both are *configuration* contradictions and a recording that

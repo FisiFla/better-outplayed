@@ -263,7 +263,19 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     } else {
         Config::from_toml(include_str!("../../../config.example.toml"))?
     };
-    let Config { recorder, buffer, encode, storage, mic, hotkeys, events, games, .. } = cfg;
+    let Config { recorder, buffer, encode, audio, storage, mic, hotkeys, events, games, .. } = cfg;
+    // `[audio] enabled = false` is not honoured: this build declares the game-audio track
+    // unconditionally (ffmpeg input 1, aac over loopback) and no code path runs the encoder
+    // without it. A user who turned it off gets audio anyway, which is worse than a missing
+    // setting — say so rather than let the file and the recording disagree. A hard refusal
+    // would be worse still: it would block the recording the user asked for.
+    if !audio.enabled {
+        tracing::warn!(
+            "audio.enabled = false is not honoured yet: this build always records the \
+             game-audio track (aac over loopback), so the recording will carry audio anyway. \
+             Set it to true so the file agrees with what is recorded."
+        );
+    }
     // Read before the move: these are the CLI's own line (it is logged after the engine is
     // already capturing). The rate the line prints comes from the engine rather than from
     // `encode.fps`, because the engine may have measured that this machine cannot hold the
@@ -293,6 +305,11 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
             buffer,
             encode,
             storage,
+            // The `[audio]` section is this setting's only home; the CLI is its only parser,
+            // so it carries the number across. The bitrate is honoured (it reaches ffmpeg's
+            // `-b:a`); `enabled`, `codec` and `source` are not — the first is warned about
+            // above and the other two are refused in `Config::validate`.
+            audio_bitrate_kbps: Some(audio.bitrate_kbps),
             // WGC + WASAPI on Windows, the synthetic stubs everywhere else
             // (`localplay_capture::platform` decides, and on Windows it refuses to fall back
             // to a stub). `--dev-stub-sources` selects the synthetic pair *explicitly* —

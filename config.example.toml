@@ -122,9 +122,26 @@ output_size = ""
 # zero_copy = true
 
 [audio]
+# Whether the game-audio track is recorded.
+#
+# **Not honoured yet, and only `true` can be.** Every recording carries the game-audio track:
+# ffmpeg is always given the loopback PCM stream as an input and encodes it as aac, and no
+# code path runs the encoder without it. Setting this to `false` cannot turn the track off —
+# the recording will carry audio anyway — and the CLI says so at startup rather than leave a
+# user who turned it off to discover it in the file. A refusal at startup would be worse: it
+# would block the recording the user asked for.
 enabled = true
+# Only "loopback" is implemented. Anything else is refused at startup (`Config::validate`),
+# naming the implemented value, rather than recorded as loopback while the file says
+# otherwise: the pipeline captures the system loopback, and the only other audio input is the
+# microphone (`[mic]`, a second track rather than a different source for this one).
 source = "loopback"
+# Only "aac" is implemented, for the same reason. The audio codec is fixed in ffmpeg's
+# argument list; a second value here would be a second source of truth.
 codec = "aac"
+# The game-audio track's bitrate, in kbps. **This key is honoured**: it reaches ffmpeg's
+# `-b:a`, so the file records what this says. 192 is what every build without a readable key
+# has recorded.
 bitrate_kbps = 192
 
 [storage]

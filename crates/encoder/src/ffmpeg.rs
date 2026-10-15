@@ -1527,6 +1527,33 @@ mod tests {
         }
     }
 
+    /// The audio bitrate in the child's argument list is `EncodeConfig::audio_bitrate_kbps`, and
+    /// nothing else.
+    ///
+    /// This is the audio half of the defect the video bitrate had: `[audio] bitrate_kbps` was
+    /// parsed and then dropped, so the number that reached ffmpeg's `-b:a` came from the
+    /// configuration *constructor* instead of from the file. The byte-for-byte argument-list test
+    /// below cannot catch a regression here — it runs with the constructor's own 128 kbps, so a
+    /// re-hardcoded `-b:a 128k` would still match it, which is exactly the "a default equal to a
+    /// hardcoded constant makes an inert path indistinguishable from a working one" shape this
+    /// project has paid for twice. Asking for a value the constructor would never pick is what
+    /// makes this bite.
+    #[test]
+    fn the_audio_bitrate_in_the_argument_list_is_the_configurations() {
+        let mut cfg = args_cfg(30, 1_000);
+        cfg.audio_bitrate_kbps = 96;
+        let text = strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", None));
+        let at = text
+            .iter()
+            .position(|a| a == "-b:a")
+            .unwrap_or_else(|| panic!("-b:a missing from {text:?}"));
+        assert_eq!(
+            text[at + 1],
+            "96k",
+            "the configured rate, not the constructor's 128: {text:?}"
+        );
+    }
+
     /// The argument list as the os-string vector `Command::args` receives it, for
     /// comparison with a written-out expectation. Every element is ASCII here; only the
     /// segment pattern is a path, and it is derived the same way on both sides.

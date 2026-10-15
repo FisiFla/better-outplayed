@@ -106,6 +106,15 @@ impl Default for MicAudioSpec {
     }
 }
 
+/// The game track's bitrate, in kbps, when nothing carries one.
+///
+/// `[audio] bitrate_kbps` in `config.toml` is the setting; the CLI parses it and hands it to
+/// the recorder, which sets it on the encoder's configuration. This is what the recorder
+/// falls back to when a front-end carries no value — the desktop shell, which deliberately
+/// does not parse `[audio]` — and it is the value this pipeline recorded with before the key
+/// was read at all. One constant rather than a literal in two crates that could drift.
+pub const DEFAULT_AUDIO_BITRATE_KBPS: u32 = 192;
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub codec: VideoCodec,
@@ -261,7 +270,7 @@ impl EncodeConfig {
             bitrate_kbps,
             segment_ms,
             scratch_dir,
-            audio_bitrate_kbps: 192,
+            audio_bitrate_kbps: DEFAULT_AUDIO_BITRATE_KBPS,
             // A first run (and every test) writes `seg-000000.mp4`; the CLI overrides
             // this from what it finds on disk before spawning.
             start_number: 0,

@@ -555,6 +555,18 @@ $ gh run view 35904179918 --log-failed
   interactive-session wrapper (`scripts/verify-in-interactive-session.ps1`) and everything
   it claims about a *real* capture path are **compiled, not run**. A not-performed row in
   its report is not a pass, and a pass on the stub path is not evidence about Windows.
+- **`[audio] enabled = false` is not honoured.** The game-audio track is declared
+  unconditionally — ffmpeg input 1 is a loopback PCM stream encoded as aac — and there is no
+  code path that runs the encoder without it, so a configuration that sets `enabled = false`
+  still records audio. The CLI says so in as many words at startup rather than leaving it to
+  be found in the file; a hard refusal would be worse, because it would block the recording
+  the user asked for. The two keys beside it are fail-closed instead: `source` and `codec` each
+  have one implemented value (`"loopback"`, `"aac"`) and anything else is refused by
+  `Config::validate`, which names what *is* implemented rather than recording something else.
+  The one key in the section that **is** honoured is `bitrate_kbps`: it reaches ffmpeg's
+  `-b:a`, and a front-end that carries no value (the desktop shell, which does not parse
+  `[audio]`) gets 192 kbps — what this pipeline recorded before the key was read. "No audio"
+  is not a configuration this build can produce.
 
 ---
 

@@ -100,6 +100,11 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
                 max_age_days: 365,
             },
         },
+        // No `[audio]` value: these tests do not configure one, which is also the desktop
+        // shell's state and must resolve to the pipeline's default (192 kbps).
+        // `the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default` pins
+        // that resolution.
+        audio_bitrate_kbps: None,
         sources: Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS }),
         dev_software_encoder: true,
     }
@@ -1314,4 +1319,35 @@ fn an_explicit_zero_copy_is_refused_off_windows() {
         refused.to_string().contains("Windows"),
         "the refusal must name the platform: {refused:#}"
     );
+}
+
+/// `[audio] bitrate_kbps` reaches the encoder's configuration, and a front-end that carries no
+/// value gets the pipeline's default rather than zero.
+///
+/// The CLI is the only thing that parses `[audio]`; it hands the number over on
+/// [`RecorderConfig::audio_bitrate_kbps`]. `None` there is the desktop shell's state — it does
+/// not parse the section — and it has to resolve to 192 kbps, the rate this pipeline recorded
+/// before the key was read, exactly as it did. The non-default half is what makes the test
+/// bite: without the plumbing the encoder keeps the constructor's own default (128 on the test
+/// software path) and both assertions fail, and with it the configured number is what the
+/// ffmpeg argument list's `-b:a` will carry.
+#[test]
+fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+
+    cfg.audio_bitrate_kbps = Some(96);
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("a 96 kbps configuration");
+    assert_eq!(encode.audio_bitrate_kbps, 96, "the configured value must reach the encoder");
+
+    cfg.audio_bitrate_kbps = None;
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("an unset value");
+    assert_eq!(
+        encode.audio_bitrate_kbps,
+        localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS,
+        "an unset value must be the pipeline's default"
+    );
+    assert_eq!(encode.audio_bitrate_kbps, 192, "which is 192 kbps, not zero and not 128");
 }

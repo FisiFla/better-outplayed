@@ -1550,6 +1550,11 @@ impl RecorderHost {
             buffer: settings.buffer.clone(),
             encode: settings.encode.clone(),
             storage: settings.storage.clone(),
+            // The shell deliberately does not parse `[audio]` (see `config.rs`), so it
+            // carries no bitrate and the encoder's own default applies — 192 kbps, what
+            // this pipeline has always recorded. Setting it here would be the second source
+            // of truth for a number the file already owns.
+            audio_bitrate_kbps: None,
             // WGC + WASAPI on Windows, the synthetic stubs everywhere else. This shell has
             // no switch for it and must not: the engine refuses to substitute a stub on
             // Windows, so there is no path here that captures nothing while looking like a
