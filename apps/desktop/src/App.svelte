@@ -357,7 +357,8 @@
     }
   }
 
-  async function deleteSession(id: number) {    const title = sessions.find((session) => session.id === id)?.title ?? `session #${id}`;
+  async function deleteSession(id: number) {
+    const title = sessions.find((session) => session.id === id)?.title ?? `session #${id}`;
     busy = true;
     try {
       const outcome = await source.deleteSession(id);
@@ -485,10 +486,12 @@
         />
       {/key}
     {:else if loaded}
-      <p class="empty">
-        Select a clip on the left to play it, scrub it and trim it — or a session, to see its
-        markers and cut a clip out of it.
-      </p>
+      <div class="empty-state">
+        <p>
+          Select a clip on the left to play it, scrub it and trim it — or a session, to see
+          its markers and cut a clip out of it.
+        </p>
+      </div>
     {/if}
   </main>
 </div>
@@ -512,5 +515,23 @@
 
   .sidebar .pane-head {
     border-top: 1px solid var(--line);
+  }
+
+  /*
+   * The window with nothing selected: one sentence in a pane as tall as the window. Pinned
+   * under the top edge it read as a stray line of text and left everything below it looking
+   * like a pane that had failed to draw; centred and bounded it reads as the pane's state.
+   */
+  .empty-state {
+    display: grid;
+    place-items: center;
+    flex: 1;
+    padding: 24px 16px;
+  }
+
+  .empty-state p {
+    max-width: 44ch;
+    text-align: center;
+    color: var(--muted);
   }
 </style>

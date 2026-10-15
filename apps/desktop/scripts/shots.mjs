@@ -1150,7 +1150,19 @@ const states = [
         await page.getByText('Select a clip on the left').isVisible(),
         'the main pane says what to do instead of showing a blank pane',
       );
-      check(this.name, await page.locator('.storage').getByText('0 B of 50 GiB').isVisible(), 'the storage panel reports 0 B in use');
+      // The storage panel is a disclosure: what it shows without being opened is the state
+      // itself — the two numbers and the cap's verdict — which is the whole claim for
+      // holding the arithmetic back, so it is asserted rather than assumed.
+      check(
+        this.name,
+        await page.locator('.storage summary').getByText('0 B / 50 GiB').isVisible(),
+        'the storage summary carries the numbers with the panel closed',
+      );
+      check(
+        this.name,
+        !(await page.locator('.storage dl').isVisible()),
+        'and the arithmetic is what the disclosure withholds',
+      );
       check(this.name, await page.getByText('50 GiB').first().isVisible(), 'the storage panel names the cap');
     },
   },
@@ -1483,6 +1495,9 @@ const states = [
     extraShots: [{ name: '07-storage-panel-closeup', selector: '.sidebar .storage' }],
     async verify(page) {
       await waitForThumbnails(page, 8);
+      // The figures and the verdict live behind the storage panel's disclosure — this state
+      // is about what is inside it, and about the bar it draws, so it opens it first.
+      await page.locator('.sidebar .storage summary').click();
       const verdict = page.locator('.panel .verdict.bad');
       check(this.name, (await verdict.count()) === 1, 'exactly one bad verdict is rendered');
       const text = ((await verdict.first().textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -1540,6 +1555,9 @@ const states = [
     group: 'noffmpeg',
     fixture: NO_FFMPEG_FIXTURE,
     async verify(page) {
+      // The startup warning is one of the three things this state photographs, and it is
+      // rendered in the storage panel, so the disclosure is opened before the capture.
+      await page.locator('.sidebar .storage summary').click();
       const banner = page.locator('.banner.error');
       await banner.waitFor({ state: 'visible', timeout: 10_000 });
       const text = ((await banner.textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -1985,6 +2003,7 @@ const states = [
     extraShots: [{ name: '16-storage-missing-closeup', selector: '.sidebar .storage' }],
     async verify(page) {
       await waitForThumbnails(page, 2);
+      await page.locator('.sidebar .storage summary').click();
       const panel = page.locator('.sidebar .storage');
       const text = ((await panel.locator('dl').textContent()) ?? '').replace(/\s+/g, ' ').trim();
       report(this.name, `storage figures: ${JSON.stringify(text)}`);

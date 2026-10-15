@@ -10,7 +10,8 @@ The app had no usable diagnostics: `init_tracing` wrote to **stderr**, which Win
 windowed process, so every `warn!`/`error!` the backend emitted went nowhere and the only way to
 report a fault was a screenshot. That is now fixed, the app was rebuilt and run on the box, and the
 log it produced **named the root cause of all four reported symptoms** — a stale clip index. That
-is fixed too. What remains is verifying the fix on the box, two tests, and the interface pass.
+is fixed too. What remained was verifying the fix on the box, two tests, and the interface pass. All
+three have since been done, and each one is kept below with how it went.
 
 ## Done, with commits
 
@@ -58,12 +59,28 @@ on the box became harmless — **no database surgery was needed**.
    **No `ERROR tauri::protocol::asset` lines at all**, where the previous run had one per dead clip.
    With the listing filtered the window never asks for those assets or thumbnails, so no ffmpeg is
    spawned and the storm cannot happen. The app ran (pid 24728, 28 MB, down from 37 MB).
-2. **Two tests** — the debugging skill wants a failing test *before* a fix and both fixes were
-   written first. `commands.rs`'s own test module is the home: it drives real command bodies against
-   a real SQLite store (see its module docs).
-3. **The interface pass** — not started. Load the **`impeccable`** skill; `App.svelte` (472 lines)
-   and `app.css` (178) plus `apps/desktop/src/lib/` are the surface. The complaint was clunky and
-   cluttered.
+2. ~~**Two tests**~~ — **done** (`a8abdd3`). The debugging skill wants a failing test *before* a
+   fix, and both fixes were written first, so the guards came after them:
+   `list_clips_leaves_out_rows_whose_files_are_gone_but_keeps_the_rows` and
+   `thumbnail_refuses_a_clip_whose_file_is_gone_before_anything_is_spawned`, in `commands.rs`'s own
+   test module, which drives real command bodies against a real SQLite store (see its module docs).
+3. ~~**The interface pass**~~ — **done** (2026-10-15). `App.svelte` and `app.css` plus
+   `apps/desktop/src/lib/` were the surface, and the complaint was that it was clunky and cluttered.
+   The sidebar was five always-open panels in one column. Storage was the only one that is purely a
+   readout, and it spent ~250px — a bar, a five-row `dl`, a verdict box and a footnote — on the room
+   the two lists need; it is now a disclosure in the same pattern as settings and the engine
+   counters, and its summary carries the numbers and the verdict (`144 MiB / 50 GiB`, *within the
+   cap*), so what it withholds is the arithmetic and not the state. Three smaller things came out of
+   the same pass. A session metadata row was labelled `Segments` and shows a directory path. A
+   `.wide` class was written on that row with no rule behind it anywhere in the component, so the
+   path wrapped three ways inside a 140px column — the rule now exists. The clip list's empty
+   message named `localplay-cli buffer`, a command the window does not offer, directly under a panel
+   offering *Start recording*; it now points at the buttons in front of the reader. The main pane's
+   empty state is centred and bounded at 44ch instead of a wall of sentences beside void. The shots
+   harness drives the disclosure rather than assuming it open, and state 01 asserts both halves of
+   the claim — that the summary carries the figures, and that the closed panel withholds the
+   arithmetic. `npm run check`, the 144 frontend tests and `npm run shots` (20 screenshots, 251
+   checks) are green.
 4. **Confirm the console windows are gone** — the log cannot show a window. With no ffmpeg spawned
    for dead clips the storm is gone by construction, but the honest check is a human watching.
 

@@ -70,7 +70,10 @@
     <div><dt>Media length</dt><dd class="mono">{sessionLengthLabel(session)}</dd></div>
     <div><dt>On disk</dt><dd class="mono">{formatBytes(session.sizeBytes)}</dd></div>
     <div><dt>Markers</dt><dd class="mono">{events.length}</dd></div>
-    <div class="wide"><dt>Segments</dt><dd class="mono path">{session.scratchDir}</dd></div>
+    <div class="wide">
+      <dt>Session directory</dt>
+      <dd class="mono path">{session.scratchDir}</dd>
+    </div>
   </dl>
 
   {#if session.hasLength}
@@ -178,6 +181,18 @@
 
   .facts dd {
     margin: 0;
+  }
+
+  /*
+   * The directory spans the grid. An absolute path is one unbreakable token several times
+   * a `minmax(140px, 1fr)` column wide, and `overflow-wrap: anywhere` breaks it wherever it
+   * has to — through a drive letter, through a directory name. This is the row that carries
+   * the path, so it is the one row that must not be squeezed into a column; `StoragePanel`
+   * spans its own path row the same way, and this class was written into the markup before
+   * the rule that gives it effect existed.
+   */
+  .facts .wide {
+    grid-column: 1 / -1;
   }
 
   .path {

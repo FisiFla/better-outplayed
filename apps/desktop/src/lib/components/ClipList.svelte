@@ -28,7 +28,8 @@
 
 {#if clips.length === 0}
   <p class="empty">
-    No clips are indexed yet. Record one with <code class="mono">localplay-cli buffer</code>.
+    No clips are indexed yet. Start recording above, then take one with
+    <strong>Save clip</strong> — or with the clip hotkey.
   </p>
 {:else}
   <ul>
