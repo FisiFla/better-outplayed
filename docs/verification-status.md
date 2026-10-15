@@ -572,9 +572,8 @@ $ gh run view 35904179918 --log-failed
   `Config::validate`, which names what *is* implemented rather than recording something else.
   `bitrate_kbps` still reaches ffmpeg's `-b:a` — 192 kbps for a front-end that carries no value
   (the desktop shell, which does not parse `[audio]`) — and is unused when `enabled = false`.
-  **The measurement is not in yet**: the argument list and the backends are what the code shows;
-  the file itself was produced on the box (a video-only capture whose `ffprobe` reports no audio
-  stream) and §17 below is where that lands.
+  **It is measured**: §17 below carries the box run — one `h264` stream, and no audio stream at
+  all.
 
 ---
 
@@ -1532,8 +1531,14 @@ its own startup line (`capture geometry …, video only: no audio track`) rather
 to be found in the file. `bitrate_kbps` still reaches ffmpeg's `-b:a` and is simply unused when
 `enabled` is false.
 
-**Evidence.** The argument list, the listeners and the backends are the code's half of this;
-the file's half is a run of the released CLI with `[audio] enabled = false`, ended by its own
-`--self-test-clip-after`, whose clip is probed for its streams. That run had not been taken when
-this section was written, and the §7 bullet above is the one that names it as missing rather
-than claiming it.
+**Evidence.** The argument list, the listeners and the backends are the code's half of this; the
+file's half is a run of the released CLI on the box at `92e5a70`, against the shipped example with
+`[audio] enabled = false` (the key the run set is `enabled = false`, at line 134 of the
+configuration the CLI actually read). Its own `--self-test-clip-after` ended the run after 45 s
+with exit code 0, and:
+
+- the startup line said it out loud — `capture geometry 3840x2160 at 60fps (frame counter starts
+  at 0), video only: no audio track`, exactly one such line in the debug log;
+- the clip it wrote, `clip-1792082573.mp4`, is **174,455,585 bytes** and `ffprobe` reports one
+  stream, `0,h264,video`. **There is no audio stream in the container at all** — not an empty
+  one, not a silent one.
