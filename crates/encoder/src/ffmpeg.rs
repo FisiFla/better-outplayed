@@ -150,6 +150,13 @@ pub(crate) const MFT_TIMEOUT: Duration = Duration::from_secs(2);
 /// pathological case, not a delay on the ordinary one (see `drain_stderr`).
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
+/// Poll interval while a failure report waits out [`STDERR_DRAIN_BUDGET`].
+///
+/// The reader signals completion by sending on a channel and this waits for it on the
+/// *reporting* thread, so the wait has to be a poll loop; five milliseconds is far below the
+/// hundred-millisecond scale the report is spent on and keeps each readiness check cheap.
+const STDERR_DRAIN_POLL: Duration = Duration::from_millis(5);
+
 /// How long a writer failure waits for ffmpeg to become reapable, so its exit status and
 /// stderr can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
 ///
@@ -633,6 +640,13 @@ pub struct FfmpegEncoder {
     /// writer failure that explains a dead encoder, and [`Encoder::finish`] — and the
     /// second one must not be left saying nothing.
     drained_stderr: Option<String>,
+    /// The reader thread still blocked on ffmpeg's stderr, when one is in flight.
+    ///
+    /// Kept across calls so that a budget which expired *before* the words arrived does not
+    /// throw the reader away: the thread is still sitting on the pipe, and a later report —
+    /// with whatever budget it has — can collect what the child eventually writes. See
+    /// [`FfmpegEncoder::drain_stderr`].
+    stderr_drain: Option<mpsc::Receiver<String>>,
 }
 
 impl FfmpegEncoder {
@@ -827,6 +841,8 @@ impl FfmpegEncoder {
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
             drained_stderr: None,
+            // No reader exists until a report asks for one.
+            stderr_drain: None,
         })
     }
 }
@@ -1286,6 +1302,14 @@ impl FfmpegEncoder {
     /// thread and taking whatever arrived keeps the report honest and bounded; on the
     /// ordinary path the text is already buffered and this returns at once.
     ///
+    /// A budget that expires **does not commit anything**: the reader is left in flight
+    /// ([`FfmpegEncoder::stderr_drain`]) and the next call, which may be the next report
+    /// with its own budget, still gets the words. Caching the timeout's empty string would
+    /// turn a transiently slow reader into a permanent one — every later report, the writer
+    /// failure's and [`Encoder::finish`]'s alike, would print nothing where ffmpeg's reason
+    /// should be. An empty string is only ever cached when it is the reader's own verdict,
+    /// which is what the channel disconnecting without a value means.
+    ///
     /// The text is remembered because a pipe can only be drained once, and more than one
     /// report wants it: the writer failure that explains a dead encoder, and
     /// [`Encoder::finish`]'s own failure. Without the cache the second one would print
@@ -1294,19 +1318,49 @@ impl FfmpegEncoder {
         if let Some(text) = &self.drained_stderr {
             return text.clone();
         }
-        let Some(mut stderr) = self.child.stderr.take() else {
-            return String::new();
+        // Reuse a reader a previous, shorter budget left in flight rather than start a
+        // second one: `child.stderr` is already taken, and the reader that is already
+        // blocked on the pipe is the one that will see the words.
+        let rx = match self.stderr_drain.take() {
+            Some(rx) => rx,
+            None => {
+                let Some(mut stderr) = self.child.stderr.take() else {
+                    return String::new();
+                };
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    let _ = stderr.read_to_string(&mut text);
+                    let _ = tx.send(text);
+                });
+                rx
+            }
         };
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            let _ = tx.send(text);
-        });
-        let text = rx.recv_timeout(budget).unwrap_or_default();
-        self.drained_stderr = Some(text.clone());
-        text
+        let deadline = Instant::now() + budget;
+        loop {
+            match rx.try_recv() {
+                Ok(text) => {
+                    self.drained_stderr = Some(text.clone());
+                    return text;
+                }
+                // The reader ended without sending: nothing more can arrive, so an empty
+                // answer is its own verdict and may be pinned rather than polled for.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.drained_stderr = Some(String::new());
+                    return String::new();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        // Nothing yet and no budget left: report nothing but keep the
+                        // reader, so a later call with a longer budget can still collect it.
+                        self.stderr_drain = Some(rx);
+                        return String::new();
+                    }
+                    std::thread::sleep(STDERR_DRAIN_POLL);
+                }
+            }
+        }
     }
 }
 
@@ -1900,6 +1954,8 @@ mod tests {
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
             drained_stderr: None,
+            // No report has asked for ffmpeg's stderr yet, so no reader is in flight.
+            stderr_drain: None,
         };
         encoder.child.wait().unwrap();
 
@@ -1907,6 +1963,56 @@ mod tests {
         assert!(first.contains("DLL amfrt64.dll failed to open"), "got: {first:?}");
         let second = encoder.drain_stderr(Duration::from_secs(1));
         assert_eq!(second, first, "the second report gets the same words, not nothing");
+    }
+
+    /// A budget that runs out before the words arrive must not be mistaken for a child that
+    /// said nothing.
+    ///
+    /// This is the defect the poll loop and the `stderr_drain` field exist for: the previous
+    /// shape waited with `recv_timeout` and cached the `String::default()` a timeout produced,
+    /// so one slow drain became a *permanent* claim that ffmpeg was silent — every later
+    /// report, including `Encoder::finish`'s, printed an empty line where the child's reason
+    /// should be. The stub here holds its words back past a deliberately short budget so the
+    /// timeout is certain rather than race-dependent, and the same encoder must still hand them
+    /// over to a later call that can outlast it.
+    ///
+    /// Unix-only like its siblings: the stand-in is a `#!/bin/sh` script (§10.7).
+    #[cfg(unix)]
+    #[test]
+    fn a_drain_that_times_out_is_not_remembered_as_an_empty_report() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("ffmpeg");
+        // The words arrive after the first budget, not before it; the trailing sleep keeps the
+        // pipe open a little longer, which is also what the reader thread is waiting on.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nsleep 0.5; echo 'late words from ffmpeg' >&2; sleep 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn");
+
+        let early = encoder.drain_stderr(Duration::from_millis(50));
+        assert_eq!(early, "", "a budget that expired reports nothing yet");
+        let late = encoder.drain_stderr(Duration::from_secs(3));
+        assert!(
+            late.contains("late words from ffmpeg"),
+            "the words written after the first budget must still be collected, not lost to it: \
+             {late:?}"
+        );
+        let again = encoder.drain_stderr(Duration::from_secs(3));
+        assert_eq!(again, late, "and they are remembered rather than drained a second time");
     }
 
     /// A shutdown is bounded: a child that will not exit is killed rather than waited for.
