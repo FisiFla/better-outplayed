@@ -1639,3 +1639,39 @@ it has not. `MF_MT_AVG_BITRATE` still describes what the stream is.
 that ignores CBR may obey VBR or a quality mode), `CODECAPI_AVEncCommonBufferSize`, and a
 driver-side preset. None was measured, and each would be another experiment for a number a reader
 of a clip's `ffprobe` output can already see is not being held.
+
+---
+
+## 20. A second CI failure on a commit that changed no code (2026-10-15)
+
+`21e0b87` ("Take the matched CPU pair for the zero-copy path") changes one thing: the text of §15.
+Its CI run (`38772177701`) failed, inside `crates/replay/tests/ram_clip.rs`:
+
+```
+test a_window_inside_the_held_footage_covers_the_whole_request ... FAILED
+thread 'a_window_inside_the_held_footage_covers_the_whole_request' (19732) panicked at
+crates/replay/tests/ram_clip.rs:322:5:
+the pre-roll is inside the held footage, so nothing should be reported as truncated
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.46s
+```
+
+That is `assert!(!window.truncated_front)`: the ring reported that the window's *front* reached
+past the footage it holds, for a window the test builds to sit wholly inside it. The file is not
+one that change touches, and this is not the dead-writer flake §16 is about — it is the second
+intermittent failure of the same kind, and it is recorded rather than re-run away.
+
+**What is known.** The runs either side of it on `main` are green (`b6d0a1d`, 4m7s; `f4dbf10`,
+4m57s). Locally the test passes five times in a row, and a full
+`cargo test --workspace --features localplay-encoder/test-encoders` passes with 35 `test result:
+ok` lines and `EXIT=0`. So it is neither caused by that commit (text only) nor deterministic.
+
+**What is not.** The mechanism. `ring_of_stub_capture(6)` builds its ring from a **real-time**
+stub capture and a real ffmpeg child, so how much footage the ring holds when the assertion runs
+is a function of how fast the host fed it; the window is `[span - 3000ms, span]`, and it lies
+inside the ring only if the ring's earliest held fragment is older than that. The two candidates
+are a front fragment ffmpeg had not yet finalised under a loaded runner, and the ring's RAM bound
+having trimmed the earliest fragment. One failure with no capture of the ring's own numbers does
+not distinguish them, and the honest reading is that **the test's margin is the fragile part**,
+not `window`/`truncated_front` — which is why the next person to touch this fixture should make
+the window a function of the ring's reported front rather than of an assumed `0`, instead of
+re-running it until it passes.
