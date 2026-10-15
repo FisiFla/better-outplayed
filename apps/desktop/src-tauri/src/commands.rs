@@ -2904,19 +2904,36 @@ mod tests {
         assert_eq!(clips.len(), 1, "expected exactly one clip file, got {clips:?}");
 
         // And it is real media of the configured window, produced by the real splice.
+        //
+        // The assertion is on the clip's **video stream**, not on the container's duration:
+        // the splice concatenates whole fragments on the encoder's grid, so the window
+        // quantises to that grid, and the container additionally carries the audio track and
+        // the muxer's stitched timestamps. Measured on this host over fourteen runs, plain and
+        // with sixteen competing processes: the video stream is 3000ms — the window exactly —
+        // or 3100ms when the window's edge falls inside a slightly longer fragment, while the
+        // container runs 3187-3396ms for those same clips. That gap is where the host shows
+        // through, and CI once reported 4393ms here on a commit that changed no code at all:
+        // the shape of an assertion that measures the machine rather than the code (see
+        // `docs/verification-status.md` §10.3).
+        //
+        // What the splice promises, and what this pins, is that the clip's video carries both
+        // sides of the window — a clip that stopped at the pre-roll (≈2s), or was empty, is
+        // the failure this rules out — and that it took the fragments around the window rather
+        // than the whole ring, which is the overhang bound below. (That bound is the splice's
+        // own arithmetic, one fragment at each end; a fragment can exceed `segment_time` when
+        // the host starves the encoder, which is why it is not tighter.)
         let info = MediaInfo::probe(&f.bins, &clips[0]).expect("the clip is readable media");
         let expected_ms = (PRE_SECONDS + POST_SECONDS) * 1_000;
+        let segment_ms = settings.buffer.segment_time * 1_000;
+        let video = info.video.as_ref().expect("a video stream");
+        let video_ms = video.duration_ms.expect("ffprobe reports the video stream's duration");
         assert!(
-            (info.duration_ms as i64 - expected_ms as i64).abs() <= 800,
-            "clip duration {}ms is not the configured window ({expected_ms}ms ± the segment \
-             grid)",
-            info.duration_ms
+            video_ms >= expected_ms * 3 / 4 && video_ms <= expected_ms + 2 * segment_ms,
+            "the clip's video is {video_ms}ms, which is not the configured window \
+             ({expected_ms}ms ± the segment grid): a clip that carries only one side of the \
+             window, or is empty, is the failure this rules out"
         );
-        assert_eq!(
-            info.video.as_ref().expect("a video stream").codec,
-            "h264",
-            "the software encoder is libx264 in a test build"
-        );
+        assert_eq!(video.codec, "h264", "the software encoder is libx264 in a test build");
 
         // One row in the index — the row `clip_now` wrote, in the store this shell reads.
         let rows = f.store.list_clips().unwrap();

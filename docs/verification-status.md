@@ -1328,3 +1328,52 @@ than discovered later:
   key is an `Option<bool>` and not a `bool` defaulting to true — an absent key resolving to `true`
   would make every machine without an encoder MFT refuse to start, and would have taken the test
   suite with it, since the suite runs on a Mac.
+
+---
+
+## 16. A clip's duration, and a CI failure on a commit that changed no code (2026-10-15)
+
+`091d956` — a **documentation-only** commit — failed the "Desktop shell Rust tests" job on
+
+```
+commands::tests::one_hotkey_press_writes_exactly_one_clip_through_the_recorder
+clip duration 4393ms is not the configured window (3000ms ± the segment grid)
+```
+
+Nothing in that commit could have changed a clip, so the assertion was measuring something
+other than the code. It was measuring two things, and both are worth having written down.
+
+**The container's duration is not the window's.** `MediaInfo::duration_ms` — and the DTO the
+UI shows — is ffprobe's `format.duration`, the same number criterion 4 is verified against.
+For a clip it is larger than either stream in the file. Measured on the dev host, fourteen
+runs of that test, plain and with sixteen competing processes:
+
+| window | video stream | audio stream | container |
+|---|---|---|---|
+| 3000ms | 3000ms (13 runs), 3100ms (1 run) | 3008ms | 3187-3396ms |
+
+The **video stream is the window**: 3000ms, or 3100ms when the window's edge falls inside a
+slightly longer fragment. The container carries the audio track's per-fragment padding and the
+muxer's stitched timestamps on top of it, and that surplus is small and steady on a real feed:
+the box's clip in §1 and §10.2 is **13,091ms against a 13,000ms target — 91ms over thirteen
+segments**, about 7ms each, comfortably inside criterion 4's ±0.5s. The test's own clips come
+out ~190ms over three fragments instead, which is a property of the synthetic stub feed or of
+how the synthetic audio is muxed; the two feeds were not isolated against each other, so treat
+the difference as unattributed rather than as a defect in either.
+
+**The splice cuts on the fragment grid.** A clip takes the whole fragments overlapping
+`[trigger−pre, trigger+post]`, so it overhangs the window by whatever the grid quantises to at
+each end — the §7 note that "it can run up to one segment past the request" is this — and on a
+loaded host the fragments themselves run past `segment_time`, because the forced keyframe
+lands on the first frame *after* the boundary. That is host pacing, not splice arithmetic, and
+it is the part that cannot be bounded by a millisecond constant.
+
+The assertion now pins what the splice promises rather than a millisecond fit: the clip's
+**video** carries both sides of the configured window (the pre-roll-only clip of ≈2s, and the
+empty one, are the failures it rules out), and the overhang is at most one fragment at each
+end. The container's duration is deliberately no longer asserted against the window: at a
+3000ms window it is not 3000ms even on an idle host, so the honest options were a bound fitted
+to the observations or no container bound at all, and §10.3's mistake is the first. The 4393ms
+reading was not reproduced here (nine further runs under sixteen competing processes, all
+3187-3396ms), and the failing run's per-stream durations were not captured, so which of the two
+effects moved furthest on the CI runner is **unattributed**.
