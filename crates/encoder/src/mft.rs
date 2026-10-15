@@ -1146,7 +1146,7 @@ mod tests {
     /// the numbers are the output, and they are printed for the record.
     #[test]
     fn the_hardware_encoders_are_enumerable_and_answer_the_d3d11_handshake() {
-        let encoders = probe_hardware_encoders().expect("the machine can be asked");
+        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
         eprintln!("hardware H.264 encoder MFTs on this machine: {}", encoders.len());
         for encoder in &encoders {
             eprintln!(

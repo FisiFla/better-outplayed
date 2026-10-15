@@ -176,12 +176,21 @@ const VIDEO_QUEUE_FRAMES: usize = 4;
 
 /// How many 10 ms audio blocks may be queued before audio submits start being dropped.
 ///
-/// Blocks are 1920 B at 48kHz stereo s16le, so this is ~61 KB — 320 ms of audio, ~1600x
-/// cheaper per millisecond of slack than the video queue. Audio is given more slack than
-/// video for that reason: a dropped block is a hole in the sound, and the memory saved by
-/// trimming this number would be noise. The microphone's queue (`FfmpegEncoder::mic_tx`) is
-/// sized the same way, because it carries the same kind of payload.
-const AUDIO_QUEUE_BLOCKS: usize = 32;
+/// Blocks are 1920 B at 48kHz stereo s16le, so this is ~576 KB — three seconds of slack, and
+/// ~1600x cheaper per millisecond than the video queue. Audio is given far more slack than
+/// video for that reason, and because of what the queue is actually for.
+///
+/// The drop path exists for an encoder that is *permanently* behind: better a hole in the
+/// sound than a capture loop blocked behind a wedged child. What a queue of a few hundred
+/// milliseconds does not survive is the child stopping its *reading* for a second or so,
+/// which is what Windows ffmpeg was measured doing at the first segment's boundary
+/// (`docs/verification-status.md` §10.4): at 320 ms of slack that transient stall discarded
+/// 760 ms of a 3 s feed — a quarter of the audio, permanently, from a pause the encoder
+/// recovered from on its own. A few hundred kilobytes is the wrong thing to trade that for,
+/// so the slack is measured in seconds, with the observed worst case multiplied out. The
+/// microphone's queue (`FfmpegEncoder::mic_tx`) is sized the same way, because it carries the
+/// same kind of payload and is read by the same child.
+const AUDIO_QUEUE_BLOCKS: usize = 300;
 
 /// The format the **game/system** audio input has always been declared with: raw s16le PCM
 /// at 48kHz stereo.
@@ -1751,15 +1760,6 @@ mod tests {
         assert_eq!(second, first, "the second report gets the same words, not nothing");
     }
 
-    /// The message a Windows capture produced was `Error: video writer thread has stopped`
-    /// while the real cause — an `h264_amf` that could not initialise — sat in ffmpeg's
-    /// stderr. A dead writer must now carry the child's own exit status and words.
-    ///
-    /// The stand-in child is a script that fails the way a hardware encoder does on a
-    /// machine with no vendor runtime: it says why on stderr and exits non-zero. No GPU is
-    /// needed, and the path under test — a pump thread noticing the broken pipe, then the
-    /// submitter asking the child what happened — is the one the real encoder uses.
-    #[cfg(unix)]
     /// A shutdown is bounded: a child that will not exit is killed rather than waited for.
     ///
     /// This is the defect the bounded wait exists for, and it is worth a test because it was
@@ -1774,6 +1774,11 @@ mod tests {
     ///
     /// The bound allows for the audio input's own connect deadline, which is the one other fixed
     /// wait on this path; everything else is bounded by `SHUTDOWN_BUDGET`.
+    ///
+    /// Unix-only, and it has to say so: the stand-in child is a `#!/bin/sh` script, like the one
+    /// below, so on Windows this test has nothing to run — and without the gate the whole crate's
+    /// test build fails there (§10.7).
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_does_not_wait_for_a_child_that_will_not_exit() {
         use std::os::unix::fs::PermissionsExt;
@@ -1874,6 +1879,17 @@ mod tests {
         encoder.finish().expect("flush the encoder");
     }
 
+    /// The message a Windows capture produced was `Error: video writer thread has stopped`
+    /// while the real cause — an `h264_amf` that could not initialise — sat in ffmpeg's
+    /// stderr. A dead writer must now carry the child's own exit status and words.
+    ///
+    /// The stand-in child is a script that fails the way a hardware encoder does on a
+    /// machine with no vendor runtime: it says why on stderr and exits non-zero. No GPU is
+    /// needed, and the path under test — a pump thread noticing the broken pipe, then the
+    /// submitter asking the child what happened — is the one the real encoder uses.
+    ///
+    /// Unix-only, like its sibling above: the stand-in is a `#!/bin/sh` script (§10.7).
+    #[cfg(unix)]
     #[test]
     fn a_dead_writer_reports_ffmpegs_exit_status_and_stderr() {
         use crate::VideoCodec;

@@ -389,7 +389,7 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
 | The pipeline **paces capture to a rate it can actually keep**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate`. **This is a pacing aid and a diagnostic, not the timeline guarantee** (see the two rows below, and §1) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, its numbers do not transfer to NVENC (hardware, content-blind), and the probe measures the encode path only — on this host it reported 62 fps where the pipeline achieved 8 |
-| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the box against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **fails on Windows** for a reason that is not yet understood (§10). |
+| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the box against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **failed on Windows**, and it turned out to be a real loss of audio rather than a test artefact: the encoder's own queue was too short to ride out a momentary stall in ffmpeg and discarded 760 ms of a 3 s feed (§10.4). |
 | A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`localplay_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
 
 The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
@@ -776,9 +776,9 @@ platform instead of across load. Each is committed with its reasoning.
 | `lol::client::tests::a_refused_connection…` | that a closed loopback port yields `FetchError::Connection` | port 1 **timed out** instead of being refused. The product was already right (`is_no_game()` accepts both); the test was over-specific about which the OS produces |
 | `media::binaries::tests::explicit_path_wins` | the literal path `/custom/dir/ffmpeg` | `/custom/dir\ffmpeg.exe` — a real and legitimate difference, since a bare `ffmpeg` is not an executable there |
 
-### 10.4 One thing still broken on Windows, and it is not a test's fault
+### 10.4 The Windows audio timeline: a queue too short for one stall (found 2026-09-24, fixed 2026-10-15)
 
-`crates/encoder/tests/timeline.rs` fails on Windows on the assertion that the audio and video
+`crates/encoder/tests/timeline.rs` failed on Windows on the assertion that the audio and video
 streams agree:
 
 ```
@@ -795,13 +795,54 @@ seg-000002.mp4: video 1000ms, audio   0ms
 seg-000003.mp4: video   67ms, audio   0ms
 ```
 
-The audio ends about 1.5s into a 3s feed while 3010ms was *fed*. What is known: the system
-ffmpeg there is 9.0.2, the same version as the dev host, so this is not an ffmpeg difference;
-and **the real capture run in §10.2 measured `video 7000ms audio 6997ms`**, a 3ms difference —
-so it is **not general to the Windows product**, and looks specific to this synthetic feed
-loop. The assertion is deliberately **left failing** rather than widened: it guards a real
-property, and a bound that moves to accommodate the observed value would be the mistake §10.3
-is about. Whoever picks this up should start from the per-segment table.
+The audio stopped about 1.5s into a 3s feed while 3010ms was *fed*. Two things were known, and
+both ruled out the obvious answers: the box's ffmpeg is 9.0.2, the same version as the dev host,
+so it was not an ffmpeg difference; and **the real capture run in §10.2 measured `video 7000ms
+audio 6997ms`**, 3ms apart, so it was not general to the Windows product. The assertion was
+**left failing rather than widened**, which was right — it was guarding a real property, and the
+property was broken.
+
+**The audio was really being lost, by the encoder's own queue.** The test feeds the pipeline for
+three seconds of wall clock, so both sides of it can be counted. Instrumenting the feed loop
+(temporary, reverted) showed the producer was innocent: 11.6M iterations of the loop, one 10 ms
+audio block drained per iteration, never a burst, no iteration whose video wait exceeded 50 ms,
+`dropped video frames 0`. The loss was on the consumer side, in the encoder's own bounded queue:
+**76 dropped audio blocks**, 760 ms. Offsetting each drop against the clock put them in **one
+window, 1.380-2.134s of the 3.000s feed** — a single ~0.75 s stall that begins just after the
+first segment boundary — and the arithmetic closes:
+
+```
+3010 ms fed - 760 ms dropped by the queue - ~207 ms still in flight at the end = 2043 ms muxed
+```
+
+**The fix is that queue's slack.** `AUDIO_QUEUE_BLOCKS` was 32 blocks, 320 ms, sized for a child
+that had *stopped reading* — with the drop path as the answer. That is the right bargain for a
+permanently wedged encoder (a hole in the sound beats a capture loop blocked behind it) and the
+wrong one for a pause the child comes out of on its own a second later: at 320 ms of slack, one
+transient stall discarded a quarter of the recording, permanently. It is now **300 blocks, three
+seconds, ~576 KB**, with the comment above it saying why — the video queue is four frames and
+cannot bend (33.2 MB each), the audio queue is a rounding error beside it, and the microphone's
+queue is sized the same way because it carries the same payload to the same child.
+
+Verified on the box at `e4d4098` plus this one constant, unmodified test, three consecutive runs,
+`test result: ok. 3 passed; 0 failed` each time:
+
+```
+46 frames (15fps nominal, 30fps configured) over 3.0005s: 3 segments, video 2901ms, audio 2803ms, fed audio 144480 frames = 3010ms
+```
+
+The gap between the streams is **98 ms** against the assertion's 700 ms, and it does not move
+run to run: the failing bound now has ~600 ms of headroom rather than sitting on the edge. The
+audio is 207 ms short of what was fed, which is the tail arriving after the last video frame that
+no segment boundary can mux — the test's own comment predicts exactly that. The siblings on the
+same runs: the starved pipeline `0 video + 0 audio dropped by the queues` with `media/wall =
+0.984-0.985`, and the splice test `4 segments spliced into 320x180 3067ms of video (46 coded
+frames), 3031ms of audio; 46 frames decoded; 0 repeated, 0 backwards`.
+
+The stall itself has only ever been measured on the synthetic feed; §10.2's real capture did not
+reproduce it. So this is measured insurance on a real path — the queue that carries loopback
+audio is this queue — rather than the fix for a shipped symptom, and it is written down that way
+on purpose. **The bound did not move. What was fixed was the behaviour it bounds.**
 
 ### 10.5 What this session did **not** run
 
@@ -831,6 +872,54 @@ as a service, or on a headless box**, and neither can `--mode session`, which re
 continuously and needs no hotkey. Kept as designed, by the owner's decision; recorded here
 because "the CLI refuses to start headlessly" is the kind of thing that belongs in a ledger
 rather than in a bug report later.
+
+### 10.7 The encoder's tests had not built on Windows for three weeks
+
+Found on 2026-10-15, trying to run the whole crate after the §10.4 fix: **`cargo test -p
+localplay-encoder` did not compile for `x86_64-pc-windows-msvc` at all.** Three errors, in two
+test modules:
+
+| site | what it was | introduced by |
+|---|---|---|
+| `crates/encoder/src/mft.rs:1149` | the test called `probe_hardware_encoders()`, a function that had grown a `VideoCodec` parameter | `3f2fe49` *Make the hardware path codec-aware, so HEVC can take it* |
+| `crates/encoder/src/ffmpeg.rs:1890,1895` | `a_dead_writer_reports_ffmpegs_exit_status_and_stderr` used `std::os::unix::fs::PermissionsExt` and a `#!/bin/sh` stub with no `#[cfg(unix)]` gate | `6e63977` *smoke-test hardware encoders so an advertised-but-unusable one fails loudly* |
+
+Neither was visible from anywhere that runs. The box's Windows sessions since then named a test
+file (`--test timeline`), which builds only that target; and this repository's own Windows gate
+is a `cargo check` of the *libraries*, which never compiles `#[cfg(test)]` code:
+
+```
+cargo check -p localplay-capture -p localplay-encoder -p localplay-events \
+            -p localplay-replay -p localplay-media -p xtask --target x86_64-pc-windows-msvc
+```
+
+So the platform the product ships on could not run the crate's tests, and had not been able to
+since 2026-09-25 — the date of both commits above, both after the 2026-09-24 Windows session that
+had recorded the encoder's counts. It matters beyond tidiness: the §10.4 failure was read for
+three weeks as "one assertion in the timeline target", and the timeline target was the only one
+anybody *could* run there.
+
+Both sites are fixed rather than deleted. The `mft.rs` test is the one that asks the machine what
+hardware encoders it has, which is what `crates/encoder/src/mft.rs` exists for; the two
+`ffmpeg.rs` tests are the dead-writer and bounded-shutdown defects, whose stand-in children are
+POSIX scripts, so each gets the `#[cfg(unix)]` gate and a line saying why. The `ed8ce59` edit
+that added the shutdown test had also stranded the dead-writer test's doc comment above the new
+test, so the doc went back to the function it describes.
+
+**And the gate now looks at the tests.** The CI cross-check step gained `--tests` and
+`--features localplay-encoder/test-encoders` (the feature the workspace suite uses: without it
+`EncodeConfig::for_tests_software` does not exist and `crates/encoder/tests/stream_output.rs`
+cannot be checked either). Verified locally against `x86_64-pc-windows-msvc`: the whole
+cross-check list now compiles with its tests, and the encoder's library-only check still reports
+only its pre-existing unused-import warning. `localplay-media` and `localplay-events` already
+gated their own unix-only test code properly, so the encoder was the whole of it.
+
+On the box the whole crate is green and has run there for the first time since 2026-09-25:
+`30 + 3 + 2 + 3 + 3 passed, 0 failed`, exit 0. That includes `mft.rs`'s own test, which is the
+one this defect silenced — and it is the test that asks the machine what hardware encoders it
+has, so its answer is worth recording: **ten MFTs**, of which the **NVIDIA H.264 and HEVC
+encoders accept the D3D11 device manager** (`d3d11=true`) and the Intel Quick Sync ones, which
+enumerate the same encoders, do not.
 
 ---
 
@@ -960,7 +1049,7 @@ revision to a second directory and running the same three targets:
 
 | Target | at `1875a89` | at the RAM commit |
 |---|---|---|
-| `localplay-cli --test self_test_clip` | **FAILED** | FAILED — pre-existing (this is §10.4's hotkey defect) |
+| `localplay-cli --test self_test_clip` | **FAILED** | FAILED — pre-existing (this is §10.6's hotkey defect) |
 | `localplay-encoder --test timeline` | **FAILED** | FAILED — pre-existing |
 | `localplay-recorder --lib` | ok. 58 passed | 1 failure in the workspace-wide run, **4/4 clean** in its own suite |
 

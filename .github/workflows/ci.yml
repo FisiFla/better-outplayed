@@ -117,10 +117,20 @@ jobs:
         # store, recorder, CLI and desktop shell are excluded on purpose: rusqlite's
         # bundled SQLite C cannot be built for MSVC here, and the CLI/desktop add
         # nothing to the API-shape gate.
+        #
+        # `--tests` as well as the libraries, because the point of this gate is code that
+        # cannot be *built* for Windows and the test modules are where that has actually
+        # happened: `localplay-encoder`'s tests stopped compiling for this target, and
+        # stayed that way, because a library-only check never looks at them (§10.7). The
+        # feature flag is the one the workspace suite uses — without it
+        # `EncodeConfig::for_tests_software` does not exist, so `crates/encoder/tests/
+        # stream_output.rs` cannot be checked either.
         run: >-
           cargo check
           -p localplay-capture -p localplay-encoder -p localplay-events
           -p localplay-replay -p localplay-media -p xtask
+          --features localplay-encoder/test-encoders
+          --tests
           --target x86_64-pc-windows-msvc
 
       - name: Frontend — install, typecheck, unit tests, production build
