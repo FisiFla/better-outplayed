@@ -2640,7 +2640,7 @@ fn build_encode_config(
     // enumeration would produce a recording with no video in it and a warning in a log.
     #[cfg(windows)]
     let openable = vendor.is_some()
-        && localplay_encoder::mft::can_encode_with_textures(codec, native_size);
+        && localplay_encoder::mft::can_encode_with_textures(codec, native_size, cfg.encode.bitrate_kbps);
     #[cfg(not(windows))]
     let openable = false;
 
@@ -2688,7 +2688,8 @@ fn build_encode_config(
             // to be ffmpeg's is now the MFT's.
             tracing::info!(
                 "zero-copy: captured textures go straight to the hardware encoder, and ffmpeg \
-                 copies the H.264 instead of encoding it ({})",
+                 copies the {} stream instead of encoding it ({})",
+                codec.bitstream_format(),
                 if zero_copy_required {
                     "set explicitly"
                 } else {

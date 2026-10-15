@@ -372,7 +372,7 @@ fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32), codec: VideoCod
     // Measured the hard way — the first version of this probe asked for the input alone and
     // reported "takes no candidate input format" on an encoder that has one, which is the same
     // shape of false negative as the async lock was, and would have been believed just as easily.
-    set_output_type(transform, size, codec)
+    set_output_type(transform, size, codec, PROBE_BITRATE_KBPS)
         .context("setting the output type, which must come before the input")?;
 
     let mut accepted = Vec::new();
@@ -406,6 +406,15 @@ fn output_subtype(codec: VideoCodec) -> windows::core::GUID {
     }
 }
 
+/// The bitrate the probes negotiate with, in kbit/s.
+///
+/// The probes ask what *formats and sizes* an encoder will take; the rate is not what they are
+/// measuring, so they use this rather than taking a parameter through four public functions. It is
+/// the example config's own number, so a probe's verdict describes the configuration somebody gets
+/// by default — while the recording path passes the configured value, which is the number that
+/// decides a clip's size. Two numbers, two purposes, each named.
+const PROBE_BITRATE_KBPS: u32 = 20_000;
+
 /// A size small enough that this encoder will accept it as a first configuration.
 ///
 /// See [`set_output_type`] — a workaround for a measured behaviour, not a preference.
@@ -426,13 +435,18 @@ const WARM_UP_SIZE: (u32, u32) = (640, 480);
 /// that has just refused 4K goes on to refuse 640x480, which is why a retry after the refusal does not
 /// help and being configured small first does. `probe_size_ceiling` found this and remains the way to
 /// re-check it. The H.264 encoder needs none of it and is not given it.
-fn set_output_type(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<()> {
+fn set_output_type(
+    transform: &IMFTransform,
+    size: (u32, u32),
+    codec: VideoCodec,
+    bitrate_kbps: u32,
+) -> Result<()> {
     if codec == VideoCodec::Hevc && size != WARM_UP_SIZE {
         // Best effort: the type that matters is the one below, and an encoder that does not need
         // warming simply accepts both.
-        let _ = set_output_type_once(transform, WARM_UP_SIZE, codec);
+        let _ = set_output_type_once(transform, WARM_UP_SIZE, codec, bitrate_kbps);
     }
-    set_output_type_once(transform, size, codec)
+    set_output_type_once(transform, size, codec, bitrate_kbps)
 }
 
 /// One attempt at configuring the output, with no warming.
@@ -442,6 +456,7 @@ fn set_output_type_once(
     transform: &IMFTransform,
     size: (u32, u32),
     codec: VideoCodec,
+    bitrate_kbps: u32,
 ) -> Result<()> {
     // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
     let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
@@ -474,10 +489,14 @@ fn set_output_type_once(
         media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        // A bitrate is not optional for a rate-controlled encoder, and this one is the project's own
-        // configured 20 Mbit/s rather than a token value: measured, a token 2 Mbit/s at 4K is not
-        // enough for the encoder to accept the size at all.
-        media_type.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?;
+        // A bitrate is not optional for a rate-controlled encoder, and this one is the configured
+        // `encode.bitrate_kbps` rather than a token value: measured, a token 2 Mbit/s at 4K is not
+        // enough for the encoder to accept the size at all, so the size of this number is
+        // load-bearing at the open. It is also **the rate the clip is really made at on this path**
+        // — nothing downstream sets one, because ffmpeg only copies what comes out of here — which
+        // is why it is a parameter: this was a hardcoded 20 Mbit/s that `bitrate_kbps` never reached,
+        // so a clip's actual size had nothing to do with the setting that describes it.
+        media_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps.saturating_mul(1_000))?;
         // **The profile and the level are the load-bearing attributes at 4K.** Without them this MFT
         // refuses *every* input format at 3840x2160 — including NV12, which it encodes for ffmpeg
         // every day — because the level it would have to claim to carry 4K@60 is not one it can
@@ -496,7 +515,10 @@ fn set_output_type_once(
     }
     // SAFETY: setting the output type on a transform that was just unlocked and given its device
     // manager, with a media type that outlives the call.
-    unsafe { transform.SetOutputType(0, &media_type, 0) }.with_context(|| format!("SetOutputType({codec:?})"))
+    // The bitrate is in the message because it is part of the question: a rate the encoder refuses
+    // is refused here, and a reader has to be able to tell that from a refusal of the size.
+    unsafe { transform.SetOutputType(0, &media_type, 0) }
+        .with_context(|| format!("SetOutputType({codec:?}, {bitrate_kbps} kbps)"))
 }
 
 /// Try to set `subtype` as the transform's input type at `size`.
@@ -741,11 +763,14 @@ impl MftEncoder {
     /// `device` is the **capture path's** device, deliberately: an MFT given a manager over a
     /// different device cannot be handed the captured texture at all, so the two have to be the
     /// same one. That is why this takes a device rather than creating its own.
-    pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>) -> Result<Self> {
+    ///
+    /// `bitrate_kbps` is the rate the stream is made at — on this path nothing else sets one, since
+    /// ffmpeg copies it rather than encoding it.
+    pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>, bitrate_kbps: u32) -> Result<Self> {
         // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
         // in one process is a supported sequence.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
-        match Self::open_started(device, size, codec, preferred) {
+        match Self::open_started(device, size, codec, preferred, bitrate_kbps) {
             Ok(encoder) => Ok(encoder),
             Err(err) => {
                 // SAFETY: balances the `MFStartup` above, which succeeded.
@@ -757,7 +782,7 @@ impl MftEncoder {
         }
     }
 
-    fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>) -> Result<Self> {
+    fn open_started(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>, bitrate_kbps: u32) -> Result<Self> {
         let manager = create_device_manager(device)?;
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
@@ -794,7 +819,7 @@ impl MftEncoder {
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            match configure_encoder(candidate, &manager, size, codec, preferred) {
+            match configure_encoder(candidate, &manager, size, codec, preferred, bitrate_kbps) {
                 Ok((transform, input_format)) => {
                     chosen = Some((transform, name, input_format));
                     break;
@@ -839,14 +864,14 @@ impl MftEncoder {
     /// The geometry comes from the texture for the same reason. It is the size that will actually
     /// arrive rather than the size somebody configured, and for this mode they are required to be the
     /// same anyway — `VideoInput::EncodedBitstream` refuses a scaled output at spawn.
-    pub fn open_for_texture(texture: &ID3D11Texture2D, codec: VideoCodec) -> Result<Self> {
+    pub fn open_for_texture(texture: &ID3D11Texture2D, codec: VideoCodec, bitrate_kbps: u32) -> Result<Self> {
         // SAFETY: `texture` is a live D3D11 texture and `GetDevice` is the documented way to ask
         // which device it belongs to. The device it returns is a new reference, held by the encoder.
         let device = unsafe { texture.GetDevice() }.context("ID3D11Texture2D::GetDevice")?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `desc` is a valid out-parameter for this texture.
         unsafe { texture.GetDesc(&mut desc) };
-        Self::open(&device, (desc.Width, desc.Height), codec, Some(desc.Format))
+        Self::open(&device, (desc.Width, desc.Height), codec, Some(desc.Format), bitrate_kbps)
     }
 
     /// The geometry this encoder was opened for.
@@ -1057,13 +1082,14 @@ fn configure_encoder(
     size: (u32, u32),
     codec: VideoCodec,
     preferred: Option<DXGI_FORMAT>,
+    bitrate_kbps: u32,
 ) -> Result<(IMFTransform, String)> {
     // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
     let transform: IMFTransform =
         unsafe { activate.ActivateObject() }.context("IMFActivate::ActivateObject(IMFTransform)")?;
 
     prepare_transform(activate, &transform, manager)?;
-    set_output_type(&transform, size, codec)?;
+    set_output_type(&transform, size, codec, bitrate_kbps)?;
 
     // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
     // 3840x2160 with `MF_E_INVALIDMEDIATYPE`, so what it will eat is a function of the size as well
@@ -1179,13 +1205,13 @@ pub struct MftFeed {
 impl MftFeed {
     /// Start the encoder's thread, whose output goes into `out` — the same video queue the pump
     /// used to write to, so the depth accounting stays in one place.
-    pub fn spawn(codec: VideoCodec, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
+    pub fn spawn(codec: VideoCodec, bitrate_kbps: u32, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&dropped);
         let handle = std::thread::Builder::new()
             .name("localplay-mft".to_string())
-            .spawn(move || encode_loop(rx, out, counter, codec))
+            .spawn(move || encode_loop(rx, out, counter, codec, bitrate_kbps))
             .expect("spawning the hardware encoder thread");
         Self {
             tx: Some(tx),
@@ -1237,6 +1263,7 @@ fn encode_loop(
     out: std::sync::mpsc::SyncSender<Vec<u8>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     codec: VideoCodec,
+    bitrate_kbps: u32,
 ) {
     // Opened on the first texture rather than up front, because both the device and the size come
     // from that texture — and opening it here rather than on the pump takes the open off the
@@ -1246,7 +1273,7 @@ fn encode_loop(
 
     while let Ok(texture) = rx.recv() {
         if encoder.is_none() {
-            match MftEncoder::open_for_texture(texture.as_raw(), codec) {
+            match MftEncoder::open_for_texture(texture.as_raw(), codec, bitrate_kbps) {
                 Ok(mut opened) => {
                     if let Err(err) = opened.start() {
                         tracing::error!("could not start the hardware encoder: {err:#}");
@@ -1822,11 +1849,11 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
 /// The device is the kind capture creates, because the encoder takes its device *from the captured
 /// texture* and this is asking the same question the recording will ask. It costs one device and one
 /// negotiation, and only while the key is left unset.
-pub fn can_encode_with_textures(codec: VideoCodec, size: (u32, u32)) -> bool {
+pub fn can_encode_with_textures(codec: VideoCodec, size: (u32, u32), bitrate_kbps: u32) -> bool {
     let Ok(device) = create_capture_kind_device() else {
         return false;
     };
-    MftEncoder::open(&device, size, codec, None).is_ok()
+    MftEncoder::open(&device, size, codec, None, bitrate_kbps).is_ok()
 }
 
 /// Every hardware video encoder MFT this machine will admit to, with no type filter at all.

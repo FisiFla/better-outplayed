@@ -700,7 +700,7 @@ impl FfmpegEncoder {
         // ffmpeg is the same one whether it was encoded in this process or by the child.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream)
-            .then(|| crate::mft::MftFeed::spawn(cfg.codec, video_tx.clone()));
+            .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, video_tx.clone()));
         let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
 
         let video_writer = std::thread::Builder::new()

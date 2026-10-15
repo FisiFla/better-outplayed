@@ -28,6 +28,10 @@ fn main() -> anyhow::Result<()> {
     } else {
         localplay_encoder::VideoCodec::H264
     };
+    // The probes below ask about formats and sizes, not about rates, so they negotiate with the
+    // example config's own bitrate. The recording path passes `encode.bitrate_kbps` down instead,
+    // because there it is the number the clip is really made at.
+    const BITRATE_KBPS: u32 = 20_000;
     // Unfiltered, so that "no encoder for this codec" can be told apart from "the filter is wrong".
     match localplay_encoder::mft::list_hardware_video_encoders() {
         Ok(names) => {
@@ -133,7 +137,7 @@ fn main() -> anyhow::Result<()> {
             size,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
         );
-        match nv12.and_then(|texture| localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec)) {
+        match nv12.and_then(|texture| localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS)) {
             Ok(encoder) => println!(
                 "an NV12 texture opens: {} taking {}",
                 encoder.encoder_name, encoder.input_format
@@ -159,6 +163,7 @@ fn main() -> anyhow::Result<()> {
             size,
             codec,
             Some(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM),
+            BITRATE_KBPS,
         ) {
             Ok(mut encoder) => {
                 println!(
