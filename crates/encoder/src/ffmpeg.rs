@@ -1,4 +1,4 @@
-//! One ffmpeg process, a pipe video input, **two optional loopback-TCP audio inputs**,
+//! One ffmpeg process, a pipe video input, **up to two optional loopback-TCP audio inputs**,
 //! segmented MP4 output.
 //!
 //! Video arrives on `pipe:0` — the child's stdin, which `std::process` hands us as a
@@ -6,19 +6,24 @@
 //! `tcp://127.0.0.1:{port}`: we bind a listener on an ephemeral loopback port and
 //! ffmpeg dials it, because for an input URL ffmpeg's tcp protocol is the CLIENT.
 //!
-//! ## Two audio inputs, one transport, one clock discipline
+//! ## Up to two audio inputs, one transport, one clock discipline
 //!
 //! The child declares up to three inputs, in this order:
 //!
 //! | input | stream | transport |
 //! |---|---|---|
 //! | 0 | raw BGRA video | `pipe:0` |
-//! | 1 | system/game audio | `tcp://127.0.0.1:{game_audio_port}` |
+//! | 1 | system/game audio ([`EncodeConfig::game_audio`]) | `tcp://127.0.0.1:{game_audio_port}` |
 //! | 2 | microphone (`EncodeConfig::mic_audio`) | `tcp://127.0.0.1:{mic_audio_port}` |
 //!
-//! Input 2 exists only when [`EncodeConfig::mic_audio`] is `Some`, and then the output
-//! carries both audio tracks: `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and
-//! `Microphone`. The microphone is a **second listener bound the same way**, pumped by the
+//! **Input 1 exists only when [`EncodeConfig::game_audio`] is true**, and input 2 only when
+//! [`EncodeConfig::mic_audio`] is `Some`. With `game_audio` off there is no audio input at
+//! all: `[audio] enabled = false` asks for a video-only recording, and the child is told
+//! about no audio — no listener is bound, no `-c:a` is passed and the container carries no
+//! audio stream. With both on, the output carries both tracks:
+//! `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and `Microphone`. A microphone with the
+//! game audio off is refused at [`FfmpegEncoder::spawn`] rather than recorded, because a
+//! one-track container would carry it under the name `Game Audio`. The microphone is a **second listener bound the same way**, pumped by the
 //! same [`pump_audio`] function on its own thread — its timing conventions are not a
 //! reimplementation but the same code: PCM is written as it is submitted, the media timeline
 //! is the sample count, starvation shows up as a stall in ffmpeg's own input, and a full
@@ -444,17 +449,21 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     );
 
     // Input 1 — system/game audio: raw s16le PCM over loopback TCP. This is the transport
-    // that works on Windows as well as here — see the module comment.
-    args.extend(
-        audio_input_args(
-            audio_url,
-            GAME_AUDIO_SAMPLE_RATE,
-            GAME_AUDIO_CHANNELS,
-            SampleFormat::S16Le,
-        )
-        .into_iter()
-        .map(OsString::from),
-    );
+    // that works on Windows as well as here — see the module comment. Declared only when
+    // `game_audio` is on: `[audio] enabled = false` asks for a video-only recording, and a
+    // declared input feeds a track that would then have to be mapped, tagged and ended.
+    if cfg.game_audio {
+        args.extend(
+            audio_input_args(
+                audio_url,
+                GAME_AUDIO_SAMPLE_RATE,
+                GAME_AUDIO_CHANNELS,
+                SampleFormat::S16Le,
+            )
+            .into_iter()
+            .map(OsString::from),
+        );
+    }
 
     // Input 2 — the microphone, when one was configured. Declared by the same function as
     // input 1 and pumped by the same function too, so the second track cannot invent its
@@ -481,8 +490,14 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         .into_iter()
         .map(OsString::from),
     );
-    args.extend(["-c:a", "aac", "-b:a"].iter().map(OsString::from));
-    args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
+    // The audio codec and rate, which only exist when there is an audio input to encode. A
+    // `-c:a` with no audio stream is not an error ffmpeg reports — it is simply unused — but
+    // an argument list that mentions a track the recording does not have is the kind of thing
+    // a reader of `ffprobe` output has to resolve, so it is not passed.
+    if cfg.game_audio {
+        args.extend(["-c:a", "aac", "-b:a"].iter().map(OsString::from));
+        args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
+    }
 
     // Only with a second audio input does the output have to be mapped explicitly: with
     // ONE audio input ffmpeg's default stream selection already picks exactly input 0's
@@ -492,7 +507,8 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // are tagged — a two-track container whose tracks cannot be told apart is not the
     // feature. Input order is the source of both indices: 1 is the game audio, which
     // `Encoder::submit_audio` feeds, and 2 the microphone, which `Encoder::submit_mic_audio`
-    // feeds.
+    // feeds. (A microphone with `game_audio` off would shift those indices, which is why that
+    // combination is refused at spawn rather than mapped here.)
     if mic_url.is_some() {
         args.extend(["-map", "0:v", "-map", "1:a", "-map", "2:a"].iter().map(OsString::from));
         // The two tag strings come from `localplay-media`, which has to apply the same names
@@ -600,6 +616,11 @@ pub struct FfmpegEncoder {
     /// [`Encoder::submit_mic_audio`] can refuse a block whose own format disagrees with the
     /// declaration instead of putting the track on a timeline of the wrong length.
     mic_spec: Option<crate::MicAudioSpec>,
+    /// Whether this encoder has the game-audio input at all. `false` is a video-only recording:
+    /// no listener, no `-c:a` in the argument list and no writer thread, so
+    /// [`Encoder::submit_audio`] refuses a block rather than queueing it nowhere and
+    /// [`Encoder::finish`] has no game-audio writer to join.
+    game_audio: bool,
     /// Frames dropped because a queue was full. Atomics because the count is written on
     /// the submitting thread and read through `&self` (see `Encoder::dropped_frames`).
     dropped_video: AtomicU64,
@@ -642,13 +663,45 @@ impl FfmpegEncoder {
         // has to be in the argument list, and `:0` makes the OS pick a free one, which
         // we read back from the socket rather than guessing (racing another process
         // for a fixed port is exactly what this avoids).
-        let audio_listener = TcpListener::bind("127.0.0.1:0")
-            .context("binding the audio input listener on 127.0.0.1")?;
-        let audio_port = audio_listener
-            .local_addr()
-            .context("reading the audio input listener's port")?
-            .port();
-        let audio_url = format!("tcp://127.0.0.1:{audio_port}");
+        //
+        // `[audio] enabled = false` is the exception and it is handled first: a video-only
+        // recording binds no listener and names no port, so there is no input to feed and no
+        // track to end. What it must *not* become is a second, quieter thing — see the refusal
+        // below, which is about the one combination that cannot be recorded honestly.
+        let game_audio_input: Option<(TcpListener, u16)> = if cfg.game_audio {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .context("binding the audio input listener on 127.0.0.1")?;
+            let port = listener
+                .local_addr()
+                .context("reading the audio input listener's port")?
+                .port();
+            Some((listener, port))
+        } else {
+            None
+        };
+        // `ffmpeg_args` is the only reader, and it reads this only when `cfg.game_audio` is on:
+        // the URL exists as an argument exactly when the input does.
+        let audio_url = game_audio_input
+            .as_ref()
+            .map(|(_, port)| format!("tcp://127.0.0.1:{port}"))
+            .unwrap_or_default();
+
+        // A microphone with no game audio is a *configuration* contradiction, like the scaling
+        // one above, and is refused here for the same reason: it would otherwise be recorded as
+        // something the file misdescribes. The container's audio tracks are named by position —
+        // `localplay_media::edit::audio_titles` calls the first `Game Audio` and the second
+        // `Microphone` — so this combination produces a one-track file labelled `Game Audio` that
+        // carries a voice, and every reader of it, this crate's splicer included, would believe
+        // the label. Refused rather than relabelled: the naming convention is not this function's
+        // to reinvent.
+        if !cfg.game_audio && cfg.mic_audio.is_some() {
+            bail!(
+                "a microphone without the game audio cannot be labelled: this build names a \
+                 container's first audio track `Game Audio`, so the recording would carry the \
+                 microphone under the name of a track it does not have. Turn the microphone off \
+                 for a video-only recording, or leave `[audio] enabled = true`."
+            );
+        }
 
         // The microphone is a SECOND listener of exactly the same kind, bound at the same
         // point (before the child exists) because its port has to be in the argument list
@@ -710,16 +763,26 @@ impl FfmpegEncoder {
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream)
             .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, video_tx.clone()));
-        let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
-
         let video_writer = std::thread::Builder::new()
             .name("ffmpeg-video-in".into())
             .spawn(move || pump(video_rx, video_in))
             .context("spawning video writer thread")?;
-        let audio_writer = std::thread::Builder::new()
-            .name("ffmpeg-audio-in".into())
-            .spawn(move || pump_audio(audio_listener, audio_rx, audio_port, GAME_AUDIO_LABEL))
-            .context("spawning audio writer thread")?;
+
+        // The game-audio queue and its writer thread exist only when the input does, which is why
+        // both fields are `Option`s. `pump_audio` accepts the child's connection under a deadline,
+        // so this thread's result is also how a start that declared an input ffmpeg never opened is
+        // reported — the `audio_res` branch in `finish`.
+        let (audio_tx, audio_writer) = match game_audio_input {
+            Some((listener, port)) => {
+                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
+                let writer = std::thread::Builder::new()
+                    .name("ffmpeg-audio-in".into())
+                    .spawn(move || pump_audio(listener, rx, port, GAME_AUDIO_LABEL))
+                    .context("spawning audio writer thread")?;
+                (Some(tx), Some(writer))
+            }
+            None => (None, None),
+        };
 
         // The microphone pump is a thread of its own, and that is not tidiness: ffmpeg
         // will not pull one input far ahead of the other, so a single thread writing both
@@ -743,10 +806,10 @@ impl FfmpegEncoder {
             child,
             output_stream,
             video_tx: Some(video_tx),
-            audio_tx: Some(audio_tx),
+            audio_tx,
             mic_tx,
             video_writer: Some(video_writer),
-            audio_writer: Some(audio_writer),
+            audio_writer,
             mic_writer,
             encoder_name: cfg.encoder_name(),
             source_size: cfg.source_size,
@@ -759,6 +822,7 @@ impl FfmpegEncoder {
             mft,
             mic_port,
             mic_spec: cfg.mic_audio,
+            game_audio: cfg.game_audio,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
@@ -943,6 +1007,10 @@ impl Encoder for FfmpegEncoder {
     /// Queue an audio block, or drop it if the queue is full. Same reasoning as
     /// [`Encoder::submit_video`]; the counter is `Encoder::dropped_audio_blocks`.
     fn submit_audio(&mut self, audio: AudioBuffer) -> Result<()> {
+        // Refused, not dropped, when this encoder was never given an audio input at all: a caller
+        // feeding a track the recording does not have is a wiring mistake, not a full queue. Same
+        // shape and same reasoning as `submit_mic_audio`'s refusal.
+        refuse_audio_without_input(self.game_audio)?;
         let queued = match self.audio_tx.as_ref() {
             Some(tx) => enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio"),
             None => bail!("encoder already finished"),
@@ -1277,6 +1345,24 @@ fn enqueue_or_drop<T>(tx: &SyncSender<T>, item: T, dropped: &AtomicU64, what: &s
     }
 }
 
+/// The refusal a video-only encoder gives an audio block, as a function so the refusal itself can
+/// be tested without a child process (the same shape as [`enqueue_or_drop`]).
+///
+/// A recording with `EncodeConfig::game_audio` false has **no audio input at all**: no listener was
+/// bound, no `-c:a` was passed, and the container will carry no audio stream. A block arriving at
+/// such an encoder is a wiring mistake rather than a full queue, so it is refused and named rather
+/// than silently dropped into nowhere — the disposition [`Encoder::submit_mic_audio`] already takes
+/// for a block with no microphone input.
+fn refuse_audio_without_input(game_audio: bool) -> Result<()> {
+    if game_audio {
+        return Ok(());
+    }
+    bail!(
+        "this encoder was spawned without a game-audio input (EncodeConfig::game_audio was \
+         false); the block was refused rather than silently dropped"
+    )
+}
+
 /// How long ffmpeg is given to exit on its own before it is killed.
 ///
 /// Generous against what it takes in practice — a child whose inputs have closed exits in
@@ -1563,6 +1649,66 @@ mod tests {
         );
     }
 
+    /// `[audio] enabled = false` is a video-only recording, and it has to be visible in the
+    /// argument list rather than implied by it: no audio **input**, and no audio encoder
+    /// arguments either.
+    ///
+    /// The failure this rules out is the quiet one. An audio input left in the list is a listener
+    /// nothing ever dials, so ffmpeg waits out `AUDIO_CONNECT_TIMEOUT` at the start of every
+    /// recording for a track that does not exist; a `-c:a` left in it describes a stream no input
+    /// can produce. Neither is an error — the recording works and the flags are decoration —
+    /// which is exactly how this file's own `-start_number`/`-segment_start_number` and
+    /// `-r`/`-framerate` mistakes read.
+    #[test]
+    fn the_argument_list_without_the_game_audio_declares_no_audio_input_or_codec() {
+        let mut cfg = args_cfg(30, 1_000);
+        cfg.game_audio = false;
+
+        let text = strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", None));
+        assert!(
+            !text.iter().any(|a| a.starts_with("tcp://")),
+            "no audio input may be declared: {text:?}"
+        );
+        for audio_arg in ["-c:a", "-b:a", "-ac", "-ar"] {
+            assert!(
+                !text.iter().any(|a| a == audio_arg),
+                "{audio_arg} has no audio stream to describe: {text:?}"
+            );
+        }
+        // The video half is untouched, so this cannot pass by the list having gone empty.
+        assert!(
+            text.iter().any(|a| a == "pipe:0"),
+            "the video input is still declared: {text:?}"
+        );
+        assert!(
+            text.iter().any(|a| a == "-segment_time"),
+            "and so is the segmenter: {text:?}"
+        );
+    }
+
+    /// A block offered to an encoder with no audio input is **refused** — not queued, and not
+    /// silently dropped. The recording has no audio stream for it, so there is nowhere for it to
+    /// go, and a quiet drop would leave the caller believing the sound was captured.
+    ///
+    /// The disposition is the microphone's, for the same reason: [`Encoder::submit_mic_audio`]
+    /// refuses a block when the encoder was spawned without a microphone, and names the
+    /// configuration key responsible so the reader knows which half to fix.
+    #[test]
+    fn a_block_offered_to_an_encoder_without_the_game_audio_is_refused() {
+        let err = refuse_audio_without_input(false)
+            .expect_err("an encoder with no audio input cannot accept a block");
+        assert!(
+            err.to_string().contains("game_audio"),
+            "the refusal must name the configuration key: {err}"
+        );
+        assert!(
+            err.to_string().contains("refused rather than silently dropped"),
+            "and say what it did with the block: {err}"
+        );
+        // The other direction, so this cannot pass by refusing everything.
+        refuse_audio_without_input(true).expect("an encoder with the game audio accepts the block");
+    }
+
     /// The argument list as the os-string vector `Command::args` receives it, for
     /// comparison with a written-out expectation. Every element is ASCII here; only the
     /// segment pattern is a path, and it is derived the same way on both sides.
@@ -1747,6 +1893,9 @@ mod tests {
             accepts_textures: false,
             mic_port: None,
             mic_spec: None,
+            // No audio input at all: this test hands the struct a child and nothing else, and
+            // `audio_tx`/`audio_writer` above are `None` to match.
+            game_audio: false,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),

@@ -125,7 +125,7 @@ impl Fixture {
         let mut pacer = FramePacer::new(FPS);
         let feed_until = Instant::now() + PRE_FED;
         while Instant::now() < feed_until {
-            localplay_recorder::pump_once(&mut pacer, &mut capture, &mut audio, &mut encoder)
+            localplay_recorder::pump_once(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
                 .expect("feeding the fixture's stubs");
         }
 
@@ -163,7 +163,7 @@ impl Fixture {
             &mut self.pacer,
             &mut self.ring,
             &mut self.capture,
-            &mut self.audio,
+            Some(&mut self.audio),
             None,
             &mut self.encoder,
             need_ms,
@@ -190,7 +190,7 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     // One iteration of the steady-state pump the CLI loop uses and `pump_until_span`
     // shares. The stub clock has caught up with real time by now, so whether a frame is
     // due does not matter: what matters is that a pump iteration cannot fail.
-    pump_once(&mut fx.pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    pump_once(&mut fx.pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder)
         .expect("a pump iteration must not fail");
 
     let before = fx.stats();

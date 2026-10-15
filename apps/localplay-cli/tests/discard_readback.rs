@@ -98,7 +98,7 @@ impl Fixture {
     }
 
     fn pump(&mut self) -> PumpCounts {
-        pump_once_counted(&mut self.pacer, &mut self.capture, &mut self.audio, &mut self.encoder)
+        pump_once_counted(&mut self.pacer, &mut self.capture, Some(&mut self.audio), &mut self.encoder)
             .expect("a pump iteration must not fail")
     }
 }

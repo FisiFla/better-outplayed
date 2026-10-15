@@ -145,6 +145,16 @@ pub struct EncodeConfig {
     /// another clippy `too_many_arguments` warning. Default `0`: a first run on an empty
     /// scratch directory, and every test.
     pub start_number: u64,
+    /// Whether the game-audio track is recorded at all.
+    ///
+    /// `true` in both constructors, which is every caller there has ever been: input 1 is the
+    /// system loopback the capture side feeds, and no shipped configuration has run without it.
+    /// `false` declares **no audio input at all** — no listener is bound, no `-c:a` is passed and
+    /// the container carries no audio stream — which is what `[audio] enabled = false` asks for.
+    ///
+    /// A `bool` and not a second `Option`, because the two states that matter are "this recording
+    /// has the game audio" and "it does not"; a `None` would add a third that means neither.
+    pub game_audio: bool,
     /// When `Some`, a second audio input is declared and mapped as the container's
     /// second audio track (`Microphone`); the first stays `Game Audio`.
     /// When `None`, the argument list is BYTE-IDENTICAL to the pre-change list.
@@ -159,6 +169,12 @@ pub struct EncodeConfig {
     /// A configured microphone that cannot be brought up (no port to bind, a child that
     /// never dials it) **fails the start**; it never degrades to a recording that claims
     /// two tracks and carries one.
+    ///
+    /// It is the container's *second* audio track, so it cannot stand alone:
+    /// [`EncodeConfig::game_audio`] is what decides whether the first one exists, and
+    /// `localplay_media::edit::audio_titles` names a one-track container `Game Audio`. A
+    /// configuration with `game_audio = false` and a microphone is refused at spawn rather than
+    /// recorded under a name that describes a track it does not carry.
     pub mic_audio: Option<MicAudioSpec>,
     /// `None` means "real hardware encoder" — the only shipping configuration.
     pub(crate) software_encoder: Option<&'static str>,
@@ -278,6 +294,9 @@ impl EncodeConfig {
             // config file that says nothing about it must produce the one-track
             // argument list this encoder has always built.
             mic_audio: None,
+            // The game-audio track is on unless a caller that has read `[audio] enabled`
+            // says otherwise, which today is the CLI alone.
+            game_audio: true,
             software_encoder: Some(codec.hw_encoder_name(vendor)),
             // Files on disk, which is the shipping behaviour and the one that survives a
             // crash. A caller that wants no disk churn sets this to `FragmentedStream`.
@@ -311,6 +330,9 @@ impl EncodeConfig {
             audio_bitrate_kbps: 128,
             start_number: 0,
             mic_audio: None,
+            // On, like the shipping constructor: a test that wants a video-only encoder
+            // sets this to `false` itself.
+            game_audio: true,
             software_encoder: None,
             output: EncodeOutput::Segmented,
             video: VideoInput::RawPixels,

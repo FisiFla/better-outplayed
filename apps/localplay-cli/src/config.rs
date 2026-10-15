@@ -34,12 +34,18 @@ pub struct Config {
 
 /// `[audio]` — the game-audio track.
 ///
-/// Of the four keys, **only `bitrate_kbps` is honoured**. `source` and `codec` have exactly
-/// one implemented value each (`"loopback"`, `"aac"`) and anything else is refused in
-/// [`Config::validate`]. `enabled = false` cannot be honoured — the engine has no path that
-/// runs the encoder without the game-audio track — so the CLI says so at startup rather than
-/// recording audio a user asked not to have (a refusal here would block the very recording
-/// that user asked for).
+/// `enabled = false` is a **video-only recording**: the engine declares no audio input at all,
+/// so no loopback listener is bound and the container carries no audio stream. It is honoured
+/// rather than warned about, because it is a thing the pipeline can genuinely do.
+///
+/// `source` and `codec` still have exactly one implemented value each (`"loopback"`, `"aac"`)
+/// and anything else is refused in [`Config::validate`]; `bitrate_kbps` reaches ffmpeg's `-b:a`
+/// and is simply unused when `enabled` is false.
+///
+/// One combination is refused rather than recorded, and refused by the recorder rather than
+/// here: `enabled = false` with a microphone (`[mic] enabled = true`). A container's audio
+/// tracks are named by position — `localplay_media::edit::audio_titles` calls the first
+/// `Game Audio` — so a one-track recording of a voice would be labelled as the game audio.
 #[derive(Debug, Deserialize)]
 pub struct AudioSection {
     pub enabled: bool,

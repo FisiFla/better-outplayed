@@ -81,7 +81,7 @@ fn a_frame_that_disagrees_with_the_declared_pipe_size_is_refused_by_name() {
     );
 
     let mut pacer = FramePacer::new(FPS);
-    let err = pump_once(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder).expect_err(
+    let err = pump_once(&mut pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder).expect_err(
         "a 64x48 frame on a pipe declared 32x24 must fail, not be fed to ffmpeg",
     );
     let msg = format!("{err:#}");
@@ -112,7 +112,7 @@ fn a_frame_that_matches_the_declared_pipe_size_is_still_submitted() {
     // The pacer admits the first frame immediately, so this is the frame's own guard that
     // is being exercised here — not the rate limiter.
     let mut pacer = FramePacer::new(FPS);
-    let counts = pump_once_counted(&mut pacer, &mut fx.capture, &mut fx.audio, &mut fx.encoder)
+    let counts = pump_once_counted(&mut pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder)
         .expect("a frame the pipe was declared for must be submitted");
     assert_eq!(counts.submitted, 1, "the matching frame must reach the encoder");
     assert_eq!(

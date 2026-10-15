@@ -105,6 +105,9 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
         // `the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default` pins
         // that resolution.
         audio_bitrate_kbps: None,
+        // Nor an `[audio] enabled`: these tests record the game audio, which is what an
+        // absent value means (`RecorderConfig::game_audio`).
+        audio_enabled: None,
         sources: Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS }),
         dev_software_encoder: true,
     }
@@ -1350,4 +1353,60 @@ fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default()
         "an unset value must be the pipeline's default"
     );
     assert_eq!(encode.audio_bitrate_kbps, 192, "which is 192 kbps, not zero and not 128");
+}
+
+/// `[audio] enabled` reaches the encoder's configuration, and a front-end that carries no value
+/// records the game audio.
+///
+/// The CLI is the only thing that parses `[audio]`; it hands the choice over on
+/// [`RecorderConfig::audio_enabled`]. `None` there is the desktop shell's state — it does not
+/// parse the section — and it has to mean "the game audio is recorded", which is what every
+/// recording this pipeline has made carried. The non-default half is what makes the test bite:
+/// without the plumbing the encoder keeps the constructor's `true` and the `false` assertion
+/// fails, and with it `false` is what `EncodeConfig::game_audio` carries into the argument list,
+/// where the input and the `-c:a` are declared or not.
+#[test]
+fn the_configured_audio_opt_out_reaches_the_encoder_and_unset_records_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+
+    cfg.audio_enabled = Some(false);
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("a video-only configuration");
+    assert!(
+        !encode.game_audio,
+        "the opt-out must reach the encoder, which is the thing that declares the input"
+    );
+
+    cfg.audio_enabled = None;
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("an unset value");
+    assert!(
+        encode.game_audio,
+        "an unset value must be the pipeline's default, which records the game audio"
+    );
+}
+
+/// The one combination this build refuses rather than records: a microphone with the game audio
+/// off.
+///
+/// A container's audio tracks are named by position, and `localplay_media::edit::audio_titles`
+/// calls the first one `Game Audio` — so a one-track recording of a voice would be labelled as
+/// the game's own audio, a file that says one thing and holds another. The refusal happens
+/// before anything is opened, which is why this test needs no capture and no encoder child: the
+/// stub sources are never started.
+#[test]
+fn a_microphone_with_the_game_audio_off_is_refused_at_start() {
+    let (_tmp, app_data_dir) = application_data_dir("video-only-mic");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.audio_enabled = Some(false);
+
+    let refused = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, true))
+        .err()
+        .expect("a microphone without the game audio must be refused");
+    let text = format!("{refused:#}");
+    assert!(
+        text.contains("[audio] enabled = false") && text.contains("[mic] enabled = true"),
+        "the refusal must name both keys so the reader knows which to change: {text}"
+    );
 }

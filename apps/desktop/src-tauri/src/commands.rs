@@ -1551,10 +1551,13 @@ impl RecorderHost {
             encode: settings.encode.clone(),
             storage: settings.storage.clone(),
             // The shell deliberately does not parse `[audio]` (see `config.rs`), so it
-            // carries no bitrate and the encoder's own default applies — 192 kbps, what
-            // this pipeline has always recorded. Setting it here would be the second source
-            // of truth for a number the file already owns.
+            // carries neither the bitrate — the encoder's own default applies, 192 kbps, what
+            // this pipeline has always recorded — nor `enabled`, whose absent value means the
+            // game audio is recorded. Setting either here would be the second source of truth
+            // for a number (or a choice) the file already owns, and this shell has no switch
+            // that asks for a video-only recording.
             audio_bitrate_kbps: None,
+            audio_enabled: None,
             // WGC + WASAPI on Windows, the synthetic stubs everywhere else. This shell has
             // no switch for it and must not: the engine refuses to substitute a stub on
             // Windows, so there is no path here that captures nothing while looking like a

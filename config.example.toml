@@ -122,14 +122,15 @@ output_size = ""
 # zero_copy = true
 
 [audio]
-# Whether the game-audio track is recorded.
+# Whether the game-audio track is recorded. `false` is a **video-only recording**: the encoder
+# is given no audio input at all, no loopback listener is bound and the container carries no
+# audio stream. Smaller files and one fewer capture session, for footage whose sound is
+# accounted for elsewhere.
 #
-# **Not honoured yet, and only `true` can be.** Every recording carries the game-audio track:
-# ffmpeg is always given the loopback PCM stream as an input and encodes it as aac, and no
-# code path runs the encoder without it. Setting this to `false` cannot turn the track off —
-# the recording will carry audio anyway — and the CLI says so at startup rather than leave a
-# user who turned it off to discover it in the file. A refusal at startup would be worse: it
-# would block the recording the user asked for.
+# It cannot be combined with `[mic] enabled = true` below: a container's audio tracks are named
+# by position (the first is "Game Audio"), so a one-track file holding only a voice would be
+# labelled as the game's own audio. That combination is refused at start, naming both keys,
+# rather than recorded under a name the file does not earn.
 enabled = true
 # Only "loopback" is implemented. Anything else is refused at startup (`Config::validate`),
 # naming the implemented value, rather than recorded as loopback while the file says
@@ -140,8 +141,8 @@ source = "loopback"
 # argument list; a second value here would be a second source of truth.
 codec = "aac"
 # The game-audio track's bitrate, in kbps. **This key is honoured**: it reaches ffmpeg's
-# `-b:a`, so the file records what this says. 192 is what every build without a readable key
-# has recorded.
+# `-b:a`, so the file records what this says — and it is unused when `enabled = false`, which
+# encodes no audio at all. 192 is what every build without a readable key has recorded.
 bitrate_kbps = 192
 
 [storage]
@@ -183,6 +184,10 @@ max_age_days = 7
 # is not configurable. On Windows this needs a capture device; if it cannot be
 # started, the recording fails at start rather than producing a video with a silent
 # voice track.
+#
+# Turning this on with `[audio] enabled = false` is refused at start, naming both keys:
+# the container's first audio track is named "Game Audio", so a video-only recording
+# with a voice in it would carry that voice under the name of a track it does not have.
 [mic]
 enabled = false
 

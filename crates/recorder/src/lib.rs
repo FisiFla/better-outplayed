@@ -242,6 +242,15 @@ pub struct RecorderConfig {
     /// [`localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] (192 kbps) in
     /// [`build_encode_config`], which is what this pipeline recorded before the key was read.
     pub audio_bitrate_kbps: Option<u32>,
+    /// `[audio] enabled` — whether this recording carries the game-audio track at all.
+    ///
+    /// `None` carries no value, which is the desktop shell (it does not parse `[audio]`) and
+    /// means `true`: every recording this pipeline has made carried the game audio. `Some(false)`
+    /// is a video-only recording, and then nothing about the game audio exists — no loopback
+    /// backend is created, the encoder declares no audio input, and the container has no audio
+    /// stream. Read through [`RecorderConfig::game_audio`], because two places need the same
+    /// answer.
+    pub audio_enabled: Option<bool>,
     pub sources: Sources,
     /// Encode with libx264 instead of a hardware vendor. This is the CLI's
     /// `--dev-software-encoder`: it exists for pipeline smoke tests on a host with no GPU
@@ -1117,7 +1126,24 @@ impl Prepared {
         // from the backend's own frame geometry (`native_size` — the monitor under WGC,
         // the configured size for the stub), so the size-dependent half of the encoder
         // config has to wait until the backend exists.
-        let (mut capture, mut audio) = build_sources(cfg.sources, cfg.encode.fps)?;
+        // The game audio's presence is one rule, read here and in the encoder's configuration
+        // below, so it is asked of the configuration rather than decided a second time.
+        let game_audio = cfg.game_audio();
+        // The two audio tracks are named by position and this build names a one-track
+        // container's track `Game Audio` (`localplay_media::edit::audio_titles`), so a microphone
+        // with the game audio off is not a recording this build can label: the file would carry
+        // the microphone under the name of a track it does not have. Refused here, before
+        // anything is opened, rather than mislabelled downstream. The encoder refuses it too, as
+        // the backstop for a front-end that reaches `spawn` without passing through here.
+        if !game_audio && self.opts.mic.enabled {
+            bail!(
+                "[audio] enabled = false with [mic] enabled = true cannot be recorded: this build \
+                 names a container's first audio track `Game Audio`, so the microphone would be \
+                 carried under the name of a track it does not have. Turn the microphone off for a \
+                 video-only recording, or leave `[audio] enabled = true`."
+            );
+        }
+        let (mut capture, mut audio) = build_sources(cfg.sources, cfg.encode.fps, game_audio)?;
         let native = capture.native_size();
 
         let mut encode_cfg = build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
@@ -1248,7 +1274,13 @@ impl Prepared {
             native.0,
             native.1,
             encoder_fps,
-            if microphone { format!(", plus a microphone track on port {mic_port:?}") } else { String::new() }
+            match (game_audio, microphone) {
+                (true, true) => format!(", plus a microphone track on port {mic_port:?}"),
+                (true, false) => String::new(),
+                // Refused above, before anything was opened: see the `[mic]`/`[audio]` check.
+                (false, true) => unreachable!("a microphone without the game audio is refused"),
+                (false, false) => ", video only: no audio track".to_string(),
+            }
         );
         // The session row, before anything is captured: a crash mid-recording then always
         // leaves a row for the next start to find, and the retention rules manage the segment
@@ -1289,15 +1321,17 @@ impl Prepared {
         );
 
         // Start the sources. The microphone first — it is the input whose failure the user
-        // cannot see in the picture — then the display, then the game audio; on any failure
-        // everything already started is stopped again, and the session row is closed so
-        // nothing is left half-open.
+        // cannot see in the picture — then the display, then the game audio when this
+        // recording has one at all; on any failure everything already started is stopped
+        // again, and the session row is closed so nothing is left half-open.
         let started = (|| -> Result<()> {
             if let Some(mic) = mic.as_mut() {
                 mic.start().context("starting the microphone")?;
             }
             capture.start().context("starting screen capture")?;
-            audio.start().context("starting audio capture")?;
+            if let Some(audio) = audio.as_mut() {
+                audio.start().context("starting audio capture")?;
+            }
             Ok(())
         })();
         if let Err(err) = started {
@@ -1305,7 +1339,9 @@ impl Prepared {
                 let _ = mic.stop();
             }
             let _ = capture.stop();
-            let _ = audio.stop();
+            if let Some(audio) = audio.as_mut() {
+                let _ = audio.stop();
+            }
             let _ = store.end_session(session, now_ms(), None, 0, 0);
             if mode.is_full_session() {
                 session::remove_session_dir(&segment_dir);
@@ -1576,7 +1612,12 @@ struct Engine {
     cleanup: CleanupReport,
     pacer: FramePacer,
     capture: Box<dyn CaptureBackend>,
-    audio: Box<dyn AudioBackend>,
+    /// The game-audio backend, when this recording has the game-audio track. `None` is a
+    /// video-only recording (`[audio] enabled = false`): nothing is captured, the encoder is
+    /// told about no audio input and the pump has nothing to drain. Taken (stopped) during
+    /// shutdown, which is why the *fact* that this recording has the game audio is a field of
+    /// its own ([`Engine::game_audio`]).
+    audio: Option<Box<dyn AudioBackend>>,
     /// The microphone backend, when this recording has a microphone track. Drained by the
     /// same pump iteration as the game audio, into the encoder's own second input queue —
     /// one writer thread per input, which is why this is a second backend and not a second
@@ -1860,7 +1901,7 @@ impl Engine {
         let counts = pump_once_counted_with_mic(
             &mut self.pacer,
             self.capture.as_mut(),
-            self.audio.as_mut(),
+            self.audio.as_deref_mut(),
             self.mic.as_deref_mut(),
             self.encoder.as_mut(),
         )?;
@@ -2089,7 +2130,7 @@ impl Engine {
             &mut self.pacer,
             self.ledger.as_ring(),
             self.capture.as_mut(),
-            self.audio.as_mut(),
+            self.audio.as_deref_mut(),
             self.mic.as_deref_mut(),
             self.encoder.as_mut(),
             need_ms,
@@ -2248,7 +2289,11 @@ impl Engine {
         };
         // The sources are closed *before* the session is concatenated: a multi-gigabyte copy
         // must not keep the user's display under a Windows Graphics Capture session.
-        let audio = self.audio.stop().context("stopping audio capture");
+        let audio = match &mut self.audio {
+            Some(audio) => audio.stop().context("stopping audio capture"),
+            // A video-only recording has no audio backend to stop, and that is not a failure.
+            None => Ok(()),
+        };
         let capture = self.capture.stop().context("stopping screen capture");
         let mic = match self.mic.take() {
             Some(mut mic) => mic.stop().context("stopping the microphone"),
@@ -2535,28 +2580,52 @@ pub fn parse_output_size(spec: &str) -> Result<Option<(u32, u32)>> {
         })
 }
 
+/// Whether this recording carries the game-audio track.
+///
+/// `[audio] enabled` is the setting and the CLI is the only front-end that reads it; an absent
+/// value (the desktop shell, which does not parse the section) is `true`, which is what every
+/// recording made before the key meant. One function because two places need the same answer:
+/// the encoder's configuration and the capture backends.
+impl RecorderConfig {
+    pub fn game_audio(&self) -> bool {
+        self.audio_enabled.unwrap_or(true)
+    }
+}
+
 /// The capture and audio backends for the configured [`Sources`].
+///
+/// The audio backend is built only when `game_audio` is set. A video-only recording must not
+/// open the loopback at all: a capture whose blocks are discarded is still a capture, costing
+/// what it costs and — on Windows — holding a WASAPI session the user asked not to have.
 fn build_sources(
     sources: Sources,
     fps: u32,
-) -> Result<(Box<dyn CaptureBackend>, Box<dyn AudioBackend>)> {
+    game_audio: bool,
+) -> Result<(Box<dyn CaptureBackend>, Option<Box<dyn AudioBackend>>)> {
     match sources {
         // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
         // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
         // there is no stub fallback to hide it behind.
         Sources::Platform => {
             let stub = StubConfig { width: STUB_CAPTURE_SIZE.0, height: STUB_CAPTURE_SIZE.1, fps };
-            Ok((
-                default_video_backend(stub)?,
-                default_audio_backend(AudioFormat::default())?,
-            ))
+            let capture = default_video_backend(stub)?;
+            let audio: Option<Box<dyn AudioBackend>> = if game_audio {
+                Some(default_audio_backend(AudioFormat::default())?)
+            } else {
+                None
+            };
+            Ok((capture, audio))
         }
         // Explicitly the synthetic pair. Only a test (or a front-end that says so out
         // loud) asks for these; nothing about them touches the display or the speakers.
-        Sources::Stub(cfg) => Ok((
-            Box::new(StubCapture::new(cfg)),
-            Box::new(StubAudio::new(AudioFormat::default())),
-        )),
+        Sources::Stub(cfg) => {
+            let audio: Option<Box<dyn AudioBackend>> = if game_audio {
+                Some(Box::new(StubAudio::new(AudioFormat::default())))
+            } else {
+                None
+            };
+            Ok((Box::new(StubCapture::new(cfg)), audio))
+        }
     }
 }
 
@@ -2638,6 +2707,11 @@ fn build_encode_config(
     // file records what the config says rather than what a constructor happened to pick.
     encode_cfg.audio_bitrate_kbps =
         cfg.audio_bitrate_kbps.unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
+
+    // Whether the game-audio track exists at all, from the same rule the capture backends were
+    // built from (`RecorderConfig::game_audio`): `false` declares no audio input, so the
+    // encoder never binds its loopback listener and the container carries no audio stream.
+    encode_cfg.game_audio = cfg.game_audio();
 
     // The hybrid, when it was asked for and this machine can do it. Both refusals happen here
     // rather than later, because both are *configuration* contradictions and a recording that

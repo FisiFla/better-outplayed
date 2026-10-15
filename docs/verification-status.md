@@ -555,18 +555,26 @@ $ gh run view 35904179918 --log-failed
   interactive-session wrapper (`scripts/verify-in-interactive-session.ps1`) and everything
   it claims about a *real* capture path are **compiled, not run**. A not-performed row in
   its report is not a pass, and a pass on the stub path is not evidence about Windows.
-- **`[audio] enabled = false` is not honoured.** The game-audio track is declared
-  unconditionally — ffmpeg input 1 is a loopback PCM stream encoded as aac — and there is no
-  code path that runs the encoder without it, so a configuration that sets `enabled = false`
-  still records audio. The CLI says so in as many words at startup rather than leaving it to
-  be found in the file; a hard refusal would be worse, because it would block the recording
-  the user asked for. The two keys beside it are fail-closed instead: `source` and `codec` each
-  have one implemented value (`"loopback"`, `"aac"`) and anything else is refused by
+- **`[audio] enabled = false` is honoured**, and this bullet is the last one here to be
+  withdrawn. The game-audio track is no longer declared unconditionally: with `false` the
+  encoder is given no audio input at all — no loopback listener is bound, `ffmpeg_args` emits
+  neither the `tcp://` input nor `-c:a`, and no writer thread starts — so a clip and a session
+  file carry one video stream and **no audio stream**. The capture side follows: `build_sources`
+  never opens the WASAPI loopback, so a track nobody asked for is not even captured and thrown
+  away. `Encoder::submit_audio` refuses a block at such an encoder rather than dropping it
+  silently into nowhere, and the startup line says `video only: no audio track` rather than
+  leaving it to be discovered in the file. One combination is refused rather than recorded —
+  `enabled = false` with a microphone — by the recorder before anything is opened, and again by
+  `FfmpegEncoder::spawn` as the backstop: a container's audio tracks are named by position, so
+  `localplay_media::edit::audio_titles` would call a one-track recording of a voice
+  `Game Audio`. The two keys beside it are fail-closed as before: `source` and `codec` each have
+  one implemented value (`"loopback"`, `"aac"`) and anything else is refused by
   `Config::validate`, which names what *is* implemented rather than recording something else.
-  The one key in the section that **is** honoured is `bitrate_kbps`: it reaches ffmpeg's
-  `-b:a`, and a front-end that carries no value (the desktop shell, which does not parse
-  `[audio]`) gets 192 kbps — what this pipeline recorded before the key was read. "No audio"
-  is not a configuration this build can produce.
+  `bitrate_kbps` still reaches ffmpeg's `-b:a` — 192 kbps for a front-end that carries no value
+  (the desktop shell, which does not parse `[audio]`) — and is unused when `enabled = false`.
+  **The measurement is not in yet**: the argument list and the backends are what the code shows;
+  the file itself was produced on the box (a video-only capture whose `ffprobe` reports no audio
+  stream) and §17 below is where that lands.
 
 ---
 
@@ -1483,3 +1491,49 @@ to the observations or no container bound at all, and §10.3's mistake is the fi
 reading was not reproduced here (nine further runs under sixteen competing processes, all
 3187-3396ms), and the failing run's per-stream durations were not captured, so which of the two
 effects moved furthest on the CI runner is **unattributed**.
+
+---
+
+## 17. A video-only recording: `[audio] enabled = false`, honoured (2026-10-15)
+
+`config.example.toml`'s `[audio] enabled` was the last key in that section the pipeline could
+not act on: setting it to `false` produced a warning at startup and a recording that carried
+the game audio anyway. The engine declared one audio input in its argument list, bound one
+loopback listener and started one writer thread, and no configuration could remove any of the
+three.
+
+It can now. `EncodeConfig::game_audio` is the switch, and `false` means the encoder is given
+**no audio input at all**: `ffmpeg_args` emits neither the `tcp://127.0.0.1:{port}` input nor
+the `-c:a aac -b:a Nk` block, `FfmpegEncoder::spawn` binds no listener and starts no
+`ffmpeg-audio-in` thread, and the container carries one video stream and no audio stream.
+`Encoder::submit_audio` **refuses** a block at such an encoder rather than dropping it
+silently — the disposition `submit_mic_audio` already took for a missing microphone — and the
+argument-list test pins the *absence* of the input, the codec and the rate, because a flag left
+in a list that nothing dials is not an error ffmpeg reports.
+
+The capture side follows the same switch: `build_sources` creates the WASAPI loopback backend
+only when the game audio is on, so a video-only recording does not capture a track it is not
+going to write — what it saves is the capture as well as the encode. The pump takes the audio
+backend as an `Option<&mut dyn AudioBackend>`, the shape the microphone already had, so "this
+recording has no such input" is one absence rule for both instead of two.
+
+One combination is refused rather than recorded: `enabled = false` together with
+`[mic] enabled = true`. A container's audio tracks are named by position and
+`localplay_media::edit::audio_titles` calls the first one `Game Audio`, so a one-track
+recording of a voice would be labelled as the game's own audio — a file that says one thing and
+holds another, which is the class of defect this ledger exists to catch. It is refused in
+`Recorder::start_with_options` before anything is opened, and again in `FfmpegEncoder::spawn`
+as the backstop for a front-end that reaches the encoder without passing through the recorder.
+
+How far the key reaches: the CLI carries it (`audio_enabled: Some(audio.enabled)`) and no
+longer warns about it; the desktop shell carries `audio_enabled: None`, which means the game
+audio is recorded, because that shell does not parse `[audio]`; and a video-only run says so in
+its own startup line (`capture geometry …, video only: no audio track`) rather than leaving it
+to be found in the file. `bitrate_kbps` still reaches ffmpeg's `-b:a` and is simply unused when
+`enabled` is false.
+
+**Evidence.** The argument list, the listeners and the backends are the code's half of this;
+the file's half is a run of the released CLI with `[audio] enabled = false`, ended by its own
+`--self-test-clip-after`, whose clip is probed for its streams. That run had not been taken when
+this section was written, and the §7 bullet above is the one that names it as missing rather
+than claiming it.

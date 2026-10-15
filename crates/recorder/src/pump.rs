@@ -273,7 +273,7 @@ impl PumpCounts {
 pub fn pump_once(
     pacer: &mut FramePacer,
     capture: &mut dyn CaptureBackend,
-    audio: &mut dyn AudioBackend,
+    audio: Option<&mut (dyn AudioBackend + '_)>,
     encoder: &mut dyn Encoder,
 ) -> Result<()> {
     pump_once_counted(pacer, capture, audio, encoder)?;
@@ -324,11 +324,15 @@ pub fn pump_once(
 /// timestamp: throttling it to the video rate would *create* the desync it looks like
 /// it is preventing.
 ///
+/// `audio` is `None` when this recording has no game-audio track at all
+/// (`EncodeConfig::game_audio` false): there is nothing to drain, because nothing was
+/// captured.
+///
 /// A frame the backend did not produce is not counted; a submit that errors aborts.
 pub fn pump_once_counted(
     pacer: &mut FramePacer,
     capture: &mut dyn CaptureBackend,
-    audio: &mut dyn AudioBackend,
+    audio: Option<&mut (dyn AudioBackend + '_)>,
     encoder: &mut dyn Encoder,
 ) -> Result<PumpCounts> {
     pump_once_counted_with_mic(pacer, capture, audio, None, encoder)
@@ -344,13 +348,17 @@ pub fn pump_once_counted(
 /// thread is the deadlock this pipeline already fixed once — and it is why the microphone
 /// adds no thread of its own here.
 ///
+/// `audio` is `None` for a recording with no game-audio track at all
+/// (`EncodeConfig::game_audio` false, `[audio] enabled = false`): nothing was captured, so
+/// there is nothing to drain. It is the same shape the microphone below already uses.
+///
 /// `mic` is `None` whenever this recording has no microphone track (`[mic] enabled = false`,
 /// the default): the function is then exactly the pre-Phase-5 pump, one `submit_audio` loop
 /// and nothing else.
 pub fn pump_once_counted_with_mic(
     pacer: &mut FramePacer,
     capture: &mut dyn CaptureBackend,
-    audio: &mut dyn AudioBackend,
+    audio: Option<&mut (dyn AudioBackend + '_)>,
     mic: Option<&mut (dyn AudioBackend + '_)>,
     encoder: &mut dyn Encoder,
 ) -> Result<PumpCounts> {
@@ -384,8 +392,13 @@ pub fn pump_once_counted_with_mic(
         std::thread::sleep(pacer.time_until_due(Instant::now()).min(FRAME_POLL));
     }
     let before = Instant::now();
-    while let Some(block) = audio.next_buffer(Duration::ZERO)? {
-        encoder.submit_audio(block)?;
+    // `None` is a recording with no game audio at all (`EncodeConfig::game_audio` false): nothing
+    // was captured, so there is nothing to drain. Same shape as `mic` below, deliberately — one
+    // absence rule for both inputs rather than two.
+    if let Some(audio) = audio {
+        while let Some(block) = audio.next_buffer(Duration::ZERO)? {
+            encoder.submit_audio(block)?;
+        }
     }
     // The microphone's blocks are drained the same way, for the same reason: its timeline
     // is the exact sample count, and a block left in the backend is a hole in the voice
@@ -462,9 +475,10 @@ pub fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
 ///
 /// Two things vary between the callers and nothing else does: which ring the span comes from
 /// (the replay buffer's, or a full session's own segments — see [`crate::session::SessionRing`])
-/// and whether a microphone is drained alongside the game audio. Both are parameters rather than a second wait loop, because this loop is the one
-/// place that must keep the encoder fed while it waits, and a second copy of it is a second
-/// chance to get that wrong.
+/// and which audio inputs exist at all — `None` is a track this recording does not have, so a
+/// video-only recording passes `None` for both. Both are parameters rather than a second wait
+/// loop, because this loop is the one place that must keep the encoder fed while it waits, and a
+/// second copy of it is a second chance to get that wrong.
 // Seven parameters plus the ring: the wait loop's handles are what it needs to keep feeding
 // one encoder while it waits, and bundling them into a struct would only move the list. The
 // pre-Phase-5 loop took seven for the same reason; the microphone is the eighth.
@@ -473,7 +487,7 @@ pub fn pump_until_span_on(
     pacer: &mut FramePacer,
     ring: &mut (dyn MediaRing + '_),
     capture: &mut dyn CaptureBackend,
-    audio: &mut dyn AudioBackend,
+    audio: Option<&mut (dyn AudioBackend + '_)>,
     mic: Option<&mut (dyn AudioBackend + '_)>,
     encoder: &mut dyn Encoder,
     need_ms: u64,
@@ -485,16 +499,17 @@ pub fn pump_until_span_on(
     // Scan on the first pass, then on the interval: the span can only move when
     // ffmpeg finalises a segment, which is a per-segment event, not a per-frame one.
     let mut next_scan = started;
-    // The microphone is borrowed for the whole wait: re-borrowing it inside the loop would
-    // mean a second `Option<&mut dyn AudioBackend>` per iteration, which the borrow checker
-    // rightly refuses.
+    // Both audio inputs are borrowed for the whole wait: taking either of them per iteration
+    // would need a fresh `Option<&mut dyn AudioBackend>` each time round, which the borrow
+    // checker rightly refuses. `None` is an input this recording does not have.
+    let mut audio = audio;
     let mut mic = mic;
 
     loop {
         counts = counts.plus(pump_once_counted_with_mic(
             pacer,
             capture,
-            audio,
+            audio.as_deref_mut(),
             mic.as_deref_mut(),
             encoder,
         )?);
@@ -660,8 +675,9 @@ mod tests {
         let (mut pacer, _) = pacer(30);
 
         let started = Instant::now();
-        let counts = pump_once_counted(&mut pacer, &mut capture, &mut audio, &mut encoder)
-            .expect("one pump against a real encoder");
+        let counts =
+            pump_once_counted(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
+                .expect("one pump against a real encoder");
         let elapsed = started.elapsed();
         encoder.finish().expect("flush");
 
