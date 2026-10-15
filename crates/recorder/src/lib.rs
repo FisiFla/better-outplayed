@@ -1467,6 +1467,14 @@ fn spawn_supervisor(
                             continue;
                         }
                         tracing::info!("{game} stopped: closing the recording");
+                        // Cleared *before* the shutdown below, not after it: `matched_game` is
+                        // documented as `None` while nothing is being recorded, and the engine
+                        // clears `running` as its own shutdown returns — so a clear placed after
+                        // the join leaves a window, the retention pass included, in which the
+                        // status names a game that is not being recorded. That window is what the
+                        // recorder's own test caught, and it widens with the size of the library
+                        // the retention pass has to walk.
+                        status.set_game(None);
                         // Clearing the command channel drops the engine's last sender, which
                         // ends its loop; the join waits for the shutdown that does the work —
                         // the encoder flush, the session file, the row's end.
@@ -1486,7 +1494,6 @@ fn spawn_supervisor(
                                  left for the next start to recover"
                             ),
                         }
-                        status.set_game(None);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     // Nothing is watching any more: rather than capture for nobody, stop.

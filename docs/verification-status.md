@@ -954,6 +954,20 @@ whole tree's binaries in flight at once. This change adds a reader thread and tw
 genuinely does alter the load profile, which is enough to tip a test like that without being a
 defect in it. Worth fixing as its own piece of work; not evidence about the RAM buffer.
 
+**Fixed, and it was a defect in the code rather than noise in the test.** The status kept the
+game until *after* the join and the retention pass that follow a watched game's stop, while the
+engine clears `running` as its own shutdown returns. `running` was therefore false with `game`
+still set for as long as that work took, which is why load widened the window enough to see it
+rather than being the cause. `spawn_supervisor` now clears the game *before* the shutdown, so
+`running == false` implies no game — which is what `RecordingStatusDto::matched_game` already
+documents ("`None` while nothing is being recorded"), and what makes the assertion deterministic
+instead of a window. The test is unchanged, deliberately: it passes because the ordering it
+asserts is now the ordering there is. Reproduced on the dev host by widening the window on
+purpose — 600 extra expired sessions for the retention pass to evict — and polling every 200µs:
+`game: Some("Dota 2")` alongside `running: false` before the change, `None` at that same instant
+after it. Not re-run on Windows; the box is where the window was first seen, and this is the
+dev-host diagnosis of it.
+
 What is **not** claimed: nothing here exercises NVENC, AMF or QSV — the tests run the software
 encoder, as they do on the dev host. The hardware-encoder selection was verified on this box in
 §10, before this change, and this change does not touch it. A real capture run into a RAM buffer
