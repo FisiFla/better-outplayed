@@ -1422,11 +1422,35 @@ than discovered later:
 
 ### What this does not say
 
-- **The CPU comparison spans two sessions.** 88.9% is §13's earlier soak; the hybrid's 3.1% and the
-  shipping path's *split* were taken minutes apart on the same build with the same instruments, but
-  the shipping path's CPU total was never re-taken in the session that produced the hybrid's (the
-  shutdown hang ended it early). The like-for-like evidence is the split instrumentation, not the
-  CPU totals. **The matched pair of CPU totals should be taken before either is quoted alone.**
+- **The CPU comparison spans two sessions — and the matched pair has now been taken.** 88.9% is §13's
+  earlier soak; the hybrid's 3.1% and the shipping path's *split* were taken minutes apart on the same
+  build with the same instruments, but the shipping path's CPU total was never re-taken in the session
+  that produced the hybrid's (the shutdown hang ended it early). The like-for-like evidence for the
+  *split* is still the split instrumentation. On 2026-10-15 the totals were paired: one run of the
+  released CLI per path, in one interactive session, same display, same 4K/60 capture, same
+  `--self-test-clip-after 45`, sampled once a second over both processes — `[encode] zero_copy = false`
+  against `true`:
+
+  | | `zero_copy = false` (readback) | `zero_copy = true` (hybrid) |
+  |---|---|---|
+  | `localplay-cli` CPU | 119.37% of one core | **4.18%** |
+  | its `ffmpeg` child | 156.10% | 4.07% |
+  | both processes | **275.47%** | **8.25%** |
+  | CLI peak RSS | 363 MB | 327 MB |
+  | `fps=` | 58.5/60 | 58.8/60 |
+  | `dropped=` | 50 | 4 |
+  | `capture_copy=` | 73.2% | 0.7% |
+  | media written | 34 segments, 86,140,600 B | 72 segments, 180,706,473 B |
+
+  The readback path spent ~2.75 cores of CPU to write 86 MB; the hybrid spent ~0.08 cores to write
+  181 MB, over windows of the same length (43.0 s and 44.5 s of steady state). **That is worse for the
+  shipping path than §13's 88.9% alone suggested, and the difference is the instrument**: §13 and
+  `xtask verify` read the `localplay-cli` process, and at 4K/60 with the loopback track live the
+  copy out of VRAM costs the CLI more than a core *and* hands ~1.5 cores of encode to a child that
+  number does not contain. The hybrid is the only path whose encoder runs inside the process being
+  measured (the MFT is in-process; the readback path encodes in the `ffmpeg` child), so a CLI-only
+  figure flatters it exactly where the pair above is honest: the same sampler over **both**
+  processes, 275.47% against 8.25%.
 - **The spread is real.** 3.1%, 3.6% and 4.0% are three runs of the same path. Criterion 6 passes
   with room to spare in all three, but the figure is a run, not a constant.
 - **`capture_wait=` is not a back-pressure signal.** It reads 61.1% while the inline encoder
