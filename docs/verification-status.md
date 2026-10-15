@@ -30,10 +30,13 @@ named, so every line below can be re-checked.
 > that would need a synthesised keypress — which this project will not do on a machine that
 > runs an anti-cheat.
 >
-> The earlier measurement stands and is not superseded: the 2026-09-23 session (RTX 3090,
-> 3840x2160 at 150% scaling, [issue #1]) proved the capture→encode→ring-buffer→splice path can
-> run, and found that **the pipeline cannot sustain the configured frame rate at 4K and burns
-> ~50% of a CPU core doing it** ([issue #1]). Both are still open.
+> The earlier measurement stands as the state of *that* build, and has since been measured again on
+> later ones: the 2026-09-23 session (RTX 3090, 3840x2160 at 150% scaling, [issue #1]) proved the
+> capture→encode→ring-buffer→splice path can run, and found that **the pipeline cannot sustain the
+> configured frame rate at 4K and burns ~50% of a CPU core doing it** ([issue #1]). Both of those
+> have since come back as passing, and both measurements are on the box: **§13** for the rate
+> (`fps=56.9/60`, 8 dropped of 10,525) and **§15** for the core (3.1–4.0% of one core, on a path
+> that stops the captured frame crossing to the CPU at all).
 
 If that paragraph surprises you, it is doing its job. The rest of this file is the detail.
 
@@ -111,7 +114,9 @@ on Windows hardware*. The numbers above are therefore wrong **in the direction o
 under-claiming**. They have not been adjusted by estimate: a tally is worth having only if it
 was counted, and the per-item tables below are the source of truth — §10 is the evidence for
 whatever moved, and the next pass should recount from those tables rather than from this
-paragraph.
+paragraph. Nothing after §10 has been folded in either: §11–§15 each add claims of their own
+that these counts do not include at all, and §15's — the zero-copy path's — are *Verified on
+Windows hardware*.
 
 ---
 
@@ -162,7 +167,7 @@ understated the state and has since been corrected.
 |---|---|---|
 | Cannot sustain the configured frame rate at 4K | Verified on Windows hardware | **~24 fps** sustained against **30 fps** configured — issue #1 |
 | Frames dropped by the encoder | Verified on Windows hardware | **~45% of delivered frames**; the debug line reads `dropped=1183` of ~3000 delivered — issue #1 |
-| CPU cost | Verified on Windows hardware | **50.8% of one core** against a **< 5%** target — issue #1 (criterion 6 **FAIL**) |
+| CPU cost | Verified on Windows hardware | **50.8% of one core** against a **< 5%** target — issue #1 (criterion 6 **FAIL** on this path; **met since on the zero-copy path, §15**) |
 | The media timeline does not track real time | Verified on Windows hardware — the measurement is unresolved there; **the mechanism is now measured on the dev host and fixed** | the divergence on the box is real, and two informal measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring). Both measured the *write* position, which is what `span_ms` is; the mechanism is the frame-rate conversion (see below), and the fix takes the dev host's ratio from 0.660× to 0.987×. **The box's own number is still unmeasured** |
 | RSS (the one criterion-6 half that passed) | Verified on Windows hardware | 235 MB, peak 267 MB against a < 400 MB target — issue #1 |
 
@@ -273,17 +278,18 @@ the probe's number is *more* optimistic. It remains as what it always should hav
 diagnostic that reports the sustainable rate and a pacing aid that keeps capture from paying
 for frames the encoder will drop.
 
-`gh issue list --state all` shows both issues still **OPEN**, and both still need the box:
+`gh issue list --state all` then showed both issues **OPEN**, and both still needed the box. Both
+have since had their readings taken and both are now **closed** — #1 and #2 — leaving #3 open:
 
-- issue #1 (throughput): unchanged by all of this. What the box must produce is the 4K soak's
-  `fps=`/`dropped=`, and criterion 6's CPU number.
-- issue #2 (the timeline): the *direction and magnitude* question above is now answered by
-  mechanism and by the local A/B (the ring's clock was the write position and it ran at
-  0.66×; it is now ~0.99×), and the fix is in the shipping argument list. **The box's own
-  number is still unmeasured** — one soak with `RUST_LOG=debug` and the `span=`-vs-wall-clock
-  reading prescribed above is what settles it, and it is also the only place the WGC readback
-  can show whether passthrough leaves the machine able to encode the frames it actually
-  captures.
+- issue #1 (throughput): **closed.** The box produced what it asked for and more: `fps=56.9/60`
+  with 8 dropped of 10,525 (§13), and criterion 6's CPU number, which the zero-copy path then met
+  at 3.1–4.0% of one core with `capture_copy=0.6–0.7%` (§15).
+- issue #2 (the timeline): **closed.** The *direction and magnitude* question above was answered by
+  mechanism and by the local A/B (the ring's clock was the write position and it ran at 0.66×; it is
+  now ~0.99×), and the fix is in the shipping argument list. **The box's own number has since been
+  taken** — §13's `media=180266ms wall=180372ms` over 180 s, a drift of 0.06% — which is what
+  settles it, and which also shows passthrough leaves the machine able to encode the frames it
+  actually captures.
 
 ---
 
@@ -487,15 +493,16 @@ $ gh run view 35904179918 --log-failed
 - ~~**Criteria 1 and 6 fail on 4K hardware.**~~ **Re-measured on the box, 2026-09-25 (§13),
   and they now part company.** Criterion 1 **passes**: the pipeline sustains **`fps=56.9/60`**
   at 3840x2160 with `h264_nvenc` and drops 8 frames of 10,525 — against ~24 fps at 30 with 45%
-  dropped when the issue was filed. Criterion 6 **still fails**, and this is now a *known cost
-  of the design* rather than an unexplained shortfall: **88.9% of one core** for the same work
-  at 2.4x the frame rate (1.49 cpu-percent per fps, against 2.1 before — better per frame,
-  higher in total). The cost is memory bandwidth, not arithmetic: 3840x2160x4 bytes at 57 fps
-  is ~2.1 GB/s moved twice (GPU to staging, staging to the pipe), which is memcpy speed. **No
-  code change fixes that except moving fewer bytes** — either encoding on the GPU (the design
-  spec's Phase 2) or capturing at the output size, which the WGC frame pool cannot do because
-  it follows the capture item's size. The criterion is left absolute, as the owner decided;
-  this line is the honest reading of it.
+  dropped when the issue was filed. Criterion 6 **failed on this path** — **88.9% of one core**
+  for the same work at 2.4x the frame rate (1.49 cpu-percent per fps, against 2.1 before — better
+  per frame, higher in total) — and the diagnosis was right: the cost is memory bandwidth, not
+  arithmetic, 3840x2160x4 bytes at 57 fps being ~2.1 GB/s moved twice (GPU to staging, staging to
+  the pipe), which is memcpy speed. ~~**No code change fixes that except moving fewer bytes**~~ —
+  **the change that stopped moving them at all is the answer, and it shipped: §15 measures the
+  zero-copy path at 3.1–4.0% of one core with `capture_copy=0.6–0.7%`, and it is the default.**
+  The other route named here, capturing at the output size, was never needed: the WGC frame pool
+  is created at the capture item's size, so it is not reachable from configuration. The criterion
+  is left absolute, as the owner decided; §15 is the honest reading of it now.
 - **The pacer already skips before the readback**, which both issues proposed as a fix: the
   pump consults the pacer first and only calls `next_frame` when a frame is due. On this
   display it has little left to win — `skipped=204` against `frames=10525` (§13) — because the
@@ -1066,16 +1073,19 @@ consults the pacer *first* and only calls `next_frame` when a frame is due, call
 `skipped=204` against `frames=10525`, because this display delivers ~60 fps and not the 144 Hz the
 issue assumed, so there are almost no frames being read back and thrown away.
 
-**Not closed: criterion 6** (< 5% of one core). It is *worse* in absolute terms than the issue's
-figure — 88.9% against 50.8% — because the run is doing 2.4x the frames per second. Per frame it is
-better (1.49 against 2.1 cpu-percent per fps), which is what the timeline fix should look like: the
-same work, more of it, and no longer thrown away. The cost is memory bandwidth, not CPU arithmetic:
-3840x2160x4 bytes at 57 fps is ~2.1 GB/s moved twice (GPU to staging, staging to the pipe), which is
-memcpy speed. **No code change fixes that except not moving the frame**, and there are only two ways
-to do that: encode on the GPU (the design spec's Phase 2) or capture fewer pixels. The second is
-cheap and was not exercised here: capturing at the *output* size would cut the traffic 4x for a
-1080p clip, and the WGC frame pool is created at the capture item's size, so it is not reachable
-from configuration — it is a change to the capture backend, and it needs its own measurements.
+**Not closed at this point: criterion 6** (< 5% of one core) — **closed since, by the zero-copy path
+(§15)**; this paragraph is left as written because it is the honest reading of *this* path, the
+ffmpeg-sidecar one. It is *worse* in absolute terms than the issue's figure — 88.9% against 50.8% —
+because the run is doing 2.4x the frames per second. Per frame it is better (1.49 against 2.1
+cpu-percent per fps), which is what the timeline fix should look like: the same work, more of it, and
+no longer thrown away. The cost is memory bandwidth, not CPU arithmetic: 3840x2160x4 bytes at 57 fps
+is ~2.1 GB/s moved twice (GPU to staging, staging to the pipe), which is memcpy speed. **No code
+change fixes that except not moving the frame**, and there are only two ways to do that: encode on
+the GPU (the design spec's Phase 2) or capture fewer pixels. **The first is what §15 then did** —
+measured at **4.0% of one core with `capture_copy=0.7%` and 59.6/60 fps**, now the default wherever
+a hardware encoder is present. The second turned out to be unnecessary as well as unreachable: the
+WGC frame pool is created at the capture item's size, so it is not a configuration away, and §15 is
+the measurement that makes it moot rather than merely unexercised.
 
 **Not measured: 1080p**, and the reason is worth recording rather than glossing. Issue #1 asks for it
 "to separate '4K is hard' from 'the pipeline is slow'", and on this box it cannot be had by
@@ -1132,6 +1142,149 @@ quarter of the wall clock in the same place. It also settles a question §13 lef
 is not where the money is, so a native encoder that still required a CPU copy would buy almost
 nothing.
 
-What this does **not** say: nothing here has been tested with a zero-copy path, because there is
-not one yet. It bounds what such a path can save, and it does so from the inside of the loop rather
-than from a total.
+What this does **not** say: this is the readback path, the shipping design, and every number above
+belongs to it. It *bounds* what removing the readback can save — 97% of the loop, so the target of
+"under 3%" is credible rather than aspirational — and it does so from the inside of the loop rather
+than from a total. **The path it bounds has since been built and measured, and the prediction is
+what came back: see §15**, where the copy falls to 0.7% of the loop and the core to 4.0%.
+
+---
+
+## 15. The readback is gone: the zero-copy path, and HEVC on it (2026-09-25)
+
+§14 bounded what removing the readback could buy and could not test it, because the path did not
+exist. It exists now, it is in the tree, and it is the **default wherever a hardware encoder is
+present**. This is the measurement §14 asked for. It was taken on the same box, against the same
+4K/60 soak and the same example config, by the work recorded in
+`docs/plans/2026-09-25-localplay-tier-2-zero-copy.md` and `docs/plans/2026-09-25-localplay-hevc.md`.
+
+What it is: the WGC texture goes to NVIDIA's H.264 Media Foundation encoder unchanged (`ARGB32`,
+no colour conversion), the encoder's own thread turns it into an H.264 elementary stream, and
+ffmpeg **copies** that stream instead of encoding one. No pixel of any frame crosses to the CPU,
+which is the entire point — §14 measured that crossing as 97% of the loop. `encode.zero_copy` is
+an `Option<bool>`: unset means *use the hardware path when the hardware is there*, `true` means
+*require it and refuse to start without it*, `false` turns it off.
+
+### The numbers, same box, same soak
+
+| | shipping path | hybrid, inline | hybrid, threaded |
+|---|---|---|---|
+| `capture_copy=` | 69.6% | 0.7% | **0.7%** |
+| `CPU` | 88.9% of one core *(§13)* | 3.1% | **4.0%** |
+| `fps=` | 55.5–56.9/60 | 35.0/60 | **59.6/60** |
+| `dropped=` | 8 | 2288 | **0** |
+| exits on its own | yes | **no** | **yes** |
+
+The threaded run's own closing numbers:
+
+```
+CPU 4.0% of one core, RSS 278.9 MB
+EXITED after 36.2s of watching
+no ffmpeg left behind
+frames=5710 segments=72 ... dropped=0 ... fps=59.6/60 capture=93.1% submit=0.2%
+capture_wait=61.3% capture_copy=0.7%
+buffer session #8 closed: 72 segment(s), 178668538 bytes held in RAM
+CLIENT_EXIT=0
+```
+
+**Criterion 6 passes: 4.0% of one core against a `< 5%` target.** **Criterion 1 passes on this path
+too, and more strongly than §13**: 59.6 of 60 with **zero** dropped frames, against 56.9 and 8.
+
+Read the three columns in order, because the middle one is really two states. The inline hybrid's
+first soak *never exited* — its process was still alive eight minutes after its log stopped, blocked
+rather than spinning (4.6 s of CPU in ten minutes) — and that shutdown defect was found and fixed
+(the three causes are below) before the threading work. Repaired, the inline run exits on its own at
+**CPU 3.1%**, still at 35 fps. So the threading change is what took the rate from 35.0 to 59.6 and
+the drops from 2288 to 0, and it is *also* what raised the CPU from 3.1% to 4.0% — an extra thread is
+not free. The trade is worth naming rather than letting 3.1 next to 4.0 look like noise.
+
+### The count that matters is the default's
+
+Verified with `config.example.toml` **copied and unmodified**, which is the case a new install gets:
+
+```
+zero_copy in the config as copied:  (unset - which is the default being tested)
+CPU 3.6% of one core
+EXITED after 36.2s
+zero-copy: captured textures go straight to the hardware encoder, and ffmpeg copies the H.264
+  instead of encoding it (chosen by default, because a hardware encoder is present)
+the hardware encoder is open on its own thread encoder=NVIDIA H.264 Encoder MFT format=ARGB32
+  size=(3840, 2160) adapter=NVIDIA GeForce RTX 3090
+CLIENT_EXIT=0
+```
+
+The device on a null adapter is whichever adapter DXGI calls the default, and on a machine with an
+integrated GPU that is not safe to assume — so it was read rather than assumed: adapter 0 is the RTX
+3090 (the Intel UHD is present and is not it, and the QSV MFTs report `d3d11=false` and cannot take
+the device at all). `MftEncoder::open_for_texture` takes the device *from the captured texture*, so
+the encoder and capture cannot disagree about which GPU they are on.
+
+### The shutdown, found on the way
+
+Three ways to wait for ever were on that path at once, and the shutdown took whichever came first:
+
+1. **The MFT's tail, sent with a blocking `send`** — written into a block whose own comment called
+   it best-effort, but the only thread that can drain that queue is the one that may be blocked
+   writing to a child that has stopped reading. Now `try_send`, and a tail that does not fit is
+   *reported* rather than sat on.
+2. **The order.** The writers were joined *before* the child was waited for, and a writer only ends
+   when its pipe breaks, which only happens when ffmpeg reads or dies — so a child that never exits
+   took the whole shutdown with it, silently, with the logger already stopped. The child is now
+   waited for first, under a 5 s `SHUTDOWN_BUDGET`, and joined after.
+3. **`std::process::Child::wait` has no timeout.** `wait_bounded` polls `try_wait` and kills at the
+   deadline, and a status that arrives only because of that kill is reported as such.
+
+The regression test asserts on **time** rather than output, because the defect was an absence, and it
+is mutation-checked: raise the budget to an hour and it hangs. Suite at the time: 541, from 540
+(546 in the workspace since, after later work).
+
+### HEVC on the same path
+
+`codec = "hevc"` with `zero_copy` left unset took the hardware path too:
+
+```
+CPU 4.2% of one core, RSS 356.9 MB
+capture=94.6%  submit=0.1%  capture_wait=62.0%  capture_copy=0.6%
+buffer session #13 closed: 35 segment(s), 167671496 bytes held in RAM
+CLIENT_EXIT=0        no ffmpeg left behind
+clip: codec_name=hevc  codec_tag_string=hvc1  3840x2160
+```
+
+`capture_copy=0.6%` is the number that says the pixels still never came back to the CPU. **It is not
+a CPU or GPU saving, and reporting it as one would be wrong**: the saving came from deleting the
+readback, which is codec-independent, and NVENC's HEVC pass costs slightly *more* per frame than its
+H.264 one. HEVC buys quality per bit. Three things it does not yet match or do, recorded here rather
+than discovered later:
+
+- **Throughput.** 56.9 fps and 9 dropped, against the H.264 hybrid's 59.6 and 0, with the recorder
+  saying so out loud (`the encoder cannot sustain the 60fps it was told`). Not a regression from
+  zero-copy — `capture_copy` and the CPU are what that change moved — but the predicted cost of the
+  codec, and the reason the default stays H.264.
+- **The bitrate is ignored.** The clip came out at **37 Mbps** against a `bitrate_kbps = 20000`
+  setting, where the H.264 path honours the same setting. `MF_MT_AVG_BITRATE` is set on the output
+  type either way, so this is HEVC-side rate control rather than a wiring mistake — and it matters,
+  because smaller files at the same picture is the whole reason HEVC was wanted.
+- **A diagnostic that hides the interesting answer:** `probe_available_types` skips any encoder whose
+  output type is refused, which is exactly the encoder that needed interrogating.
+
+### What this does not say
+
+- **The CPU comparison spans two sessions.** 88.9% is §13's earlier soak; the hybrid's 3.1% and the
+  shipping path's *split* were taken minutes apart on the same build with the same instruments, but
+  the shipping path's CPU total was never re-taken in the session that produced the hybrid's (the
+  shutdown hang ended it early). The like-for-like evidence is the split instrumentation, not the
+  CPU totals. **The matched pair of CPU totals should be taken before either is quoted alone.**
+- **The spread is real.** 3.1%, 3.6% and 4.0% are three runs of the same path. Criterion 6 passes
+  with room to spare in all three, but the figure is a run, not a constant.
+- **`capture_wait=` is not a back-pressure signal.** It reads 61.1% while the inline encoder
+  throttled the pump to 35 fps and 61.3% while a threaded encoder kept up at 59.6 — the same number
+  for opposite situations. Most of it is a correctly paced 60 Hz capture idling between frames.
+- **AV1 is not reachable on this hardware.** The 3090 does H.264 and HEVC through NVENC; AV1 is
+  40-series and later.
+- **1080p is still unmeasured**, for the reason §1 already gives: the pool follows the capture item,
+  only the primary 4K monitor is captured, and no configuration reaches a smaller size.
+- **Windows only, and by construction.** Off Windows there is no encoder MFT, so the hardware path
+  cannot be selected: the default resolves to the ordinary path and logs why. That is also why the
+  key is an `Option<bool>` and not a `bool` defaulting to true — an absent key resolving to `true`
+  would make every machine without an encoder MFT refuse to start, and would have taken the test
+  suite with it, since the suite runs on a Mac.
