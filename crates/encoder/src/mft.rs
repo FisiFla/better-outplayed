@@ -1185,6 +1185,21 @@ mod tests {
 /// rather than as an error. Half the ring is what keeps the guarantee true instead of likely.
 const QUEUE_DEPTH: usize = 2;
 
+/// How long one encoded frame waits for room in the video queue before it is dropped instead.
+///
+/// The queue it waits on is drained by the thread that writes to ffmpeg, and that thread stops
+/// making progress whenever ffmpeg stops reading: a child that has gone quiet fills its own pipe,
+/// the pipe fills the queue, and the queue fills this thread. Waiting there without a deadline is
+/// how the recorder stopped closing — [`MftFeed::shutdown`] joins this thread, and the step that
+/// could break the reader loose (killing ffmpeg) sits *below* that join, so a handover that never
+/// returns is an app that never exits. Measured on the box, 2026-10-15, four runs of the shipped
+/// hardware path: two of four were inside this send when the join was reached and had to be killed,
+/// while both runs that got through it closed in ~21 s.
+///
+/// It is [`MFT_TIMEOUT`], the budget the encoder calls in this same thread already use, because it
+/// answers the same question — how long to wait on the other side of the transform before giving up.
+const HANDOVER_BUDGET: Duration = MFT_TIMEOUT;
+
 /// The hardware encoder on its own thread, fed through a queue that never blocks.
 ///
 /// `submit` is called from the capture pump, and the encoder is a Media Foundation transform whose
@@ -1200,6 +1215,9 @@ pub struct MftFeed {
     tx: Option<std::sync::mpsc::SyncSender<GpuTexture>>,
     handle: Option<std::thread::JoinHandle<()>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set by [`MftFeed::shutdown`] before it joins the thread, so a handover that is waiting for
+    /// room stops waiting: from that point nothing below the join can make room.
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MftFeed {
@@ -1209,14 +1227,17 @@ impl MftFeed {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&dropped);
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&stopping);
         let handle = std::thread::Builder::new()
             .name("localplay-mft".to_string())
-            .spawn(move || encode_loop(rx, out, counter, codec, bitrate_kbps))
+            .spawn(move || encode_loop(rx, out, counter, codec, bitrate_kbps, stop))
             .expect("spawning the hardware encoder thread");
         Self {
             tx: Some(tx),
             handle: Some(handle),
             dropped,
+            stopping,
         }
     }
 
@@ -1248,11 +1269,59 @@ impl MftFeed {
     /// hang. Closing the sender ends the `recv` loop after the frames already queued have been
     /// taken, so nothing in flight is lost.
     pub fn shutdown(&mut self) {
+        // The flag before the sender, and both before the join: this thread cannot finish a
+        // handover that is waiting for a queue whose reader has stopped draining, and the join
+        // cannot return until the thread ends. Telling it to stop waiting is what keeps the join
+        // bounded — see [`hand_over`].
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.tx.take();
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
                 tracing::warn!("the hardware encoder thread panicked");
             }
+        }
+    }
+}
+
+/// What handing one encoded frame to the video queue did.
+enum Handover {
+    Queued,
+    /// The queue stayed full for [`HANDOVER_BUDGET`], or shutdown has been asked for: the frame is
+    /// not queued, and the stream goes on without it.
+    Dropped,
+    /// The reader is gone. There is no queue left to write to.
+    Closed,
+}
+
+/// Hand one encoded frame to the video queue, waiting for room but not for ever.
+///
+/// A `send` here is what stopped the recorder closing: the queue is drained by the thread that
+/// writes to ffmpeg, that thread stops when ffmpeg stops reading, and the join in
+/// [`MftFeed::shutdown`] — the only thing that could unstick it — cannot run until this returns. So
+/// the wait is bounded, and a frame that cannot be queued in time is dropped and counted, which is
+/// the same bargain the encoder's own input queue strikes one step up: the timeline is wall-clock,
+/// and a gap is better than a recording that will not stop.
+fn hand_over(
+    out: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    units: Vec<u8>,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> Handover {
+    let deadline = Instant::now() + HANDOVER_BUDGET;
+    let mut pending = units;
+    loop {
+        match out.try_send(pending) {
+            Ok(()) => return Handover::Queued,
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                pending = back;
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) || Instant::now() >= deadline {
+                    return Handover::Dropped;
+                }
+                // A millisecond: short enough that a shutdown is not felt, long enough that a
+                // stalled queue is not a spin.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Handover::Closed,
         }
     }
 }
@@ -1264,12 +1333,16 @@ fn encode_loop(
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     codec: VideoCodec,
     bitrate_kbps: u32,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Opened on the first texture rather than up front, because both the device and the size come
     // from that texture — and opening it here rather than on the pump takes the open off the
     // capture path as well.
     let mut encoder: Option<MftEncoder> = None;
     let mut pts_ms: i64 = 0;
+    // Frames this thread encoded and then could not queue. Counted rather than logged one by one:
+    // a stalled queue drops every frame behind it, and the total is the whole story.
+    let mut unqueued: u64 = 0;
 
     while let Ok(texture) = rx.recv() {
         if encoder.is_none() {
@@ -1306,18 +1379,23 @@ fn encode_loop(
         pts_ms += (1000 / FRAME_RATE.0 as i64).max(1);
         match mft.encode_texture(texture.as_raw(), pts_ms, MFT_TIMEOUT) {
             Ok(units) if units.is_empty() => {}
-            Ok(units) => {
-                // Blocking, unlike the handover above: this queue is drained by a thread whose job
-                // is to write to ffmpeg, and the pump is no longer waiting behind it.
-                if out.send(units).is_err() {
-                    break;
-                }
-            }
+            Ok(units) => match hand_over(&out, units, &stopping) {
+                Handover::Queued => {}
+                Handover::Dropped => unqueued += 1,
+                Handover::Closed => break,
+            },
             Err(err) => {
                 tracing::warn!("the hardware encoder refused a frame: {err:#}");
                 break;
             }
         }
+    }
+
+    if unqueued > 0 {
+        tracing::warn!(
+            "{unqueued} encoded frames were dropped instead of queued: the video queue stayed full \
+             for {HANDOVER_BUDGET:?}, which is the ffmpeg writer thread not keeping up"
+        );
     }
 
     // The tail. An asynchronous MFT produces output when it decides to, so the last frames of a
