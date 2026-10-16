@@ -77,6 +77,38 @@ impl GameSnapshot {
         names
     }
 
+    /// The end-of-game scoreboard: one row per entry of `allPlayers`, as a JSON array.
+    ///
+    /// Read from the same `allgamedata` document every poll already fetches (a GET; nothing
+    /// is ever sent to the client). `is_local` marks the watched player by matching the
+    /// names [`GameSnapshot::player_names`] offers. Empty when the document lists no players.
+    pub fn scoreboard(&self) -> serde_json::Value {
+        let names = self.player_names();
+        let rows: Vec<serde_json::Value> = self
+            .all_players
+            .iter()
+            .map(|p| {
+                let name = p.riot_id_game_name.as_deref().or(p.summoner_name.as_deref());
+                let local = [p.summoner_name.as_deref(), p.riot_id_game_name.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|n| names.contains(&n.trim()));
+                serde_json::json!({
+                    "name": name,
+                    "champion": p.champion_name,
+                    "team": p.team,
+                    "kills": p.scores.kills,
+                    "deaths": p.scores.deaths,
+                    "assists": p.scores.assists,
+                    "cs": p.scores.creep_score,
+                    "ward_score": p.scores.ward_score,
+                    "is_local": local,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(rows)
+    }
+
     /// The game's clock in seconds, which is what the payloads here record as context.
     pub fn game_time(&self) -> f64 {
         self.game_data.game_time
@@ -133,6 +165,9 @@ pub struct StreamEvent {
     pub turret_killed: Option<String>,
     #[serde(rename = "InhibKilled")]
     pub inhib_killed: Option<String>,
+    /// `GameEnd` only: `"Win"` or `"Lose"` for the local player's team.
+    #[serde(rename = "Result")]
+    pub result: Option<String>,
 }
 
 /// `activePlayer` — the local player, as far as the client will name them.

@@ -122,6 +122,38 @@ export interface SessionEvent {
   clip_id: number | null;
 }
 
+/** One row of a League end-of-game scoreboard, captured from the Live Client (GET only). */
+export interface ScoreRow {
+  name: string | null;
+  champion: string | null;
+  team: string | null;
+  kills: number;
+  deaths: number;
+  assists: number;
+  cs: number;
+  ward_score: number;
+  /** The watched player. */
+  is_local: boolean;
+}
+
+/** One match inside a session (Full Match splitting), on the session's media timeline. */
+export interface MatchDto {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  /** A `game_end` marker closed it; `false` means the end is an inferred boundary. */
+  complete: boolean;
+  /** No `game_start` marker preceded the end; the start is an inferred boundary. */
+  start_inferred: boolean;
+  game_mode: string | null;
+  map: string | null;
+  /** `'Win'` / `'Lose'` when the game reported it; `null` is not a guess of either. */
+  result: string | null;
+  /** Empty for games and matches without a captured scoreboard. */
+  scoreboard: ScoreRow[];
+  events: SessionEvent[];
+}
+
 /** What deleting a session did, in the vocabulary of spec §8.2. */
 export interface DeleteSessionOutcome {
   id: number;

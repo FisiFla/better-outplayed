@@ -28,6 +28,7 @@ import type {
   DeleteOutcome,
   DeleteSessionOutcome,
   ErrorCode,
+  MatchDto,
   RecordedClip,
   RecordingStatus,
   SessionDto,
@@ -60,6 +61,13 @@ export interface ClipSource {
    * An empty list is a real answer — a session nobody tagged has no markers.
    */
   sessionEvents(sessionId: number): Promise<SessionEvent[]>;
+  /**
+   * A session split into its matches (Full Match segments), each with its markers and, for
+   * League, the end-of-game scoreboard. Empty for a session with no game markers.
+   */
+  sessionMatches(sessionId: number): Promise<MatchDto[]>;
+  /** Cut one match out of a **finished** session as a clip. */
+  extractMatch(sessionId: number, matchIndex: number): Promise<ClipDto>;
   setSessionFavourite(sessionId: number, favourite: boolean): Promise<SessionDto>;
   /** Delete a session: its row, then its segments and its recorded file. */
   deleteSession(sessionId: number): Promise<DeleteSessionOutcome>;
@@ -148,6 +156,10 @@ export const tauriIpc: ClipSource = {
   sessionDetail: (sessionId) => invoke<SessionDto>('session_detail', { session_id: sessionId }),
   sessionEvents: (sessionId) =>
     invoke<SessionEvent[]>('session_events', { session_id: sessionId }),
+  sessionMatches: (sessionId) =>
+    invoke<MatchDto[]>('session_matches', { session_id: sessionId }),
+  extractMatch: (sessionId, matchIndex) =>
+    invoke<ClipDto>('extract_match', { session_id: sessionId, match_index: matchIndex }),
   setSessionFavourite: (sessionId, favourite) =>
     invoke<SessionDto>('set_session_favourite', { session_id: sessionId, favourite }),
   deleteSession: (sessionId) =>

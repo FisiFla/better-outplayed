@@ -14,6 +14,9 @@ publish = false
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+# Parses the League/GSI event payloads for the match scoreboard; tests also assert the exact
+# JSON keys the TypeScript interfaces mirror.
+serde_json = "1"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -52,8 +55,6 @@ tauri-build = { version = "2", features = [] }
 [dev-dependencies]
 # The command tests use real temporary stores and real temporary files.
 tempfile = "3"
-# Contract tests assert the exact JSON keys the TypeScript interfaces mirror.
-serde_json = "1"
 # The integration test drives a **real** recording (a real encoder child, a real ring, a
 # real splice and a real index row) through the tray's and the hotkey's trigger path. It
 # needs the engine's synthetic capture source (so that no test opens a capture session on
