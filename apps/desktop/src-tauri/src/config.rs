@@ -44,6 +44,7 @@
 
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
+use localplay_recorder::event_driver::EventsSection;
 use localplay_recorder::config::{BufferSection, EncodeSection, MicSection, StorageSection};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -285,6 +286,9 @@ impl BackgroundConfig {
 pub struct EngineOptionsConfig {
     pub mic: MicSection,
     pub games: GamesSection,
+    /// Which game-event sources to run. Absent means the example's values (League polling on,
+    /// the GSI listener on its default port), the same as the CLI.
+    pub events: EventsSection,
 }
 
 impl EngineOptionsConfig {
@@ -299,14 +303,16 @@ impl EngineOptionsConfig {
             mic: MicSection,
             #[serde(default)]
             games: GamesSection,
+            #[serde(default)]
+            events: EventsSection,
         }
         toml::from_str::<File>(text)
-            .map(|f| Self { mic: f.mic, games: f.games })
+            .map(|f| Self { mic: f.mic, games: f.games, events: f.events })
             .map_err(|err| {
                 CommandError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "the config file's [mic] or [games] section could not be read: \
+                        "the config file's [mic], [games] or [events] section could not be read: \
                          {err}"
                     ),
                 )
@@ -1105,6 +1111,22 @@ mod tests {
         // No watch list given: the six documented defaults, which is what the engine
         // watches then too.
         assert_eq!(opts.games.watch, default_watch());
+    }
+
+    #[test]
+    fn the_events_section_defaults_to_the_example_and_comes_from_the_file_when_set() {
+        // Absent: League polling on and the GSI listener on its default port, as the CLI's
+        // example config has it — a desktop user with an old config file still gets events.
+        let absent = EngineOptionsConfig::from_toml("[storage]\nclips_dir = \"\"\n").unwrap();
+        assert_eq!(absent.events, EventsSection::default());
+        assert!(absent.events.lol_poll_enabled);
+
+        let set = EngineOptionsConfig::from_toml(
+            "[events]\nlol_poll_enabled = false\ngsi_port = 0\n",
+        )
+        .unwrap();
+        assert!(!set.events.lol_poll_enabled);
+        assert_eq!(set.events.gsi_port, 0);
     }
 
     #[test]

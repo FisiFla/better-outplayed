@@ -112,6 +112,7 @@
 //!   ([`pump_once_counted_with_mic`]).
 
 pub mod config;
+pub mod event_driver;
 pub mod fps;
 pub mod index;
 pub mod memory_ring;
