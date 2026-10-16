@@ -11,6 +11,7 @@
    */
   import type { RecordingStatus, SettingsDto, SettingsUpdate } from '../types';
   import { open } from '@tauri-apps/plugin-dialog';
+  import { QUALITY_OPTIONS, captureUpdate, monitorIndex } from '../settings';
 
   interface Props {
     /** `null` until the first read answers; the panel is hidden meanwhile. */
@@ -37,6 +38,9 @@
   let outputSize = $state('');
   let micEnabled = $state(false);
   let autoRecord = $state(false);
+  let quality = $state('balanced');
+  let monitorText = $state('0');
+  let windowTitle = $state('');
 
   $effect(() => {
     if (settings === null) return;
@@ -45,10 +49,14 @@
     outputSize = settings.output_size;
     micEnabled = settings.mic_enabled;
     autoRecord = settings.auto_record;
+    quality = settings.quality;
+    monitorText = String(settings.capture_monitor);
+    windowTitle = settings.capture_window;
   });
 
   const fps = $derived(/^\d+$/.test(fpsText.trim()) ? Number(fpsText.trim()) : null);
   const fpsValid = $derived(fps !== null && fps >= 1 && fps <= 240);
+  const monitor = $derived(monitorIndex(monitorText));
   const recordingNow = $derived(recording !== null && recording.running);
   const isDefault = $derived(
     (key: string) => settings?.defaulted.includes(key) ?? false,
@@ -74,7 +82,13 @@
 
   function applyCapture() {
     if (!fpsValid || fps === null) return;
-    onApply({ fps, output_size: outputSize, mic_enabled: micEnabled });
+    if (monitor === null || settings === null) return;
+    onApply({
+      fps,
+      output_size: outputSize,
+      mic_enabled: micEnabled,
+      ...captureUpdate(settings, { quality, monitor, window: windowTitle }),
+    });
   }
 
   function applyAutomatic() {
@@ -144,6 +158,51 @@
       {#if !fpsValid}
         <p class="invalid">Framerate must be 1–240.</p>
       {/if}
+      <label class="field">
+        <span>Quality {#if isDefault('encode.bitrate_kbps')}<span class="muted">(default)</span>{/if}</span>
+        <select
+          value={quality}
+          onchange={(event) => (quality = event.currentTarget.value)}
+          disabled={busy}
+        >
+          {#if settings.quality === 'custom'}
+            <option value="custom">Custom ({settings.bitrate_kbps} kbit/s)</option>
+          {/if}
+          {#each QUALITY_OPTIONS as option (option.value)}
+            <option value={option.value}>{option.label}</option>
+          {/each}
+        </select>
+      </label>
+      <div class="row">
+        <label class="field">
+          <span>Monitor {#if isDefault('capture.monitor')}<span class="muted">(default)</span>{/if}</span>
+          <input
+            type="number"
+            min="0"
+            value={monitorText}
+            oninput={(event) => (monitorText = event.currentTarget.value)}
+            disabled={busy}
+          />
+        </label>
+        <label class="field">
+          <span>Window title {#if isDefault('capture.window')}<span class="muted">(default)</span>{/if}</span>
+          <input
+            type="text"
+            value={windowTitle}
+            oninput={(event) => (windowTitle = event.currentTarget.value)}
+            placeholder="Whole monitor"
+            disabled={busy}
+            spellcheck={false}
+          />
+        </label>
+      </div>
+      {#if monitor === null}
+        <p class="invalid">Monitor must be a number from 0 (the primary monitor).</p>
+      {/if}
+      <p class="muted footnote">
+        Monitor 0 is the primary. A window title records that window instead; no match refuses to
+        start. Windows only.
+      </p>
       <label class="check">
         <input
           type="checkbox"
@@ -156,7 +215,7 @@
       {#if recordingNow}
         <p class="muted footnote">Takes effect on the next recording.</p>
       {/if}
-      <button type="button" onclick={applyCapture} disabled={busy || !fpsValid}>
+      <button type="button" onclick={applyCapture} disabled={busy || !fpsValid || monitor === null}>
         Apply capture
       </button>
     </div>

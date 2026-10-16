@@ -104,6 +104,7 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
         // shell's state and must resolve to the pipeline's default (192 kbps).
         // `the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default` pins
         // that resolution.
+        capture: Default::default(),
         audio_bitrate_kbps: None,
         // Nor an `[audio] enabled`: these tests record the game audio, which is what an
         // absent value means (`RecorderConfig::game_audio`).

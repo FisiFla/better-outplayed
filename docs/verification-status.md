@@ -1640,6 +1640,13 @@ that ignores CBR may obey VBR or a quality mode), `CODECAPI_AVEncCommonBufferSiz
 driver-side preset. None was measured, and each would be another experiment for a number a reader
 of a clip's `ffprobe` output can already see is not being held.
 
+**Follow-up (P11, unmeasured).** Two changes aimed at §19, both argument/property level and neither
+run on the 3090: the ffmpeg path (`video_output_args`, used for every non-zero-copy hardware encoder)
+now sends `-rc cbr` (NVENC/AMF) plus `-maxrate` and `-bufsize` equal to the target, where it used to
+send only `-b:v`; and `pin_bitrate` for the MFT path now also sets `CODECAPI_AVEncCommonMaxBitRate`,
+`CODECAPI_AVEncCommonBufferSize` (one second) and `CODECAPI_AVLowLatencyMode`, the untried items
+above. Whether either holds the rate is still a `bit_rate` measurement owed on Windows.
+
 ---
 
 ## 20. A second CI failure on a commit that changed no code (2026-10-15)

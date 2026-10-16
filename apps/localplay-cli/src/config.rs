@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use localplay_events::process::GamesSection;
 use localplay_recorder::config::{
-    BufferSection, EncodeSection, MicSection, RecorderSection, StorageSection,
+    BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -19,6 +19,8 @@ pub struct Config {
     pub recorder: RecorderSection,
     pub buffer: BufferSection,
     pub encode: EncodeSection,
+    #[serde(default)]
+    pub capture: CaptureSection,
     pub audio: AudioSection,
     pub storage: StorageSection,
     #[serde(default)]

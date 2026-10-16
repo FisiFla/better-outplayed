@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { describeSettingsUpdate } from './settings';
+import { captureUpdate, describeSettingsUpdate, monitorIndex } from './settings';
 import type { SettingsDto, UpdateSettingsOutcome } from './types';
 
 function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
@@ -17,6 +17,10 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     output_size: '',
     mic_enabled: false,
     auto_record: false,
+    bitrate_kbps: 20000,
+    quality: 'balanced',
+    capture_monitor: 0,
+    capture_window: '',
     watch_titles: ['League of Legends'],
     defaulted: [],
     config_exists: true,
@@ -56,5 +60,39 @@ describe('the settings notice', () => {
         }),
       ),
     ).toBe('Saved encode.fps. a recording is running: encode.fps takes effect now');
+  });
+});
+
+describe('the capture drafts', () => {
+  const saved = settings();
+  const same = { quality: 'balanced', monitor: 0, window: '' };
+
+  it('writes nothing for an untouched panel', () => {
+    expect(captureUpdate(saved, same)).toEqual({});
+  });
+
+  it('sends only the keys that changed, trimming the window title', () => {
+    expect(captureUpdate(saved, { quality: 'high', monitor: 1, window: '  League  ' })).toEqual({
+      quality: 'high',
+      capture_monitor: 1,
+      capture_window: 'League',
+    });
+  });
+
+  it('never overwrites a custom bitrate with the placeholder option', () => {
+    const custom = settings({ quality: 'custom', bitrate_kbps: 12000 });
+    expect(captureUpdate(custom, { quality: 'custom', monitor: 0, window: '' })).toEqual({});
+  });
+
+  it('clears the window with an empty title', () => {
+    const windowed = settings({ capture_window: 'Game' });
+    expect(captureUpdate(windowed, { ...same, window: '' })).toEqual({ capture_window: '' });
+  });
+
+  it('parses a monitor index only as a whole non-negative number', () => {
+    expect(monitorIndex(' 2 ')).toBe(2);
+    expect(monitorIndex('-1')).toBeNull();
+    expect(monitorIndex('1.5')).toBeNull();
+    expect(monitorIndex('')).toBeNull();
   });
 });

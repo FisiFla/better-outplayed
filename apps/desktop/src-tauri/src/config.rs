@@ -45,7 +45,7 @@
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
 use localplay_recorder::event_driver::EventsSection;
-use localplay_recorder::config::{BufferSection, EncodeSection, MicSection, StorageSection};
+use localplay_recorder::config::{BufferSection, CaptureSection, EncodeSection, MicSection, StorageSection};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +131,8 @@ pub struct RecordingConfig {
     pub buffer: BufferSection,
     pub encode: EncodeSection,
     pub storage: StorageSection,
+    #[serde(default)]
+    pub capture: CaptureSection,
 }
 
 impl RecordingConfig {
@@ -379,6 +381,28 @@ pub enum SettingEdit {
     MicEnabled(bool),
     /// `[games] auto_record`.
     AutoRecord(bool),
+    /// A quality preset ([`QUALITY_PRESETS`]), written as `[encode] bitrate_kbps`.
+    Quality(String),
+    /// `[capture] monitor`.
+    CaptureMonitor(usize),
+    /// `[capture] window`. Empty captures the monitor.
+    CaptureWindow(String),
+}
+
+/// The quality presets the panel offers, as `[encode] bitrate_kbps`.
+///
+/// A preset is only a name for a bitrate: nothing but `bitrate_kbps` is stored, so the engine
+/// and the CLI need no second key and cannot disagree with the panel. `balanced` is the
+/// example config's own 20 Mbit/s. A bitrate that matches no preset reads back as `custom`.
+pub const QUALITY_PRESETS: [(&str, u32); 3] = [("low", 8_000), ("balanced", 20_000), ("high", 40_000)];
+
+/// The preset name a bitrate corresponds to, or `"custom"`.
+pub fn quality_for_bitrate(kbps: u32) -> &'static str {
+    QUALITY_PRESETS.iter().find(|(_, b)| *b == kbps).map_or("custom", |(name, _)| name)
+}
+
+fn preset_bitrate(name: &str) -> Option<u32> {
+    QUALITY_PRESETS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
 }
 
 impl SettingEdit {
@@ -389,6 +413,9 @@ impl SettingEdit {
             SettingEdit::OutputSize(_) => "encode.output_size",
             SettingEdit::MicEnabled(_) => "mic.enabled",
             SettingEdit::AutoRecord(_) => "games.auto_record",
+            SettingEdit::Quality(_) => "encode.bitrate_kbps",
+            SettingEdit::CaptureMonitor(_) => "capture.monitor",
+            SettingEdit::CaptureWindow(_) => "capture.window",
         }
     }
 }
@@ -411,6 +438,12 @@ pub struct EffectiveSettings {
     pub output_size: String,
     pub mic_enabled: bool,
     pub auto_record: bool,
+    /// `[encode] bitrate_kbps`; [`quality_for_bitrate`] names it.
+    pub bitrate_kbps: u32,
+    /// `[capture] monitor`.
+    pub capture_monitor: usize,
+    /// `[capture] window`; empty captures the monitor.
+    pub capture_window: String,
     /// Display names from the file's `[[games.watch]]`, or the default watch list when
     /// the file names none (which is what the engine watches then, too).
     pub watch_titles: Vec<String>,
@@ -430,8 +463,8 @@ fn mistyped(key: &'static str) -> CommandError {
             "the config file's [{section}] {key} is not a {what}, so it cannot be used",
             section = key.split('.').next().unwrap_or("config"),
             what = match key {
-                "storage.clips_dir" | "encode.output_size" => "string",
-                "encode.fps" => "integer",
+                "storage.clips_dir" | "encode.output_size" | "capture.window" => "string",
+                "encode.fps" | "encode.bitrate_kbps" | "capture.monitor" => "integer",
                 "mic.enabled" | "games.auto_record" => "true/false value",
                 "games.watch" => "list of [[games.watch]] tables",
                 _ => "value of the shape this key takes",
@@ -614,6 +647,26 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
         SettingEdit::Fps(fps) => validate_fps(*fps),
         SettingEdit::OutputSize(size) => validate_output_size(size),
         SettingEdit::MicEnabled(_) | SettingEdit::AutoRecord(_) => Ok(()),
+        SettingEdit::Quality(name) => preset_bitrate(name).map(|_| ()).ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "quality {name:?} is not a preset (low, balanced or high); \
+                     encode.bitrate_kbps is set by hand for anything else"
+                ),
+            )
+        }),
+        SettingEdit::CaptureMonitor(_) => Ok(()),
+        SettingEdit::CaptureWindow(title) => {
+            if title.contains(['\n', '\r']) {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    "capture.window is a single-line window title",
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -728,6 +781,35 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             get_bool(&example, "games", "auto_record", "games.auto_record")?.unwrap_or(false)
         }
     };
+    let bitrate_kbps = match get_int(&doc, "encode", "bitrate_kbps", "encode.bitrate_kbps")? {
+        Some(raw) => u32::try_from(raw).map_err(|_| mistyped("encode.bitrate_kbps"))?,
+        None => {
+            if config_exists {
+                defaulted.push("encode.bitrate_kbps");
+            }
+            get_int(&example, "encode", "bitrate_kbps", "encode.bitrate_kbps")?
+                .and_then(|raw| u32::try_from(raw).ok())
+                .unwrap_or(20_000)
+        }
+    };
+    let capture_monitor = match get_int(&doc, "capture", "monitor", "capture.monitor")? {
+        Some(raw) => usize::try_from(raw).map_err(|_| mistyped("capture.monitor"))?,
+        None => {
+            if config_exists {
+                defaulted.push("capture.monitor");
+            }
+            0
+        }
+    };
+    let capture_window = match get_str(&doc, "capture", "window", "capture.window")? {
+        Some(window) => window,
+        None => {
+            if config_exists {
+                defaulted.push("capture.window");
+            }
+            String::new()
+        }
+    };
     let watch_titles = read_watch_titles(&doc)?;
 
     Ok(EffectiveSettings {
@@ -736,6 +818,9 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         output_size,
         mic_enabled,
         auto_record,
+        bitrate_kbps,
+        capture_monitor,
+        capture_window,
         watch_titles,
         defaulted,
         config_exists,
@@ -818,6 +903,9 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::OutputSize(_) => ("encode", "output_size", "encode"),
             SettingEdit::MicEnabled(_) => ("mic", "enabled", "mic"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
+            SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
+            SettingEdit::CaptureMonitor(_) => ("capture", "monitor", "capture"),
+            SettingEdit::CaptureWindow(_) => ("capture", "window", "capture"),
         };
         match doc.get(table_key) {
             None => {
@@ -839,6 +927,12 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::OutputSize(size) => toml_edit::value(size.clone()),
             SettingEdit::MicEnabled(enabled) => toml_edit::value(*enabled),
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
+            // Validated above, so the preset exists; the fallback is the balanced rate.
+            SettingEdit::Quality(name) => {
+                toml_edit::value(preset_bitrate(name).unwrap_or(20_000) as i64)
+            }
+            SettingEdit::CaptureMonitor(index) => toml_edit::value(*index as i64),
+            SettingEdit::CaptureWindow(title) => toml_edit::value(title.clone()),
         };
         doc[table_key][value_key] = value;
     }
@@ -1160,7 +1254,8 @@ mod tests {
             &path,
             "# a comment the writer must keep\n\
              [storage]\nclips_dir = \"D:\\\\clips\"\n\n\
-             [encode]\nfps = 30\noutput_size = \"1280x720\"\n\n\
+             [encode]\nfps = 30\nbitrate_kbps = 8000\noutput_size = \"1280x720\"\n\n\
+             [capture]\nmonitor = 0\nwindow = \"\"\n\n\
              [mic]\nenabled = true\n\n\
              [games]\nauto_record = true\n\
              [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n",
@@ -1202,6 +1297,75 @@ mod tests {
             settings.watch_titles,
             default_watch().iter().map(|w| w.name.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn quality_presets_round_trip_through_the_bitrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (name, kbps) in QUALITY_PRESETS {
+            write_settings(&path, &[SettingEdit::Quality(name.to_string())]).unwrap();
+            let settings = read_effective_settings(&path).unwrap();
+            assert_eq!(settings.bitrate_kbps, kbps);
+            assert_eq!(quality_for_bitrate(settings.bitrate_kbps), name);
+        }
+        assert_eq!(quality_for_bitrate(12_345), "custom");
+    }
+
+    #[test]
+    fn an_unknown_preset_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for bad in ["custom", "ultra", ""] {
+            let err = write_settings(&path, &[SettingEdit::Quality(bad.to_string())]).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput);
+        }
+        assert!(!path.exists(), "a refused edit must not create the file");
+    }
+
+    #[test]
+    fn capture_target_is_written_read_and_defaults_to_the_primary_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[storage]\nclips_dir = \"\"\n").unwrap();
+        let before = read_effective_settings(&path).unwrap();
+        assert_eq!((before.capture_monitor, before.capture_window.as_str()), (0, ""));
+        assert!(before.defaulted.contains(&"capture.monitor"));
+
+        write_settings(
+            &path,
+            &[SettingEdit::CaptureMonitor(1), SettingEdit::CaptureWindow("League".into())],
+        )
+        .unwrap();
+        let after = read_effective_settings(&path).unwrap();
+        assert_eq!((after.capture_monitor, after.capture_window.as_str()), (1, "League"));
+        assert!(!after.defaulted.contains(&"capture.monitor"));
+
+    }
+
+    #[test]
+    fn the_recorders_parser_reads_the_capture_the_panel_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // No file yet: the writer starts from the example, so this is a complete config.
+        write_settings(
+            &path,
+            &[SettingEdit::CaptureMonitor(1), SettingEdit::CaptureWindow("League".into())],
+        )
+        .unwrap();
+        let rec = RecordingConfig::load(&path).unwrap();
+        assert_eq!((rec.capture.monitor, rec.capture.window.as_str()), (1, "League"));
+        let default = RecordingConfig::example().unwrap();
+        assert!(default.capture.target().is_default(), "the example records the primary monitor");
+    }
+
+    #[test]
+    fn a_mistyped_capture_monitor_is_an_error_naming_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[capture]\nmonitor = -1\n").unwrap();
+        let err = read_effective_settings(&path).unwrap_err();
+        assert!(err.message.contains("capture.monitor"), "got: {}", err.message);
     }
 
     #[test]

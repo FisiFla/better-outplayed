@@ -43,8 +43,10 @@
 //!   when that changes), while [`WgcCapture::size`] keeps reporting the capture item's
 //!   size. If the two ever diverge, the CLI refuses the frame and names both sizes
 //!   rather than feeding a differently sized frame to ffmpeg.
-//! - Only the primary monitor is captured, and monitor selection is not wired to
-//!   configuration.
+//! - Monitor and window selection (`[capture]`) is written but has never run on Windows; it
+//!   is type-checked from macOS only. A captured *window* that is resized mid-capture hits the
+//!   same size-divergence gap as a display mode change (above), and one that is minimised
+//!   stops delivering frames.
 //! - Frames are copied through a staging texture on every frame the caller keeps. That is
 //!   the cost this design accepts to keep the encoder an ffmpeg sidecar (spec §6.1); the
 //!   frames the pacer discards are closed without it (`discard_pending`).
@@ -52,6 +54,7 @@
 #![cfg(windows)]
 
 use crate::platform::init_com;
+use crate::target::{ordered_monitors, pick_monitor, pick_window, CaptureTarget};
 use crate::{clock_base, CaptureBackend, Frame, PixelFormat};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
@@ -66,7 +69,8 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DisplayId;
 use windows::Graphics::SizeInt32;
 use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
@@ -80,7 +84,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
-use windows::Win32::Graphics::Gdi::{HMONITOR, MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, HDC, HMONITOR, MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+};
 use windows::Win32::System::Com::CoUninitialize;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -104,11 +113,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// error — every frame taken is closed — and the next call picks up whatever is left.
 const DISCARD_LIMIT: usize = BUFFER_COUNT as usize * 4;
 
-/// Primary-monitor screen capture.
+/// Monitor or window capture, per [`CaptureTarget`].
 pub struct WgcCapture {
-    /// Only monitor 0 (the primary monitor) is supported; the constructor says so
-    /// explicitly rather than quietly capturing the wrong display.
-    monitor_index: usize,
+    /// What to capture. Kept so a restart after `stop` rebuilds the same item.
+    target: CaptureTarget,
     /// The geometry of the frames this backend produces: the capture item's size in
     /// **physical pixels** (`GraphicsCaptureItem::Size()`), which is the size the frame
     /// pool is created with and therefore the size of every texture WGC hands back.
@@ -244,22 +252,11 @@ struct Session {
 type Staging = (u32, u32, ID3D11Texture2D);
 
 impl WgcCapture {
-    /// `monitor_index` is 0 for the primary monitor.
-    ///
-    /// The WGC session is created here rather than in [`CaptureBackend::start`]: the
-    /// capture item's size is what the CLI sizes the ffmpeg rawvideo pipe from, and the
-    /// encoder is spawned between this call and `start`, so the size has to be known
-    /// (and be the real one) before the pipeline is wired up.
-    pub fn new(monitor_index: usize) -> Result<Self> {
-        if monitor_index != 0 {
-            bail!(
-                "monitor {} was requested, but localplay only captures the primary \
-                 monitor (index 0)",
-                monitor_index
-            );
-        }
+    /// `target` defaults to the primary monitor; an unknown monitor or window is an error here,
+    /// not a quiet capture of something else.
+    pub fn new(target: &CaptureTarget) -> Result<Self> {
         let mut this = Self {
-            monitor_index,
+            target: target.clone(),
             size: (0, 0),
             session: None,
             want_textures: false,
@@ -275,7 +272,7 @@ impl WgcCapture {
     /// Take this thread's COM apartment and build the WGC session on it.
     fn start_session(&mut self) -> Result<()> {
         self.com_owned = init_com()?;
-        match Session::new() {
+        match Session::new(&self.target) {
             Ok(mut session) => {
                 self.size = session.size;
                 // Carry the caller's answer into the session, since it may have been given before
@@ -285,7 +282,7 @@ impl WgcCapture {
                 tracing::info!(
                     width = self.size.0,
                     height = self.size.1,
-                    "the primary monitor's capture item measures these physical pixels"
+                    "the capture item measures these physical pixels"
                 );
                 self.session = Some(session);
                 Ok(())
@@ -322,13 +319,6 @@ impl CaptureBackend for WgcCapture {
     fn start(&mut self) -> Result<()> {
         if self.started {
             bail!("WGC capture is already started");
-        }
-        if self.monitor_index != 0 {
-            bail!(
-                "monitor {} was requested, but localplay only captures the primary \
-                 monitor (index 0)",
-                self.monitor_index
-            );
         }
         // `new` already built the session. This arm covers a restart after `stop`,
         // which tears the session down and gives the COM apartment back.
@@ -457,13 +447,13 @@ impl Drop for WgcCapture {
 }
 
 impl Session {
-    fn new() -> Result<Self> {
+    fn new(target: &CaptureTarget) -> Result<Self> {
         let (device, context) = create_device()?;
-        let item = create_capture_item()?;
+        let item = create_capture_item(target)?;
         let item_size = item.Size().context("GraphicsCaptureItem::Size")?;
         let size = pixel_size(item_size)?;
         match item.DisplayName() {
-            Ok(name) => tracing::info!(display = %name, "capturing the primary monitor"),
+            Ok(name) => tracing::info!(display = %name, ?target, "capturing"),
             Err(e) => tracing::debug!("the capture item has no display name: {e}"),
         }
         let winrt_device = winrt_device(&device)?;
@@ -492,7 +482,7 @@ impl Session {
         tracing::info!(
             width = size.0,
             height = size.1,
-            "WGC capture started on the primary monitor"
+            "WGC capture started"
         );
 
         Ok(Self {
@@ -823,9 +813,10 @@ fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
         .context("casting to Windows.Graphics.DirectX.Direct3D11.IDirect3DDevice")
 }
 
-/// The capture item for the primary monitor.
+/// The capture item for the target: a window when `[capture] window` names one, else the
+/// monitor at `[capture] monitor` (0 = primary).
 ///
-/// Two routes exist and this tries both, because they fail in different places:
+/// Monitors have two routes and this tries both, because they fail in different places:
 ///
 /// 1. `IGraphicsCaptureItemInterop::CreateForMonitor`, the pre-Windows-11 interop
 ///    interface. It works for unpackaged Win32 apps, which is what this is, but has
@@ -838,24 +829,104 @@ fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
 ///    directly here instead of being reconstructed from `QueryDisplayConfig`, whose
 ///    LUID/target-id values are a different token entirely.
 ///
+/// A window uses `IGraphicsCaptureItemInterop::CreateForWindow` only.
+///
 /// Neither route has been executed on Windows; see the module docs.
-fn create_capture_item() -> Result<GraphicsCaptureItem> {
+fn create_capture_item(target: &CaptureTarget) -> Result<GraphicsCaptureItem> {
+    if let Some(title) = &target.window {
+        let candidates = visible_windows();
+        let hwnd = pick_window(&candidates, title)?;
+        return create_item_for_window(hwnd);
+    }
     // SAFETY: a null HWND with MONITOR_DEFAULTTOPRIMARY is the documented way to ask
     // for the primary monitor, and it touches nothing the caller owns.
-    let monitor = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
-    if monitor.is_invalid() {
+    let primary = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
+    if primary.is_invalid() {
         bail!("MonitorFromWindow could not resolve the primary monitor");
     }
+    let monitor = if target.monitor == 0 {
+        primary
+    } else {
+        pick_monitor(&ordered_monitors(primary, &enumerate_monitors()), target.monitor)?
+    };
 
     match create_item_via_interop(monitor) {
         Ok(item) => Ok(item),
         Err(interop_err) => match create_item_via_display_id(monitor) {
             Ok(item) => Ok(item),
             Err(display_err) => bail!(
-                "no GraphicsCaptureItem for the primary monitor: the interop path failed \
-                 ({interop_err:#}); the DisplayId path failed ({display_err:#})"
+                "no GraphicsCaptureItem for monitor {}: the interop path failed \
+                 ({interop_err:#}); the DisplayId path failed ({display_err:#})",
+                target.monitor
             ),
         },
+    }
+}
+
+/// Every monitor, in the OS's enumeration order.
+fn enumerate_monitors() -> Vec<HMONITOR> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `data` is the `&mut Vec<HMONITOR>` passed below, alive for the whole call.
+        let out = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
+        out.push(monitor);
+        BOOL(1)
+    }
+    let mut monitors: Vec<HMONITOR> = Vec::new();
+    // SAFETY: the callback only pushes into `monitors`, which outlives the synchronous call.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut monitors as *mut Vec<HMONITOR> as isize),
+        );
+    }
+    monitors
+}
+
+/// Visible, titled, top-level windows, topmost first (`EnumWindows` order).
+fn visible_windows() -> Vec<(HWND, String)> {
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the `&mut Vec` passed below, alive for the whole call.
+        let out = unsafe { &mut *(data.0 as *mut Vec<(HWND, String)>) };
+        // SAFETY: plain queries on a handle the OS just handed us.
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return BOOL(1);
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let n = GetWindowTextW(hwnd, &mut buf);
+            if n > 0 {
+                out.push((hwnd, String::from_utf16_lossy(&buf[..n as usize])));
+            }
+        }
+        BOOL(1)
+    }
+    let mut windows: Vec<(HWND, String)> = Vec::new();
+    // SAFETY: the callback only pushes into `windows`, which outlives the synchronous call.
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut Vec<(HWND, String)> as isize));
+    }
+    windows
+}
+
+/// `IGraphicsCaptureItemInterop::CreateForWindow`.
+fn create_item_for_window(hwnd: HWND) -> Result<GraphicsCaptureItem> {
+    let interop: IGraphicsCaptureItemInterop =
+        factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .context("activating IGraphicsCaptureItemInterop for GraphicsCaptureItem")?;
+    // SAFETY: `hwnd` came from EnumWindows moments ago; a stale handle is an error return.
+    unsafe {
+        interop.CreateForWindow(hwnd).context("IGraphicsCaptureItemInterop::CreateForWindow")
     }
 }
 

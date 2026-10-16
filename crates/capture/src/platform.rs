@@ -14,6 +14,7 @@
 //! non-Windows development, and that is the only place they are selected.
 
 use crate::stub::StubConfig;
+use crate::target::CaptureTarget;
 use crate::{AudioBackend, AudioFormat, CaptureBackend};
 use anyhow::Result;
 
@@ -22,7 +23,10 @@ use anyhow::Result;
 /// `stub` describes the synthetic source used off Windows. On Windows the real
 /// backend reports the monitor's own native size through
 /// [`CaptureBackend::native_size`], so `stub` is not consulted there.
-pub fn default_video_backend(stub: StubConfig) -> Result<Box<dyn CaptureBackend>> {
+pub fn default_video_backend(
+    stub: StubConfig,
+    target: &CaptureTarget,
+) -> Result<Box<dyn CaptureBackend>> {
     #[cfg(windows)]
     {
         // The stub's size is irrelevant here: WGC reports the monitor it will capture,
@@ -30,10 +34,17 @@ pub fn default_video_backend(stub: StubConfig) -> Result<Box<dyn CaptureBackend>
         // configured `encode.output_size` that differs from the monitor is now scaled
         // rather than mis-read.
         let _ = stub;
-        Ok(Box::new(crate::wgc::WgcCapture::new(0)?))
+        Ok(Box::new(crate::wgc::WgcCapture::new(target)?))
     }
     #[cfg(not(windows))]
     {
+        if !target.is_default() {
+            tracing::warn!(
+                ?target,
+                "monitor/window capture needs Windows Graphics Capture; the synthetic stub \
+                 has no screen, so the target is ignored"
+            );
+        }
         Ok(Box::new(crate::stub::StubCapture::new(stub)))
     }
 }

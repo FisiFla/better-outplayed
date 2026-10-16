@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 pub mod platform;
+pub mod target;
 pub mod stub;
 
 // The microphone backend: a cross-platform module (so the recorder's microphone path is

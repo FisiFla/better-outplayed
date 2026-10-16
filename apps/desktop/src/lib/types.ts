@@ -244,6 +244,14 @@ export interface SettingsDto {
   mic_enabled: boolean;
   /** `[games] auto_record`. */
   auto_record: boolean;
+  /** `[encode] bitrate_kbps`. */
+  bitrate_kbps: number;
+  /** The preset that bitrate is (`low`, `balanced`, `high`) or `custom`. */
+  quality: string;
+  /** `[capture] monitor` — 0 is the primary monitor. */
+  capture_monitor: number;
+  /** `[capture] window` — a window title to record instead of a monitor; empty is the monitor. */
+  capture_window: string;
   /** Display names from `[[games.watch]]`, or the default titles. */
   watch_titles: string[];
   /** Keys that fell back to the example because the file does not set them. */
@@ -261,6 +269,10 @@ export interface SettingsUpdate {
   output_size?: string;
   mic_enabled?: boolean;
   auto_record?: boolean;
+  /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
+  quality?: string;
+  capture_monitor?: number;
+  capture_window?: string;
 }
 
 /** What writing settings did, and what it means for a running recorder. */

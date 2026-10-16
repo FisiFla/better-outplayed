@@ -48,6 +48,15 @@ scratch_dir = ""
 # rather than quietly returning less than was asked for.
 ram_cap_bytes = 268435456
 
+[capture]
+# What is recorded. Windows only: other platforms have no screen backend and ignore these.
+# Monitor index; 0 is the primary monitor. An index with no monitor refuses to start.
+monitor = 0
+# A window title to record instead of a whole monitor (case-insensitive; an exact title
+# beats a substring match, the topmost window wins a tie). Empty records the monitor.
+# No visible window matching the title refuses to start rather than recording something else.
+window = ""
+
 [encode]
 # auto | nvenc | qsv | amf
 # "auto" probes the GPU and picks the first available hardware encoder.
@@ -56,6 +65,8 @@ ram_cap_bytes = 268435456
 vendor = "auto"
 # h264 | hevc
 codec = "h264"
+# Also settable as a quality preset in the app: low 8000, balanced 20000, high 40000.
+# Held as a constant bitrate (CBR) where the encoder obeys it; see docs/verification-status.md section 19.
 bitrate_kbps = 20000
 # The frame rate asked for — a ceiling, not a promise. See adapt_fps below.
 fps = 60

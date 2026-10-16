@@ -53,7 +53,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MF_MT_MAX_KEYFRAME_SPACING,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVLowLatencyMode,
     eAVEncCommonRateControlMode_CBR, ICodecAPI,
 };
 
@@ -593,6 +594,15 @@ fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
         bitrate_kbps.saturating_mul(1_000),
         "mean bitrate (bit/s)",
     );
+    // §19 left the mode and the mean accepted-and-ignored on the NVENC MFT, and a maximum added
+    // alone moved the file by half a percent. The two things §19 listed as untried and that
+    // define a CBR *window* are the buffer (one second of the rate) and low-latency mode, which
+    // the hardware MFTs tie their strict rate control to. Set together with the ceiling so the
+    // encoder is told the whole contract; whether this one obeys is a measurement still owed.
+    let bits = bitrate_kbps.saturating_mul(1_000);
+    set_codec_api_value(&api, &CODECAPI_AVEncCommonMaxBitRate, bits, "maximum bitrate (bit/s)");
+    set_codec_api_value(&api, &CODECAPI_AVEncCommonBufferSize, bits, "buffer size (bits)");
+    set_codec_api_value(&api, &CODECAPI_AVLowLatencyMode, 1, "low latency mode");
 }
 
 /// Try to set `subtype` as the transform's input type at `size`.

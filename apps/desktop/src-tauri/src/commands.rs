@@ -1788,6 +1788,7 @@ impl RecorderHost {
             buffer: settings.buffer.clone(),
             encode: settings.encode.clone(),
             storage: settings.storage.clone(),
+            capture: settings.capture.clone(),
             // The shell deliberately does not parse `[audio]` (see `config.rs`), so it
             // carries neither the bitrate — the encoder's own default applies, 192 kbps, what
             // this pipeline has always recorded — nor `enabled`, whose absent value means the
@@ -1960,6 +1961,14 @@ pub struct SettingsDto {
     pub mic_enabled: bool,
     /// `[games] auto_record`.
     pub auto_record: bool,
+    /// `[encode] bitrate_kbps`.
+    pub bitrate_kbps: u32,
+    /// The quality preset that bitrate is (`low`, `balanced`, `high`) or `custom`.
+    pub quality: String,
+    /// `[capture] monitor` — 0 is the primary monitor.
+    pub capture_monitor: usize,
+    /// `[capture] window` — a window title to capture instead; empty captures the monitor.
+    pub capture_window: String,
     /// Display names from `[[games.watch]]`, or the default titles when the file names
     /// none (which is what the engine watches then, too).
     pub watch_titles: Vec<String>,
@@ -1981,6 +1990,10 @@ pub struct SettingsUpdate {
     pub output_size: Option<String>,
     pub mic_enabled: Option<bool>,
     pub auto_record: Option<bool>,
+    /// A preset name; sets `[encode] bitrate_kbps`.
+    pub quality: Option<String>,
+    pub capture_monitor: Option<usize>,
+    pub capture_window: Option<String>,
 }
 
 /// What writing settings did, and what it means for a running recorder.
@@ -2028,6 +2041,10 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         output_size: effective.output_size,
         mic_enabled: effective.mic_enabled,
         auto_record: effective.auto_record,
+        quality: crate::config::quality_for_bitrate(effective.bitrate_kbps).to_string(),
+        bitrate_kbps: effective.bitrate_kbps,
+        capture_monitor: effective.capture_monitor,
+        capture_window: effective.capture_window,
         watch_titles: effective.watch_titles,
         defaulted: effective.defaulted.iter().map(|s| s.to_string()).collect(),
         config_exists: effective.config_exists,
@@ -2065,6 +2082,15 @@ pub fn update_settings_file(
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
     }
+    if let Some(quality) = &update.quality {
+        edits.push(SettingEdit::Quality(quality.clone()));
+    }
+    if let Some(index) = update.capture_monitor {
+        edits.push(SettingEdit::CaptureMonitor(index));
+    }
+    if let Some(title) = &update.capture_window {
+        edits.push(SettingEdit::CaptureWindow(title.clone()));
+    }
     let applied: Vec<String> = edits.iter().map(|edit| edit.key().to_string()).collect();
 
     if !edits.is_empty() {
@@ -2086,6 +2112,15 @@ pub fn update_settings_file(
     }
     if update.auto_record.is_some() && after.auto_record != before.auto_record {
         engine_changed.push("games.auto_record");
+    }
+    if update.quality.is_some() && after.bitrate_kbps != before.bitrate_kbps {
+        engine_changed.push("encode.bitrate_kbps");
+    }
+    if update.capture_monitor.is_some() && after.capture_monitor != before.capture_monitor {
+        engine_changed.push("capture.monitor");
+    }
+    if update.capture_window.is_some() && after.capture_window != before.capture_window {
+        engine_changed.push("capture.window");
     }
     let restart_required = recorder_running && !engine_changed.is_empty();
     let restart_reason = restart_required.then(|| {
@@ -3490,6 +3525,9 @@ mod tests {
             keys,
             [
                 "auto_record",
+                "bitrate_kbps",
+                "capture_monitor",
+                "capture_window",
                 "clips_dir",
                 "clips_dir_resolved",
                 "config_exists",
@@ -3498,6 +3536,7 @@ mod tests {
                 "fps",
                 "mic_enabled",
                 "output_size",
+                "quality",
                 "watch_titles"
             ]
         );
@@ -3544,6 +3583,44 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("fps = 60"));
         assert!(text.contains("enabled = true"));
+    }
+
+    #[test]
+    fn quality_and_capture_updates_apply_and_need_a_restart_while_recording() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[encode]\nbitrate_kbps = 20000\n").unwrap();
+
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                quality: Some("high".into()),
+                capture_monitor: Some(1),
+                capture_window: Some("Game".into()),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.applied,
+            vec!["encode.bitrate_kbps", "capture.monitor", "capture.window"]
+        );
+        assert_eq!(outcome.settings.bitrate_kbps, 40_000);
+        assert_eq!(outcome.settings.quality, "high");
+        assert_eq!((outcome.settings.capture_monitor, outcome.settings.capture_window.as_str()), (1, "Game"));
+        assert!(outcome.restart_required);
+
+        // Re-applying the same preset is not a change.
+        let again = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate { quality: Some("high".into()), ..Default::default() },
+            true,
+        )
+        .unwrap();
+        assert!(!again.restart_required);
     }
 
     #[test]
