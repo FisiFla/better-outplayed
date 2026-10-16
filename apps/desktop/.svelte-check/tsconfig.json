@@ -1,0 +1,38 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDirs": [
+      "..",
+      "svelte"
+    ],
+    "allowArbitraryExtensions": true,
+    "noEmit": true,
+    "incremental": false,
+    "tsBuildInfoFile": "tsbuildinfo.json"
+  },
+  "files": [
+    "../node_modules/svelte-check/dist/src/svelte-shims-v4.d.ts",
+    "../node_modules/svelte-check/dist/src/svelte-jsx-v4.d.ts"
+  ],
+  "include": [
+    "../src/**/*.ts",
+    "../src/**/*.svelte",
+    "../vite.config.ts",
+    "../svelte.config.js",
+    "svelte/src/**/*.ts",
+    "svelte/src/**/*.d.svelte.ts",
+    "svelte/vite.config.ts",
+    "svelte/svelte.config.js"
+  ],
+  "exclude": [
+    "../src/App.svelte",
+    "../src/lib/components/ClipDetail.svelte",
+    "../src/lib/components/ClipList.svelte",
+    "../src/lib/components/RecordingPanel.svelte",
+    "../src/lib/components/SessionDetail.svelte",
+    "../src/lib/components/SessionList.svelte",
+    "../src/lib/components/SettingsPanel.svelte",
+    "../src/lib/components/StoragePanel.svelte",
+    "../src/lib/components/Timeline.svelte"
+  ]
+}

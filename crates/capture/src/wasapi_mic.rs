@@ -337,7 +337,7 @@ mod wasapi_impl {
     use anyhow::{bail, Context, Result};
     use std::time::{Duration, Instant};
     use windows::core::IUnknown;
-    use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::Media::Audio::{
         eCapture, eCommunications, IAudioCaptureClient, IAudioClient, IMMDevice,
         IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
@@ -699,7 +699,7 @@ mod wasapi_impl {
         // The event is auto-reset: each wait consumes one signal from the engine.
         // SAFETY: no security attributes and no name are needed for a private event.
         let event = unsafe {
-            CreateEventW(None, BOOL::from(false), BOOL::from(false), None)
+            CreateEventW(None, false, false, None)
                 .context("CreateEventW for the WASAPI capture event")?
         };
         let event = EventHandle(event);

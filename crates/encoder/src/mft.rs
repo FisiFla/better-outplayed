@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use localplay_capture::GpuTexture;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12};
 use windows::Win32::Graphics::Dxgi::{
@@ -532,7 +533,20 @@ fn set_output_type_once(
 fn set_codec_api_value(api: &ICodecAPI, key: &windows::core::GUID, value: u32, what: &str) {
     // SAFETY: `SetValue` is the interface's own method on a transform this process owns; the
     // `VT_UI4` variant is created here and outlives the call.
-    let variant: windows::core::VARIANT = value.into();
+    // `windows` 0.62 dropped the safe `VARIANT` wrapper, so the `VT_UI4` payload is built by
+    // hand. A plain integer owns nothing, so there is nothing to `VariantClear`.
+    use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
+    let variant = VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { ulVal: value },
+            }),
+        },
+    };
     match unsafe { api.SetValue(key, &variant) } {
         Ok(()) => tracing::info!("the encoder accepted {what} = {value}"),
         Err(err) => tracing::warn!(
@@ -724,7 +738,7 @@ pub fn create_capture_kind_device() -> Result<ID3D11Device> {
         D3D11CreateDevice(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
-            None,
+            HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None,
             D3D11_SDK_VERSION,

@@ -842,7 +842,7 @@ fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
 fn create_capture_item() -> Result<GraphicsCaptureItem> {
     // SAFETY: a null HWND with MONITOR_DEFAULTTOPRIMARY is the documented way to ask
     // for the primary monitor, and it touches nothing the caller owns.
-    let monitor = unsafe { MonitorFromWindow(None::<&HWND>, MONITOR_DEFAULTTOPRIMARY) };
+    let monitor = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
     if monitor.is_invalid() {
         bail!("MonitorFromWindow could not resolve the primary monitor");
     }
@@ -877,7 +877,7 @@ fn create_item_via_interop(monitor: HMONITOR) -> Result<GraphicsCaptureItem> {
 fn create_item_via_display_id(monitor: HMONITOR) -> Result<GraphicsCaptureItem> {
     let status = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Programmatic)
         .context("GraphicsCaptureAccess::RequestAccessAsync(Programmatic)")?
-        .get()
+        .join()
         .context("waiting for the graphics capture access request")?;
     if status != AppCapabilityAccessStatus::Allowed {
         bail!("programmatic graphics capture access was not granted ({status:?})");
