@@ -5,6 +5,7 @@
  */
 
 import { formatBytes, formatDateTime, formatDuration } from './time';
+import { isClick } from './markers';
 import type { ClipDto, DeleteOutcome, TrimRange } from './types';
 
 /** One row of the clip list. */
@@ -24,6 +25,12 @@ export interface ClipView {
   favourite: boolean;
   createdAtMs: number;
   createdAtLabel: string;
+  /** The user's title, or `null`. */
+  title: string | null;
+  /** What the list and the header show: the title when there is one, else the file name. */
+  displayName: string;
+  game: string | null;
+  tags: string[];
 }
 
 /**
@@ -71,6 +78,10 @@ export function toClipView(clip: ClipDto, assetUrl: (path: string) => string): C
     favourite: clip.favourite,
     createdAtMs: clip.created_at_ms,
     createdAtLabel: formatDateTime(clip.created_at_ms),
+    title: clip.title,
+    displayName: clip.title ?? basename(clip.path),
+    game: clip.game,
+    tags: clip.tags,
   };
 }
 
@@ -147,3 +158,85 @@ export function describeTrim(requested: TrimRange, written: ClipDto): string {
 
 /** How close two durations have to be before the trim report calls them equal. */
 const TRIM_MATCH_TOLERANCE_MS = 50;
+
+/** The library's filters: free-text search, one game, one tag. */
+export interface ClipFilter {
+  query: string;
+  /** Exact game name, or `null` for all. */
+  game: string | null;
+  /** Normalized tag, or `null` for all. */
+  tag: string | null;
+}
+
+export const NO_FILTER: ClipFilter = { query: '', game: null, tag: null };
+
+/** Whether any filter is narrowing the list. */
+export function isFiltering(filter: ClipFilter): boolean {
+  return filter.query.trim() !== '' || filter.game !== null || filter.tag !== null;
+}
+
+/**
+ * The clips that pass `filter`, in their given order.
+ *
+ * The query is split on whitespace and every word must appear (case-insensitively) somewhere
+ * in the title, file name, game or tags — "ace valorant" finds a Valorant clip tagged ace.
+ * The game and tag filters are exact. Done here rather than in SQL because the library is
+ * already fully in memory for the list and the sort order is the Rust side's.
+ */
+export function filterClips(views: ClipView[], filter: ClipFilter): ClipView[] {
+  const words = filter.query.toLowerCase().split(/\s+/).filter((w) => w !== '');
+  return views.filter((view) => {
+    if (filter.game !== null && view.game !== filter.game) return false;
+    if (filter.tag !== null && !view.tags.includes(filter.tag)) return false;
+    if (words.length === 0) return true;
+    const haystack = [view.displayName, view.name, view.game ?? '', ...view.tags]
+      .join('\n')
+      .toLowerCase();
+    return words.every((word) => haystack.includes(word));
+  });
+}
+
+/** Distinct games with their clip counts, alphabetical (case-insensitive). */
+export function gameOptions(views: ClipView[]): { value: string; count: number }[] {
+  return countBy(views.flatMap((v) => (v.game !== null ? [v.game] : [])));
+}
+
+/** Distinct tags with their clip counts, alphabetical. */
+export function tagOptions(views: ClipView[]): { value: string; count: number }[] {
+  return countBy(views.flatMap((v) => v.tags));
+}
+
+function countBy(values: string[]): { value: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => a.value.localeCompare(b.value, undefined, { sensitivity: 'base' }));
+}
+
+/**
+ * Tags typed into the editor: split on commas and newlines, trimmed, inner whitespace
+ * collapsed, lower-cased and de-duplicated — the same normalization the store applies, so
+ * what the user sees is what is saved. Blank entries are dropped.
+ */
+export function parseTagInput(text: string): string[] {
+  const seen = new Set<string>();
+  for (const part of text.split(/[,\n]/)) {
+    const tag = part.trim().split(/\s+/).join(' ').toLowerCase();
+    if (tag !== '') seen.add(tag);
+  }
+  return [...seen];
+}
+
+/**
+ * Whether a pointer that went down on a library row and is now at `now` should hand the
+ * gesture to a native drag-out: the primary button is still held and it has moved beyond
+ * the click slop (so an ordinary click still selects).
+ */
+export function shouldStartDrag(
+  down: { x: number; y: number },
+  now: { x: number; y: number },
+  buttons: number,
+): boolean {
+  return (buttons & 1) === 1 && !isClick(down, now);
+}

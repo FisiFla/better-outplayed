@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 /// The schema this build writes. Each version adds columns in place, without reading,
 /// copying or losing a row (see [`Store::migrate`]): **v2** the session columns Phase 5
 /// needs, **v3** the media-clock anchor a session's event timeline is measured from, **v4**
-/// the media *length* that timeline is plotted against.
-const SCHEMA_VERSION: i32 = 4;
+/// the media *length* that timeline is plotted against, **v5** the clip library's own
+/// metadata: a display title, the game, and user tags.
+const SCHEMA_VERSION: i32 = 5;
 
 /// The mode of a session the ring buffer opened: the row exists to group the clips and
 /// events of one buffer run, and there is no concatenated session file (spec §5.5).
@@ -135,6 +136,62 @@ const V4_SESSION_COLUMNS: [(&str, &str); 1] = [(
     "ALTER TABLE sessions ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
 )];
 
+/// The columns schema v5 adds to `clips`, and the DDL that adds each.
+///
+/// `title` is a *display* name the user chose; the file on disk is never renamed (a rename
+/// would move the only copy of the footage and invalidate every path the index, the thumbnail
+/// cache and the asset scope hold). NULL means "show the file name", which is what every
+/// legacy row gets. `game` is the game the recording session matched, NULL when nobody
+/// detected one. Both are nullable with no default, so a legacy row claims nothing it
+/// cannot support.
+const V5_CLIP_COLUMNS: [(&str, &str); 2] = [
+    ("title", "ALTER TABLE clips ADD COLUMN title TEXT"),
+    ("game", "ALTER TABLE clips ADD COLUMN game TEXT"),
+];
+
+/// The v5 tag table: one row per (clip, tag). Tags are normalized by [`normalize_tag`]
+/// before they are written, so the primary key makes a tag set a set.
+const V5_TAGS_DDL: &str = r#"
+            CREATE TABLE IF NOT EXISTS clip_tags (
+                clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                tag     TEXT NOT NULL,
+                PRIMARY KEY (clip_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_clip_tags_tag ON clip_tags(tag);
+            "#;
+
+/// Longest tag, in characters.
+pub const MAX_TAG_CHARS: usize = 32;
+/// Most tags one clip carries.
+pub const MAX_TAGS_PER_CLIP: usize = 20;
+/// Longest display title, in characters.
+pub const MAX_TITLE_CHARS: usize = 120;
+
+/// A tag as it is stored: trimmed, internal whitespace collapsed to single spaces,
+/// lower-cased. `None` for a tag that is empty after that, or longer than
+/// [`MAX_TAG_CHARS`] — refused rather than silently truncated.
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let tag = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let n = tag.chars().count();
+    (n > 0 && n <= MAX_TAG_CHARS && !tag.chars().any(char::is_control)).then_some(tag)
+}
+
+/// A display title as it is stored: trimmed; `None` (clear the title) when empty. Over-long
+/// or control-character titles are an error rather than a silent edit.
+pub fn normalize_title(raw: &str) -> Result<Option<String>> {
+    let title = raw.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        anyhow::bail!("a clip title is at most {MAX_TITLE_CHARS} characters");
+    }
+    if title.chars().any(char::is_control) {
+        anyhow::bail!("a clip title cannot contain control characters");
+    }
+    Ok(Some(title.to_string()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewClip {
     pub path: PathBuf,
@@ -163,6 +220,12 @@ pub struct Clip {
     /// one the storage policy ages clips by and orders a library by (see
     /// [`cleanup::plan_cleanup`]).
     pub created_at_ms: i64,
+    /// User-chosen display name (schema v5); `None` shows the file name.
+    pub title: Option<String>,
+    /// The game the recording matched (schema v5); `None` when none was detected.
+    pub game: Option<String>,
+    /// User tags (schema v5), normalized and sorted.
+    pub tags: Vec<String>,
 }
 
 /// A row to write into `events` (spec §5.5).
@@ -342,6 +405,9 @@ impl Store {
         if current < 4 {
             self.upgrade_to_v4()?;
         }
+        if current < 5 {
+            self.upgrade_to_v5()?;
+        }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     }
@@ -409,6 +475,25 @@ impl Store {
         self.add_session_columns(&V4_SESSION_COLUMNS)
     }
 
+    /// v4 → v5: `clips` gains a title and a game, and the tag table appears. The game is
+    /// back-filled from the clip's session where it has one; everything else starts empty.
+    /// One transaction, and every step idempotent, like [`Store::add_session_columns`].
+    fn upgrade_to_v5(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (column, ddl) in &V5_CLIP_COLUMNS {
+            if !column_exists(&tx, "clips", column)? {
+                tx.execute_batch(ddl)?;
+            }
+        }
+        tx.execute_batch(V5_TAGS_DDL)?;
+        tx.execute_batch(
+            "UPDATE clips SET game = (SELECT game FROM sessions WHERE sessions.id = clips.session_id)
+             WHERE game IS NULL AND session_id IS NOT NULL",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Add whichever of `columns` the `sessions` table does not already have.
     ///
     /// Safe to run against a database it has already been applied to, on purpose and twice
@@ -452,7 +537,8 @@ impl Store {
 
     pub fn list_clips(&self) -> Result<Vec<Clip>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, started_at, duration_ms, size_bytes, codec, favourite, created_at
+            "SELECT id, path, started_at, duration_ms, size_bytes, codec, favourite, created_at,
+                    title, game
              FROM clips ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -465,9 +551,72 @@ impl Store {
                 codec: r.get(5)?,
                 favourite: r.get::<_, i64>(6)? != 0,
                 created_at_ms: r.get(7)?,
+                title: r.get(8)?,
+                game: r.get(9)?,
+                tags: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut clips = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut tags: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT clip_id, tag FROM clip_tags ORDER BY tag")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, tag) = row?;
+            tags.entry(id).or_default().push(tag);
+        }
+        for clip in &mut clips {
+            clip.tags = tags.remove(&clip.id).unwrap_or_default();
+        }
+        Ok(clips)
+    }
+
+    /// Set (or, with an empty/blank `title`, clear) a clip's display title. Returns whether
+    /// a clip with that id exists. The file is never touched (see [`V5_CLIP_COLUMNS`]).
+    pub fn set_clip_title(&self, id: i64, title: &str) -> Result<bool> {
+        let title = normalize_title(title)?;
+        let updated =
+            self.conn.execute("UPDATE clips SET title = ?2 WHERE id = ?1", params![id, title])?;
+        Ok(updated > 0)
+    }
+
+    /// Set or clear the game a clip belongs to. Returns whether the clip exists.
+    pub fn set_clip_game(&self, id: i64, game: Option<&str>) -> Result<bool> {
+        let game = game.map(str::trim).filter(|g| !g.is_empty());
+        let updated =
+            self.conn.execute("UPDATE clips SET game = ?2 WHERE id = ?1", params![id, game])?;
+        Ok(updated > 0)
+    }
+
+    /// Replace a clip's whole tag set. Tags are normalized ([`normalize_tag`]) and
+    /// de-duplicated; an invalid tag or more than [`MAX_TAGS_PER_CLIP`] is an error and
+    /// leaves the existing set untouched. Returns whether the clip exists.
+    pub fn set_clip_tags(&self, id: i64, tags: &[String]) -> Result<bool> {
+        let mut clean = std::collections::BTreeSet::new();
+        for raw in tags {
+            match normalize_tag(raw) {
+                Some(tag) => {
+                    clean.insert(tag);
+                }
+                None => anyhow::bail!(
+                    "invalid tag {raw:?}: tags are 1-{MAX_TAG_CHARS} characters, without control characters"
+                ),
+            }
+        }
+        if clean.len() > MAX_TAGS_PER_CLIP {
+            anyhow::bail!("a clip carries at most {MAX_TAGS_PER_CLIP} tags");
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)", params![id], |r| r.get(0))?;
+        if !exists {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM clip_tags WHERE clip_id = ?1", params![id])?;
+        for tag in &clean {
+            tx.execute("INSERT INTO clip_tags (clip_id, tag) VALUES (?1, ?2)", params![id, tag])?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Write one `events` row and return its id.
@@ -563,6 +712,7 @@ impl Store {
         };
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("UPDATE events SET clip_id = NULL WHERE clip_id = ?1", params![id])?;
+        tx.execute("DELETE FROM clip_tags WHERE clip_id = ?1", params![id])?;
         let removed = tx.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok((removed == 1).then_some(path))
@@ -1747,5 +1897,97 @@ mod tests {
             !column_exists(&store.conn, "sessions", "final_path").expect("table_info"),
             "a refused migration changes no structure either"
         );
+    }
+
+    // -- schema v5: clip title, game, tags -------------------------------------------------
+
+    fn new_clip(path: &str) -> NewClip {
+        NewClip {
+            path: path.into(),
+            started_at_ms: 1,
+            duration_ms: 1_000,
+            size_bytes: 1,
+            codec: "h264".into(),
+        }
+    }
+
+    #[test]
+    fn a_v1_database_gains_the_v5_columns_backfills_the_game_and_loses_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("localplay.db");
+        let store = v1_database(&db);
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+
+        let clips = store.list_clips().unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].path, PathBuf::from("/app/clips/kill.mp4"));
+        assert_eq!(clips[0].game.as_deref(), Some("League of Legends"), "game back-filled from the session");
+        assert_eq!(clips[0].title, None);
+        assert!(clips[0].tags.is_empty());
+        assert_eq!(store.events_for_clip(1).unwrap().len(), 1, "the event is untouched");
+    }
+
+    #[test]
+    fn the_v5_step_is_safe_to_run_twice() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        s.upgrade_to_v5().expect("columns and table already exist");
+    }
+
+    #[test]
+    fn titles_games_and_tags_round_trip_through_list_clips() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+
+        assert!(s.set_clip_title(id, "  Pentakill  ").unwrap());
+        assert!(s.set_clip_game(id, Some("Valorant")).unwrap());
+        assert!(s
+            .set_clip_tags(id, &["Ace".into(), " clutch  play ".into(), "ace".into()])
+            .unwrap());
+
+        let c = &s.list_clips().unwrap()[0];
+        assert_eq!(c.title.as_deref(), Some("Pentakill"));
+        assert_eq!(c.game.as_deref(), Some("Valorant"));
+        assert_eq!(c.tags, vec!["ace".to_string(), "clutch play".to_string()], "normalized, de-duplicated, sorted");
+
+        // Blank clears.
+        s.set_clip_title(id, "   ").unwrap();
+        s.set_clip_game(id, None).unwrap();
+        s.set_clip_tags(id, &[]).unwrap();
+        let c = &s.list_clips().unwrap()[0];
+        assert_eq!((c.title.clone(), c.game.clone(), c.tags.clone()), (None, None, vec![]));
+    }
+
+    #[test]
+    fn unknown_ids_are_reported_and_invalid_input_is_refused_without_changing_anything() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        assert!(!s.set_clip_title(99, "x").unwrap());
+        assert!(!s.set_clip_game(99, Some("x")).unwrap());
+        assert!(!s.set_clip_tags(99, &["x".into()]).unwrap());
+
+        let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        s.set_clip_tags(id, &["keep".into()]).unwrap();
+        assert!(s.set_clip_tags(id, &["ok".into(), "   ".into()]).is_err());
+        assert!(s.set_clip_tags(id, &["x".repeat(MAX_TAG_CHARS + 1)]).is_err());
+        let many: Vec<String> = (0..=MAX_TAGS_PER_CLIP).map(|i| format!("t{i}")).collect();
+        assert!(s.set_clip_tags(id, &many).is_err());
+        assert_eq!(s.list_clips().unwrap()[0].tags, vec!["keep".to_string()], "a refused set changes nothing");
+
+        assert!(s.set_clip_title(id, &"x".repeat(MAX_TITLE_CHARS + 1)).is_err());
+        assert!(s.set_clip_title(id, "bad\ntitle").is_err());
+    }
+
+    #[test]
+    fn deleting_a_clip_takes_its_tags_with_it() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        s.set_clip_tags(id, &["a".into()]).unwrap();
+        s.delete_clip_returning_path(id).unwrap();
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM clip_tags", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 }

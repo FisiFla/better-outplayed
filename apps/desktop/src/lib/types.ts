@@ -24,6 +24,12 @@ export interface ClipDto {
   favourite: boolean;
   /** Wall-clock instant the row was written, ms since the Unix epoch. */
   created_at_ms: number;
+  /** User-chosen display name; `null` shows the file name. The file is never renamed. */
+  title: string | null;
+  /** The game the recording matched; `null` when none was detected. */
+  game: string | null;
+  /** User tags: lower-case, sorted. */
+  tags: string[];
 }
 
 /** The storage panel's data. */

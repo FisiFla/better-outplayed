@@ -2155,6 +2155,15 @@ impl Engine {
         // segment numbering — and so the footage itself — is measured on.
         let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(self.pre_ms);
         let id = index_clip(&self.store, &clip, started_at_ms);
+        // Schema v5: the clip carries the game its recording session matched, so the library
+        // can filter by game without joining. Best effort: a failure costs a filter label.
+        if let Some(id) = id {
+            if let Ok(Some(game)) = self.store.get_session(self.session).map(|s| s.and_then(|s| s.game)) {
+                if let Err(err) = self.store.set_clip_game(id, Some(&game)) {
+                    tracing::warn!("could not record the game on clip #{id}: {err:#}");
+                }
+            }
+        }
 
         // Spec §5.5: an event-triggered clip says *why* it exists, and so does a manual one —
         // the bookmark is the user's own marker, and without it a session's timeline showed

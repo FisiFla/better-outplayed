@@ -3,6 +3,11 @@ import {
   basename,
   describeDelete,
   describeTrim,
+  filterClips,
+  gameOptions,
+  parseTagInput,
+  shouldStartDrag,
+  tagOptions,
   resolveSelection,
   thumbnailAtMs,
   toClipView,
@@ -23,6 +28,9 @@ function clip(overrides: Partial<ClipDto> = {}): ClipDto {
     codec: 'h264_nvenc',
     favourite: false,
     created_at_ms: 1_756_000_000_000,
+    title: null,
+    game: null,
+    tags: [],
     ...overrides,
   };
 }
@@ -214,5 +222,70 @@ describe('describeDelete', () => {
   it('says when the file was already gone', () => {
     const message = describeDelete(outcome({ file_removed: false, already_missing: true }), 'x.mp4');
     expect(message).toContain('already gone');
+  });
+});
+
+describe('filterClips', () => {
+  const view = (over: Partial<ClipDto>) => toClipView(clip(over), assetUrl);
+  const views = [
+    view({ id: 1, path: '/c/a.mp4', title: 'Pentakill', game: 'League of Legends', tags: ['ace', 'funny'] }),
+    view({ id: 2, path: '/c/b.mp4', game: 'Valorant', tags: ['ace'] }),
+    view({ id: 3, path: '/c/clutch-1v3.mp4', game: null, tags: [] }),
+  ];
+  const ids = (f: Partial<import('./clips').ClipFilter>) =>
+    filterClips(views, { query: '', game: null, tag: null, ...f }).map((v) => v.id);
+
+  it('shows everything with no filter, preserving order', () => {
+    expect(ids({})).toEqual([1, 2, 3]);
+  });
+
+  it('searches title, file name, game and tags, case-insensitively, all words required', () => {
+    expect(ids({ query: 'PENTA' })).toEqual([1]);
+    expect(ids({ query: 'clutch' })).toEqual([3]);
+    expect(ids({ query: 'valorant' })).toEqual([2]);
+    expect(ids({ query: 'ace' })).toEqual([1, 2]);
+    expect(ids({ query: 'ace valorant' })).toEqual([2]);
+    expect(ids({ query: 'ace nothing' })).toEqual([]);
+    expect(ids({ query: '   ' })).toEqual([1, 2, 3]);
+  });
+
+  it('filters by exact game and tag, and combines with the query', () => {
+    expect(ids({ game: 'Valorant' })).toEqual([2]);
+    expect(ids({ tag: 'ace' })).toEqual([1, 2]);
+    expect(ids({ tag: 'ace', game: 'League of Legends', query: 'penta' })).toEqual([1]);
+    expect(ids({ game: 'valorant' })).toEqual([]);
+  });
+
+  it('lists games and tags with counts, ignoring clips that have none', () => {
+    expect(gameOptions(views)).toEqual([
+      { value: 'League of Legends', count: 1 },
+      { value: 'Valorant', count: 1 },
+    ]);
+    expect(tagOptions(views)).toEqual([
+      { value: 'ace', count: 2 },
+      { value: 'funny', count: 1 },
+    ]);
+  });
+
+  it('shows the title when there is one and the file name otherwise', () => {
+    expect(views[0]?.displayName).toBe('Pentakill');
+    expect(views[1]?.displayName).toBe('b.mp4');
+  });
+});
+
+describe('parseTagInput', () => {
+  it('splits on commas and newlines, normalizes and de-duplicates', () => {
+    expect(parseTagInput(' Ace, clutch  play\nACE ,, ')).toEqual(['ace', 'clutch play']);
+    expect(parseTagInput('')).toEqual([]);
+  });
+});
+
+describe('shouldStartDrag', () => {
+  it('needs the primary button held and movement past the click slop', () => {
+    const down = { x: 10, y: 10 };
+    expect(shouldStartDrag(down, { x: 12, y: 11 }, 1)).toBe(false);
+    expect(shouldStartDrag(down, { x: 30, y: 10 }, 1)).toBe(true);
+    expect(shouldStartDrag(down, { x: 30, y: 10 }, 0)).toBe(false);
+    expect(shouldStartDrag(down, { x: 30, y: 10 }, 2)).toBe(false);
   });
 });

@@ -10,14 +10,26 @@
    */
   import { onMount } from 'svelte';
   import ClipDetail from './lib/components/ClipDetail.svelte';
-  import ClipList from './lib/components/ClipList.svelte';
+  import ClipFilterBar from './lib/components/ClipFilterBar.svelte';
+import ClipList from './lib/components/ClipList.svelte';
   import RecordingPanel from './lib/components/RecordingPanel.svelte';
   import SessionDetail from './lib/components/SessionDetail.svelte';
   import SessionList from './lib/components/SessionList.svelte';
   import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import StoragePanel from './lib/components/StoragePanel.svelte';
-  import { describeDelete, describeTrim, resolveSelection, thumbnailAtMs, toClipViews } from './lib/clips';
-  import type { ClipView } from './lib/clips';
+  import {
+    describeDelete,
+    describeTrim,
+    filterClips,
+    gameOptions,
+    isFiltering,
+    NO_FILTER,
+    resolveSelection,
+    tagOptions,
+    thumbnailAtMs,
+    toClipViews,
+  } from './lib/clips';
+  import type { ClipFilter, ClipView } from './lib/clips';
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
   import { describeRecordedClip } from './lib/recording';
@@ -82,6 +94,10 @@
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let loaded = $state(false);
+
+  /** Search text, game and tag filters over the library list. */
+  let filter = $state<ClipFilter>(NO_FILTER);
+  const visibleClips = $derived(filterClips(clips, filter));
 
   const selected = $derived(clips.find((clip) => clip.id === selectedId) ?? null);
   const selectedSession = $derived(
@@ -245,6 +261,39 @@
     }
   }
 
+  async function runClipAction(action: () => Promise<unknown>, done: string) {
+    busy = true;
+    try {
+      await action();
+      notice = done;
+      await refresh();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const renameClip = (id: number, title: string) =>
+    runClipAction(
+      () => source.setClipTitle(id, title),
+      title.trim() === '' ? 'Title cleared: showing the file name.' : 'Clip renamed.',
+    );
+
+  const setClipTags = (id: number, tags: string[]) =>
+    runClipAction(() => source.setClipTags(id, tags), 'Tags updated.');
+
+  // The OS actions change nothing in the library, so they neither hold the controls nor
+  // refresh; a failure is shown like any other command's.
+  async function osAction(action: () => Promise<unknown>, done: string | null) {
+    try {
+      await action();
+      if (done !== null) notice = done;
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
   async function deleteClip(id: number, name: string) {
     busy = true;
     try {
@@ -281,7 +330,7 @@
   }
 
   function clipName(id: number): string {
-    return clips.find((clip) => clip.id === id)?.name ?? `clip #${id}`;
+    return clips.find((clip) => clip.id === id)?.displayName ?? `clip #${id}`;
   }
 
   /**
@@ -431,10 +480,19 @@
     />
     <div class="pane-head">
       <h2>Clips</h2>
-      <span class="muted">{clips.length} indexed</span>
+      <span class="muted">
+        {isFiltering(filter) ? `${visibleClips.length} of ${clips.length}` : clips.length} indexed
+      </span>
     </div>
+    <ClipFilterBar
+      {filter}
+      games={gameOptions(clips)}
+      tags={tagOptions(clips)}
+      onChange={(next) => (filter = next)}
+    />
     <ClipList
-      {clips}
+      clips={visibleClips}
+      filtering={isFiltering(filter)}
       {thumbnails}
       {selectedId}
       onSelect={(id) => {
@@ -446,6 +504,10 @@
       }}
       onFavourite={toggleFavourite}
       onDelete={(id) => deleteClip(id, clipName(id))}
+      onCopy={(id) =>
+        osAction(() => source.copyClipToClipboard(id), 'Clip file copied to the clipboard.')}
+      onReveal={(id) => osAction(() => source.revealClip(id), null)}
+      onDragOut={(id) => osAction(() => source.dragClipOut(id), null)}
     />
     <div class="pane-head">
       <h2>Sessions</h2>
@@ -509,6 +571,11 @@
           {busy}
           onTrim={(range) => trimClip(clip.id, range)}
           onFavourite={(favourite) => toggleFavourite(clip.id, favourite)}
+          onRename={(title) => renameClip(clip.id, title)}
+          onTags={(tags) => setClipTags(clip.id, tags)}
+          onCopy={() =>
+            osAction(() => source.copyClipToClipboard(clip.id), 'Clip file copied to the clipboard.')}
+          onReveal={() => osAction(() => source.revealClip(clip.id), null)}
         />
       {/key}
     {:else if loaded}

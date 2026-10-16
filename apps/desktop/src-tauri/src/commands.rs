@@ -224,6 +224,13 @@ pub struct ClipDto {
     pub favourite: bool,
     /// Wall-clock instant the row was written, ms since the Unix epoch.
     pub created_at_ms: i64,
+    /// User-chosen display name (schema v5); `None` shows the file name. The file is never
+    /// renamed.
+    pub title: Option<String>,
+    /// The game the recording matched; `None` when none was detected.
+    pub game: Option<String>,
+    /// User tags, normalized (lower-case) and sorted.
+    pub tags: Vec<String>,
 }
 
 impl From<&Clip> for ClipDto {
@@ -237,6 +244,9 @@ impl From<&Clip> for ClipDto {
             codec: clip.codec.clone(),
             favourite: clip.favourite,
             created_at_ms: clip.created_at_ms,
+            title: clip.title.clone(),
+            game: clip.game.clone(),
+            tags: clip.tags.clone(),
         }
     }
 }
@@ -554,6 +564,76 @@ pub fn set_favourite(deps: &Deps<'_>, id: i64, favourite: bool) -> Result<ClipDt
     Ok(ClipDto::from(&clip))
 }
 
+/// Rename a clip: set its display title (blank clears it back to the file name). The file on
+/// disk is deliberately not renamed — see `localplay_store::V5_CLIP_COLUMNS`.
+pub fn set_clip_title(deps: &Deps<'_>, id: i64, title: &str) -> Result<ClipDto, CommandError> {
+    let updated = deps.store.set_clip_title(id, title).map_err(|e| {
+        CommandError::new(ErrorCode::InvalidInput, format!("could not set the title: {e:#}"))
+    })?;
+    if !updated {
+        return Err(CommandError::clip_not_found(id));
+    }
+    Ok(ClipDto::from(&find_clip(deps.store, id)?))
+}
+
+/// Replace a clip's tags. Invalid tags (blank, too long, too many) are refused and nothing
+/// changes.
+pub fn set_clip_tags(deps: &Deps<'_>, id: i64, tags: &[String]) -> Result<ClipDto, CommandError> {
+    let updated = deps.store.set_clip_tags(id, tags).map_err(|e| {
+        CommandError::new(ErrorCode::InvalidInput, format!("could not set the tags: {e:#}"))
+    })?;
+    if !updated {
+        return Err(CommandError::clip_not_found(id));
+    }
+    Ok(ClipDto::from(&find_clip(deps.store, id)?))
+}
+
+/// The on-disk file of clip `id`, for the actions that hand it to the OS (clipboard, reveal,
+/// drag-out). The path comes from the index, which is a user-writable SQLite file, so it must
+/// exist and sit inside the library — the same guard `delete_clip` applies before unlinking.
+pub fn clip_file(deps: &Deps<'_>, id: i64) -> Result<PathBuf, CommandError> {
+    let clip = find_clip(deps.store, id)?;
+    if !clip.path.is_file() {
+        return Err(CommandError::new(
+            ErrorCode::Io,
+            format!("clip #{id} is indexed at {} but that file is not on disk", clip.path.display()),
+        ));
+    }
+    if !is_inside_library(&clip.path, deps.paths) {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "clip #{id} points outside the clips and application data directories ({}); \
+                 refusing to hand it to the system",
+                clip.path.display()
+            ),
+        ));
+    }
+    Ok(clip.path)
+}
+
+/// Give a freshly cut clip its parent's game and tags (a trim of a Valorant ace is still a
+/// Valorant ace). The title is not inherited: it names the parent. Best effort — the new file
+/// and row exist either way — and the returned DTO is the row as it ends up.
+fn inherit_metadata(
+    deps: &Deps<'_>,
+    new: ClipDto,
+    game: Option<&str>,
+    tags: &[String],
+) -> ClipDto {
+    if game.is_some() {
+        if let Err(err) = deps.store.set_clip_game(new.id, game) {
+            tracing::warn!("clip #{}: could not inherit the game: {err:#}", new.id);
+        }
+    }
+    if !tags.is_empty() {
+        if let Err(err) = deps.store.set_clip_tags(new.id, tags) {
+            tracing::warn!("clip #{}: could not inherit the tags: {err:#}", new.id);
+        }
+    }
+    find_clip(deps.store, new.id).map(|c| ClipDto::from(&c)).unwrap_or(new)
+}
+
 /// Cut `[start_ms, end_ms)` out of clip `id` into a **new** file next to the original, and
 /// index the result.
 ///
@@ -597,7 +677,7 @@ pub fn trim_clip(
     // The file exists from here on. Everything below can fail, and if it does the file
     // stays: it is what the user asked for, and deleting it to report a bookkeeping error
     // would destroy the only copy of their edit.
-    index_new_clip(
+    let new = index_new_clip(
         deps,
         &format!("clip #{}", clip.id),
         clip.started_at_ms,
@@ -605,7 +685,8 @@ pub fn trim_clip(
         &dst,
         start_ms,
         end_ms,
-    )
+    )?;
+    Ok(inherit_metadata(deps, new, clip.game.as_deref(), &clip.tags))
 }
 
 /// Describe a newly written file and add it to the index.
@@ -1413,7 +1494,7 @@ pub fn extract_clip(
     // `started_at` across files, so this is the only reading that carries information. An
     // estimate, not a measurement: a stream copy cannot cut at an arbitrary point.
     let parent_started_at_ms = session.media_epoch_ms.max(0) as u64;
-    index_new_clip(
+    let new = index_new_clip(
         deps,
         &format!("session #{session_id}"),
         parent_started_at_ms,
@@ -1421,7 +1502,8 @@ pub fn extract_clip(
         &dst,
         start_ms,
         end_ms,
-    )
+    )?;
+    Ok(inherit_metadata(deps, new, session.game.as_deref(), &[]))
 }
 
 /// Total bytes of every file under `dir`, or 0 when it cannot be walked.
@@ -2397,10 +2479,13 @@ mod tests {
                 "created_at_ms",
                 "duration_ms",
                 "favourite",
+                "game",
                 "id",
                 "path",
                 "size_bytes",
-                "started_at_ms"
+                "started_at_ms",
+                "tags",
+                "title"
             ]
         );
 
@@ -2506,6 +2591,77 @@ mod tests {
 
         // The original is untouched: a trim never modifies the clip it came from.
         assert_eq!(std::fs::metadata(&src).unwrap().len(), src_size);
+    }
+
+    // -- library metadata: title, tags, game; files handed to the OS ---------------------
+
+    #[test]
+    fn renaming_and_tagging_a_clip_changes_the_row_and_never_the_file() {
+        let f = Fixture::new();
+        let id = f.add_row("raw-name.mp4", 0, 1_000, 1);
+
+        let renamed = set_clip_title(&f.deps(), id, "  Triple kill  ").unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Triple kill"));
+        assert!(f.paths.clips_dir.join("raw-name.mp4").exists(), "the file keeps its name");
+
+        let tagged = set_clip_tags(&f.deps(), id, &["Ace".into(), "ace".into(), "funny".into()]).unwrap();
+        assert_eq!(tagged.tags, vec!["ace".to_string(), "funny".to_string()]);
+        assert_eq!(tagged.title.as_deref(), Some("Triple kill"), "tags do not disturb the title");
+
+        assert_eq!(set_clip_title(&f.deps(), id, "").unwrap().title, None, "blank clears");
+    }
+
+    #[test]
+    fn metadata_commands_report_unknown_ids_and_refuse_bad_input() {
+        let f = Fixture::new();
+        let id = f.add_row("a.mp4", 0, 1_000, 1);
+        assert_eq!(set_clip_title(&f.deps(), id + 9, "x").unwrap_err().code, ErrorCode::ClipNotFound);
+        assert_eq!(set_clip_tags(&f.deps(), id + 9, &[]).unwrap_err().code, ErrorCode::ClipNotFound);
+        assert_eq!(set_clip_tags(&f.deps(), id, &["  ".into()]).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(
+            set_clip_title(&f.deps(), id, &"x".repeat(500)).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn clip_file_resolves_library_files_and_refuses_missing_or_outside_ones() {
+        let f = Fixture::new();
+        let id = f.add_row("in.mp4", 0, 1_000, 1);
+        assert_eq!(clip_file(&f.deps(), id).unwrap(), f.paths.clips_dir.join("in.mp4"));
+
+        std::fs::remove_file(f.paths.clips_dir.join("in.mp4")).unwrap();
+        assert_eq!(clip_file(&f.deps(), id).unwrap_err().code, ErrorCode::Io);
+
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("out.mp4");
+        std::fs::write(&path, b"").unwrap();
+        let rogue = f
+            .store
+            .insert_clip(&NewClip {
+                path,
+                started_at_ms: 0,
+                duration_ms: 1,
+                size_bytes: 0,
+                codec: "mpeg4".into(),
+            })
+            .unwrap();
+        assert_eq!(clip_file(&f.deps(), rogue).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(clip_file(&f.deps(), rogue + 9).unwrap_err().code, ErrorCode::ClipNotFound);
+    }
+
+    #[test]
+    fn a_trim_inherits_the_games_and_tags_but_not_the_title() {
+        let f = Fixture::new();
+        let (id, _src) = f.add_real_clip("meta.mp4", 4);
+        f.store.set_clip_game(id, Some("Valorant")).unwrap();
+        f.store.set_clip_tags(id, &["ace".into()]).unwrap();
+        f.store.set_clip_title(id, "Parent").unwrap();
+
+        let trimmed = trim_clip(&f.deps(), id, 1_000, 3_000).unwrap();
+        assert_eq!(trimmed.game.as_deref(), Some("Valorant"));
+        assert_eq!(trimmed.tags, vec!["ace".to_string()]);
+        assert_eq!(trimmed.title, None);
     }
 
     #[test]
