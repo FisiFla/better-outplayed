@@ -5,7 +5,7 @@
 cargo test --workspace --features localplay-encoder/test-encoders   # needs ffmpeg on PATH
 cd apps/desktop && npm ci && npm run check && npm test && npm run build
 cd apps/desktop/src-tauri && cargo test                              # separate workspace
-cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -D warnings
+cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings
 scripts/check-forbidden-apis.sh                                      # anti-cheat guard
 ```
 On macOS the capture path is a synthetic stub: green tests prove nothing about Windows capture.
