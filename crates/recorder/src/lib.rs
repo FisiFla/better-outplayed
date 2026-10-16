@@ -123,7 +123,7 @@ pub mod session;
 mod tests;
 
 pub use config::{
-    BufferSection, EncodeSection, MicSection, RecorderSection, RecordingMode, SessionStorageRules,
+    BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, RecordingMode, SessionStorageRules,
     StorageSection,
 };
 pub use fps::FpsDecision;
@@ -233,6 +233,8 @@ pub struct RecorderConfig {
     pub buffer: BufferSection,
     pub encode: EncodeSection,
     pub storage: StorageSection,
+    /// `[capture]` — which monitor or window `Sources::Platform` records.
+    pub capture: CaptureSection,
     /// `[audio] bitrate_kbps` — the game-audio track's bitrate, in kbps, as the CLI read it
     /// out of `config.toml`.
     ///
@@ -1144,7 +1146,7 @@ impl Prepared {
                  video-only recording, or leave `[audio] enabled = true`."
             );
         }
-        let (mut capture, mut audio) = build_sources(cfg.sources, cfg.encode.fps, game_audio)?;
+        let (mut capture, mut audio) = build_sources(cfg.sources, &cfg.capture, cfg.encode.fps, game_audio)?;
         let native = capture.native_size();
 
         let mut encode_cfg = build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
@@ -2610,6 +2612,7 @@ impl RecorderConfig {
 #[allow(clippy::type_complexity)]
 fn build_sources(
     sources: Sources,
+    capture_section: &CaptureSection,
     fps: u32,
     game_audio: bool,
 ) -> Result<(Box<dyn CaptureBackend>, Option<Box<dyn AudioBackend>>)> {
@@ -2619,7 +2622,7 @@ fn build_sources(
         // there is no stub fallback to hide it behind.
         Sources::Platform => {
             let stub = StubConfig { width: STUB_CAPTURE_SIZE.0, height: STUB_CAPTURE_SIZE.1, fps };
-            let capture = default_video_backend(stub)?;
+            let capture = default_video_backend(stub, &capture_section.target())?;
             let audio: Option<Box<dyn AudioBackend>> = if game_audio {
                 Some(default_audio_backend(AudioFormat::default())?)
             } else {

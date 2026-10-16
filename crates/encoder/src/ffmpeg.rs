@@ -383,13 +383,34 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     if cfg.codec == crate::VideoCodec::Hevc {
         args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
     }
-    args.extend(["-b:v".to_string(), format!("{}k", cfg.bitrate_kbps)]);
+    args.extend(rate_control_args(cfg.encoder_name(), cfg.bitrate_kbps));
     args.extend(["-g".to_string(), gop_frames(cfg).to_string()]);
     // Forced keyframes are what make segment boundaries cuttable (spec §6.3).
     args.extend([
         "-force_key_frames".to_string(),
         format!("expr:gte(t,n_forced*{})", keyframe_seconds(cfg)),
     ]);
+    args
+}
+
+/// The arguments that make an ffmpeg encoder *hold* `bitrate_kbps` rather than aim near it.
+///
+/// `-b:v` alone is an average target: the ledger (§18/§19) measured clips at ~1.9x the setting.
+/// A constant-bitrate setting needs three things the encoder is told together: the hardware
+/// encoders' own rate-control switch (`-rc cbr`, which NVENC and AMF name and QSV infers), a
+/// `-maxrate` equal to the target (a ceiling on the peaks) and a `-bufsize` of one second of
+/// that rate (the window the ceiling is enforced over). `-maxrate`/`-bufsize` are generic ffmpeg
+/// options, so the software encoders the tests use take them too.
+///
+/// Only the argument list is tested; whether a given driver then obeys it is a measurement on
+/// that hardware, and none was made for this change.
+pub fn rate_control_args(encoder: &str, bitrate_kbps: u32) -> Vec<String> {
+    let rate = format!("{bitrate_kbps}k");
+    let mut args = vec!["-b:v".to_string(), rate.clone()];
+    if encoder.ends_with("_nvenc") || encoder.ends_with("_amf") {
+        args.extend(["-rc".to_string(), "cbr".to_string()]);
+    }
+    args.extend(["-maxrate".to_string(), rate.clone(), "-bufsize".to_string(), rate]);
     args
 }
 
@@ -1469,6 +1490,33 @@ mod tests {
     use std::process::Command;
     use super::*;
 
+    /// Constant-bitrate rate control reaches the argument list for every encoder family, with the
+    /// vendor-specific switch only where the vendor names one.
+    #[test]
+    fn rate_control_holds_the_bitrate_for_each_encoder_family() {
+        let get = |args: &[String], flag: &str| {
+            args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+        };
+        for enc in ["h264_nvenc", "hevc_amf", "h264_qsv", "libx264"] {
+            let args = rate_control_args(enc, 20_000);
+            assert_eq!(get(&args, "-b:v").as_deref(), Some("20000k"), "{enc}");
+            assert_eq!(get(&args, "-maxrate").as_deref(), Some("20000k"), "{enc}");
+            assert_eq!(get(&args, "-bufsize").as_deref(), Some("20000k"), "{enc}");
+        }
+        assert_eq!(get(&rate_control_args("h264_nvenc", 1), "-rc").as_deref(), Some("cbr"));
+        assert_eq!(get(&rate_control_args("hevc_amf", 1), "-rc").as_deref(), Some("cbr"));
+        assert_eq!(get(&rate_control_args("h264_qsv", 1), "-rc"), None);
+        assert_eq!(get(&rate_control_args("libx264", 1), "-rc"), None);
+    }
+
+    /// The video output arguments carry the rate control, not a bare `-b:v`.
+    #[test]
+    fn the_output_arguments_carry_the_ceiling_and_buffer() {
+        let args = video_output_args(&args_cfg(60, 1000));
+        assert!(args.windows(2).any(|w| w[0] == "-maxrate" && w[1] == "20000k"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "20000k"), "{args:?}");
+    }
+
     /// A configuration the argument builders can be exercised with. Small on purpose: these
     /// tests are about the argument *list*, not about encoding anything.
     fn args_cfg(fps: u32, segment_ms: u64) -> EncodeConfig {
@@ -1795,7 +1843,7 @@ mod tests {
             "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
             // The video encoder: the passthrough frame-rate mode, the codec, its bitrate,
             // its GOP and its forced keyframes.
-            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-g", "30",
+            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
             "-force_key_frames", "expr:gte(t,n_forced*1)",
             // The audio codec, then the segment muxer and its numbering.
             "-c:a", "aac", "-b:a", "128k", "-f", "segment", "-segment_time", "1",
@@ -1848,7 +1896,7 @@ mod tests {
             "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
             // Input 2, from the configuration's spec.
             "-f", "s16le", "-ar", "44100", "-ac", "1", "-i", "tcp://127.0.0.1:43210",
-            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-g", "30",
+            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
             "-force_key_frames", "expr:gte(t,n_forced*1)",
             "-c:a", "aac", "-b:a", "128k",
             // What a second audio input makes necessary, and the only two things this

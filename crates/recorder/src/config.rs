@@ -158,6 +158,28 @@ fn default_ram_cap_bytes() -> u64 {
     256 * 1024 * 1024
 }
 
+/// `[capture]` — what is recorded: a monitor, or one window.
+///
+/// Both keys are optional and default to the primary monitor, so a `config.toml` written
+/// before this section existed records what it always did. Choosing is the capture crate's
+/// ([`localplay_capture::target`]); only Windows Graphics Capture honours it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct CaptureSection {
+    /// Monitor index; 0 is the primary monitor. An index with no monitor behind it refuses
+    /// to start rather than recording another display.
+    pub monitor: usize,
+    /// A window title (case-insensitive; exact beats substring) to capture instead of a
+    /// monitor. Empty captures the monitor. No match refuses to start.
+    pub window: String,
+}
+
+impl CaptureSection {
+    pub fn target(&self) -> localplay_capture::target::CaptureTarget {
+        localplay_capture::target::CaptureTarget::from_config(self.monitor, &self.window)
+    }
+}
+
 /// `[encode]` — what the encoder is asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EncodeSection {

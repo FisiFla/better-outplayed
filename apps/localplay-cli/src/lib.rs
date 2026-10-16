@@ -262,7 +262,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     } else {
         Config::from_toml(include_str!("../../../config.example.toml"))?
     };
-    let Config { recorder, buffer, encode, audio, storage, mic, hotkeys, events, games, .. } = cfg;
+    let Config { recorder, buffer, encode, capture, audio, storage, mic, hotkeys, events, games, .. } = cfg;
     // `[audio] enabled = false` is carried to the engine rather than interpreted here: it asks
     // for a video-only recording, and the engine is what knows how to make one — no audio input
     // is declared, no loopback listener is bound and the container carries no audio stream.
@@ -298,6 +298,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
             buffer,
             encode,
             storage,
+            capture,
             // The `[audio]` section is this setting's only home; the CLI is its only parser,
             // so it carries the values across. `enabled` and `bitrate_kbps` are both honoured —
             // a video-only recording, and ffmpeg's `-b:a` — while `codec` and `source` are
