@@ -33,10 +33,15 @@ export default defineConfig({
     sourcemap: true,
   },
 
+  // Svelte's package exports a server build unless told otherwise, and its `mount` throws
+  // there. Only the component tests (`a11y.test.ts`) mount anything.
+  resolve: { conditions: process.env.VITEST ? ['browser'] : [] },
+
   test: {
-    // The suite covers the pure logic — time formatting, trim-range maths, the
+    // Most of the suite covers pure logic — time formatting, trim-range maths, the
     // clip-list mapping — and drives the IPC module with the Tauri `invoke` call
-    // mocked. None of it needs a DOM, so no jsdom/happy-dom environment is pulled in.
+    // mocked, so the default is `node`. The component accessibility test opts into jsdom
+    // with a per-file pragma.
     environment: 'node',
     include: ['src/**/*.test.ts'],
   },

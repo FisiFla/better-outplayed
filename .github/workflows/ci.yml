@@ -52,6 +52,9 @@ name: CI
 on:
   push:
   pull_request:
+  # Also runnable by hand, which is how the Windows installer job below is exercised
+  # without opening a PR.
+  workflow_dispatch:
 
 # A newer push supersedes an in-flight run of the same branch/PR.
 concurrency:
@@ -297,3 +300,66 @@ jobs:
             exit 1
           }
           echo "sidecar: $ffmpeg"
+
+  # The Windows installer, built and inspected but never published (docs/packaging.md §5.7).
+  #
+  # Safe to run on a pull request: `permissions: contents: read` (set above), no secrets, no
+  # artifact upload and no release step. The installer is checked, not shipped — it carries an
+  # ffmpeg pair that is only fetched, checksum-verified, for this job. It runs on PRs and by
+  # hand, not on every push, because a Windows runner plus a release build is the slowest job
+  # here.
+  package-windows:
+    name: Bundle (Windows NSIS installer)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Fetch the ffmpeg sidecars
+        # Pinned and checksum-verified (sidecars.toml); bundling refuses to run without them.
+        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+
+      - name: Install the frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build the NSIS installer
+        # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
+        # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
+        # tauri.windows.conf.json.
+        working-directory: apps/desktop
+        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
+
+      - name: Check the installer exists and carries the sidecars
+        # Lists the NSIS archive with 7-Zip (preinstalled on the runner); does not run it.
+        shell: pwsh
+        run: |
+          $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $exe = Get-ChildItem -Path $dir -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $exe) { throw "no NSIS installer was produced in $dir" }
+          Write-Host "installer: $($exe.FullName) ($($exe.Length) bytes)"
+          $listing = & 7z l $exe.FullName | Out-String
+          foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'localplay.exe') {
+            if ($listing -notmatch [regex]::Escape($name)) {
+              Write-Host $listing
+              throw "the installer does not contain $name"
+            }
+          }
