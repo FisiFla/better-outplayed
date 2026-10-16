@@ -17,6 +17,7 @@
 pub mod background;
 pub mod commands;
 pub mod config;
+mod log_file;
 
 use background::{
     AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,
@@ -987,10 +988,8 @@ fn init_tracing() {
         .then(|| std::fs::create_dir_all(&log_dir).ok())
         .flatten()
         .and_then(|()| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_dir.join("better-outplayed.log"))
+            // 5 MB x (1 live + 3 rotated): a background app must not grow its log forever.
+            log_file::RotatingFile::open(log_dir.join("better-outplayed.log"), 5 * 1024 * 1024, 3)
                 .ok()
         });
 

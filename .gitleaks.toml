@@ -1,0 +1,5 @@
+# Throwaway TLS key used only by crates/events/tests/lol_mock.rs (see its README):
+# trusted by nothing, never protected anything.
+[allowlist]
+description = "test fixture private key"
+paths = ['''crates/events/tests/fixtures/tls/.*''']
