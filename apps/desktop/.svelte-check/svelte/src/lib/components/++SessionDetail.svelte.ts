@@ -12,6 +12,7 @@
    * shows what a click did. Nothing here pretends to play, and there is no `<video>` to
    * drive.
    */
+import MatchTimeline from './MatchTimeline.svelte';
 import Timeline from './Timeline.svelte';
 import {
     canExtract,
@@ -22,15 +23,18 @@ import {
   } from '../sessions';
 import type { SessionView } from '../sessions';
 import { formatBytes, formatPrecise } from '../time';
-import type { SessionEvent, TrimRange } from '../types';
+import type { MatchDto, SessionEvent, TrimRange } from '../types';
 ;
 
   interface Props {
     session: SessionView;
     /** The session's markers, in the store's media-time order. */
     events: SessionEvent[];
+    /** The session split into matches (Full Match segments). */
+    matches: MatchDto[];
     busy: boolean;
     onExtract: (range: TrimRange) => void;
+    onExtractMatch: (index: number) => void;
     onFavourite: (favourite: boolean) => void;
     onDelete: () => void;
   };function $$render() {
@@ -41,9 +45,10 @@ import type { SessionEvent, TrimRange } from '../types';
   
   
   
+  
 
 
-  let { session, events, busy, onExtract, onFavourite, onDelete }: Props = $props();
+  let { session, events, matches, busy, onExtract, onExtractMatch, onFavourite, onDelete }: Props = $props();
 
   /**
    * The range to cut out. The whole session until the user says otherwise.
@@ -95,6 +100,8 @@ async () => {
                    
      }
   }
+
+   { const $$_enilemiThctaM1C = __sveltets_2_ensureComponent(MatchTimeline); new $$_enilemiThctaM1C({ target: __sveltets_2_any(), props: {         matches,"durationMs":session.durationMs,"extractable":extractable,busy,"onExtract":onExtractMatch,}});}
 
   if(events.length > 0){
      { svelteHTML.createElement("table", { "class":`markers`,});

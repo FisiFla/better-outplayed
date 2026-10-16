@@ -192,6 +192,8 @@ fn only_the_loopback_modules_talk_to_a_socket_at_all() {
     assert_eq!(
         connecting,
         vec![
+            // The listener's own unit tests dial its loopback socket (rate-limiter test).
+            "crates/events/src/gsi.rs".to_string(),
             "crates/events/src/lol/client.rs".to_string(),
             "crates/events/tests/gsi_listener.rs".to_string(),
             "crates/events/tests/lol_mock.rs".to_string(),
