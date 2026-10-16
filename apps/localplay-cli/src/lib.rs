@@ -67,7 +67,7 @@ use config::Config;
 #[cfg(feature = "test-encoders")]
 use localplay_capture::stub::StubConfig;
 use localplay_events::hotkey;
-use localplay_recorder::event_driver::{act_on_burst, start_event_sources, Coalesce, EventSources};
+use localplay_recorder::event_driver::{act_on_burst, start_event_sources, EventSources, Policy};
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::{
     Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources,
@@ -273,7 +273,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // `encode.fps`, because the engine may have measured that this machine cannot hold the
     // configured rate and is pacing to a lower one — see `RecorderStatus::effective_fps`.
     let (pre_seconds, post_seconds) = (buffer.pre_seconds, buffer.post_seconds);
-    let coalesce = Coalesce::for_pre_roll(pre_seconds);
+    let policy = Policy::new(&events, pre_seconds)?;
     // `--mode` overrides the file (Phase 5), and the resolved value is what the CLI logs and
     // what the engine is told: one number, decided here, never re-derived below.
     let mode = opts.mode.unwrap_or(recorder.mode);
@@ -412,7 +412,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         // the same call the hotkey just made; a marker is recorded and takes no footage.
         // `try_recv` rather than `recv`, so a quiet game cannot make the hotkey wait.
         while let Ok(event) = sources.events.try_recv() {
-            if let Err(err) = act_on_burst(&recorder, event, &sources.events, coalesce) {
+            if let Err(err) = act_on_burst(&recorder, event, &sources.events, &policy) {
                 // The same state as above: no recording exists to clip or to mark, and a
                 // game event that arrived while nothing is being recorded is not a reason
                 // to stop watching for a game.

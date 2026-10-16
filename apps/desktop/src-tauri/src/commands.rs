@@ -27,7 +27,7 @@ use localplay_capture::stub::StubConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
-use localplay_recorder::event_driver::{Coalesce, EventDriver};
+use localplay_recorder::event_driver::{EventDriver, Policy};
 use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Session, SessionEvent, Store};
@@ -1621,7 +1621,9 @@ impl RecorderHost {
                 recorder,
                 &self.app_data_dir,
                 &engine.events,
-                Coalesce::for_pre_roll(settings.buffer.pre_seconds),
+                Policy::new(&engine.events, settings.buffer.pre_seconds).map_err(|err| {
+                    CommandError::new(ErrorCode::InvalidInput, format!("{err:#}"))
+                })?,
             ) {
                 Ok(driver) => {
                     if let Ok(mut held) = self.events.lock() {
