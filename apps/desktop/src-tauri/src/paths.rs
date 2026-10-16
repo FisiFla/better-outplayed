@@ -54,6 +54,40 @@ pub fn ensure_within(path: &Path, roots: &[&Path]) -> Result<PathBuf, PathRefusa
     }
 }
 
+/// `path` resolved all the way through, if it lies inside `root`; for a file about to be
+/// *written* (which, unlike an unlink, follows a symlink at the final component).
+///
+/// `path` need not exist yet: the deepest existing ancestor is canonicalised (resolving
+/// symlinks and junctions) and the missing tail re-appended, so the caller can create the
+/// missing directories afterwards. A `..` is refused outright rather than normalised.
+/// Returns the resolved path, which is the one to write to, so the check and the use cannot
+/// disagree. This is [`ensure_within`]'s counterpart for creation; the two differ only in
+/// that rule (a final-component link is followed here, left alone there).
+pub fn ensure_new_file_within(root: &Path, path: &Path) -> Result<PathBuf, PathRefusal> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(PathRefusal::NotAbsoluteAndClean);
+    }
+    let root = root.canonicalize().map_err(|_| PathRefusal::Unresolvable)?;
+    let mut existing = path;
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return Err(PathRefusal::Unresolvable),
+        }
+    }
+    let mut resolved = existing.canonicalize().map_err(|_| PathRefusal::Unresolvable)?;
+    resolved.extend(tail.iter().rev());
+    if resolved.starts_with(&root) {
+        Ok(resolved)
+    } else {
+        Err(PathRefusal::Outside)
+    }
+}
+
 /// Whether `name` is `session-<digits>` with an optional `-<digits>` suffix and, for a file,
 /// the `.mp4` extension: exactly what `localplay_recorder::session` names its directories and
 /// files. A configured `sessions_dir` may be anywhere, so this shape (not the location) is
@@ -165,6 +199,33 @@ mod tests {
             .unwrap();
         let resolved = ensure_within(&root.path().join("l.mp4"), &[root.path()]).unwrap();
         assert!(resolved.starts_with(std::fs::canonicalize(root.path()).unwrap()));
+    }
+
+    #[test]
+    fn a_new_file_inside_the_root_is_accepted_even_under_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("a/b/c.cfg");
+        let resolved = ensure_new_file_within(dir.path(), &inside).unwrap();
+        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
+        assert!(resolved.ends_with("a/b/c.cfg"));
+    }
+
+    #[test]
+    fn a_new_file_with_dotdot_or_outside_the_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let sneaky = dir.path().join("sub/../../escape.cfg");
+        assert!(ensure_new_file_within(dir.path(), &sneaky).is_err());
+        assert!(ensure_new_file_within(dir.path(), &other.path().join("x.cfg")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_behind_a_symlink_that_leaves_the_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("cfg")).unwrap();
+        assert!(ensure_new_file_within(dir.path(), &dir.path().join("cfg/x.cfg")).is_err());
     }
 
     #[test]
