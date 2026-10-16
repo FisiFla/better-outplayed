@@ -534,6 +534,8 @@ pub fn run() {
         // The settings panel's folder picker (open dialogs only — see
         // capabilities/default.json).
         .plugin(tauri_plugin_dialog::init())
+        // The "clip saved" toast and sound (see `RecorderHost::on_clip_saved`).
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // Playback is served by Tauri's asset protocol, scoped to the clips directory
             // (spec §9) — there is no file server in this application. `tauri.conf.json`
@@ -550,6 +552,24 @@ pub fn run() {
                     );
                 }
             }
+            // A toast and the system sound whenever a clip lands, from any trigger. Best
+            // effort: a notification that cannot show (permission denied, no daemon) is a
+            // warning, never a reason to lose the clip it was announcing.
+            let notifier = app.handle().clone();
+            state.recorder().on_clip_saved(move |clip| {
+                use tauri_plugin_notification::NotificationExt;
+                let name = background::clip_file_name(&clip.path);
+                if let Err(err) = notifier
+                    .notification()
+                    .builder()
+                    .title("Clip saved")
+                    .body(name)
+                    .sound("default")
+                    .show()
+                {
+                    tracing::warn!("the clip-saved notification could not be shown: {err}");
+                }
+            });
             app.manage(state);
 
             // The start-with-Windows entry, if the config asks for it. Best effort and

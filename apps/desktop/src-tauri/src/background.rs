@@ -149,7 +149,7 @@ impl PressOutcome {
 
 /// The file name of a path that may use either separator: the clip paths in a DTO are
 /// Windows paths even when this code runs on the development host.
-fn clip_file_name(path: &str) -> &str {
+pub(crate) fn clip_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 

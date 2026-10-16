@@ -28,12 +28,12 @@ use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::event_driver::{EventDriver, Policy};
-use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecorderStatus, Sources};
+use localplay_recorder::{RecordedClip, Recorder, RecorderConfig, RecorderOptions, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Session, SessionEvent, Store};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// The app-data-relative directories the shell reads and writes.
 ///
@@ -1489,11 +1489,44 @@ pub struct RecorderHost {
     /// CS2 / Dota 2 listener only ever ran under the CLI, so a desktop user got no
     /// event-triggered clips at all.
     events: Mutex<Option<EventDriver>>,
+    /// Told about every clip that lands, whichever trigger took it (button, tray, hotkey or a
+    /// game event). Set once by the shell, which owns the notification; empty in tests.
+    clip_hook: Arc<OnceLock<ClipSavedHook>>,
+}
+
+/// What the shell does when a clip is saved (a toast and a sound, in the app).
+pub type ClipSavedHook = Box<dyn Fn(&RecordedClipDto) + Send + Sync>;
+
+impl RecordedClipDto {
+    fn from_clip(clip: &RecordedClip) -> Self {
+        Self {
+            id: clip.id,
+            path: clip.metadata.path.to_string_lossy().into_owned(),
+            duration_ms: clip.metadata.duration_ms,
+            size_bytes: clip.metadata.size_bytes,
+            codec: clip.metadata.encoder.clone(),
+            started_at_ms: clip.started_at_ms,
+        }
+    }
 }
 
 impl RecorderHost {
     pub fn new(app_data_dir: PathBuf, bins: Option<FfmpegBinaries>) -> Self {
-        Self { app_data_dir, bins, current: Mutex::new(None), events: Mutex::new(None) }
+        Self { app_data_dir, bins, current: Mutex::new(None),
+            events: Mutex::new(None),
+            clip_hook: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Register what happens when a clip is saved. Only the first call takes effect.
+    pub fn on_clip_saved(&self, hook: impl Fn(&RecordedClipDto) + Send + Sync + 'static) {
+        let _ = self.clip_hook.set(Box::new(hook));
+    }
+
+    fn announce(hook: &OnceLock<ClipSavedHook>, dto: &RecordedClipDto) {
+        if let Some(hook) = hook.get() {
+            hook(dto);
+        }
     }
 
     /// The `config.toml` a recording would be started from.
@@ -1624,6 +1657,10 @@ impl RecorderHost {
                 Policy::new(&engine.events, settings.buffer.pre_seconds).map_err(|err| {
                     CommandError::new(ErrorCode::InvalidInput, format!("{err:#}"))
                 })?,
+                {
+                    let hook = Arc::clone(&self.clip_hook);
+                    Box::new(move |clip| Self::announce(&hook, &RecordedClipDto::from_clip(clip)))
+                },
             ) {
                 Ok(driver) => {
                     if let Ok(mut held) = self.events.lock() {
@@ -1696,14 +1733,9 @@ impl RecorderHost {
         let clip = recorder.clip_now().map_err(|err| {
             CommandError::new(ErrorCode::Recording, format!("taking a clip failed: {err:#}"))
         })?;
-        Ok(RecordedClipDto {
-            id: clip.id,
-            path: clip.metadata.path.to_string_lossy().into_owned(),
-            duration_ms: clip.metadata.duration_ms,
-            size_bytes: clip.metadata.size_bytes,
-            codec: clip.metadata.encoder,
-            started_at_ms: clip.started_at_ms,
-        })
+        let dto = RecordedClipDto::from_clip(&clip);
+        Self::announce(&self.clip_hook, &dto);
+        Ok(dto)
     }
 
     /// Whether a recording currently holds the slot (and the engine says it is running).
