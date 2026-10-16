@@ -271,6 +271,12 @@ lol_poll_enabled = true
 # generated cfg file must then be replaced too).
 gsi_port = 45671
 
+# Highlights that should be recorded on the session timeline but NOT take a clip. Tags are
+# kill, death, assist, objective, bomb_planted, bomb_defused, game_end. A typo is an error,
+# not a silent no-op. Example: only clip kills and the end of the game.
+#   mute_clips = ["death", "assist", "objective"]
+mute_clips = []
+
 # --- What an event does -------------------------------------------------------------
 # A *highlight* (kill, death, assist, objective, bomb planted/defused, end of game) takes a
 # clip through the same trigger the hotkey uses: pre_seconds before it, post_seconds after

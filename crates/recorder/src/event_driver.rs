@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use localplay_events::gsi::{self, GsiConfig, GsiListener};
 use localplay_events::lol::{self, LolConfig, LolHandle};
-use localplay_events::GameEvent;
+use localplay_events::{EventKind, GameEvent};
 use serde::Deserialize;
 
 use crate::{ClipReason, Recorder};
@@ -33,13 +33,51 @@ pub struct EventsSection {
     pub lol_poll_enabled: bool,
     /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
     pub gsi_port: u16,
+    /// Event kinds that must **not** take a clip even though they are highlights — the tags
+    /// from `EventKind::as_tag`, e.g. `["objective", "assist"]` for a player who wants their
+    /// kills and not every turret. A muted kind is still recorded as a marker on the session
+    /// timeline. Unknown tags are rejected at load, so a typo cannot silently mute nothing.
+    #[serde(default)]
+    pub mute_clips: Vec<String>,
+}
+
+impl EventsSection {
+    /// The muted kinds, or the first tag that is not one.
+    pub fn muted_kinds(&self) -> Result<Vec<EventKind>> {
+        self.mute_clips
+            .iter()
+            .map(|tag| {
+                EventKind::from_tag(tag).with_context(|| {
+                    format!("events.mute_clips: `{tag}` is not an event kind (kill, death, assist, objective, bomb_planted, bomb_defused, game_end, ...)")
+                })
+            })
+            .collect()
+    }
+}
+
+/// What the driver does with events: how bursts coalesce, and which highlights stay markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    pub coalesce: Coalesce,
+    pub muted: Vec<EventKind>,
+}
+
+impl Policy {
+    pub fn new(events: &EventsSection, pre_seconds: u64) -> Result<Self> {
+        Ok(Self { coalesce: Coalesce::for_pre_roll(pre_seconds), muted: events.muted_kinds()? })
+    }
+
+    /// Whether this event takes a clip: a highlight that has not been muted.
+    pub fn clips(&self, event: &GameEvent) -> bool {
+        event.is_highlight() && !self.muted.contains(&event.kind)
+    }
 }
 
 impl Default for EventsSection {
     /// The values `config.example.toml` ships: a file with no `[events]` section behaves as
     /// the example does, which is also what the desktop shell relies on.
     fn default() -> Self {
-        Self { lol_poll_enabled: true, gsi_port: 45671 }
+        Self { lol_poll_enabled: true, gsi_port: 45671, mute_clips: Vec::new() }
     }
 }
 
@@ -192,7 +230,8 @@ impl Coalesce {
 ///
 /// Non-highlights (markers) that arrive meanwhile are collected but neither extend nor end
 /// the burst. The channel closing ends it, because nothing further can arrive.
-fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, c: Coalesce) -> Vec<GameEvent> {
+fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> Vec<GameEvent> {
+    let c = policy.coalesce;
     let started = std::time::Instant::now();
     let mut last_highlight = started;
     let mut burst = vec![first];
@@ -206,7 +245,7 @@ fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, c: Coalesce) -> Vec<
         }
         match rx.recv_timeout(wait) {
             Ok(event) => {
-                if event.is_highlight() {
+                if policy.clips(&event) {
                     last_highlight = std::time::Instant::now();
                 }
                 burst.push(event);
@@ -223,12 +262,16 @@ pub fn act_on_burst(
     recorder: &Recorder,
     first: GameEvent,
     rx: &Receiver<GameEvent>,
-    coalesce: Coalesce,
+    policy: &Policy,
 ) -> Result<()> {
-    if !first.is_highlight() {
-        return act_on_event(recorder, first);
+    if !policy.clips(&first) {
+        // A marker, or a highlight the player muted: recorded on the timeline, no footage.
+        return recorder
+            .note_event(first)
+            .map(|_| ())
+            .context("recording a game-event marker");
     }
-    let mut burst = gather_burst(first, rx, coalesce).into_iter();
+    let mut burst = gather_burst(first, rx, policy).into_iter();
     let head = burst.next().expect("a burst always holds its first event");
     let result = act_on_event(recorder, head);
     for rest in burst {
@@ -256,14 +299,14 @@ impl EventDriver {
         recorder: Arc<Recorder>,
         app_dir: &Path,
         events: &EventsSection,
-        coalesce: Coalesce,
+        policy: Policy,
     ) -> Result<Self> {
         let sources = start_event_sources(app_dir, events);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("localplay-events".into())
-            .spawn(move || drive(&recorder, sources, &flag, coalesce))
+            .spawn(move || drive(&recorder, sources, &flag, &policy))
             .context("spawning the game-event thread")?;
         Ok(Self { stop, thread: Some(thread) })
     }
@@ -280,7 +323,7 @@ impl Drop for EventDriver {
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
 
-fn drive(recorder: &Recorder, sources: EventSources, stop: &AtomicBool, coalesce: Coalesce) {
+fn drive(recorder: &Recorder, sources: EventSources, stop: &AtomicBool, policy: &Policy) {
     while !stop.load(Ordering::Acquire) {
         match sources.events.recv_timeout(DRIVER_POLL) {
             Ok(event) => {
@@ -290,7 +333,7 @@ fn drive(recorder: &Recorder, sources: EventSources, stop: &AtomicBool, coalesce
                     tracing::info!("a game event arrived while nothing is being recorded; ignored");
                     continue;
                 }
-                if let Err(err) = act_on_burst(recorder, event, &sources.events, coalesce) {
+                if let Err(err) = act_on_burst(recorder, event, &sources.events, policy) {
                     tracing::warn!("the game event could not be acted on: {err:#}");
                 }
             }
@@ -308,8 +351,22 @@ mod tests {
         GameEvent::bare(localplay_events::Source::Lol, localplay_events::EventKind::Kill)
     }
 
-    fn quick() -> Coalesce {
-        Coalesce { quiet: Duration::from_millis(60), max: Duration::from_millis(400) }
+    fn quick() -> Policy {
+        Policy {
+            coalesce: Coalesce { quiet: Duration::from_millis(60), max: Duration::from_millis(400) },
+            muted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_muted_highlight_does_not_take_a_clip_and_an_unknown_tag_is_an_error() {
+        let events = EventsSection { mute_clips: vec!["objective".into()], ..EventsSection::default() };
+        let policy = Policy::new(&events, 30).unwrap();
+        let objective = GameEvent::bare(localplay_events::Source::Lol, EventKind::Objective);
+        assert!(!policy.clips(&objective), "muted");
+        assert!(policy.clips(&kill()), "an unmuted highlight still clips");
+        let bad = EventsSection { mute_clips: vec!["kil".into()], ..EventsSection::default() };
+        assert!(bad.muted_kinds().unwrap_err().to_string().contains("kil"));
     }
 
     #[test]
@@ -318,7 +375,7 @@ mod tests {
         for _ in 0..4 {
             tx.send(kill()).unwrap();
         }
-        let burst = gather_burst(kill(), &rx, quick());
+        let burst = gather_burst(kill(), &rx, &quick());
         assert_eq!(burst.len(), 5, "the first plus the four that were already waiting");
     }
 
@@ -326,7 +383,7 @@ mod tests {
     fn a_lone_event_ends_after_the_quiet_gap_and_not_the_max() {
         let (_tx, rx) = mpsc::channel::<GameEvent>();
         let t = std::time::Instant::now();
-        assert_eq!(gather_burst(kill(), &rx, quick()).len(), 1);
+        assert_eq!(gather_burst(kill(), &rx, &quick()).len(), 1);
         assert!(t.elapsed() < Duration::from_millis(300), "ended on the quiet gap");
     }
 
@@ -342,7 +399,7 @@ mod tests {
             }
         });
         let t = std::time::Instant::now();
-        let burst = gather_burst(kill(), &rx, quick());
+        let burst = gather_burst(kill(), &rx, &quick());
         assert!(t.elapsed() < Duration::from_millis(700), "cut near max, not run to the end of the stream");
         assert!(burst.len() > 3);
         drop(rx);
@@ -361,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_missing_events_section_means_the_example_values() {
-        assert_eq!(EventsSection::default(), EventsSection { lol_poll_enabled: true, gsi_port: 45671 });
+        assert_eq!(EventsSection::default(), EventsSection { lol_poll_enabled: true, gsi_port: 45671, mute_clips: Vec::new() });
     }
 
     #[test]
