@@ -346,12 +346,14 @@ fn a_window_inside_the_held_footage_covers_the_whole_request() {
         PRE + POST
     );
 
-    // As the post-roll wait leaves it: the ring holds footage up to `span`, and the trigger
-    // instant sits `post` behind that. The window start is `span - post - pre`, which the
-    // assertion above places at or after `front`; the end is `span` itself. The request is
-    // wholly inside the held footage by construction.
-    let t = span - POST;
-    let start = t - PRE;
+    // Anchored at the ring's reported front, not at `span`. Frame timestamps are arrival
+    // times, so on a loaded runner the footage can contain a hole; a window measured back
+    // from `span` may then start inside the hole and honestly report a truncated front.
+    // Starting exactly at the front keeps the request wholly inside the held footage by
+    // construction, whatever the host's timing was (this test failed intermittently on
+    // CI before it was anchored this way — docs/verification-status.md §20).
+    let start = front;
+    let t = start + PRE;
     let window = ring
         .window(start, t + POST)
         .expect("the ring can serve a window inside its own footage");

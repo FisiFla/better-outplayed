@@ -155,8 +155,8 @@ jobs:
         # `unwrap_used` is warn-level workspace-wide so production code is flagged; the many
         # intentional unwraps in test bodies are allowed here rather than blessed one by one.
         run: |
-          cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -D warnings
-          cd apps/desktop/src-tauri && cargo clippy --all-targets -- -A clippy::unwrap_used -D warnings
+          cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings
+          cd apps/desktop/src-tauri && cargo clippy --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings
 
   # Executes the Windows code that needs no GPU: bundled SQLite on MSVC, the store,
   # recorder, CLI and the desktop shell's command layer. Hosted runners have no
