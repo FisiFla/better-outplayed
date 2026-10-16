@@ -321,3 +321,30 @@ fn a_listener_started_without_a_token_refuses_to_start() {
     assert!(format!("{err:#}").contains("token"), "got: {err:#}");
     assert_eq!(with_token(CS2_COMPETITIVE, TOKEN), CS2_COMPETITIVE);
 }
+
+#[test]
+fn a_flood_of_connections_is_answered_429_and_the_listener_recovers() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    // Well over the per-second cap, from several threads so it lands inside one window. Every
+    // connection is answered (nothing hangs), the excess with 429, and none of it becomes
+    // an event.
+    let total = gsi::MAX_REQUESTS_PER_WINDOW as usize * 3;
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                (0..total / 8)
+                    .map(|_| status_of(&post(addr, "/gsi", "{}")))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+    assert!(statuses.contains(&429), "the excess is refused with 429");
+    assert!(statuses.iter().all(|s| *s == 403 || *s == 429), "and nothing else is served");
+    assert!(harness.drained().is_empty(), "a flood derives no events");
+
+    // The window rolls over, and the listener serves again.
+    std::thread::sleep(gsi::RATE_WINDOW + Duration::from_millis(100));
+    assert_eq!(status_of(&post(addr, "/gsi", "{}")), 403, "served again (403: no token)");
+}
