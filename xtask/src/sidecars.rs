@@ -459,7 +459,10 @@ pub fn scan<R: Read + Seek>(
                 .by_index(index)
                 .with_context(|| format!("reading zip entry #{index}"))?;
             (
-                entry.name().to_string(),
+                entry
+                    .name()
+                    .map_err(|e| anyhow::anyhow!("zip entry #{index} has an unreadable name: {e}"))?
+                    .to_string(),
                 entry.is_dir(),
                 is_symlink_mode(entry.unix_mode()),
                 entry.size(),
