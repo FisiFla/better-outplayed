@@ -57,6 +57,12 @@ pub struct AudioSection {
 #[derive(Debug, Deserialize)]
 pub struct HotkeySection {
     pub clip: String,
+    /// Desktop-app chords, accepted here so one config file serves both front-ends; the CLI
+    /// itself only listens for `clip`.
+    #[serde(default)]
+    pub toggle_recording: Option<String>,
+    #[serde(default)]
+    pub bookmark: Option<String>,
 }
 
 pub use localplay_recorder::event_driver::EventsSection;

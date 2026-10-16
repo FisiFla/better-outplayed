@@ -47,6 +47,7 @@ const KIND_COLORS: Record<string, string> = {
   bomb_defused: '#38bdf8',
   match_start: '#a78bfa',
   match_end: '#a78bfa',
+  bookmark: '#22c55e',
 };
 
 /** The colour for a tag this build does not know. Deliberately visible, not a hairline. */
@@ -70,6 +71,7 @@ const KIND_LABELS: Record<string, string> = {
   bomb_defused: 'bomb defused',
   match_start: 'match start',
   match_end: 'match end',
+  bookmark: 'bookmark',
 };
 
 export function markerColor(kind: string): string {

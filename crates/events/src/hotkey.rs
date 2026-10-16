@@ -120,55 +120,83 @@ fn parse_key(key: Option<&str>) -> Result<u32> {
     anyhow::bail!("unsupported key: {key}")
 }
 
-/// Start listening. Returns a channel that yields once per press.
+/// Start listening for one chord. Returns a channel that yields once per press.
+///
+/// A convenience over [`listen_all`] for the callers (the CLI) that hold a single chord.
+pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
+    let presses = listen_all(vec![hk])?;
+    let (tx, rx) = channel();
+    std::thread::Builder::new().name("localplay-hotkey-fwd".into()).spawn(move || {
+        while presses.recv().is_ok() {
+            if tx.send(()).is_err() {
+                break;
+            }
+        }
+    })?;
+    Ok(rx)
+}
+
+/// Start listening for several chords at once. The channel yields the **index** (into `hks`)
+/// of the chord that was pressed.
 ///
 /// **Blocks until the registration outcome is known**, so the `Err` is the truth about this
 /// process rather than a guess: on Windows, `RegisterHotKey` runs on a dedicated thread that
 /// owns the message queue it will receive `WM_HOTKEY` on, and the error it produces is
-/// carried back to this call. The error names the chord and the likely cause.
+/// carried back to this call. It is all-or-nothing — if any chord cannot be registered the
+/// ones already held are released and the error names the chord that failed and the likely
+/// cause, so a half-installed set never looks like a working one.
 #[cfg(windows)]
-pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
+pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
-    let chord = hk.to_string();
+    let chords = hks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     let (tx, rx) = channel();
-    // The registration outcome: `Ok(())` once the chord is held, `Err(message)` when it is
-    // not. A separate channel from the press channel, because one is a handshake and the
+    // The registration outcome: `Ok(())` once every chord is held, `Err(message)` when one
+    // is not. A separate channel from the press channel, because one is a handshake and the
     // other is a stream of events.
     let (report_tx, report_rx) = channel::<std::result::Result<(), String>>();
     std::thread::Builder::new()
         .name("localplay-hotkey".into())
         .spawn(move || {
-            let mut modifiers = HOT_KEY_MODIFIERS(0);
-            if hk.ctrl {
-                modifiers |= MOD_CONTROL;
-            }
-            if hk.alt {
-                modifiers |= MOD_ALT;
-            }
-            if hk.shift {
-                modifiers |= MOD_SHIFT;
-            }
             // SAFETY: called on a dedicated thread that owns the message queue.
             unsafe {
-                if let Err(err) = RegisterHotKey(None, 1, modifiers, hk.vk) {
-                    let _ = report_tx.send(Err(format!(
-                        "the chord {chord} could not be registered (RegisterHotKey failed: \
-                         {err}). Another application — or another localplay (the CLI and \
-                         this app cannot both hold one chord) — already owns it. Nothing \
-                         will happen when {chord} is pressed. Close the other application, \
-                         or set a different [hotkeys] clip in config.toml and restart."
-                    )));
-                    return;
+                for (index, hk) in hks.iter().enumerate() {
+                    let mut modifiers = HOT_KEY_MODIFIERS(0);
+                    if hk.ctrl {
+                        modifiers |= MOD_CONTROL;
+                    }
+                    if hk.alt {
+                        modifiers |= MOD_ALT;
+                    }
+                    if hk.shift {
+                        modifiers |= MOD_SHIFT;
+                    }
+                    if let Err(err) = RegisterHotKey(None, index as i32 + 1, modifiers, hk.vk) {
+                        for held in 0..index {
+                            let _ = UnregisterHotKey(None, held as i32 + 1);
+                        }
+                        let _ = report_tx.send(Err(format!(
+                            "the chord {hk} could not be registered (RegisterHotKey failed: \
+                             {err}). Another application — or another localplay (the CLI and \
+                             this app cannot both hold one chord) — already owns it. Nothing \
+                             will happen when {hk} is pressed. Close the other application, \
+                             or set a different chord under [hotkeys] in config.toml and \
+                             restart."
+                        )));
+                        return;
+                    }
                 }
                 let _ = report_tx.send(Ok(()));
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    if msg.message == WM_HOTKEY && tx.send(()).is_err() {
-                        break;
+                    if msg.message == WM_HOTKEY {
+                        let index = (msg.wParam.0 as usize).saturating_sub(1);
+                        if tx.send(index).is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -178,12 +206,12 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
         Ok(Ok(())) => Ok(rx),
         Ok(Err(message)) => Err(anyhow::anyhow!(message)),
         Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-            "the chord {hk} was not registered within {REGISTRATION_TIMEOUT:?}: the \
-             listener thread did not report back. Treat the hotkey as NOT installed."
+            "the chords {chords} were not registered within {REGISTRATION_TIMEOUT:?}: the \
+             listener thread did not report back. Treat the hotkeys as NOT installed."
         )),
         Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "the clip hotkey listener thread died before it could register {hk}. Treat \
-             the hotkey as NOT installed."
+            "the hotkey listener thread died before it could register {chords}. Treat \
+             the hotkeys as NOT installed."
         )),
     }
 }
@@ -194,7 +222,7 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
 /// Windows they get a channel that never yields. [`supported`] is how a front-end says so to
 /// its user instead of showing a dead chord.
 #[cfg(not(windows))]
-pub fn listen(_hk: Hotkey) -> Result<Receiver<()>> {
+pub fn listen_all(_hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     let (_tx, rx) = channel();
     Ok(rx)
 }

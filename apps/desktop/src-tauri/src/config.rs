@@ -194,6 +194,10 @@ pub struct BackgroundConfig {
     /// `[hotkeys] clip`, verbatim. Parsed by `localplay_events::hotkey::Hotkey` — the same
     /// parser the CLI uses — so one file means one chord to both front-ends.
     pub clip_hotkey: String,
+    /// `[hotkeys] toggle_recording`: start/stop the recording. Off unless set.
+    pub toggle_recording_hotkey: Option<String>,
+    /// `[hotkeys] bookmark`: drop a marker on the session timeline. Off unless set.
+    pub bookmark_hotkey: Option<String>,
     /// `[app] start_with_system`: whether the shell should own a start-with-Windows entry.
     pub start_with_system: bool,
 }
@@ -224,6 +228,10 @@ impl BackgroundConfig {
         #[derive(Deserialize)]
         struct HotkeySection {
             clip: String,
+            #[serde(default)]
+            toggle_recording: Option<String>,
+            #[serde(default)]
+            bookmark: Option<String>,
         }
         #[derive(Deserialize)]
         struct AppSection {
@@ -240,7 +248,14 @@ impl BackgroundConfig {
                 ),
             )
         })?;
+        let (toggle_recording_hotkey, bookmark_hotkey) = file
+            .hotkeys
+            .as_ref()
+            .map(|h| (h.toggle_recording.clone(), h.bookmark.clone()))
+            .unwrap_or_default();
         Ok(Self {
+            toggle_recording_hotkey,
+            bookmark_hotkey,
             clip_hotkey: file.hotkeys.map(|h| h.clip).unwrap_or_else(|| {
                 tracing::info!(
                     "config.toml has no [hotkeys] section; using the documented default \
@@ -1446,6 +1461,18 @@ mod tests {
     }
 
     #[test]
+    fn the_extra_hotkeys_are_off_unless_the_file_sets_them() {
+        let off = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Ctrl+F8\"\n").unwrap();
+        assert_eq!((off.toggle_recording_hotkey, off.bookmark_hotkey), (None, None));
+        let on = BackgroundConfig::from_toml(
+            "[hotkeys]\nclip = \"Ctrl+F8\"\ntoggle_recording = \"Ctrl+F9\"\nbookmark = \"Ctrl+F10\"\n",
+        )
+        .unwrap();
+        assert_eq!(on.toggle_recording_hotkey.as_deref(), Some("Ctrl+F9"));
+        assert_eq!(on.bookmark_hotkey.as_deref(), Some("Ctrl+F10"));
+    }
+
+    #[test]
     fn output_size_follows_the_engines_own_parser() {
         // Reused rather than re-invented: `localplay_recorder::parse_output_size` trims
         // each component and sets no bounds, so the panel accepts exactly what a start
@@ -1463,5 +1490,18 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_extra_chords_are_off_unless_the_file_sets_them() {
+        let none = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Ctrl+F8\"\n").unwrap();
+        assert_eq!((none.toggle_recording_hotkey, none.bookmark_hotkey), (None, None));
+
+        let set = BackgroundConfig::from_toml(
+            "[hotkeys]\nclip = \"Ctrl+F8\"\ntoggle_recording = \"Ctrl+F9\"\nbookmark = \"Ctrl+F10\"\n",
+        )
+        .unwrap();
+        assert_eq!(set.toggle_recording_hotkey.as_deref(), Some("Ctrl+F9"));
+        assert_eq!(set.bookmark_hotkey.as_deref(), Some("Ctrl+F10"));
     }
 }
