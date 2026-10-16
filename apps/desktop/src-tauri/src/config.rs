@@ -469,10 +469,10 @@ fn is_absolute_either(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some('/') | Some('\\') => true,
-        Some(drive) if drive.is_ascii_alphabetic() => match (chars.next(), chars.next()) {
-            (Some(':'), Some('/' | '\\')) => true,
-            _ => false,
-        },
+        Some(drive) if drive.is_ascii_alphabetic() => matches!(
+            (chars.next(), chars.next()),
+            (Some(':'), Some('/' | '\\'))
+        ),
         _ => false,
     }
 }
@@ -535,7 +535,7 @@ fn clips_dir_problem(dir: &str) -> Option<&'static str> {
     let stripped = slashed.strip_prefix("//?/").unwrap_or(slashed.as_str());
     let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
 
-    if segments.iter().any(|segment| *segment == "..") {
+    if segments.contains(&"..") {
         return Some("names a parent-directory segment");
     }
     // A UNC path is `//server/share/...`; fewer than three segments names a host, or a

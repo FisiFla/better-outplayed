@@ -1757,7 +1757,7 @@ pub struct UpdateSettingsOutcome {
 fn recorder_options(engine: &EngineOptionsConfig) -> RecorderOptions {
     RecorderOptions {
         mode: Default::default(),
-        mic: engine.mic.clone(),
+        mic: engine.mic,
         games: engine.games.clone(),
         game: None,
     }
@@ -1910,7 +1910,7 @@ pub fn update_settings_and_prepare(
 mod tests {
     use super::*;
     use localplay_media::binaries::run_with_timeout;
-    use std::process::Command;
+    
     use std::time::{Duration, Instant};
 
     /// A cap nothing reaches and an age nothing exceeds: the policy is a no-op, so a test

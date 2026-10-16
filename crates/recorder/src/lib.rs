@@ -2597,6 +2597,7 @@ impl RecorderConfig {
 /// The audio backend is built only when `game_audio` is set. A video-only recording must not
 /// open the loopback at all: a capture whose blocks are discarded is still a capture, costing
 /// what it costs and — on Windows — holding a WASAPI session the user asked not to have.
+#[allow(clippy::type_complexity)]
 fn build_sources(
     sources: Sources,
     fps: u32,

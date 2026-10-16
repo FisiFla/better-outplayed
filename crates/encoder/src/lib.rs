@@ -268,6 +268,7 @@ pub enum EncodeOutput {
 }
 
 impl EncodeConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn hardware(
         codec: VideoCodec,
         vendor: Vendor,
