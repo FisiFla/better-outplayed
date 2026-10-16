@@ -2726,7 +2726,7 @@ fn frame_stats(bin: &FfmpegBinaries, clip: &Path) -> Result<Option<FrameStats>> 
     let mut colours = std::collections::HashSet::new();
     let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
     // `as_chunks` is newer than this workspace's oldest supported toolchain.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for chunk in out.stdout.chunks_exact(3) {
         colours.insert((chunk[0], chunk[1], chunk[2]));
         r += chunk[0] as u64;
