@@ -2,6 +2,11 @@
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
+ignore = [
+  # Marvin timing attack in `rsa`: only used (dev-dependency) to mint a throwaway RSA test leaf
+  # for the LoL mock TLS server; no network-facing RSA operation in shipped code, no fix available.
+  "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2
