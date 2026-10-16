@@ -19,7 +19,7 @@ use localplay_events::lol::{self, LolConfig, LolHandle};
 use localplay_events::{EventKind, GameEvent};
 use serde::Deserialize;
 
-use crate::{ClipReason, Recorder};
+use crate::{ClipReason, RecordedClip, Recorder};
 
 /// `[events]` — which game-event sources to run (spec §7.1, §7.2).
 ///
@@ -181,20 +181,24 @@ fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Re
 ///
 /// The only decision here is highlight versus marker, and it is the vocabulary's
 /// ([`localplay_events::EventKind::is_highlight`]) rather than this loop's. Everything else is one call.
-pub fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<()> {
+pub fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<Option<RecordedClip>> {
     if event.is_highlight() {
         let described = format!("{} {}", event.source, event.kind);
         recorder
             .clip_now_with(ClipReason::GameEvent(event))
             .map(|clip| {
                 tracing::info!("the {described} clip is {}", clip.metadata.path.display());
+                Some(clip)
             })
             .with_context(|| format!("taking a clip for a {described} event"))
     } else {
         let described = format!("{} {}", event.source, event.kind);
         recorder
             .note_event(event)
-            .map(|id| tracing::info!("recorded the {described} marker as event #{id}"))
+            .map(|id| {
+                tracing::info!("recorded the {described} marker as event #{id}");
+                None
+            })
             .with_context(|| format!("recording a {described} marker"))
     }
 }
@@ -257,18 +261,19 @@ fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> 
 
 /// [`act_on_event`] with burst coalescing: a highlight waits for its burst to settle, then
 /// one clip is cut for the burst (reason: the first highlight) and every other event in it
-/// is recorded as a marker, so nothing is lost from the session's timeline.
+/// is recorded as a marker, so nothing is lost from the session's timeline. Returns the clip
+/// when one was taken.
 pub fn act_on_burst(
     recorder: &Recorder,
     first: GameEvent,
     rx: &Receiver<GameEvent>,
     policy: &Policy,
-) -> Result<()> {
+) -> Result<Option<RecordedClip>> {
     if !policy.clips(&first) {
         // A marker, or a highlight the player muted: recorded on the timeline, no footage.
         return recorder
             .note_event(first)
-            .map(|_| ())
+            .map(|_| None)
             .context("recording a game-event marker");
     }
     let mut burst = gather_burst(first, rx, policy).into_iter();
@@ -282,6 +287,10 @@ pub fn act_on_burst(
     }
     result
 }
+
+/// Called with every clip the driver takes, on the driver's thread — the desktop shell's way
+/// to tell the player a clip landed without the recorder crate knowing about notifications.
+pub type ClipHook = Box<dyn Fn(&RecordedClip) + Send + 'static>;
 
 /// The thread that turns derived events into clips while a recording runs (the desktop
 /// shell's counterpart of the CLI's driver loop).
@@ -300,13 +309,14 @@ impl EventDriver {
         app_dir: &Path,
         events: &EventsSection,
         policy: Policy,
+        on_clip: ClipHook,
     ) -> Result<Self> {
         let sources = start_event_sources(app_dir, events);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("localplay-events".into())
-            .spawn(move || drive(&recorder, sources, &flag, &policy))
+            .spawn(move || drive(&recorder, sources, &flag, &policy, &on_clip))
             .context("spawning the game-event thread")?;
         Ok(Self { stop, thread: Some(thread) })
     }
@@ -323,7 +333,13 @@ impl Drop for EventDriver {
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
 
-fn drive(recorder: &Recorder, sources: EventSources, stop: &AtomicBool, policy: &Policy) {
+fn drive(
+    recorder: &Recorder,
+    sources: EventSources,
+    stop: &AtomicBool,
+    policy: &Policy,
+    on_clip: &ClipHook,
+) {
     while !stop.load(Ordering::Acquire) {
         match sources.events.recv_timeout(DRIVER_POLL) {
             Ok(event) => {
@@ -333,8 +349,10 @@ fn drive(recorder: &Recorder, sources: EventSources, stop: &AtomicBool, policy: 
                     tracing::info!("a game event arrived while nothing is being recorded; ignored");
                     continue;
                 }
-                if let Err(err) = act_on_burst(recorder, event, &sources.events, policy) {
-                    tracing::warn!("the game event could not be acted on: {err:#}");
+                match act_on_burst(recorder, event, &sources.events, policy) {
+                    Ok(Some(clip)) => on_clip(&clip),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!("the game event could not be acted on: {err:#}"),
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

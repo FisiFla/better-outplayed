@@ -44,6 +44,7 @@ toml_edit = "0.25"
 # listener the CLI does, from the same `[hotkeys] clip` key — there is one hotkey
 # implementation in this repository, and this is the dependency that makes that true.
 localplay-events = { path = "../../../crates/events" }
+tauri-plugin-notification = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
