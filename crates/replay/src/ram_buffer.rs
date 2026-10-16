@@ -324,7 +324,6 @@ impl MemoryRingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     /// A real fragmented-MP4 stream, generated rather than pasted.
     ///
