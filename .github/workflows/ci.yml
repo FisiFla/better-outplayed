@@ -89,7 +89,7 @@ jobs:
             apps/desktop/src-tauri -> target
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -173,7 +173,7 @@ jobs:
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -243,7 +243,7 @@ jobs:
             apps/desktop/src-tauri -> target
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
