@@ -306,6 +306,9 @@ mod tests {
             codec: "h264_nvenc".into(),
             favourite,
             created_at_ms,
+            title: None,
+            game: None,
+            tags: Vec::new(),
         }
     }
 

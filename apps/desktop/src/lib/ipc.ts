@@ -45,6 +45,16 @@ export interface ClipSource {
   listClips(): Promise<ClipDto[]>;
   storageStats(): Promise<StorageStats>;
   setFavourite(id: number, favourite: boolean): Promise<ClipDto>;
+  /** Set the clip's display title (blank clears it). The file keeps its name. */
+  setClipTitle(id: number, title: string): Promise<ClipDto>;
+  /** Replace the clip's tags. */
+  setClipTags(id: number, tags: string[]): Promise<ClipDto>;
+  /** Put the clip's file on the system clipboard, as a file. */
+  copyClipToClipboard(id: number): Promise<void>;
+  /** Show the clip's file in the system file manager. */
+  revealClip(id: number): Promise<void>;
+  /** Start a native drag of the clip's file out of the window. */
+  dragClipOut(id: number): Promise<void>;
   trimClip(id: number, startMs: number, endMs: number): Promise<ClipDto>;
   thumbnail(id: number, atMs: number): Promise<ThumbnailRef>;
   deleteClip(id: number): Promise<DeleteOutcome>;
@@ -148,6 +158,11 @@ export const tauriIpc: ClipSource = {
   listClips: () => invoke<ClipDto[]>('list_clips'),
   storageStats: () => invoke<StorageStats>('storage_stats'),
   setFavourite: (id, favourite) => invoke<ClipDto>('set_favourite', { id, favourite }),
+  setClipTitle: (id, title) => invoke<ClipDto>('set_clip_title', { id, title }),
+  setClipTags: (id, tags) => invoke<ClipDto>('set_clip_tags', { id, tags }),
+  copyClipToClipboard: (id) => invoke<void>('copy_clip_to_clipboard', { id }),
+  revealClip: (id) => invoke<void>('reveal_clip', { id }),
+  dragClipOut: (id) => invoke<void>('drag_clip_out', { id }),
   trimClip: (id, startMs, endMs) =>
     invoke<ClipDto>('trim_clip', { id, start_ms: startMs, end_ms: endMs }),
   thumbnail: (id, atMs) => invoke<ThumbnailRef>('thumbnail', { id, at_ms: atMs }),

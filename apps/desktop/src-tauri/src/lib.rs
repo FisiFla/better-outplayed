@@ -15,6 +15,7 @@
 //! `docs/verification-status.md` §8 lists them item by item rather than implying otherwise.
 
 pub mod background;
+pub mod clip_files;
 pub mod commands;
 pub mod config;
 mod log_file;
@@ -244,6 +245,89 @@ fn set_favourite(
     favourite: bool,
 ) -> Result<ClipDto, CommandError> {
     state.with_deps(|deps| commands::set_favourite(deps, id, favourite))
+}
+
+/// Rename a clip (its display title; the file keeps its name). Blank clears the title.
+#[tauri::command(rename_all = "snake_case")]
+fn set_clip_title(
+    state: State<'_, AppState>,
+    id: i64,
+    title: String,
+) -> Result<ClipDto, CommandError> {
+    state.with_deps(|deps| commands::set_clip_title(deps, id, &title))
+}
+
+/// Replace a clip's tags.
+#[tauri::command(rename_all = "snake_case")]
+fn set_clip_tags(
+    state: State<'_, AppState>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<ClipDto, CommandError> {
+    state.with_deps(|deps| commands::set_clip_tags(deps, id, &tags))
+}
+
+/// Put the clip's file on the system clipboard, as a file.
+#[tauri::command(rename_all = "snake_case")]
+fn copy_clip_to_clipboard(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
+    let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
+    clip_files::copy_file_to_clipboard(&path)
+        .map_err(|msg| CommandError::new(commands::ErrorCode::Io, msg))
+}
+
+/// Show the clip's file in the system file manager, selected where the platform allows.
+#[tauri::command(rename_all = "snake_case")]
+fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
+    let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
+    let (program, args) = background::reveal_command(&path, background::FileManager::current());
+    localplay_media::sidecar_command(&program)
+        .args(&args)
+        .spawn()
+        .map(drop)
+        .map_err(|err| CommandError::new(commands::ErrorCode::Io, format!("could not run {program}: {err}")))
+}
+
+/// Begin a native drag of the clip's file out of the window (to Explorer, Discord, a browser
+/// upload). Called when the pointer has started dragging a library row; the OS drag loop
+/// then runs on the main thread until the drop or a cancel.
+#[tauri::command(rename_all = "snake_case")]
+fn drag_clip_out(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<(), CommandError> {
+    let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
+    start_native_drag(&window, path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_native_drag(window: &tauri::WebviewWindow, path: PathBuf) -> Result<(), CommandError> {
+    let to_error = |msg: String| CommandError::new(commands::ErrorCode::Io, msg);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let result = drag::start_drag(
+                &target,
+                drag::DragItem::Files(vec![path]),
+                drag::Image::Raw(include_bytes!("../icons/64x64.png").to_vec()),
+                |_result, _cursor| {},
+                drag::Options::default(),
+            );
+            let _ = tx.send(result.map_err(|err| format!("could not start the drag: {err}")));
+        })
+        .map_err(|err| to_error(format!("could not reach the UI thread: {err}")))?;
+    rx.recv()
+        .map_err(|_| to_error("the drag never started".to_string()))?
+        .map_err(to_error)
+}
+
+#[cfg(target_os = "linux")]
+fn start_native_drag(_window: &tauri::WebviewWindow, _path: PathBuf) -> Result<(), CommandError> {
+    Err(CommandError::new(
+        commands::ErrorCode::Io,
+        "dragging a clip out of the window is not supported on this platform".to_string(),
+    ))
 }
 
 /// Cut `[start_ms, end_ms)` into a new clip file with a lossless stream copy.
@@ -628,6 +712,11 @@ pub fn run() {
             list_clips,
             storage_stats,
             set_favourite,
+            set_clip_title,
+            set_clip_tags,
+            copy_clip_to_clipboard,
+            reveal_clip,
+            drag_clip_out,
             trim_clip,
             thumbnail,
             delete_clip,

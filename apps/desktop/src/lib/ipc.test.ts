@@ -46,7 +46,7 @@ function rustParameters(command: string): string[] {
   // named `commands`.
   return [...body.matchAll(/(\w+)\s*:(?!:)/g)]
     .map((match) => match[1] ?? '')
-    .filter((name) => name !== 'state' && name !== 'app');
+    .filter((name) => name !== 'state' && name !== 'app' && name !== 'window');
 }
 
 /** Run one IPC call and return the first argument `invoke` was handed. */
@@ -75,6 +75,11 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.listClips())).toBe('list_clips');
     expect(await wireName(() => tauriIpc.storageStats())).toBe('storage_stats');
     expect(await wireName(() => tauriIpc.setFavourite(1, true))).toBe('set_favourite');
+    expect(await wireName(() => tauriIpc.setClipTitle(1, 'x'))).toBe('set_clip_title');
+    expect(await wireName(() => tauriIpc.setClipTags(1, ['x']))).toBe('set_clip_tags');
+    expect(await wireName(() => tauriIpc.copyClipToClipboard(1))).toBe('copy_clip_to_clipboard');
+    expect(await wireName(() => tauriIpc.revealClip(1))).toBe('reveal_clip');
+    expect(await wireName(() => tauriIpc.dragClipOut(1))).toBe('drag_clip_out');
     expect(await wireName(() => tauriIpc.trimClip(1, 0, 100))).toBe('trim_clip');
     expect(await wireName(() => tauriIpc.thumbnail(1, 0))).toBe('thumbnail');
     expect(await wireName(() => tauriIpc.deleteClip(1))).toBe('delete_clip');
@@ -105,6 +110,11 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.listClips()),
       await wireName(() => tauriIpc.storageStats()),
       await wireName(() => tauriIpc.setFavourite(1, true)),
+      await wireName(() => tauriIpc.setClipTitle(1, 'x')),
+      await wireName(() => tauriIpc.setClipTags(1, ['x'])),
+      await wireName(() => tauriIpc.copyClipToClipboard(1)),
+      await wireName(() => tauriIpc.revealClip(1)),
+      await wireName(() => tauriIpc.dragClipOut(1)),
       await wireName(() => tauriIpc.trimClip(1, 0, 100)),
       await wireName(() => tauriIpc.thumbnail(1, 0)),
       await wireName(() => tauriIpc.deleteClip(1)),
@@ -152,6 +162,11 @@ describe('the argument keys', () => {
     // parameters either.
     const sent = {
       set_favourite: await wireArgs(() => tauriIpc.setFavourite(3, true)),
+      set_clip_title: await wireArgs(() => tauriIpc.setClipTitle(3, 'x')),
+      set_clip_tags: await wireArgs(() => tauriIpc.setClipTags(3, ['x'])),
+      copy_clip_to_clipboard: await wireArgs(() => tauriIpc.copyClipToClipboard(3)),
+      reveal_clip: await wireArgs(() => tauriIpc.revealClip(3)),
+      drag_clip_out: await wireArgs(() => tauriIpc.dragClipOut(3)),
       trim_clip: await wireArgs(() => tauriIpc.trimClip(3, 1_000, 2_000)),
       thumbnail: await wireArgs(() => tauriIpc.thumbnail(3, 1_000)),
       delete_clip: await wireArgs(() => tauriIpc.deleteClip(3)),

@@ -8,6 +8,7 @@
    * (see `list_clips`' own note on why `clips.started_at` cannot be used for it). Sorting
    * again here would be a second opinion that could silently disagree.
    */
+  import { shouldStartDrag } from '../clips';
   import type { ClipView } from '../clips';
 
   interface Props {
@@ -18,15 +19,46 @@
     onSelect: (id: number) => void;
     onFavourite: (id: number, favourite: boolean) => void;
     onDelete: (id: number) => void;
+    onCopy: (id: number) => void;
+    onReveal: (id: number) => void;
+    /** The pointer dragged a row: hand the clip's file to a native drag. */
+    onDragOut: (id: number) => void;
+    /** A filter is hiding clips, so an empty list is not "no clips". */
+    filtering?: boolean;
   }
 
-  let { clips, thumbnails, selectedId, onSelect, onFavourite, onDelete }: Props = $props();
+  let {
+    clips,
+    thumbnails,
+    selectedId,
+    onSelect,
+    onFavourite,
+    onDelete,
+    onCopy,
+    onReveal,
+    onDragOut,
+    filtering = false,
+  }: Props = $props();
+
+  /** Where the primary button went down on a row, until it is released or becomes a drag. */
+  let press: { id: number; x: number; y: number } | null = null;
+
+  function pointerMove(event: PointerEvent) {
+    if (press === null) return;
+    if (shouldStartDrag(press, { x: event.clientX, y: event.clientY }, event.buttons)) {
+      const id = press.id;
+      press = null;
+      onDragOut(id);
+    }
+  }
 
   /** The clip whose delete button is armed, if any. */
   let confirming = $state<number | null>(null);
 </script>
 
-{#if clips.length === 0}
+{#if clips.length === 0 && filtering}
+  <p class="empty">No clips match the current search and filters.</p>
+{:else if clips.length === 0}
   <p class="empty">
     No clips are indexed yet. Start recording above, then take one with
     <strong>Save clip</strong> — or with the clip hotkey.
@@ -41,15 +73,29 @@
           type="button"
           aria-current={clip.id === selectedId}
           onclick={() => onSelect(clip.id)}
+          onpointerdown={(e) => {
+            if (e.button === 0) press = { id: clip.id, x: e.clientX, y: e.clientY };
+          }}
+          onpointermove={pointerMove}
+          onpointerup={() => (press = null)}
+          onpointerleave={pointerMove}
+          title="Drag to copy this clip's file into another app"
         >
           {#if thumbnail}
-            <img class="thumb" src={thumbnail} alt="" loading="lazy" />
+            <img class="thumb" src={thumbnail} alt="" loading="lazy" draggable="false" />
           {:else}
             <span class="thumb placeholder" aria-hidden="true"></span>
           {/if}
           <span class="meta">
-            <span class="name">{clip.name}</span>
-            <span class="sub muted">{clip.durationLabel} · {clip.sizeLabel} · {clip.codec} · {clip.createdAtLabel}</span>
+            <span class="name">{clip.displayName}</span>
+            <span class="sub muted">
+              {#if clip.game}{clip.game} · {/if}{clip.durationLabel} · {clip.sizeLabel} · {clip.createdAtLabel}
+            </span>
+            {#if clip.tags.length > 0}
+              <span class="tags">
+                {#each clip.tags as tag (tag)}<span class="tag">#{tag}</span>{/each}
+              </span>
+            {/if}
           </span>
         </button>
 
@@ -63,6 +109,23 @@
             onclick={() => onFavourite(clip.id, !clip.favourite)}
           >
             {clip.favourite ? '★' : '☆'}
+          </button>
+
+          <button
+            type="button"
+            title="Copy the clip file to the clipboard"
+            aria-label="Copy clip file"
+            onclick={() => onCopy(clip.id)}
+          >
+            Copy
+          </button>
+          <button
+            type="button"
+            title="Show the clip file in the file manager"
+            aria-label="Show in folder"
+            onclick={() => onReveal(clip.id)}
+          >
+            Folder
           </button>
 
           {#if confirming === clip.id}
@@ -160,6 +223,22 @@
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tags {
+    display: flex;
+    gap: 4px;
+    overflow: hidden;
+    margin-top: 2px;
+  }
+
+  .tag {
+    font-size: 10px;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0 6px;
     white-space: nowrap;
   }
 

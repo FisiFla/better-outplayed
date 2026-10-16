@@ -7,6 +7,7 @@
    * scrubbing works. There is no streaming code in this application and there must not be.
    */
   import Timeline from './Timeline.svelte';
+  import { parseTagInput } from '../clips';
   import type { ClipView } from '../clips';
   import { formatDateTime } from '../time';
   import { fullRange, rangeLabel, rangeLengthLabel, validateRange } from '../trim';
@@ -18,9 +19,30 @@
     busy: boolean;
     onTrim: (range: TrimRange) => void;
     onFavourite: (favourite: boolean) => void;
+    onRename: (title: string) => void;
+    onTags: (tags: string[]) => void;
+    onCopy: () => void;
+    onReveal: () => void;
   }
 
-  let { clip, busy, onTrim, onFavourite }: Props = $props();
+  let { clip, busy, onTrim, onFavourite, onRename, onTags, onCopy, onReveal }: Props = $props();
+
+  // svelte-ignore state_referenced_locally — keyed on the clip id by App (see `range`).
+  let titleDraft = $state(clip.title ?? '');
+  let tagDraft = $state('');
+
+  const titleChanged = $derived(titleDraft.trim() !== (clip.title ?? ''));
+
+  function saveTitle() {
+    if (titleChanged) onRename(titleDraft);
+  }
+
+  function addTags() {
+    const added = parseTagInput(tagDraft);
+    if (added.length === 0) return;
+    tagDraft = '';
+    onTags([...new Set([...clip.tags, ...added])]);
+  }
 
   let video = $state<HTMLVideoElement | null>(null);
   let playheadMs = $state(0);
@@ -67,7 +89,7 @@
 
 <header class="head">
   <div class="titles">
-    <h1>{clip.name}</h1>
+    <h1>{clip.displayName}</h1>
     <p class="mono muted">{clip.path}</p>
   </div>
   <button
@@ -83,11 +105,70 @@
 </header>
 
 <div class="facts">
+  {#if clip.game}<span class="chip">{clip.game}</span>{/if}
   <span class="chip">{clip.durationLabel}</span>
   <span class="chip">{clip.sizeLabel}</span>
   <span class="chip">{clip.codec}</span>
   <span class="chip">{formatDateTime(clip.createdAtMs)}</span>
 </div>
+
+<section class="meta">
+  <form
+    class="row"
+    onsubmit={(e) => {
+      e.preventDefault();
+      saveTitle();
+    }}
+  >
+    <input
+      type="text"
+      aria-label="Clip title"
+      placeholder={clip.name}
+      maxlength="120"
+      bind:value={titleDraft}
+      disabled={busy}
+    />
+    <button type="submit" disabled={busy || !titleChanged}>Rename</button>
+  </form>
+  <p class="muted note">The title is a label in this library; the file keeps its name.</p>
+
+  <div class="row tagrow">
+    {#each clip.tags as tag (tag)}
+      <span class="tag">
+        #{tag}
+        <button
+          type="button"
+          class="x"
+          aria-label={`Remove tag ${tag}`}
+          disabled={busy}
+          onclick={() => onTags(clip.tags.filter((t) => t !== tag))}>×</button
+        >
+      </span>
+    {/each}
+    <form
+      class="row"
+      onsubmit={(e) => {
+        e.preventDefault();
+        addTags();
+      }}
+    >
+      <input
+        type="text"
+        aria-label="Add tags"
+        placeholder="Add tags, comma separated"
+        maxlength="200"
+        bind:value={tagDraft}
+        disabled={busy}
+      />
+      <button type="submit" disabled={busy || parseTagInput(tagDraft).length === 0}>Add</button>
+    </form>
+  </div>
+
+  <div class="row">
+    <button type="button" onclick={onCopy}>Copy file</button>
+    <button type="button" onclick={onReveal}>Show in folder</button>
+  </div>
+</section>
 
 <!--
   svelte-ignore a11y_media_has_caption — there is no caption source to point a <track> at.
@@ -177,6 +258,47 @@
   .star[aria-pressed='true'] {
     color: var(--star);
     border-color: var(--star);
+  }
+
+  .meta {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 16px 12px;
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .row input {
+    flex: 1 1 200px;
+    min-width: 0;
+  }
+
+  .note {
+    margin: 0;
+    font-size: 11px;
+  }
+
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1px 4px 1px 8px;
+  }
+
+  .x {
+    border: 0;
+    background: transparent;
+    padding: 0 4px;
+    line-height: 1;
   }
 
   .facts {
