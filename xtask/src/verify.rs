@@ -1595,13 +1595,13 @@ impl Session {
         // Duration against the configured window.
         let window = RUN_CONFIG.window_ms();
         let delta = (info.duration_ms as i64 - window as i64).abs();
-        let tolerance = 500 + RUN_CONFIG.segment_time as i64 * 1000;
+        let tolerance = 500 + 2 * RUN_CONFIG.segment_time as i64 * 1000;
         if delta <= tolerance {
             self.pass(
                 "clip_duration",
                 "the clip is the configured pre+post window",
                 "criterion 4",
-                format!("{window}ms ± {tolerance}ms (500ms + one {}s segment: the lossless cut lands on segment boundaries)", RUN_CONFIG.segment_time),
+                format!("{window}ms ± {tolerance}ms (500ms + one {}s segment at each end: the lossless cut snaps outward to segment boundaries)", RUN_CONFIG.segment_time),
                 format!("{}ms (off by {delta}ms)", info.duration_ms),
             );
         } else {
