@@ -165,7 +165,6 @@ jobs:
   windows:
     name: Windows tests (no GPU)
     runs-on: windows-latest
-    continue-on-error: true   # promote to required once it has been green for a week
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
