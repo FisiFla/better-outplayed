@@ -943,15 +943,31 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
 /// junctions are resolved) but the file itself is not, so a symlink *at* the path is
 /// unlinked as a link and never followed.
 fn is_inside_library(path: &Path, paths: &AppPaths) -> bool {
-    let Some(parent) = path.parent().and_then(|p| std::fs::canonicalize(p).ok()) else {
-        return false;
-    };
-    let app_data = paths.db_path.parent();
-    [Some(paths.clips_dir.as_path()), app_data]
-        .into_iter()
-        .flatten()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .any(|root| parent.starts_with(root))
+    crate::paths::ensure_within(path, &library_roots(paths)).is_ok()
+}
+
+/// The directories the shell owns: the clips directory and the application data directory.
+fn library_roots(paths: &AppPaths) -> Vec<&Path> {
+    [Some(paths.clips_dir.as_path()), paths.db_path.parent()].into_iter().flatten().collect()
+}
+
+/// Whether a session's recorded file (`file`) or scratch directory read from the index may
+/// be removed or cut from. Inside the library, or shaped like what the recorder names its
+/// session artifacts (a configured `sessions_dir` can live anywhere) — and never something
+/// that contains the clips, thumbnails or application data directories.
+fn session_artifact_ok(
+    path: &Path,
+    file: bool,
+    paths: &AppPaths,
+) -> Result<(), crate::paths::PathRefusal> {
+    let protected = [
+        Some(paths.clips_dir.as_path()),
+        Some(paths.thumbnails_dir.as_path()),
+        paths.db_path.parent(),
+    ];
+    let protected: Vec<&Path> = protected.into_iter().flatten().collect();
+    crate::paths::ensure_session_artifact(path, file, &library_roots(paths), &protected)
+        .map(|_| ())
 }
 
 fn find_clip(store: &Store, id: i64) -> Result<Clip, CommandError> {
@@ -1369,6 +1385,16 @@ pub fn delete_session(
     // A buffer-mode session has no file, which is not a failure.
     if let Some(final_path) = paths.final_path {
         let final_path = PathBuf::from(final_path);
+        // The row is user-writable: a recorded path that is not a session artifact costs the
+        // user the row and nothing else (see `session_artifact_ok`).
+        if let Err(why) = session_artifact_ok(&final_path, true, deps.paths) {
+            tracing::warn!(
+                "session #{session_id}: refusing to unlink {} ({why}); the index row is \
+                 gone, the file is untouched",
+                final_path.display()
+            );
+            outcome.orphaned.push(final_path.to_string_lossy().into_owned());
+        } else {
         let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
         match std::fs::remove_file(&final_path) {
             Ok(()) => {
@@ -1385,11 +1411,21 @@ pub fn delete_session(
                 outcome.orphaned.push(final_path.to_string_lossy().into_owned());
             }
         }
+        }
     }
 
     // The store hands these back as strings (they come out of the database), so they are
     // turned into paths once, here, rather than at each use.
     let scratch_dir = PathBuf::from(&paths.scratch_dir);
+    if let Err(why) = session_artifact_ok(&scratch_dir, false, deps.paths) {
+        tracing::warn!(
+            "session #{session_id}: refusing to remove {} ({why}); the index row is gone, the \
+             directory is untouched",
+            scratch_dir.display()
+        );
+        outcome.orphaned.push(scratch_dir.to_string_lossy().into_owned());
+        return Ok(outcome);
+    }
     let scratch = dir_size(&scratch_dir);
     match std::fs::remove_dir_all(&scratch_dir) {
         Ok(()) => {
@@ -1452,6 +1488,16 @@ pub fn extract_clip(
         ));
     };
     let src = PathBuf::from(final_path);
+    session_artifact_ok(&src, true, deps.paths).map_err(|why| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "session #{session_id} names {} as its recorded file, but {why}, so nothing \
+                 will be cut from it",
+                src.display()
+            ),
+        )
+    })?;
     if !src.is_file() {
         return Err(CommandError::new(
             ErrorCode::Io,
@@ -4141,6 +4187,80 @@ mod tests {
         let again = delete_session(&f.deps(), id).unwrap();
         assert!(!again.row_deleted);
         assert_eq!(again.bytes_reclaimed, 0);
+    }
+
+    /// A finished session row whose paths are whatever the test says: the index is a
+    /// user-writable file, so nothing about them can be trusted.
+    fn add_session_row(f: &Fixture, scratch: &Path, final_path: Option<&Path>) -> i64 {
+        let id = f
+            .store
+            .start_session(None, localplay_store::SESSION_MODE_SESSION, WALL_START_MS, &scratch.to_string_lossy(), 0)
+            .unwrap();
+        f.store
+            .end_session(id, WALL_START_MS + 1_000, final_path.map(|p| p.to_string_lossy()).as_deref(), 0, 1_000)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn deleting_a_session_whose_row_points_outside_the_library_costs_the_row_only() {
+        let f = Fixture::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // A directory with precious contents that is not shaped like a session, and a file
+        // likewise: a tampered index must not be able to make the shell remove either.
+        let precious_dir = elsewhere.path().join("Documents");
+        std::fs::create_dir_all(&precious_dir).unwrap();
+        std::fs::write(precious_dir.join("thesis.txt"), b"x").unwrap();
+        let precious_file = elsewhere.path().join("photo.mp4");
+        std::fs::write(&precious_file, b"x").unwrap();
+        let id = add_session_row(&f, &precious_dir, Some(&precious_file));
+
+        let outcome = delete_session(&f.deps(), id).unwrap();
+        assert!(outcome.row_deleted);
+        assert!(!outcome.scratch_removed && !outcome.final_file_removed);
+        assert_eq!(outcome.orphaned.len(), 2, "both are reported, not removed: {:?}", outcome.orphaned);
+        assert!(precious_dir.join("thesis.txt").is_file());
+        assert!(precious_file.is_file());
+    }
+
+    #[test]
+    fn a_session_row_naming_the_library_itself_removes_nothing() {
+        let f = Fixture::new();
+        let app_data = f.paths.db_path.parent().unwrap().to_path_buf();
+        let id = add_session_row(&f, &app_data, Some(&f.paths.db_path));
+
+        let outcome = delete_session(&f.deps(), id).unwrap();
+        assert!(!outcome.scratch_removed);
+        assert!(f.paths.clips_dir.is_dir() && app_data.is_dir(), "the library survives");
+    }
+
+    #[test]
+    fn a_session_shaped_directory_in_a_custom_sessions_dir_is_still_removed() {
+        let f = Fixture::new();
+        let custom = tempfile::tempdir().unwrap();
+        let scratch = custom.path().join("session-1700000000");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("seg-000001.mp4"), b"x").unwrap();
+        let id = add_session_row(&f, &scratch, None);
+
+        let outcome = delete_session(&f.deps(), id).unwrap();
+        assert!(outcome.scratch_removed, "a configured sessions_dir keeps working");
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn cutting_from_a_session_row_outside_the_library_is_refused_before_ffmpeg_runs() {
+        let f = Fixture::new();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stranger = elsewhere.path().join("movie.mp4");
+        std::fs::write(&stranger, b"x").unwrap();
+        let scratch = f.paths.clips_dir.parent().unwrap().join("sessions");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let id = add_session_row(&f, &scratch, Some(&stranger));
+
+        let err = extract_clip(&f.deps(), id, 0, 500).expect_err("not a session artifact");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(!elsewhere.path().join("movie.trim-0-500.mp4").exists());
     }
 }
 
