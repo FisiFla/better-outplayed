@@ -207,7 +207,7 @@ jobs:
         with:
           command: check
           manifest-path: apps/desktop/src-tauri/Cargo.toml
-          arguments: --config ../../../deny.toml
+          arguments: --config deny.toml
       - name: Anti-cheat API guard
         run: scripts/check-forbidden-apis.sh
       - name: npm audit (production dependencies)
