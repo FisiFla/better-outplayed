@@ -401,6 +401,10 @@ pub struct RecorderStatus {
     pub clips: u64,
     /// Set when the loop stopped because of a failure, so a front-end can say why.
     pub error: Option<String>,
+    /// The encoder the most recent recording actually ran (`h264_nvenc`, `libx264`, ...);
+    /// `None` until one has started. It outlives the recording, so a health readout can say
+    /// what the last run used even after it stopped.
+    pub encoder: Option<String>,
 }
 
 impl RecorderStatus {
@@ -428,6 +432,7 @@ impl RecorderStatus {
             drift_ms: 0,
             clips: 0,
             error: None,
+            encoder: None,
         }
     }
 }
@@ -563,6 +568,8 @@ struct SharedStatus {
     /// The failure the loop stopped for, if any. A mutex rather than an atomic because it
     /// is a string and is written at most once per run — never on the hot path.
     error: Mutex<Option<String>>,
+    /// The encoder the latest recording ran; kept after the recording ends.
+    encoder: Mutex<Option<String>>,
 }
 
 impl SharedStatus {
@@ -586,6 +593,7 @@ impl SharedStatus {
             watching: AtomicBool::new(false),
             game: Mutex::new(None),
             error: Mutex::new(None),
+            encoder: Mutex::new(None),
         }
     }
 
@@ -872,6 +880,7 @@ impl Recorder {
             drift_ms: status.drift_ms.load(Ordering::Relaxed),
             clips: status.clips.load(Ordering::Relaxed),
             error,
+            encoder: status.encoder.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         }
     }
 
@@ -1250,6 +1259,7 @@ impl Prepared {
             }
         }
         tracing::info!("encoding with {encoder_name}");
+        *status.encoder.lock().unwrap_or_else(|p| p.into_inner()) = Some(encoder_name.clone());
         // The pacer's rate is read back out of the encoder object — i.e. out of the
         // configuration ffmpeg was actually spawned with — instead of being taken from
         // `encode_cfg.fps` a second time. That is the structural half of the fix: the pacer

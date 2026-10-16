@@ -28,6 +28,10 @@ import type {
   DeleteOutcome,
   DeleteSessionOutcome,
   ErrorCode,
+  GsiGame,
+  GsiInstallOutcome,
+  GsiTarget,
+  Health,
   MatchDto,
   RecordedClip,
   RecordingStatus,
@@ -117,6 +121,15 @@ export interface ClipSource {
    * cross-checks these methods against the handler list in `lib.rs`: a command reached one way on
    * one side and another way on the other is exactly what that guard exists to catch.
    */
+  /** Recorder, encoder, disk, event sources and the log's recent problems. */
+  health(): Promise<Health>;
+  /** Which of CS2 / Dota 2 Steam has installed, and whether the cfg is already there. */
+  gsiTargets(): Promise<GsiTarget[]>;
+  /**
+   * Write the Game State Integration cfg into that game's detected folder. Only the game is
+   * sent: the backend finds and validates the directory itself.
+   */
+  installGsiCfg(game: GsiGame): Promise<GsiInstallOutcome>;
   logFromFrontend(level: 'error' | 'warn' | 'info', message: string, detail: string): Promise<void>;
   /** An `asset:` URL for an absolute path, for `<video>` and `<img>`. */
   assetUrl(path: string): string;
@@ -189,6 +202,9 @@ export const tauriIpc: ClipSource = {
   getSettings: () => invoke<SettingsDto>('get_settings'),
   updateSettings: (update: SettingsUpdate) =>
     invoke<UpdateSettingsOutcome>('update_settings', { update }),
+  health: () => invoke<Health>('health'),
+  gsiTargets: () => invoke<GsiTarget[]>('gsi_targets'),
+  installGsiCfg: (game) => invoke<GsiInstallOutcome>('install_gsi_cfg', { game }),
   logFromFrontend: (level, message, detail) =>
     invoke<void>('log_from_frontend', { level, message, detail }),
   assetUrl: (path) => convertFileSrc(path),

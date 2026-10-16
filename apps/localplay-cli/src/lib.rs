@@ -357,7 +357,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
                  exactly one clip)"
             );
             let (_sink, events) = mpsc::channel();
-            EventSources { events, _lol: None, _gsi: None }
+            EventSources { events, _lol: None, _gsi: None, reports: Vec::new() }
         }
         None => start_event_sources(&data_dir, &events),
     };

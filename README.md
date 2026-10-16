@@ -49,6 +49,44 @@ acceptance criteria.
 
 ---
 
+## Privacy
+
+What this app records, and where it goes. Nothing in it phones home.
+
+**What is recorded**
+
+- **Your screen** (the captured display, via Windows Graphics Capture) and **the system audio**
+  that plays through your default output (WASAPI loopback). These are kept in a rolling buffer
+  (in RAM for the replay buffer; in a scratch folder on disk for a full session) and only the
+  window around a clip you take, or a whole session you chose to record, is saved as a file.
+- **Your microphone, only if you turn it on.** It is off by default (`[mic] enabled`) and goes on
+  its own audio track.
+- **Game events**, only while a recording runs and the matching source is enabled: kills,
+  objectives and round boundaries from League of Legends (Riot's local Live Client API) and
+  CS2 / Dota 2 (Valve's Game State Integration). They are stored as markers beside the clip or
+  session they belong to.
+- **A clip index** (a local SQLite database: clip and session paths, sizes, durations, favourite
+  flags, the marker rows) and **a log file** of the app's own warnings and errors. The log
+  holds file paths and error text, never the GSI token and never footage.
+
+**Where it lives.** All of it is under one per-user folder (`%LOCALAPPDATA%\localplay`: the
+config, the database, the logs, the thumbnails and, unless you chose another folder in
+Settings, the clips). Deleting a clip or session in the app deletes its files; uninstalling does
+not delete your clips.
+
+**Local only.** There is no account, no sign-in, no telemetry, no crash reporting, no analytics
+and no upload. The only network traffic the app creates is to your own machine: it polls
+`127.0.0.1:2999` for League events and, if enabled, listens on `127.0.0.1` for CS2 / Dota 2.
+The listener binds loopback only and rejects any request without its generated token; a test
+in `crates/events` asserts that nothing else in that crate opens a socket to a non-loopback
+address. There is no auto-updater yet; a new version is something you download yourself.
+
+**Your input.** The app never sends keystrokes or mouse input and never writes to a game
+client's API. The Settings button that installs the Game State Integration file writes exactly
+one file into the game's own `cfg` folder, only when you press it.
+
+---
+
 ## Architecture
 
 ```
@@ -202,7 +240,10 @@ the config file:
 - **CS2 / Dota 2** — a `127.0.0.1`-bound HTTP listener for Valve's Game State Integration.
   It requires a generated token (which the game echoes back inside the payload's `auth`
   object), rejects anything that does not carry it, and generates the
-  `gamestate_integration_localplay.cfg` you copy into the game's `cfg` directory.
+  `gamestate_integration_localplay.cfg`. In the desktop app, **Settings > Game integrations**
+  has an Install button that finds the game in your Steam libraries and writes that file into
+  its `cfg` folder (after checking the destination stays inside the game's install folder);
+  otherwise copy the generated file there yourself.
 
 An event takes a clip through **the hotkey's own trigger** — same pre-roll, same post-roll,
 same lossless splice in media time — and writes why it was taken into the `events` table,
@@ -270,8 +311,8 @@ exits non-zero only when a check actually failed. Over SSH — where there is no
 capture — use `scripts\verify-in-interactive-session.ps1`, which runs it in the logged-on
 user's session through a one-shot scheduled task and cleans the task up afterwards.
 
-The harness **has never run on Windows** — it was built and exercised on macOS against the
-synthetic backends — so its own report is part of what a fresh run checks. It cannot verify
+The harness first ran on Windows on 2026-10-15 (it was built on macOS against the synthetic
+backends), and its own report is still part of what a fresh run checks. It cannot verify
 the GUI window, a real keypress, anything needing a real game, or the live capture-clock
 divergence; §8 of [`docs/verification-status.md`](docs/verification-status.md) lists what
 stays manual.
@@ -315,8 +356,9 @@ stays manual.
 > track surviving the concat and `h264_nvenc` chosen by `vendor = "auto"`, all for the first
 > time. Three test defects were found and fixed by doing it, and one assertion still fails
 > there for a reason nobody has explained yet. What has *still* never run anywhere: the
-> desktop **GUI**, `cargo xtask verify`, either game integration against a real game, and any
-> synthesised keypress. The per-item truth is in
+> either game integration against a real game, and any synthesised keypress. (The desktop GUI
+> did run on the box on 2026-09-26, and `cargo xtask verify` on 2026-10-15; the tray, the
+> keypress and hide-on-close are still unobserved.) The per-item truth is in
 > [`docs/verification-status.md`](docs/verification-status.md) — §10 is that session, and its
 > headline paragraph is the short version.
 

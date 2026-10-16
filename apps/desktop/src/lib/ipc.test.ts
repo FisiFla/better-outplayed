@@ -100,6 +100,9 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.appStatus())).toBe('app_status');
     expect(await wireName(() => tauriIpc.getSettings())).toBe('get_settings');
     expect(await wireName(() => tauriIpc.updateSettings({ fps: 30 }))).toBe('update_settings');
+    expect(await wireName(() => tauriIpc.health())).toBe('health');
+    expect(await wireName(() => tauriIpc.gsiTargets())).toBe('gsi_targets');
+    expect(await wireName(() => tauriIpc.installGsiCfg('dota2'))).toBe('install_gsi_cfg');
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
@@ -133,6 +136,9 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.appStatus()),
       await wireName(() => tauriIpc.getSettings()),
       await wireName(() => tauriIpc.updateSettings({ fps: 30 })),
+      await wireName(() => tauriIpc.health()),
+      await wireName(() => tauriIpc.gsiTargets()),
+      await wireName(() => tauriIpc.installGsiCfg('cs2')),
       await wireName(() => tauriIpc.logFromFrontend('info', 'a message', 'a detail')),
     ];
 
@@ -141,6 +147,10 @@ describe('the command names', () => {
 });
 
 describe('the argument keys', () => {
+  it('sends only the game to install_gsi_cfg, never a path', async () => {
+    expect(await wireArgs(() => tauriIpc.installGsiCfg('cs2'))).toEqual({ game: 'cs2' });
+  });
+
   it('sends snake_case, because the commands declare rename_all = "snake_case"', async () => {
     // Tauri's default is camelCase for command arguments; these commands opt out of it, so
     // `start_ms` — not `startMs` — is what the Rust side expects. This is exactly the kind

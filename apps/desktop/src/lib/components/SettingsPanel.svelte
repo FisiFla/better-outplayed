@@ -9,7 +9,7 @@
    * are), while fps, output size, mic and auto-record are baked in per recorder start.
    * The panel says which is which instead of pretending everything is live.
    */
-  import type { RecordingStatus, SettingsDto, SettingsUpdate } from '../types';
+  import type { GsiGame, GsiTarget, RecordingStatus, SettingsDto, SettingsUpdate } from '../types';
   import { open } from '@tauri-apps/plugin-dialog';
   import { QUALITY_OPTIONS, captureUpdate, monitorIndex } from '../settings';
 
@@ -21,9 +21,20 @@
     /** A command is in flight; the apply buttons are held while it is. */
     busy?: boolean;
     onApply: (update: SettingsUpdate) => void;
+    /** CS2 / Dota 2 as Steam has them; empty until the first detection answers. */
+    gsiTargets?: GsiTarget[];
+    /** Write that game's Game State Integration cfg into its detected folder. */
+    onInstallGsi?: (game: GsiGame) => void;
   }
 
-  let { settings, recording = null, busy = false, onApply }: Props = $props();
+  let {
+    settings,
+    recording = null,
+    busy = false,
+    onApply,
+    gsiTargets = [],
+    onInstallGsi = () => {},
+  }: Props = $props();
 
   const RESOLUTIONS = [
     { label: 'Native (capture size)', value: '' },
@@ -237,11 +248,39 @@
       {/if}
       <button type="button" onclick={applyAutomatic} disabled={busy}>Apply automatic</button>
     </div>
+
+    <div class="group">
+      <h3>Game integrations</h3>
+      <p class="muted footnote">
+        Counter-Strike 2 and Dota 2 send round and kill events to this app through a small
+        file in the game's folder. The button writes that one file; nothing else in the game
+        folder is touched. Restart the game afterwards.
+      </p>
+      {#each gsiTargets as target (target.game)}
+        <div class="gsi-row">
+          <span>{target.label}</span>
+          {#if target.install_dir === null}
+            <span class="muted">not found in Steam</span>
+          {:else}
+            <button type="button" onclick={() => onInstallGsi(target.game)} disabled={busy}>
+              {target.installed ? 'Reinstall' : 'Install'}
+            </button>
+          {/if}
+        </div>
+      {/each}
+    </div>
     </details>
   {/if}
 </section>
 
 <style>
+  .gsi-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
   .body summary {
     cursor: pointer;
     color: var(--muted);

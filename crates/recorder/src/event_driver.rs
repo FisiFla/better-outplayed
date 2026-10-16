@@ -93,6 +93,28 @@ pub struct EventSources {
     pub _lol: Option<LolHandle>,
     /// The same for the GSI listener.
     pub _gsi: Option<GsiListener>,
+    /// What starting each source concluded, for a health readout. Empty when the sources
+    /// were assembled by hand (a test, the CLI's fake).
+    pub reports: Vec<SourceReport>,
+}
+
+/// How a source came out of startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceState {
+    /// Listening / polling.
+    Running,
+    /// Switched off by its `[events]` setting.
+    Disabled,
+    /// Asked for, but it could not start; the `detail` says why.
+    Failed,
+}
+
+/// One source's startup outcome. `detail` is user-facing and never carries the GSI token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceReport {
+    pub source: &'static str,
+    pub state: SourceState,
+    pub detail: String,
 }
 
 /// Start whatever `[events]` asked for, best effort.
@@ -104,6 +126,7 @@ pub struct EventSources {
 pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSources {
     let (sink, events_rx) = mpsc::channel::<GameEvent>();
 
+    let mut reports = Vec::new();
     let lol = if events.lol_poll_enabled {
         match lol::spawn(LolConfig::live_client(), sink.clone()) {
             Ok(handle) => {
@@ -112,38 +135,71 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
                      events.lol_poll_enabled = false to stop)",
                     handle.endpoint().url()
                 );
+                reports.push(SourceReport {
+                    source: "League of Legends",
+                    state: SourceState::Running,
+                    detail: format!("polling {}", handle.endpoint().url()),
+                });
                 Some(handle)
             }
             Err(err) => {
                 tracing::warn!("events.lol_poll_enabled is set but polling could not start: {err:#}");
+                reports.push(SourceReport {
+                    source: "League of Legends",
+                    state: SourceState::Failed,
+                    detail: format!("{err:#}"),
+                });
                 None
             }
         }
     } else {
         tracing::info!("League of Legends polling is disabled (events.lol_poll_enabled = false)");
+        reports.push(SourceReport {
+            source: "League of Legends",
+            state: SourceState::Disabled,
+            detail: "events.lol_poll_enabled = false".into(),
+        });
         None
     };
 
     let gsi = if events.gsi_port == 0 {
         tracing::info!("the CS2 / Dota 2 listener is disabled (events.gsi_port = 0)");
+        reports.push(SourceReport {
+            source: "CS2 / Dota 2",
+            state: SourceState::Disabled,
+            detail: "events.gsi_port = 0".into(),
+        });
         None
     } else {
         match start_gsi(app_dir, events.gsi_port, sink.clone()) {
-            Ok(listener) => Some(listener),
+            Ok(listener) => {
+                reports.push(SourceReport {
+                    source: "CS2 / Dota 2",
+                    state: SourceState::Running,
+                    detail: format!("listening on 127.0.0.1:{}", events.gsi_port),
+                });
+                Some(listener)
+            }
             Err(err) => {
                 tracing::warn!("events.gsi_port is set but the listener could not start: {err:#}");
+                reports.push(SourceReport {
+                    source: "CS2 / Dota 2",
+                    state: SourceState::Failed,
+                    detail: format!("{err:#}"),
+                });
                 None
             }
         }
     };
 
-    EventSources { events: events_rx, _lol: lol, _gsi: gsi }
+    EventSources { events: events_rx, _lol: lol, _gsi: gsi, reports }
 }
 
 /// Bring up the GSI listener and write out the file the user has to install (spec §7.2).
 ///
-/// The application never writes into a game's installation directory: it generates the file
-/// into its own data directory and says where to copy it. The token is loaded from (or
+/// This function never writes into a game's installation directory: it generates the file
+/// into its own data directory and says where to copy it (the desktop app's settings button
+/// is the one, user-triggered, path that installs it for them). The token is loaded from (or
 /// generated into) the data directory, so the file the user installed once keeps working
 /// across runs — and it is never logged, only the path it lives at.
 fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Result<GsiListener> {
@@ -298,6 +354,7 @@ pub type ClipHook = Box<dyn Fn(&RecordedClip) + Send + 'static>;
 /// Dropping it stops the thread and then the sources, so nothing keeps polling a game or
 /// holding a port once the recording it served has ended.
 pub struct EventDriver {
+    reports: Vec<SourceReport>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -312,13 +369,21 @@ impl EventDriver {
         on_clip: ClipHook,
     ) -> Result<Self> {
         let sources = start_event_sources(app_dir, events);
+        let reports = sources.reports.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("localplay-events".into())
             .spawn(move || drive(&recorder, sources, &flag, &policy, &on_clip))
             .context("spawning the game-event thread")?;
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { reports, stop, thread: Some(thread) })
+    }
+}
+
+impl EventDriver {
+    /// How each source came out of startup, for the health page.
+    pub fn reports(&self) -> &[SourceReport] {
+        &self.reports
     }
 }
 
