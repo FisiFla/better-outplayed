@@ -813,6 +813,18 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
         thumbnails_removed: remove_cached_thumbnails(&deps.paths.thumbnails_dir, id),
     };
 
+    // The row is the only authority for the path, and the index is a user-writable SQLite
+    // file: a row pointing outside the library must cost the user a row, never a file.
+    if path.exists() && !is_inside_library(&path, deps.paths) {
+        tracing::warn!(
+            "clip #{id}: refusing to unlink {} because it is outside the clips and \
+             application data directories; the index row is gone, the file is untouched",
+            path.display()
+        );
+        outcome.orphaned_path = Some(path.to_string_lossy().into_owned());
+        return Ok(outcome);
+    }
+
     // Sized before the unlink so the reported figure is what was actually freed.
     let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     match std::fs::remove_file(&path) {
@@ -843,6 +855,22 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
 // ---------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------
+
+/// Whether `path`'s real parent directory is the clips directory or lives under the
+/// application data directory. Parents are canonicalised (so `..` segments, symlinks and
+/// junctions are resolved) but the file itself is not, so a symlink *at* the path is
+/// unlinked as a link and never followed.
+fn is_inside_library(path: &Path, paths: &AppPaths) -> bool {
+    let Some(parent) = path.parent().and_then(|p| std::fs::canonicalize(p).ok()) else {
+        return false;
+    };
+    let app_data = paths.db_path.parent();
+    [Some(paths.clips_dir.as_path()), app_data]
+        .into_iter()
+        .flatten()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| parent.starts_with(root))
+}
 
 fn find_clip(store: &Store, id: i64) -> Result<Clip, CommandError> {
     store
@@ -2686,6 +2714,68 @@ mod tests {
         assert!(outcome.already_missing);
         assert_eq!(outcome.orphaned_path, None);
         assert_eq!(outcome.bytes_reclaimed, 0);
+    }
+
+    #[test]
+    fn delete_never_unlinks_a_file_outside_the_library() {
+        // A tampered index row naming a file somewhere else entirely: the row goes, the
+        // file stays, and the path is reported as an orphan so the UI can say so.
+        let f = Fixture::new();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("precious.mp4");
+        std::fs::write(&outside, b"not a clip of ours").unwrap();
+        let id = f
+            .store
+            .insert_clip(&NewClip {
+                path: outside.clone(),
+                started_at_ms: 0,
+                duration_ms: 1_000,
+                size_bytes: 18,
+                codec: "mpeg4".to_string(),
+            })
+            .unwrap();
+
+        let outcome = delete_clip(&f.deps(), id).unwrap();
+
+        assert!(outcome.row_deleted);
+        assert!(!outcome.file_removed);
+        assert_eq!(outcome.bytes_reclaimed, 0);
+        assert_eq!(
+            outcome.orphaned_path.as_deref(),
+            Some(outside.to_string_lossy().as_ref())
+        );
+        assert!(outside.exists(), "a file outside the library is never unlinked");
+    }
+
+    #[test]
+    fn delete_never_follows_dot_dot_out_of_the_library() {
+        let f = Fixture::new();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("precious.mp4");
+        std::fs::write(&outside, b"x").unwrap();
+        // clips/../../<outside>/precious.mp4 resolves to `outside` but looks library-local.
+        // Enough `..` to reach the filesystem root from anywhere, then back down.
+        let mut sneaky = f.paths.clips_dir.clone();
+        for _ in 0..32 {
+            sneaky.push("..");
+        }
+        sneaky.push(outside.strip_prefix("/").unwrap_or(&outside));
+        assert_eq!(std::fs::canonicalize(&sneaky).unwrap(), std::fs::canonicalize(&outside).unwrap());
+        let id = f
+            .store
+            .insert_clip(&NewClip {
+                path: sneaky,
+                started_at_ms: 0,
+                duration_ms: 1_000,
+                size_bytes: 1,
+                codec: "mpeg4".to_string(),
+            })
+            .unwrap();
+
+        let outcome = delete_clip(&f.deps(), id).unwrap();
+
+        assert!(!outcome.file_removed);
+        assert!(outside.exists());
     }
 
     #[test]
