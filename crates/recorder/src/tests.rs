@@ -46,6 +46,8 @@ fn application_data_dir(what: &str) -> (Option<tempfile::TempDir>, PathBuf) {
             // inside the build directory (and removes it, unless it is killed).
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-tests");
             std::fs::create_dir_all(&base).expect("creating the test scratch root under target/");
+            // Canonical: the store refuses to delete through a `..` path.
+            let base = base.canonicalize().expect("canonicalising the test scratch root");
             let dir = tempfile::Builder::new()
                 .prefix(&format!("{what}-"))
                 .tempdir_in(&base)
