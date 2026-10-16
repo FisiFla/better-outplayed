@@ -23,7 +23,7 @@ sha2 = "0.11"
 # allowlisted entries) then live in *this repository's own tested code* instead of in an
 # external tool's behaviour. Default features off — localplay only ever reads stored or
 # deflated entries, so the other decoders would be dead weight.
-zip = { version = "5", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # The inflate backend behind `deflate-flate2` above: flate2's pure-Rust `miniz_oxide`
 # backend, so building the sidecar tooling needs no C toolchain.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
