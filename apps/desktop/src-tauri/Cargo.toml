@@ -29,6 +29,8 @@ tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"]
 # capabilities/default.json — open dialogs only, which return a path and grant no
 # filesystem access beyond it).
 tauri-plugin-dialog = "2"
+# One running instance owns the global hotkey, the tray and the capture session.
+tauri-plugin-single-instance = "2"
 # The Phase 1 crates are reused as-is. Nothing here re-implements them: the shell reads
 # the index, edits clips and probes them, and it *records* through the same engine the CLI
 # drives (`localplay-recorder`), which owns capture, audio, the encoder and the ring.
