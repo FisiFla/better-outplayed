@@ -49,16 +49,73 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 /// How long one request may take to arrive and be read. A game POSTs a small body to
 /// loopback; two seconds is generous, and it is what bounds a connection that stalls.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The most connections the listener will serve in one [`RATE_WINDOW`]. A game POSTs a handful
+/// of times a second (CS2 throttles to 0.1 s at its busiest); anything past this is not the
+/// game, and is answered `429` without its request being read, so a local process hammering
+/// the port cannot keep the single-threaded accept loop busy or flood the log.
+pub const MAX_REQUESTS_PER_WINDOW: u32 = 100;
+
+/// The length of the fixed window [`MAX_REQUESTS_PER_WINDOW`] is counted in.
+pub const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The most wall-clock time one request may take in total. [`REQUEST_TIMEOUT`] bounds each
+/// *read*, which a peer trickling one byte at a time resets forever; this bounds the sum.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How often the accept loop looks at its stop flag. The listener is idle almost all the
 /// time, so this is a sleep, not a spin.
 const ACCEPT_SLICE: Duration = Duration::from_millis(25);
+
+/// A fixed-window request counter: [`MAX_REQUESTS_PER_WINDOW`] per [`RATE_WINDOW`].
+#[derive(Debug)]
+struct RateLimiter {
+    window_start: Instant,
+    count: u32,
+}
+
+impl RateLimiter {
+    fn new(now: Instant) -> Self {
+        Self { window_start: now, count: 0 }
+    }
+
+    /// Whether a connection arriving at `now` may be served.
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.window_start) >= RATE_WINDOW {
+            self.window_start = now;
+            self.count = 0;
+        }
+        if self.count >= MAX_REQUESTS_PER_WINDOW {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+/// A reader over the connection that fails once [`REQUEST_DEADLINE`] has passed in total,
+/// re-arming the socket's read timeout with whatever time is left before every read.
+struct DeadlineReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl std::io::Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left.min(REQUEST_TIMEOUT)))?;
+        self.stream.read(buf)
+    }
+}
 
 /// Everything the listener needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,12 +235,18 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
 fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &AtomicBool) {
     let mut tracker = Tracker::default();
     let mut counters = Counters::default();
+    let mut limiter = RateLimiter::new(Instant::now());
 
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _peer)) => {
                 // `_peer` is not logged: on a loopback bind it is `127.0.0.1` by
                 // definition, and it is not what a reader of the log needs.
+                if !limiter.allow(Instant::now()) {
+                    counters.rate_limited();
+                    turn_away(&mut stream);
+                    continue;
+                }
                 if handle(&mut stream, config, &mut tracker, sink, &mut counters).is_err() {
                     tracing::debug!("the GSI listener stopped: nothing is receiving events");
                     return;
@@ -198,6 +261,24 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Ato
         }
     }
     tracing::debug!("the GSI listener stopped");
+}
+
+/// Answer `429` without reading the request, then swallow a bounded amount of what the peer
+/// already sent: closing a socket that still holds unread data resets the connection, and the
+/// reset can destroy the response before the peer reads it.
+fn turn_away(stream: &mut TcpStream) {
+    use std::io::Read;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let _ = write_response(stream, 429);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+    let mut sink = [0u8; 4096];
+    for _ in 0..4 {
+        if !matches!(stream.read(&mut sink), Ok(n) if n == sink.len()) {
+            break;
+        }
+    }
 }
 
 /// Serve one connection. Returns `Err` when the sink is gone, which is how the listener
@@ -221,7 +302,8 @@ fn handle(
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_nodelay(true);
 
-    let request = match http::read_request(stream, &config.path) {
+    let mut reader = DeadlineReader { stream: &mut *stream, deadline: Instant::now() + REQUEST_DEADLINE };
+    let request = match http::read_request(&mut reader, &config.path) {
         Ok(request) => request,
         Err(reject) => {
             counters.refused(reject);
@@ -283,6 +365,7 @@ struct Counters {
     refused: u64,
     refused_tokens: u64,
     malformed: u64,
+    rate_limited: u64,
 }
 
 impl Counters {
@@ -320,6 +403,18 @@ impl Counters {
         }
     }
 
+    fn rate_limited(&mut self) {
+        self.rate_limited += 1;
+        if self.rate_limited == 1 {
+            tracing::warn!(
+                "the GSI listener is over {MAX_REQUESTS_PER_WINDOW} connections per second and \
+                 is answering the excess with HTTP 429"
+            );
+        } else {
+            tracing::debug!("the GSI listener has rate-limited {} connections", self.rate_limited);
+        }
+    }
+
     fn malformed(&mut self, bytes: usize) {
         self.malformed += 1;
         if self.malformed == 1 {
@@ -336,6 +431,29 @@ impl Counters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rate_limiter_allows_a_window_s_worth_then_refuses_until_the_next_window() {
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter::new(t0);
+        for n in 0..MAX_REQUESTS_PER_WINDOW {
+            assert!(limiter.allow(t0), "request {n} is inside the cap");
+        }
+        assert!(!limiter.allow(t0), "the next one is over it");
+        assert!(!limiter.allow(t0 + RATE_WINDOW / 2), "and so is one later in the same window");
+        assert!(limiter.allow(t0 + RATE_WINDOW), "a new window starts afresh");
+    }
+
+    #[test]
+    fn a_reader_past_its_deadline_times_out_instead_of_waiting() {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut reader = DeadlineReader { stream: &mut server, deadline: Instant::now() };
+        let err = reader.read(&mut [0u8; 8]).expect_err("the deadline has passed");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
     use std::net::SocketAddr;
 
     fn snapshot(body: &str) -> GsiSnapshot {
