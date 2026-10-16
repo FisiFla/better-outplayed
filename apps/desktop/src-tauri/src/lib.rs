@@ -20,6 +20,7 @@ pub mod commands;
 pub mod config;
 pub mod health;
 mod log_file;
+pub mod paths;
 
 use background::{
     AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,

@@ -11,7 +11,7 @@
 
 use crate::{Clip, Store};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Milliseconds in a day; the age rule's unit conversion.
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
@@ -219,6 +219,13 @@ pub struct CleanupOutcome {
     pub cap_met: bool,
 }
 
+/// Whether a path read out of the index names one place regardless of the process's working
+/// directory: absolute, with no `..` component. The index is user-writable, so a relative
+/// path in a row would otherwise be unlinked relative to wherever the process happens to be.
+pub(crate) fn is_absolute_and_clean(path: &Path) -> bool {
+    path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
 /// Apply a plan: for each id, delete the row and commit, then unlink the path that
 /// committed delete handed back (spec §8.2).
 ///
@@ -259,6 +266,16 @@ pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutco
         // That DELETE ran in autocommit: it is committed before this line.
         outcome.deleted += 1;
         let path = PathBuf::from(path);
+        if !is_absolute_and_clean(&path) {
+            tracing::warn!(
+                "cleanup: clip #{} was deleted from the index but its recorded path {} is \
+                 relative or contains `..`; nothing was unlinked",
+                entry.id,
+                path.display()
+            );
+            outcome.orphaned.push(path);
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => outcome.bytes_reclaimed += entry.size_bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

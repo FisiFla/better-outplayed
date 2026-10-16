@@ -603,6 +603,9 @@ fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_byt
 /// number a lie. `NotFound` is reported as such rather than as a silent zero, because a row
 /// pointing at nothing is worth knowing about even when the end state is right.
 fn unlink(path: &Path) -> Removal {
+    if !crate::cleanup::is_absolute_and_clean(path) {
+        return Removal::Refused("it is relative or contains `..`, so it names no fixed place");
+    }
     let bytes = match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.is_file() {
@@ -649,6 +652,9 @@ fn remove_scratch_dir(path: &Path) -> Removal {
         return Removal::Refused(
             "no final path component: it names a filesystem root, '.' or '..'",
         );
+    }
+    if !crate::cleanup::is_absolute_and_clean(path) {
+        return Removal::Refused("it is relative or contains `..`, so it names no fixed place");
     }
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -1113,6 +1119,18 @@ mod tests {
                 "{path:?} must be refused, never recursed into"
             );
         }
+    }
+
+    #[test]
+    fn relative_and_dotdot_paths_are_refused_for_files_and_directories_alike() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let dotdot = dir.path().join("sub").join("..").join("x");
+        for path in [Path::new("clips/a.mp4"), Path::new("a.mp4"), dotdot.as_path()] {
+            assert!(matches!(unlink(path), Removal::Refused(_)), "{path:?} (file)");
+            assert!(matches!(remove_scratch_dir(path), Removal::Refused(_)), "{path:?} (dir)");
+        }
+        // An absolute, clean path that is merely absent is still just Missing.
+        assert!(matches!(unlink(&dir.path().join("gone.mp4")), Removal::Missing));
     }
 
     #[test]

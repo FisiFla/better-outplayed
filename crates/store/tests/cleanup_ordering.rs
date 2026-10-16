@@ -230,6 +230,28 @@ fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
 }
 
 #[test]
+fn a_relative_or_dotdot_path_in_a_row_is_never_unlinked() {
+    let fx = Fixture::new();
+    // A file reachable from the working directory by a relative path, and by a `..` path
+    // from an absolute one. Rows naming them lose the row and never the file.
+    let cwd = std::env::current_dir().expect("a working directory");
+    let probe = tempfile::NamedTempFile::new_in(&cwd).expect("a file beside the cwd");
+    let relative = PathBuf::from(probe.path().file_name().expect("a name"));
+    let dotdot = fx.clips_dir.join("..").join("..").join("never-created.mp4");
+    let a = fx.index_only(relative.clone(), 100);
+    let b = fx.index_only(dotdot.clone(), 100);
+
+    let plan = fx.plan(&policy(0, 3_650));
+    assert!(plan.ids().contains(&a) && plan.ids().contains(&b));
+    let outcome = execute_cleanup(&fx.store, &plan).expect("execute the plan");
+
+    assert_eq!(outcome.deleted, 2, "the rows go");
+    assert!(outcome.orphaned.contains(&relative) && outcome.orphaned.contains(&dotdot));
+    assert_eq!(outcome.bytes_reclaimed, 0);
+    assert!(probe.path().exists(), "the file the relative path would have hit is untouched");
+}
+
+#[test]
 fn a_plan_id_whose_row_is_already_gone_deletes_nothing() {
     let fx = Fixture::new();
     let (id, path) = fx.add_clip("keep.mp4", 100);
