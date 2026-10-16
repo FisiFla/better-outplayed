@@ -73,11 +73,13 @@ pub enum EventKind {
     RoundEnd,
     BombPlanted,
     BombDefused,
+    /// The player pressed the bookmark hotkey: a marker on the session timeline, no clip.
+    Bookmark,
 }
 
 impl EventKind {
     /// Every kind, for exhaustive tests and for a UI that wants to name them all.
-    pub const ALL: [EventKind; 10] = [
+    pub const ALL: [EventKind; 11] = [
         EventKind::Kill,
         EventKind::Death,
         EventKind::Assist,
@@ -88,6 +90,7 @@ impl EventKind {
         EventKind::RoundEnd,
         EventKind::BombPlanted,
         EventKind::BombDefused,
+        EventKind::Bookmark,
     ];
 
     /// The string this kind is persisted as — `events.kind` (spec §5.5) and the `"kind"`
@@ -104,6 +107,7 @@ impl EventKind {
             EventKind::RoundEnd => "round_end",
             EventKind::BombPlanted => "bomb_planted",
             EventKind::BombDefused => "bomb_defused",
+            EventKind::Bookmark => "bookmark",
         }
     }
 
@@ -138,7 +142,10 @@ impl EventKind {
             | EventKind::BombPlanted
             | EventKind::BombDefused
             | EventKind::GameEnd => true,
-            EventKind::GameStart | EventKind::RoundStart | EventKind::RoundEnd => false,
+            EventKind::GameStart
+            | EventKind::RoundStart
+            | EventKind::RoundEnd
+            | EventKind::Bookmark => false,
         }
     }
 }
@@ -156,6 +163,8 @@ pub enum Source {
     Lol,
     /// Counter-Strike 2 / Dota 2, Game State Integration (spec §7.2).
     Gsi,
+    /// The player, with a hotkey (a bookmark) — not an integration at all.
+    Manual,
 }
 
 impl Source {
@@ -163,6 +172,7 @@ impl Source {
         match self {
             Source::Lol => "lol",
             Source::Gsi => "gsi",
+            Source::Manual => "manual",
         }
     }
 }

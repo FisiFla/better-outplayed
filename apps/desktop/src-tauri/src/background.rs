@@ -74,8 +74,11 @@ impl HotkeyStatus {
 ///   another localplay. The error names the chord and the likely owner
 ///   (`crates/events/src/hotkey.rs` composes it), because this is the failure that would
 ///   otherwise be invisible.
-pub fn install_hotkey(config_value: &str) -> (HotkeyStatus, Option<Receiver<()>>) {
-    let parsed = match Hotkey::parse(config_value) {
+pub fn install_hotkey(
+    config_value: &str,
+    extras: &[(HotkeyAction, &str)],
+) -> (HotkeyStatus, Option<Receiver<HotkeyAction>>) {
+    let clip = match Hotkey::parse(config_value) {
         Ok(parsed) => parsed,
         Err(err) => {
             return (
@@ -91,7 +94,33 @@ pub fn install_hotkey(config_value: &str) -> (HotkeyStatus, Option<Receiver<()>>
         }
     };
 
-    let chord = parsed.to_string();
+    // The optional chords parse before anything is registered, so a typo in one of them
+    // installs nothing rather than a half-working set.
+    let mut actions = vec![HotkeyAction::Clip];
+    let mut chords = vec![clip];
+    for (action, text) in extras {
+        match Hotkey::parse(text) {
+            Ok(parsed) => {
+                actions.push(*action);
+                chords.push(parsed);
+            }
+            Err(err) => {
+                return (
+                    HotkeyStatus::not_installed(
+                        clip.to_string(),
+                        format!(
+                            "[hotkeys] {} = \"{text}\" could not be read ({err}), so no \
+                             hotkey is installed. It wants a chord like \"Ctrl+F9\".",
+                            action.config_key()
+                        ),
+                    ),
+                    None,
+                );
+            }
+        }
+    }
+
+    let chord = clip.to_string();
     if !hotkey::supported() {
         return (
             HotkeyStatus::not_installed(
@@ -105,9 +134,48 @@ pub fn install_hotkey(config_value: &str) -> (HotkeyStatus, Option<Receiver<()>>
         );
     }
 
-    match hotkey::listen(parsed) {
-        Ok(presses) => (HotkeyStatus::installed(chord), Some(presses)),
+    match hotkey::listen_all(chords) {
+        Ok(indices) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let forwarder = std::thread::Builder::new()
+                .name("localplay-hotkey-actions".into())
+                .spawn(move || {
+                    while let Ok(index) = indices.recv() {
+                        if let Some(action) = actions.get(index) {
+                            if tx.send(*action).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            match forwarder {
+                Ok(_) => (HotkeyStatus::installed(chord), Some(rx)),
+                Err(err) => (
+                    HotkeyStatus::not_installed(chord, format!("the hotkey thread did not start: {err}")),
+                    None,
+                ),
+            }
+        }
         Err(err) => (HotkeyStatus::not_installed(chord, err.to_string()), None),
+    }
+}
+
+/// What a global chord asks for. `Clip` is the one that has always existed; the other two
+/// are opt-in (`[hotkeys] toggle_recording` / `bookmark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyAction {
+    Clip,
+    ToggleRecording,
+    Bookmark,
+}
+
+impl HotkeyAction {
+    pub fn config_key(self) -> &'static str {
+        match self {
+            HotkeyAction::Clip => "clip",
+            HotkeyAction::ToggleRecording => "toggle_recording",
+            HotkeyAction::Bookmark => "bookmark",
+        }
     }
 }
 
@@ -894,7 +962,7 @@ mod tests {
 
     #[test]
     fn a_chord_that_does_not_parse_is_reported_with_the_text_from_the_config() {
-        let (hotkey, presses) = install_hotkey("Ctrl+Shift");
+        let (hotkey, presses) = install_hotkey("Ctrl+Shift", &[]);
 
         assert!(!hotkey.installed);
         assert!(presses.is_none(), "nothing is listening when the chord does not parse");
@@ -905,12 +973,33 @@ mod tests {
     }
 
     #[test]
+    fn a_mistyped_extra_chord_installs_nothing_and_names_its_key() {
+        let (hotkey, presses) =
+            install_hotkey("Ctrl+F8", &[(HotkeyAction::Bookmark, "Ctrl+Shift")]);
+
+        assert!(!hotkey.installed);
+        assert!(presses.is_none(), "a half-working set is worse than none");
+        let error = hotkey.error.expect("a failure carries its reason");
+        assert!(error.contains("bookmark") && error.contains("Ctrl+Shift"), "{error}");
+    }
+
+    #[test]
+    fn a_typo_in_an_optional_chord_installs_nothing_and_names_the_key() {
+        let (hotkey, presses) = install_hotkey("Ctrl+F8", &[(HotkeyAction::Bookmark, "Ctrl+")]);
+
+        assert!(!hotkey.installed);
+        assert!(presses.is_none(), "a half-working set is worse than none");
+        let error = hotkey.error.expect("a failure carries its reason");
+        assert!(error.contains("bookmark"), "the reason names the key: {error}");
+    }
+
+    #[test]
     fn the_hotkey_status_is_honest_about_what_this_build_can_do() {
         // On the development host there is no global hotkey to install, and the status says
         // so — with the chord it *would* have used, and with something to do instead. This
         // is also the only shape this test suite can produce: registering a real chord needs
         // Windows, and the suite never takes one (see `docs/verification-status.md`).
-        let (hotkey, presses) = install_hotkey("ctrl+f8");
+        let (hotkey, presses) = install_hotkey("ctrl+f8", &[]);
 
         assert_eq!(hotkey.chord, "Ctrl+F8", "the chord is normalised, as the CLI prints it");
         if hotkey::supported() {

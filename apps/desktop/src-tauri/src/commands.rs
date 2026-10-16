@@ -1738,6 +1738,23 @@ impl RecorderHost {
         Ok(dto)
     }
 
+    /// Drop a marker on the running session's timeline (the bookmark hotkey). No clip is cut:
+    /// it is a note to find this moment by, recorded where a game event would be.
+    pub fn bookmark(&self) -> Result<(), CommandError> {
+        let recorder = self.handle()?.ok_or_else(|| {
+            CommandError::new(ErrorCode::Recording, "nothing is recording, so there is no timeline to bookmark")
+        })?;
+        recorder
+            .note_event(localplay_events::GameEvent::bare(
+                localplay_events::Source::Manual,
+                localplay_events::EventKind::Bookmark,
+            ))
+            .map(|_| ())
+            .map_err(|err| {
+                CommandError::new(ErrorCode::Recording, format!("the bookmark was not saved: {err:#}"))
+            })
+    }
+
     /// Whether a recording currently holds the slot (and the engine says it is running).
     pub fn is_running(&self) -> Result<bool, CommandError> {
         Ok(self.handle()?.is_some_and(|recorder| recorder.is_running()))

@@ -494,7 +494,16 @@ pub fn run() {
     // registered here; the thread that turns a press into a clip is started in `setup`,
     // because it needs the application handle to reach the recorder.
     let (hotkey_status, presses) = match &background_cfg {
-        Ok(cfg) => background::install_hotkey(&cfg.clip_hotkey),
+        Ok(cfg) => {
+            let mut extras = Vec::new();
+            if let Some(chord) = &cfg.toggle_recording_hotkey {
+                extras.push((background::HotkeyAction::ToggleRecording, chord.as_str()));
+            }
+            if let Some(chord) = &cfg.bookmark_hotkey {
+                extras.push((background::HotkeyAction::Bookmark, chord.as_str()));
+            }
+            background::install_hotkey(&cfg.clip_hotkey, &extras)
+        }
         Err(err) => (
             HotkeyStatus::not_installed(
                 "(none)",
@@ -650,7 +659,7 @@ fn log_from_frontend(level: String, message: String, detail: Option<String>) {
 fn wire_background(
     app: AppHandle,
     hotkey: HotkeyStatus,
-    presses: Option<std::sync::mpsc::Receiver<()>>,
+    presses: Option<std::sync::mpsc::Receiver<background::HotkeyAction>>,
 ) -> tauri::Result<()> {
     let shell = AppShell { app };
     let icons = TrayIcons::load()?;
@@ -686,14 +695,32 @@ fn wire_background(
             .spawn(move || {
                 // `recv` blocks until a press or the channel closes (which happens when the
                 // listener thread ends — at process exit).
-                while presses.recv().is_ok() {
-                    let outcome = background::on_hotkey_press(|| shell.clip_now());
-                    if outcome.saved_a_clip() {
-                        tracing::info!("{} pressed: {}", hotkey.chord, outcome.describe());
-                    } else {
-                        tracing::warn!("{} pressed: {}", hotkey.chord, outcome.describe());
+                while let Ok(action) = presses.recv() {
+                    match action {
+                        background::HotkeyAction::Clip => {
+                            let outcome = background::on_hotkey_press(|| shell.clip_now());
+                            if outcome.saved_a_clip() {
+                                tracing::info!("{} pressed: {}", hotkey.chord, outcome.describe());
+                            } else {
+                                tracing::warn!("{} pressed: {}", hotkey.chord, outcome.describe());
+                            }
+                            wiring.set_last_press(outcome.describe());
+                        }
+                        background::HotkeyAction::ToggleRecording => {
+                            let outcome =
+                                background::dispatch(background::MenuAction::ToggleRecording, &shell);
+                            tracing::info!("the recording hotkey: {}", outcome.describe());
+                            wiring.set_last_press(outcome.describe());
+                        }
+                        background::HotkeyAction::Bookmark => {
+                            let note = match shell.state().and_then(|s| s.recorder().bookmark()) {
+                                Ok(()) => "bookmarked".to_string(),
+                                Err(err) => err.message,
+                            };
+                            tracing::info!("the bookmark hotkey: {note}");
+                            wiring.set_last_press(note);
+                        }
                     }
-                    wiring.set_last_press(outcome.describe());
                     wiring.refresh(&shell, &hotkey);
                 }
             })?;
@@ -1061,7 +1088,7 @@ mod tests {
     /// exercise the "nothing is listening, and here is why" path rather than a chord that
     /// could never fire). No test registers a real chord: that needs Windows.
     fn hotkey_status() -> HotkeyStatus {
-        background::install_hotkey(crate::config::DEFAULT_CLIP_HOTKEY).0
+        background::install_hotkey(crate::config::DEFAULT_CLIP_HOTKEY, &[]).0
     }
 
     /// The directory holding this crate's manifest, i.e. `apps/desktop/src-tauri`: the

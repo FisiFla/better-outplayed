@@ -224,6 +224,9 @@ poll_ms = 2500
 
 [hotkeys]
 clip = "Ctrl+F8"
+# Desktop app only, off unless uncommented. Each must be a chord nothing else holds:
+#   toggle_recording = "Ctrl+F9"   # start / stop the recording
+#   bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
 
 [app]
 # Start localplay with Windows (the desktop app; the CLI is never autostarted).
