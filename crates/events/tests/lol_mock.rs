@@ -263,14 +263,14 @@ fn a_full_event_history_is_derived_in_order_and_each_event_is_emitted_once() {
     let history = poller.poll_once();
     assert_eq!(
         kinds(&history),
-        vec![EventKind::Kill, EventKind::Death, EventKind::Objective]
+        vec![EventKind::Kill, EventKind::Death, EventKind::Dragon]
     );
     assert!(payload_of(&history, EventKind::Kill).contains("\"killer\":\"FisiFla#EUW\""));
     assert!(payload_of(&history, EventKind::Death).contains("\"victim\":\"FisiFla#EUW\""));
-    assert!(payload_of(&history, EventKind::Objective).contains("\"monster\":\"DRAGON\""));
+    assert!(payload_of(&history, EventKind::Dragon).contains("\"monster\":\"DRAGON\""));
 
     // Two more events arrive later, one at a time.
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Objective]);
+    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Baron]);
     assert!(poller.poll_once().is_empty(), "the same document, again");
 }
 
@@ -281,8 +281,8 @@ fn an_incremental_event_is_emitted_once_and_the_same_poll_twice_is_a_no_op() {
     poller.poll_once(); // attach
 
     let incremental = poller.poll_once();
-    assert_eq!(kinds(&incremental), vec![EventKind::Kill, EventKind::Objective]);
-    assert!(payload_of(&incremental, EventKind::Objective).contains("\"stolen\":true"));
+    assert_eq!(kinds(&incremental), vec![EventKind::Kill, EventKind::Baron]);
+    assert!(payload_of(&incremental, EventKind::Baron).contains("\"stolen\":true"));
     assert!(poller.poll_once().is_empty(), "the mock repeats its last reply");
 }
 
@@ -348,14 +348,14 @@ fn a_malformed_body_is_neither_an_event_nor_the_end_of_the_game() {
     assert_eq!(kinds(&poller.poll_once()), vec![EventKind::GameStart]);
     assert_eq!(
         kinds(&poller.poll_once()),
-        vec![EventKind::Kill, EventKind::Death, EventKind::Objective]
+        vec![EventKind::Kill, EventKind::Death, EventKind::Dragon]
     );
     assert!(poller.poll_once().is_empty(), "a body localplay cannot read is not an event");
     assert!(poller.poll_once().is_empty(), "and it is not reported again");
     assert!(poller.in_game(), "one unreadable response is not the end of a game");
 
     // Recovery: only the two new events, nothing replayed.
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Objective]);
+    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Baron]);
     assert!(poller.poll_once().is_empty());
 }
 

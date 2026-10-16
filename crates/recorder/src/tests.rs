@@ -74,6 +74,8 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             // Deliberately large: these tests are about the pipeline, and a ring that evicted
             // mid-recording would make them about eviction instead.
             ram_cap_bytes: 1 << 30,
+            max_pre_seconds: 0,
+            max_post_seconds: 0,
         },
         encode: EncodeSection {
             vendor: "auto".to_string(),
@@ -1409,5 +1411,62 @@ fn a_microphone_with_the_game_audio_off_is_refused_at_start() {
     assert!(
         text.contains("[audio] enabled = false") && text.contains("[mic] enabled = true"),
         "the refusal must name both keys so the reader knows which to change: {text}"
+    );
+}
+
+#[test]
+fn a_clip_window_is_clamped_to_the_buffers_ceiling_and_defaults_to_the_configured_one() {
+    // (default pre, default post, max pre, max post), all in ms.
+    let resolve = |w: ClipWindow| w.resolve(2_000, 1_000, 4_000, 1_000);
+    assert_eq!(resolve(ClipWindow::default()), (2_000, 1_000), "unset is the configured window");
+    assert_eq!(resolve(ClipWindow::new(1, 0)), (1_000, 0), "a short clip");
+    assert_eq!(resolve(ClipWindow::new(4, 1)), (4_000, 1_000), "up to the ceiling is honoured");
+    assert_eq!(resolve(ClipWindow::new(60, 30)), (4_000, 1_000), "beyond it is clamped, not refused");
+    assert_eq!(
+        resolve(ClipWindow { pre_seconds: Some(3), post_seconds: None }),
+        (3_000, 1_000),
+        "one half set leaves the other at the configured value"
+    );
+    assert_eq!(resolve(ClipWindow::new(0, 0)), (0, 1_000), "an empty window still holds a second");
+}
+
+#[test]
+fn a_short_and_a_long_clip_come_out_of_one_recording_at_their_own_lengths() {
+    // The short/long hotkeys and the per-game lengths all end at `clip_now_in`. One recording,
+    // two clips: the long one reaches back further than the configured pre-roll (the buffer
+    // ceiling is 4s here against a 2s default), the short one takes only the post-roll.
+    const LONG_PRE: u64 = 4;
+    let (_tmp, app_data_dir) = application_data_dir("clip-window");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.max_pre_seconds = LONG_PRE;
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(&recorder, Duration::from_secs(40), "enough media for a long clip", |s| {
+        s.span_ms >= (LONG_PRE + POST_SECONDS + 1) * 1000
+    });
+
+    let long = recorder
+        .clip_now_in(ClipReason::Manual, ClipWindow::new(LONG_PRE, POST_SECONDS))
+        .expect("the long clip");
+    let short = recorder
+        .clip_now_in(ClipReason::Manual, ClipWindow::new(0, POST_SECONDS))
+        .expect("the short clip");
+    recorder.stop().expect("stop must succeed");
+
+    assert!(
+        long.metadata.duration_ms >= LONG_PRE * 1000,
+        "the long clip reaches back past the configured {PRE_SECONDS}s pre-roll: {}ms",
+        long.metadata.duration_ms
+    );
+    assert!(
+        short.metadata.duration_ms < long.metadata.duration_ms,
+        "the short clip is shorter: {}ms vs {}ms",
+        short.metadata.duration_ms,
+        long.metadata.duration_ms
+    );
+    assert!(
+        short.metadata.duration_ms < PRE_SECONDS * 1000 + POST_SECONDS * 1000,
+        "and shorter than the default window: {}ms",
+        short.metadata.duration_ms
     );
 }

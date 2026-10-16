@@ -30,7 +30,8 @@
 //! | `EventName` | kind |
 //! |---|---|
 //! | `ChampionKill` | `Kill` / `Death` / `Assist`, by comparing `KillerName` / `VictimName` / `Assisters` against the watched player's names |
-//! | `DragonKill`, `BaronKill`, `HeraldKill`, `EpicMonsterKill`, `HordeKill`, `TurretKilled`, `InhibKilled`, `FirstBrick`, `FirstBlood`, `Ace`, `Multikill` | `Objective` |
+//! | `DragonKill`, `BaronKill`, `HeraldKill`, `TurretKilled` / `FirstBrick`, `InhibKilled` | `Dragon`, `Baron`, `Herald`, `Turret`, `Inhibitor` |
+//! | `EpicMonsterKill` (by `MonsterType`), `HordeKill`, `FirstBlood`, `Ace`, `Multikill` | the matching sub-kind, else `Objective` |
 //! | `GameStart`, `GameEnd` | handled by the state machine above, never by the table |
 //! | anything else (`MinionsSpawning`, a future name) | nothing |
 //!
@@ -275,13 +276,34 @@ fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind
             None
         }
         // Game-level milestones count whoever did them: a baron is a baron.
-        "DragonKill" | "BaronKill" | "HeraldKill" | "EpicMonsterKill" | "HordeKill"
-        | "TurretKilled" | "InhibKilled" | "FirstBrick" | "FirstBlood" | "Ace" | "Multikill" => {
-            Some(EventKind::Objective)
-        }
+        "DragonKill" => Some(EventKind::Dragon),
+        "BaronKill" => Some(EventKind::Baron),
+        "HeraldKill" => Some(EventKind::Herald),
+        "TurretKilled" | "FirstBrick" => Some(EventKind::Turret),
+        "InhibKilled" => Some(EventKind::Inhibitor),
+        // The client folds the epic monsters into one name on some patches; the monster type
+        // says which. An epic monster this build cannot name stays a plain objective.
+        "EpicMonsterKill" => Some(epic_monster_kind(entry.monster_type.as_deref())),
+        "HordeKill" | "FirstBlood" | "Ace" | "Multikill" => Some(EventKind::Objective),
         // The lifecycle is the state machine's business; the pacing events are not
         // clip-worthy, and an unknown name is a patch this build has not seen.
         _ => None,
+    }
+}
+
+/// The sub-kind of an `EpicMonsterKill`, from the client's `MonsterType` (`"Dragon"`,
+/// `"Baron"`, `"Horde"`, ... — matched case-insensitively and by prefix, as the client has
+/// spelled these both `"BARON_NASHOR"` and `"Baron"`).
+fn epic_monster_kind(monster_type: Option<&str>) -> EventKind {
+    let monster = monster_type.unwrap_or_default().to_ascii_lowercase();
+    if monster.starts_with("dragon") {
+        EventKind::Dragon
+    } else if monster.starts_with("baron") {
+        EventKind::Baron
+    } else if monster.starts_with("herald") || monster.starts_with("sru_riftherald") {
+        EventKind::Herald
+    } else {
+        EventKind::Objective
     }
 }
 
@@ -459,7 +481,7 @@ mod tests {
             vec![
                 EventKind::Kill,       // EventID 2, the player's kill
                 EventKind::Death,      // EventID 3, the player died
-                EventKind::Objective,  // EventID 5, a dragon
+                EventKind::Dragon,     // EventID 5, a dragon
             ],
             "the player's kills/deaths and the objectives, in the document's order — and \
              nothing for EventID 4, which involved nobody the document names as the player"
@@ -486,14 +508,14 @@ mod tests {
         let next = tracker.observe(snapshot(EVENTS_NEXT).as_ref());
         assert_eq!(
             kinds(&next),
-            vec![EventKind::Kill, EventKind::Objective],
+            vec![EventKind::Kill, EventKind::Baron],
             "exactly the two new lines (ids 6 and 7): the six already seen are not replayed"
         );
         assert!(
-            payload_of(&next, EventKind::Objective).contains("\"monster\":\"BARON_NASHOR\""),
+            payload_of(&next, EventKind::Baron).contains("\"monster\":\"BARON_NASHOR\""),
             "the incremental event carries its own detail"
         );
-        assert!(payload_of(&next, EventKind::Objective).contains("\"stolen\":true"));
+        assert!(payload_of(&next, EventKind::Baron).contains("\"stolen\":true"));
 
         assert!(tracker.observe(snapshot(EVENTS_NEXT).as_ref()).is_empty());
     }
@@ -627,24 +649,35 @@ mod tests {
 
     #[test]
     fn objectives_are_derived_for_every_milestone_the_client_names() {
-        for name in [
-            "DragonKill",
-            "BaronKill",
-            "HeraldKill",
-            "EpicMonsterKill",
-            "HordeKill",
-            "TurretKilled",
-            "InhibKilled",
-            "FirstBrick",
-            "FirstBlood",
-            "Ace",
-            "Multikill",
+        for (name, kind) in [
+            ("DragonKill", EventKind::Dragon),
+            ("BaronKill", EventKind::Baron),
+            ("HeraldKill", EventKind::Herald),
+            ("EpicMonsterKill", EventKind::Objective),
+            ("HordeKill", EventKind::Objective),
+            ("TurretKilled", EventKind::Turret),
+            ("InhibKilled", EventKind::Inhibitor),
+            ("FirstBrick", EventKind::Turret),
+            ("FirstBlood", EventKind::Objective),
+            ("Ace", EventKind::Objective),
+            ("Multikill", EventKind::Objective),
         ] {
             assert_eq!(
                 classify(name, &StreamEvent::default(), &["me"]),
-                Some(EventKind::Objective),
+                Some(kind),
                 "{name} is an objective"
             );
+            assert!(kind.is_objective());
+        }
+        // An epic monster is named by its type when the client folds them into one event.
+        for (monster, kind) in [
+            ("Dragon", EventKind::Dragon),
+            ("BARON_NASHOR", EventKind::Baron),
+            ("SRU_RiftHerald", EventKind::Herald),
+            ("Horde", EventKind::Objective),
+        ] {
+            let entry = StreamEvent { monster_type: Some(monster.into()), ..StreamEvent::default() };
+            assert_eq!(classify("EpicMonsterKill", &entry, &["me"]), Some(kind), "{monster}");
         }
         // Pacing and lifecycle events never come out of the table.
         for name in ["MinionsSpawning", "GameStart", "GameEnd", "SomethingFromAPatch"] {
@@ -670,7 +703,7 @@ mod tests {
             .unwrap()
             .as_ref(),
         );
-        assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::Objective]);
+        assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::Dragon]);
         assert!(tracker.observe(document.as_ref()).is_empty(), "the same line again");
 
         // A *different* id-less event is emitted: the key is content, not "any id-less
@@ -682,7 +715,7 @@ mod tests {
                                      {"EventName":"BaronKill","EventTime":108.9,"MonsterType":"BARON_NASHOR"}]}}"#,
         )
         .unwrap();
-        assert_eq!(kinds(&tracker.observe(other.as_ref())), vec![EventKind::Objective]);
+        assert_eq!(kinds(&tracker.observe(other.as_ref())), vec![EventKind::Baron]);
     }
 
     #[test]

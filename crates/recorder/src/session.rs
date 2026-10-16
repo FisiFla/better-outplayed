@@ -210,20 +210,31 @@ impl SessionRing {
     /// both modes, and it is the *same* splice the ring mode uses — only the window it is
     /// given comes from this ledger.
     pub fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
+        self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
+    }
+
+    /// [`SessionRing::trigger`] with this clip's own pre- and post-roll.
+    pub fn trigger_window(
+        &self,
+        trigger_ms: u64,
+        stem: &str,
+        pre_ms: u64,
+        post_ms: u64,
+    ) -> Result<ClipMetadata> {
         let win = window::resolve(
             &self.ledger,
             // `trigger_ms` is run-relative; the ledger's timeline is absolute — the same
             // conversion the ring's trigger makes.
             self.origin_ms + trigger_ms,
-            self.pre_ms,
-            self.post_ms,
+            pre_ms,
+            post_ms,
         )
         .map_err(|err| anyhow::anyhow!("{err}"))?;
         if win.truncated_front {
             tracing::warn!(
                 "only {}ms of pre-roll was buffered for a {}ms request",
                 win.segments.first().map(|_| win.duration_ms()).unwrap_or(0),
-                self.pre_ms
+                pre_ms
             );
         }
         let out = self.clips_dir.join(format!("{stem}.mp4"));

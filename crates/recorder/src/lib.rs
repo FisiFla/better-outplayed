@@ -479,6 +479,44 @@ impl From<GameEvent> for ClipReason {
     }
 }
 
+/// How much footage one clip takes, when it is not the configured `[buffer]` window.
+///
+/// `None` fields mean "the configured `pre_seconds` / `post_seconds`". A request is **clamped**
+/// to the buffer's ceiling (`[buffer] max_pre_seconds` / `max_post_seconds`, never below the
+/// configured window) rather than refused: the footage beyond the ring does not exist, and a
+/// clip a little shorter than asked for is better than no clip when the key was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipWindow {
+    pub pre_seconds: Option<u64>,
+    pub post_seconds: Option<u64>,
+}
+
+impl ClipWindow {
+    pub const fn new(pre_seconds: u64, post_seconds: u64) -> Self {
+        Self { pre_seconds: Some(pre_seconds), post_seconds: Some(post_seconds) }
+    }
+
+    /// The effective `(pre_ms, post_ms)`: the request (or `default_*`) clamped to `max_*`. An
+    /// empty window (both zero) falls back to one second of post-roll, because a clip needs
+    /// at least one frame to exist.
+    pub fn resolve(
+        self,
+        default_pre_ms: u64,
+        default_post_ms: u64,
+        max_pre_ms: u64,
+        max_post_ms: u64,
+    ) -> (u64, u64) {
+        let pre = self.pre_seconds.map_or(default_pre_ms, |s| s.saturating_mul(1000)).min(max_pre_ms);
+        let post =
+            self.post_seconds.map_or(default_post_ms, |s| s.saturating_mul(1000)).min(max_post_ms);
+        if pre + post == 0 {
+            (0, 1000)
+        } else {
+            (pre, post)
+        }
+    }
+}
+
 /// What a trigger produced.
 #[derive(Debug, Clone)]
 pub struct RecordedClip {
@@ -524,7 +562,7 @@ pub struct Recorder {
 /// A request from a caller on another thread to the pump loop.
 enum Command {
     /// Take a clip now, for this reason. The reply is the clip, or why there is none.
-    Clip { reason: ClipReason, reply: Sender<Result<RecordedClip>> },
+    Clip { reason: ClipReason, window: ClipWindow, reply: Sender<Result<RecordedClip>> },
     /// Record an event that did not ask for a clip (a game or round boundary). The reply is
     /// the `events` row's id, so a caller can tell that it landed.
     Note { event: GameEvent, reply: Sender<Result<i64>> },
@@ -911,9 +949,15 @@ impl Recorder {
     /// the reason adds is one `events` row (spec §5.5) naming what happened, written after
     /// the clip is indexed and linked to it.
     pub fn clip_now_with(&self, reason: ClipReason) -> Result<RecordedClip> {
+        self.clip_now_in(reason, ClipWindow::default())
+    }
+
+    /// [`Recorder::clip_now_with`] with this clip's own [`ClipWindow`]: the short and long clip
+    /// hotkeys and the per-game lengths come in here.
+    pub fn clip_now_in(&self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
-            .send(Command::Clip { reason, reply })
+            .send(Command::Clip { reason, window, reply })
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?;
         // Cannot hang: the loop answers every queued command, and if it stops first its
         // receiver is dropped — which drops this command and its reply channel, making
@@ -1225,7 +1269,7 @@ impl Prepared {
                         // truncate a clip. Deliberately not larger: nothing can ask for more
                         // footage than `pre + post`, and the buffer's *length* is the user's
                         // `pre_seconds`. A longer buffer is that key, not a second knob here.
-                        cap_ms: buffer_cfg.pre_ms + buffer_cfg.post_ms + buffer_cfg.segment_ms,
+                        cap_ms: cfg.buffer.max_pre_ms() + cfg.buffer.max_post_ms() + buffer_cfg.segment_ms,
                         pre_ms: buffer_cfg.pre_ms,
                         post_ms: buffer_cfg.post_ms,
                         encoder: encode_cfg.encoder_name().to_string(),
@@ -1366,6 +1410,8 @@ impl Prepared {
         let engine = Engine {
             pre_ms: buffer_cfg.pre_ms,
             post_ms: buffer_cfg.post_ms,
+            max_pre_ms: cfg.buffer.max_pre_ms(),
+            max_post_ms: cfg.buffer.max_post_ms(),
             // Only the RAM budget is carried. The scratch cap bounded a directory a replay
             // buffer no longer has (it is session mode's, and session mode deletes nothing), so
             // the cap the engine checks a run against is the in-memory one.
@@ -1618,6 +1664,9 @@ fn log_recovery(recovery: &session::Recovery) {
 struct Engine {
     pre_ms: u64,
     post_ms: u64,
+    /// The ceilings a per-clip [`ClipWindow`] is clamped to (`[buffer] max_*_seconds`).
+    max_pre_ms: u64,
+    max_post_ms: u64,
     /// The in-memory ring's byte budget, carried so the ring can be checked against the number it
     /// was configured with rather than re-reading a config the engine has already been built from.
     ram_cap_bytes: u64,
@@ -1837,10 +1886,10 @@ impl Ledger {
     }
 
     /// Splice a clip around `trigger_ms` out of this ledger's footage.
-    fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
+    fn trigger(&self, trigger_ms: u64, stem: &str, pre_ms: u64, post_ms: u64) -> Result<ClipMetadata> {
         match self {
-            Ledger::Memory(ring) => ring.trigger(trigger_ms, stem),
-            Ledger::Session(session) => session.trigger(trigger_ms, stem),
+            Ledger::Memory(ring) => ring.trigger_window(trigger_ms, stem, pre_ms, post_ms),
+            Ledger::Session(session) => session.trigger_window(trigger_ms, stem, pre_ms, post_ms),
         }
     }
 }
@@ -1870,8 +1919,8 @@ impl Engine {
         loop {
             match commands.try_recv() {
                 Ok(Command::Stop) => break,
-                Ok(Command::Clip { reason, reply }) => {
-                    let taken = self.take_clip(reason);
+                Ok(Command::Clip { reason, window, reply }) => {
+                    let taken = self.take_clip(reason, window);
                     // The caller may have given up (a window closed, a test finished);
                     // that is its business, not the loop's.
                     let _ = reply.send(taken);
@@ -2087,7 +2136,9 @@ impl Engine {
     }
 
     /// The trigger path (spec §6.2), run on the loop thread because it pumps.
-    fn take_clip(&mut self, reason: ClipReason) -> Result<RecordedClip> {
+    fn take_clip(&mut self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
+        let (pre_ms, post_ms) =
+            window.resolve(self.pre_ms, self.post_ms, self.max_pre_ms, self.max_post_ms);
         // The trigger is "now" on the LEDGER's timeline — media time — not on the wall
         // clock, and that is deliberate: the two clocks only agree while the pipeline
         // keeps up with `encode.fps`, and on real 4K hardware it does not. Measured on
@@ -2134,8 +2185,8 @@ impl Engine {
         // media — real seconds, one for one, but still invisible to the ring until ffmpeg has
         // finished the segment carrying them. The margin absorbs that segment plus the
         // encoder's own lag (see `POST_ROLL_MARGIN`).
-        let need_ms = trigger_ms + self.post_ms;
-        let budget = Duration::from_millis(self.post_ms) + POST_ROLL_MARGIN;
+        let need_ms = trigger_ms + post_ms;
+        let budget = Duration::from_millis(post_ms) + POST_ROLL_MARGIN;
         // One wait loop for both modes and for the microphone: which ledger the span comes
         // from, and whether a second input is drained alongside the game audio, are the only
         // two things that differ (see `pump_until_span_on`).
@@ -2152,7 +2203,7 @@ impl Engine {
         self.account(counts);
 
         let stem = format!("clip-{}", unix_seconds());
-        let clip = self.ledger.trigger(trigger_ms, &stem)?;
+        let clip = self.ledger.trigger(trigger_ms, &stem, pre_ms, post_ms)?;
         tracing::info!(
             "wrote {} ({}ms, {} bytes, encoder={})",
             clip.path.display(),
@@ -2165,7 +2216,7 @@ impl Engine {
         // run-relative media time and the window starts `pre_ms` before it;
         // `ledger_origin_ms` moves that onto the ledger's timeline, which is the timeline
         // segment numbering — and so the footage itself — is measured on.
-        let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(self.pre_ms);
+        let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(pre_ms);
         let id = index_clip(&self.store, &clip, started_at_ms);
         // Schema v5: the clip carries the game its recording session matched, so the library
         // can filter by game without joining. Best effort: a failure costs a filter label.

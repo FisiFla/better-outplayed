@@ -151,6 +151,26 @@ pub struct BufferSection {
     /// (the same reasoning as `[mic]` and `[games]`).
     #[serde(default = "default_ram_cap_bytes")]
     pub ram_cap_bytes: u64,
+    /// The longest pre-roll a single clip may ask for, in seconds; `0` (the default) means
+    /// "no more than `pre_seconds`". It sizes the ring, so a long-clip hotkey can reach back
+    /// further than the everyday clip does. A request above it is clamped, never an error.
+    #[serde(default)]
+    pub max_pre_seconds: u64,
+    /// The longest post-roll a single clip may ask for, in seconds; `0` means `post_seconds`.
+    #[serde(default)]
+    pub max_post_seconds: u64,
+}
+
+impl BufferSection {
+    /// The pre-roll ceiling in milliseconds: the larger of `pre_seconds` and `max_pre_seconds`.
+    pub fn max_pre_ms(&self) -> u64 {
+        self.pre_seconds.max(self.max_pre_seconds) * 1000
+    }
+
+    /// The post-roll ceiling in milliseconds: the larger of `post_seconds` and `max_post_seconds`.
+    pub fn max_post_ms(&self) -> u64 {
+        self.post_seconds.max(self.max_post_seconds) * 1000
+    }
 }
 
 /// 256 MiB. See [`BufferSection::ram_cap_bytes`] for why it is not larger.
