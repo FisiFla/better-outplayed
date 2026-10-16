@@ -1743,3 +1743,23 @@ fragment stream, or a stub whose frames are produced by count rather than by the
 because a test whose subject is ring arithmetic should not also be a test of how busy the machine
 is. Until then this file's tests are quiet when run alone and can fail under load, which is worth
 knowing before a red CI run on this file is read as a regression.
+
+## 23. `xtask verify` re-run after the harness was corrected (2026-10-16)
+
+The three-to-four failures §21 recorded came back identically on 2026-10-16 (25 pass, 4 fail,
+1 not performed): `frame_rate` (read the final sample, taken during shutdown: 0.5 fps), `dropped`
+(1 frame, lost at t = 0.4 s while the encoder child was still starting; none in the other
+51 s), `eviction` (the scratch directory is removed on exit, so it was always empty by the time
+the check looked) and `clip_duration` (9014 ms against 8000 ± 500; segments are 1 s and the
+lossless cut lands on segment boundaries). All four were judged to be **harness assumptions, not
+pipeline defects**, and the harness was changed (`13063a2`): steady-state median fps, startup
+drops reported but excluded, one segment of duration slack, and `eviction` is now *not performed*
+with the reason instead of a failure.
+
+Read that honestly: this loosened four checks. It did not fix a pipeline. The one-frame startup
+drop is real and is now disclosed in the `dropped` row's measured text rather than failing it.
+`eviction` is **still unproven** — the ring peaked at 10.5 of 16.8 MB, so nothing was evicted —
+and needs a run with a lower cap or a longer `--seconds`.
+
+Result at `13063a2` on the box (RTX 3090, 3840x2160/30fps, `h264_nvenc`): **28 passed, 0 failed,
+2 not performed** (`silence_detector`, `eviction`).
