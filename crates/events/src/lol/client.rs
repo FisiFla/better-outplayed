@@ -1,10 +1,12 @@
-//! The one place in localplay that relaxes TLS verification (spec §7.1).
+//! The one place in localplay that relaxes any part of TLS verification (spec §7.1).
 //!
 //! Riot's Live Client Data API is an HTTPS service on `127.0.0.1:2999` whose certificate is
-//! self-signed, so there is nothing about it that *can* be verified: no name to match and
-//! no authority to trust. The spec's constraint is therefore not "skip verification" but
-//! "skip it only for a client that cannot talk to anything else", and that is what this
-//! module is:
+//! issued by Riot's own "LoL Game Engineering Certificate Authority" and carries no name that
+//! matches an IP literal. So the chain *can* be verified, and is: the client trusts **only**
+//! that pinned root (`riotgames.pem`, published by Riot at
+//! `static.developer.riotgames.com/docs/lol/riotgames.pem`) and none of the platform's roots.
+//! What is relaxed is the host-name match alone, which has nothing to match against. A
+//! process squatting on port 2999 with any other certificate fails the handshake.
 //!
 //! * The relaxation is a private field of [`LoopbackClient`], built here and nowhere else.
 //!   No public API hands out a connector, and none can build this type from a host name or
@@ -12,8 +14,8 @@
 //! * The client's destination is an [`Endpoint`], which can only be built for a loopback
 //!   address ([`Endpoint::loopback`] refuses anything else) — so the relaxed connector can
 //!   only ever be pointed at this machine, whatever a caller does with it.
-//! * `tests/no_egress.rs` asserts statically that `danger_accept_invalid_certs` appears in
-//!   exactly one file in the tree, and that this is it.
+//! * `tests/no_egress.rs` asserts statically that `danger_accept_invalid_certs` appears
+//!   nowhere in the tree, and that `danger_accept_invalid_hostnames` appears only here.
 //!
 //! The request is written by hand: `GET <path> HTTP/1.1` with `Host: 127.0.0.1:2999` and
 //! SNI disabled, since the certificate matches no name we could send. Reading the response
@@ -21,10 +23,14 @@
 
 use crate::lol::endpoint::Endpoint;
 use crate::wire::Framed;
-use native_tls::{HandshakeError, TlsConnector};
+use native_tls::{Certificate, HandshakeError, TlsConnector};
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+
+/// Riot's root certificate for the Live Client, which is the only trust anchor this client
+/// has. Pinned in the tree rather than fetched, so nothing is downloaded at runtime.
+const RIOT_ROOT_PEM: &[u8] = include_bytes!("riotgames.pem");
 
 /// How long to wait for the TCP connection. Loopback either answers at once or not at all,
 /// so a short budget is right: the poller runs once a second and must not be able to fall
@@ -105,17 +111,29 @@ impl LoopbackClient {
     /// could be given something that is not loopback: the check happened in
     /// [`Endpoint::loopback`], and this constructor cannot undo it.
     pub fn for_endpoint(endpoint: Endpoint) -> Result<Self, FetchError> {
+        Self::for_endpoint_with_root(endpoint, RIOT_ROOT_PEM)
+    }
+
+    /// As [`Self::for_endpoint`], but trusting `root_pem` instead of Riot's root. Exists so
+    /// tests can stand up a mock server under a root of their own; it is still a *pin* (the
+    /// platform roots stay disabled), never a way to skip verification.
+    pub fn for_endpoint_with_root(endpoint: Endpoint, root_pem: &[u8]) -> Result<Self, FetchError> {
         debug_assert!(endpoint.is_loopback(), "an Endpoint is loopback by construction");
+        let tls_err = |e: &dyn std::fmt::Display| FetchError::Tls(endpoint.addr(), format!("{e}"));
+        let root = Certificate::from_pem(root_pem).map_err(|e| tls_err(&e))?;
         let connector = TlsConnector::builder()
-            // The two lines this module exists for. Both are scoped to a connector that
-            // is stored in this struct and never handed out; see the module docs.
-            .danger_accept_invalid_certs(true)
+            // Trust the pinned root and nothing else: a certificate any other authority
+            // signed (or a self-signed one) must fail.
+            .disable_built_in_roots(true)
+            .add_root_certificate(root)
+            // The one relaxation left, scoped to a connector stored in this struct and never
+            // handed out: Riot's certificate names no host, and ours is an IP literal.
             .danger_accept_invalid_hostnames(true)
             // No SNI: the Host header is an IP literal, and sending a name would only
             // involve a resolver in a loopback request.
             .use_sni(false)
             .build()
-            .map_err(|e| FetchError::Tls(endpoint.addr(), format!("{e}")))?;
+            .map_err(|e| tls_err(&e))?;
         Ok(Self { endpoint, connector })
     }
 
@@ -200,6 +218,24 @@ mod tests {
         let client = LoopbackClient::for_endpoint(ep.clone()).expect("a relaxed connector");
         assert_eq!(client.endpoint(), &ep);
         assert!(client.endpoint().is_loopback());
+    }
+
+    #[test]
+    fn the_pinned_root_is_riots_and_parses() {
+        let pem = std::str::from_utf8(RIOT_ROOT_PEM).expect("a PEM is ASCII");
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        let der = Certificate::from_pem(RIOT_ROOT_PEM).expect("the pinned root parses").to_der().unwrap();
+        let needle = b"LoL Game Engineering Certificate Authority";
+        assert!(der.windows(needle.len()).any(|w| w == needle), "it is Riot's CA");
+    }
+
+    #[test]
+    fn a_garbage_root_is_a_tls_error_and_never_an_unpinned_client() {
+        let ep = Endpoint::live_client();
+        let err = LoopbackClient::for_endpoint_with_root(ep, b"not a certificate")
+            .err()
+            .expect("a bad root must fail closed");
+        assert!(matches!(err, FetchError::Tls(..)), "{err}");
     }
 
     #[test]

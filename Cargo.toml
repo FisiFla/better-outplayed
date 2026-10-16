@@ -34,6 +34,15 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+# X.509 for test fixtures only. Deliberately WITHOUT rcgen's `crypto` feature (ring/aws-lc-rs
+# need a C toolchain, which breaks the macOS -> x86_64-pc-windows-msvc `cargo check`); tests
+# sign with pure-Rust p256 through rcgen's `RemoteKeyPair`.
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std", "arithmetic"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# The test leaf must be RSA: macOS Security.framework (native-tls `Identity::from_pkcs8`)
+# cannot import an EC PKCS#8 key.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 localplay-capture = { path = "crates/capture" }
 localplay-encoder = { path = "crates/encoder" }
 localplay-replay  = { path = "crates/replay" }
@@ -48,3 +57,12 @@ unsafe_op_in_unsafe_fn = "deny"
 # `warn`, not `deny`: test bodies legitimately use `unwrap()` everywhere, and
 # denying it would make `cargo test` fail to compile.
 unwrap_used = "warn"
+
+# RSA key generation in the LoL TLS test fixture (`crates/events/tests/lol_mock.rs`) is
+# unusably slow at opt-level 0; optimise just the bignum stack.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3

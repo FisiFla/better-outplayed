@@ -68,12 +68,23 @@ pub struct LolPoller {
 
 impl LolPoller {
     pub fn new(config: LolConfig) -> Result<Self, FetchError> {
-        Ok(Self {
-            client: LoopbackClient::for_endpoint(config.endpoint)?,
+        let client = LoopbackClient::for_endpoint(config.endpoint.clone())?;
+        Ok(Self::with_client(config, client))
+    }
+
+    /// As [`Self::new`], trusting `root_pem` instead of Riot's root — how tests reach a mock.
+    pub fn with_root(config: LolConfig, root_pem: &[u8]) -> Result<Self, FetchError> {
+        let client = LoopbackClient::for_endpoint_with_root(config.endpoint.clone(), root_pem)?;
+        Ok(Self::with_client(config, client))
+    }
+
+    fn with_client(config: LolConfig, client: LoopbackClient) -> Self {
+        Self {
+            client,
             tracker: Tracker::default(),
             interval: config.interval,
             quiet: Quiet::default(),
-        })
+        }
     }
 
     pub fn endpoint(&self) -> &Endpoint {

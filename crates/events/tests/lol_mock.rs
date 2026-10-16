@@ -32,8 +32,113 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-const CERT: &[u8] = include_bytes!("fixtures/tls/cert.pem");
-const KEY: &[u8] = include_bytes!("fixtures/tls/key-pkcs8.pem");
+/// A throwaway CA plus a leaf it signed, generated fresh for every mock so that no private key
+/// is committed. P-256 keys come from pure-Rust `p256` (see the workspace `rcgen` note), and
+/// are handed to rcgen through its `SigningKey` trait.
+mod tls {
+    use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rcgen::{
+        BasicConstraints, CertificateParams, SerialNumber, DistinguishedName, DnType, IsCa, Issuer, KeyUsagePurpose,
+        PublicKeyData, SanType, SignatureAlgorithm, SigningKey as RcgenSigningKey, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
+    };
+
+    struct Key {
+        sk: SigningKey,
+        public: Vec<u8>,
+    }
+
+    impl Key {
+        fn new() -> Self {
+            let sk = SigningKey::random(&mut rand_core::OsRng);
+            let public = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+            Self { sk, public }
+        }
+    }
+
+    impl PublicKeyData for Key {
+        fn der_bytes(&self) -> &[u8] {
+            &self.public
+        }
+        fn algorithm(&self) -> &'static SignatureAlgorithm {
+            &PKCS_ECDSA_P256_SHA256
+        }
+    }
+
+    impl RcgenSigningKey for Key {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+            let sig: DerSignature = self.sk.sign(msg);
+            Ok(sig.as_bytes().to_vec())
+        }
+    }
+
+    /// The RSA leaf's public half, for rcgen to put in the leaf certificate.
+    struct RsaPublic(Vec<u8>);
+
+    impl PublicKeyData for RsaPublic {
+        fn der_bytes(&self) -> &[u8] {
+            &self.0
+        }
+        fn algorithm(&self) -> &'static SignatureAlgorithm {
+            &PKCS_RSA_SHA256
+        }
+    }
+
+    /// PEM material for one throwaway chain.
+    pub struct Chain {
+        /// The CA certificate a client pins to trust the leaf.
+        pub root_pem: Vec<u8>,
+        pub leaf_pem: Vec<u8>,
+        /// PKCS#8 PEM, the form `native_tls::Identity::from_pkcs8` takes.
+        pub leaf_key_pem: Vec<u8>,
+    }
+
+    fn ca(name: &str) -> (CertificateParams, Key, rcgen::Certificate) {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, name);
+        dn.push(DnType::OrganizationName, "localplay test fixture");
+        params.distinguished_name = dn;
+        params.serial_number = Some(SerialNumber::from(1u64));
+        let key = Key::new();
+        let cert = params.self_signed(&key).expect("a self-signed test CA");
+        (params, key, cert)
+    }
+
+    /// A CA certificate that signed nothing: the "some other authority" a pin must refuse.
+    pub fn unrelated_root() -> Vec<u8> {
+        ca("unrelated test CA").2.pem().into_bytes()
+    }
+
+    /// The chain every mock in this test binary shares. RSA-2048 key generation is slow in a
+    /// debug build, so it happens once per process rather than once per mock.
+    pub fn chain() -> &'static Chain {
+        static CHAIN: std::sync::OnceLock<Chain> = std::sync::OnceLock::new();
+        CHAIN.get_or_init(|| {
+            let (ca_params, ca_key, ca_cert) = ca("localplay test CA");
+            let rsa = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("an RSA key");
+            let public = RsaPublic(rsa.to_public_key().to_pkcs1_der().expect("PKCS#1").as_bytes().to_vec());
+
+            let mut leaf_params = CertificateParams::default();
+            leaf_params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::CommonName, "localplay test leaf");
+            leaf_params.distinguished_name = dn;
+            leaf_params.serial_number = Some(SerialNumber::from(2u64));
+            let issuer = Issuer::from_params(&ca_params, &ca_key);
+            let leaf = leaf_params.signed_by(&public, &issuer).expect("a leaf signed by the test CA");
+
+            Chain {
+                root_pem: ca_cert.pem().into_bytes(),
+                leaf_pem: leaf.pem().into_bytes(),
+                leaf_key_pem: rsa.to_pkcs8_pem(Default::default()).expect("PKCS#8").as_bytes().to_vec(),
+            }
+        })
+    }
+}
 
 const IN_PROGRESS: &str = include_str!("fixtures/lol_in_progress.json");
 const EVENTS_NEXT: &str = include_str!("fixtures/lol_events_next.json");
@@ -59,6 +164,8 @@ enum Reply {
 /// than it queued answers without the server inventing anything.
 struct MockGame {
     addr: SocketAddr,
+    /// The CA a client must pin to trust this mock (fresh per mock).
+    root_pem: Vec<u8>,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<Mutex<bool>>,
     thread: Option<JoinHandle<()>>,
@@ -66,7 +173,9 @@ struct MockGame {
 
 impl MockGame {
     fn start(replies: Vec<Reply>) -> Self {
-        let identity = Identity::from_pkcs8(CERT, KEY).expect("the fixture certificate loads");
+        let chain = tls::chain();
+        let identity = Identity::from_pkcs8(&chain.leaf_pem, &chain.leaf_key_pem)
+            .expect("the generated certificate loads");
         let acceptor = TlsAcceptor::new(identity).expect("a TLS acceptor");
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral loopback port");
         listener.set_nonblocking(true).expect("a non-blocking listener");
@@ -96,7 +205,7 @@ impl MockGame {
                 .expect("the mock thread starts")
         };
 
-        Self { addr, requests, stop, thread: Some(thread) }
+        Self { addr, root_pem: chain.root_pem.clone(), requests, stop, thread: Some(thread) }
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -104,8 +213,11 @@ impl MockGame {
     }
 
     fn poller(&self) -> LolPoller {
-        LolPoller::new(LolConfig { endpoint: self.endpoint(), interval: Duration::from_millis(20) })
-            .expect("a client for the mock")
+        LolPoller::with_root(
+            LolConfig { endpoint: self.endpoint(), interval: Duration::from_millis(20) },
+            &self.root_pem,
+        )
+        .expect("a client for the mock")
     }
 
     /// The request lines the mock has seen, so a test can assert on the wire as well as on
@@ -192,23 +304,37 @@ fn payload_of(events: &[GameEvent], kind: EventKind) -> &str {
 }
 
 #[test]
-fn the_relaxed_client_accepts_the_self_signed_certificate_and_a_strict_one_does_not() {
-    // The security property the whole LoL exemption rests on, tested from both sides. If
-    // this test ever passes for the wrong reason (a certificate that some authority *did*
-    // sign, or a client that stopped verifying), the failure below catches it.
+fn the_client_trusts_only_its_pinned_root() {
+    // The security property the whole LoL arrangement rests on, tested from both sides. A
+    // server whose certificate chains to the pinned root is served; the same server, seen by
+    // a client pinned to a different root or by a stock client, is refused.
     let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS)]);
     let addr = mock.addr;
 
-    // 1. A stock client — full verification — must refuse this certificate.
+    // 1. A stock client — platform roots — must refuse the throwaway CA.
     let strict = TlsConnector::builder().build().expect("a default connector");
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("loopback connects");
-    let refused = strict.connect("127.0.0.1", tcp);
     assert!(
-        refused.is_err(),
-        "the fixture certificate must be untrusted, or this test proves nothing"
+        strict.connect("127.0.0.1", tcp).is_err(),
+        "the generated CA must be untrusted by default, or this test proves nothing"
     );
 
-    // 2. localplay's own client accepts it and gets the game document.
+    // 2. localplay's client pinned to a *different* root (Riot's, as in production) refuses it
+    //    too: a squatter on port 2999 with some other certificate gets nothing.
+    let err = localplay_events::lol::LoopbackClient::for_endpoint(mock.endpoint())
+        .expect("pinned to Riot's root")
+        .get()
+        .expect_err("a certificate Riot's CA did not sign must be refused");
+    assert!(matches!(err, localplay_events::lol::FetchError::Tls(..)), "{err}");
+    let other = tls::unrelated_root();
+    let err = localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
+        .expect("pinned to an unrelated root")
+        .get()
+        .expect_err("an unrelated root must be refused too");
+    assert!(matches!(err, localplay_events::lol::FetchError::Tls(..)), "{err}");
+
+    // 3. Pinned to the CA that signed it, the client gets the game document (the host-name
+    //    mismatch on an IP literal is the only relaxation).
     let mut poller = mock.poller();
     let events = poller.poll_once();
     assert_eq!(kinds(&events), vec![EventKind::GameStart], "the attach, through real TLS");
@@ -423,8 +549,8 @@ fn the_poller_only_ever_asks_for_loopback() {
     assert_eq!(poller.endpoint().addr(), mock.addr);
 
     // And a response type is what the client reports for a 404 rather than an error.
-    let client = localplay_events::lol::LoopbackClient::for_endpoint(mock.endpoint())
-        .expect("a relaxed client for the mock");
+    let client = localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &mock.root_pem)
+        .expect("a pinned client for the mock");
     assert_eq!(
         client.get().expect("the mock answers"),
         Response::NotServing,

@@ -31,12 +31,11 @@
 //! # The security arrangement, in one place
 //!
 //! The endpoint is a loopback address *by type*: [`Endpoint::loopback`] refuses anything
-//! that is not, and there is no other constructor. The client that skips TLS verification
-//! ([`client::LoopbackClient`]) is built from an `Endpoint` and from nothing else, so a
-//! relaxed connector can only ever be pointed at this machine. `tests/no_egress.rs`
-//! asserts statically that `danger_accept_invalid_certs` appears in exactly one file in
-//! the tree — `lol/client.rs` — so the relaxation cannot spread to a general-purpose
-//! client without failing the suite.
+//! that is not, and there is no other constructor. The client ([`client::LoopbackClient`])
+//! trusts only Riot's pinned root certificate and skips just the host-name match; it is built
+//! from an `Endpoint` and from nothing else, so it can only ever be pointed at this machine.
+//! `tests/no_egress.rs` asserts statically that `danger_accept_invalid_certs` appears nowhere
+//! and `danger_accept_invalid_hostnames` only in `lol/client.rs`.
 
 pub mod client;
 pub mod derive;

@@ -30,7 +30,7 @@ fn is_the_league_module(rel: &str) -> bool {
 }
 
 /// The mock server the League tests drive, which builds a connector of its own **with
-/// verification left on** — that is the assertion that the fixture certificate is untrusted,
+/// verification left on** — that is the assertion that the generated CA is untrusted,
 /// so exempting it does not weaken anything: its connector cannot be relaxed by accident
 /// without the `danger_accept_invalid_certs` guard below failing first.
 fn is_the_league_mock(rel: &str) -> bool {
@@ -74,14 +74,15 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
 }
 
 #[test]
-fn certificate_verification_is_relaxed_in_exactly_one_place() {
-    // The binding security constraint of spec §7.1, as a static property: the *set of files*
-    // that turn verification off has to be exactly one, and it has to be the file that pins
-    // the address. A second relaxed client anywhere in the tree — a general-purpose one,
-    // which is the thing the constraint forbids — fails here rather than in review.
+fn certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed() {
+    // The binding security constraint of spec §7.1, as a static property. The League client
+    // trusts Riot's pinned root only, so *no* file may turn chain verification off, and the
+    // one remaining relaxation (the host-name match, which an IP literal cannot satisfy) lives
+    // in exactly one file: the one that pins the address.
     const THE_ONE_FILE: &str = "crates/events/src/lol/client.rs";
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut offenders = Vec::new();
+    let mut chain_offenders = Vec::new();
+    let mut name_offenders = Vec::new();
 
     for entry in walk_rs(&root) {
         let rel = entry.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
@@ -93,15 +94,27 @@ fn certificate_verification_is_relaxed_in_exactly_one_place() {
         }
         let text = code_of(&entry);
         if text.contains("danger_accept_invalid_certs") {
-            offenders.push(rel);
+            chain_offenders.push(rel.clone());
+        }
+        if text.contains("danger_accept_invalid_hostnames") {
+            name_offenders.push(rel);
         }
     }
 
-    assert_eq!(
-        offenders,
-        vec![THE_ONE_FILE.to_string()],
-        "exactly one file may relax TLS verification, and it must be the loopback client"
+    assert!(
+        chain_offenders.is_empty(),
+        "nothing may skip certificate-chain verification; pin a root instead: {chain_offenders:?}"
     );
+    assert_eq!(
+        name_offenders,
+        vec![THE_ONE_FILE.to_string()],
+        "exactly one file may relax the host-name check, and it must be the loopback client"
+    );
+
+    // The client must really pin: platform roots off, Riot's root added.
+    let client = code_of(&root.join(THE_ONE_FILE));
+    assert!(client.contains("disable_built_in_roots(true)"), "platform roots must be disabled");
+    assert!(client.contains("add_root_certificate"), "the pinned root must be added");
 
     // And that one file must be the one that pins the address: the relaxation and the
     // loopback endpoint are supposed to be the same object, not two decisions.
