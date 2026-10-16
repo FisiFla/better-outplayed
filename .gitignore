@@ -157,3 +157,4 @@ $RECYCLE.BIN/
 *.swo
 *~
 .claude/settings.local.json
+!crates/events/src/lol/riotgames.pem
