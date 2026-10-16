@@ -6,6 +6,11 @@
 #
 # localplay never reads configuration from environment variables.
 
+# The version of this file's layout. Written by the app; leave it alone. A file without it
+# is read as version 1. A file declaring a version newer than the app understands is refused
+# rather than half-read — update localplay instead.
+schema_version = 1
+
 [recorder]
 # What a recording is:
 #

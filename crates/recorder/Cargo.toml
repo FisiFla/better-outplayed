@@ -13,6 +13,8 @@ publish = false
 anyhow.workspace = true
 serde.workspace = true
 tracing.workspace = true
+# `config_schema` reads `schema_version` out of the raw TOML table before any section is parsed.
+toml.workspace = true
 localplay-capture = { path = "../capture" }
 localplay-encoder = { path = "../encoder" }
 localplay-replay  = { path = "../replay" }
@@ -29,9 +31,6 @@ test-encoders = ["localplay-encoder/test-encoders"]
 
 [dev-dependencies]
 tempfile.workspace = true
-# The config section's own tests parse TOML, the way both front-ends do: a knob exercised
-# only through a hand-built struct is not tested the way it is used.
-toml.workspace = true
 # The event tests build a payload the way the integrations do — as one line of JSON — and
 # read it back out of the database. Test-only: this crate stores payloads, and rendering one
 # is the events crate's business.
