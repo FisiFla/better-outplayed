@@ -11,7 +11,8 @@
   import { onMount } from 'svelte';
   import ClipDetail from './lib/components/ClipDetail.svelte';
   import ClipFilterBar from './lib/components/ClipFilterBar.svelte';
-import ClipList from './lib/components/ClipList.svelte';
+  import ClipList from './lib/components/ClipList.svelte';
+  import HealthPanel from './lib/components/HealthPanel.svelte';
   import RecordingPanel from './lib/components/RecordingPanel.svelte';
   import SessionDetail from './lib/components/SessionDetail.svelte';
   import SessionList from './lib/components/SessionList.svelte';
@@ -32,6 +33,7 @@ import ClipList from './lib/components/ClipList.svelte';
   import type { ClipFilter, ClipView } from './lib/clips';
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
+  import { describeGsiInstall } from './lib/health';
   import { describeRecordedClip } from './lib/recording';
   import { describeSettingsUpdate } from './lib/settings';
   import {
@@ -42,6 +44,9 @@ import ClipList from './lib/components/ClipList.svelte';
   import type { SessionView } from './lib/sessions';
   import type {
     AppStatus,
+    GsiGame,
+    GsiTarget,
+    Health,
     RecordingStatus,
     MatchDto,
     SessionEvent,
@@ -60,6 +65,9 @@ import ClipList from './lib/components/ClipList.svelte';
    * meaningfully change.
    */
   const RECORDING_POLL_MS = 500;
+
+  /** The health page reads the log's tail and the disk, so it is polled far less often. */
+  const HEALTH_POLL_MS = 5000;
 
   interface Props {
     /** Injected so the window can be driven without the Tauri runtime. */
@@ -82,6 +90,10 @@ import ClipList from './lib/components/ClipList.svelte';
   let settings = $state<SettingsDto | null>(null);
   /** The clip hotkey and where the config came from; `null` until the first read answers. */
   let app = $state<AppStatus | null>(null);
+  /** The health page's data; `null` until the first read answers. */
+  let health = $state<Health | null>(null);
+  /** CS2 / Dota 2 as Steam has them, for the integration installer. */
+  let gsiTargets = $state<GsiTarget[]>([]);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   let selectedId = $state<number | null>(null);
@@ -185,6 +197,37 @@ import ClipList from './lib/components/ClipList.svelte';
       app = await source.appStatus();
     } catch (err) {
       error = errorMessage(err);
+    }
+  }
+
+  async function refreshHealth() {
+    try {
+      health = await source.health();
+    } catch (err) {
+      // A failing health read must not raise the main banner every five seconds.
+      void source.logFromFrontend('warn', 'health read failed', errorMessage(err));
+    }
+  }
+
+  async function refreshGsiTargets() {
+    try {
+      gsiTargets = await source.gsiTargets();
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function installGsi(game: GsiGame) {
+    busy = true;
+    try {
+      const outcome = await source.installGsiCfg(game);
+      const label = gsiTargets.find((t) => t.game === game)?.label ?? game;
+      notice = describeGsiInstall(outcome, label);
+      await refreshGsiTargets();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
     }
   }
 
@@ -463,8 +506,14 @@ import ClipList from './lib/components/ClipList.svelte';
     void refreshApp();
     // The settings panel's values; re-read after every apply, which returns them anyway.
     void refreshSettings();
+    void refreshHealth();
+    void refreshGsiTargets();
     const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
-    return () => clearInterval(poll);
+    const healthPoll = setInterval(() => void refreshHealth(), HEALTH_POLL_MS);
+    return () => {
+      clearInterval(poll);
+      clearInterval(healthPoll);
+    };
   });
 </script>
 
@@ -523,8 +572,13 @@ import ClipList from './lib/components/ClipList.svelte';
     {#if stats !== null}
       <StoragePanel {stats} />
     {/if}
+    {#if health !== null}
+      <HealthPanel {health} />
+    {/if}
     {#if settings !== null}
       <SettingsPanel
+        {gsiTargets}
+        onInstallGsi={installGsi}
         {settings}
         {recording}
         {busy}

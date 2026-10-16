@@ -358,3 +358,50 @@ export interface TrimRange {
   startMs: number;
   endMs: number;
 }
+
+/** The recorder in one word, as `health` returns it. */
+export type RecorderState = 'recording' | 'waiting' | 'idle' | 'failed';
+
+export interface DiskHealth {
+  path: string;
+  free_bytes: number;
+  total_bytes: number;
+}
+
+export interface EventSourceHealth {
+  source: string;
+  state: 'running' | 'disabled' | 'failed';
+  detail: string;
+}
+
+/** The health page, as `health` returns it. Mirrors `health::HealthDto`. */
+export interface Health {
+  recorder_state: RecorderState;
+  recorder_error: string | null;
+  /** The encoder the latest recording ran; `null` before any recording. */
+  encoder: string | null;
+  ffmpeg_available: boolean;
+  disk: DiskHealth | null;
+  /** Empty until a recording starts: the sources live as long as it does. */
+  event_sources: EventSourceHealth[];
+  /** WARN/ERROR lines from the log, newest last. */
+  recent_errors: string[];
+  log_path: string;
+}
+
+export type GsiGame = 'cs2' | 'dota2';
+
+/** One game in the settings panel's integration section. */
+export interface GsiTarget {
+  game: GsiGame;
+  label: string;
+  /** `null` when no Steam library has the game. */
+  install_dir: string | null;
+  installed: boolean;
+}
+
+export interface GsiInstallOutcome {
+  game: GsiGame;
+  path: string;
+  replaced: boolean;
+}

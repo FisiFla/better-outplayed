@@ -664,6 +664,27 @@ function installMockSource(fixture) {
       clips.unshift(written);
       return { ...written };
     },
+    async health() {
+      return {
+        recorder_state: recording.running ? 'recording' : 'idle',
+        recorder_error: null,
+        encoder: 'h264_nvenc',
+        ffmpeg_available: true,
+        disk: { path: fixture.clipsDir, free_bytes: 200 * 1024 ** 3, total_bytes: 931 * 1024 ** 3 },
+        event_sources: [],
+        recent_errors: [],
+        log_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\logs\\better-outplayed.log',
+      };
+    },
+    async gsiTargets() {
+      return [
+        { game: 'cs2', label: 'Counter-Strike 2', install_dir: null, installed: false },
+        { game: 'dota2', label: 'Dota 2', install_dir: null, installed: false },
+      ];
+    },
+    async installGsiCfg(game) {
+      return { game, path: 'unused in the harness', replaced: false };
+    },
     async logFromFrontend() {
       return;
     },

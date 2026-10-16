@@ -191,7 +191,7 @@ impl CommandError {
         Self::new(ErrorCode::Media, format!("{action} failed: {err:#}"))
     }
 
-    fn io(action: &str, path: &Path, err: std::io::Error) -> Self {
+    pub(crate) fn io(action: &str, path: &Path, err: std::io::Error) -> Self {
         Self::new(ErrorCode::Io, format!("{action} failed for {}: {err}", path.display()))
     }
 }
@@ -1702,6 +1702,21 @@ impl RecorderHost {
     /// The `config.toml` a recording would be started from.
     pub fn config_path(&self) -> PathBuf {
         self.app_data_dir.join("config.toml")
+    }
+
+    /// How each game-event source came out of the running recording's startup; empty when
+    /// no recording (and so no driver) is up.
+    pub fn event_reports(&self) -> Vec<localplay_recorder::event_driver::SourceReport> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|d| d.reports().to_vec()))
+            .unwrap_or_default()
+    }
+
+    /// The engine's own status, undigested (the health page wants the encoder name).
+    pub fn raw_status(&self) -> RecorderStatus {
+        self.handle().ok().flatten().map_or_else(RecorderStatus::stopped, |r| r.status())
     }
 
     /// The slot, or the error a poisoned slot deserves.

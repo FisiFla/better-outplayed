@@ -49,6 +49,7 @@ toml_edit = "0.25"
 localplay-events = { path = "../../../crates/events" }
 tauri-plugin-notification = "2"
 drag = "2.1.1"
+fs4 = { version = "0.13", features = ["sync"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

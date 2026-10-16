@@ -23,12 +23,20 @@ named, so every line below can be re-checked.
 > type-checked for it. Doing it found three test defects — each fixed — and one thing that is
 > still broken on Windows and is not a test's fault.
 >
-> What has still never run anywhere: the desktop **GUI** (no window has been opened on the
-> box, and the shell's background half has never been a background application in practice),
-> `cargo xtask verify`, the two game integrations **against a real game**, the microphone's
-> silence detector *firing*, `[app] start_with_system` writing a registry value, and anything
-> that would need a synthesised keypress — which this project will not do on a machine that
-> runs an anti-cheat.
+> **Correction (2026-10-17).** An earlier version of this paragraph said the desktop **GUI** had
+> "never run". That stopped being true on 2026-09-26: the installer was built, installed and
+> run on the box in Session 1 (`docs/packaging.md` §3.5, pid 23320, up for 30 seconds), and the
+> rebuilt app was run again with its own log file (`docs/HANDOFF.md`: pid 24728, 28 MB), whose
+> output diagnosed the stale-clip-index fault behind the reported symptoms. So the window
+> *has* been opened on the box. What that does **not** establish: the tray's appearance, the
+> hotkey keypress, hide-on-close, and that the console windows are gone (a human has to watch;
+> the log cannot show a window).
+>
+> What has still never run anywhere: the two game integrations **against a real game**, the
+> microphone's silence detector *firing*, `[app] start_with_system` writing a registry value,
+> and anything that would need a synthesised keypress — which this project will not do on a
+> machine that runs an anti-cheat. (`cargo xtask verify` has run on Windows since 2026-10-15:
+> §21, §23.)
 >
 > The earlier measurement stands as the state of *that* build, and has since been measured again on
 > later ones: the 2026-09-23 session (RTX 3090, 3840x2160 at 150% scaling, [issue #1]) proved the
@@ -46,8 +54,9 @@ session and writes `target\verify\report.md` — every check with its threshold,
 measured value and the raw output behind it — marking anything it could not perform as
 *not performed*, with the reason. From an SSH session, use
 `scripts/verify-in-interactive-session.ps1`, because a capture session needs a desktop.
-**The harness itself has never run on Windows** (it was exercised on the development host
-against the synthetic backends), so its own report is part of what you are checking: the
+**The harness first ran on Windows on 2026-10-15** (§21, §23; before that it had only been
+exercised on the development host against the synthetic backends), and its own report is still
+part of what you are checking: the
 first row to look at is `capture_started` — if the WGC line is missing, or the geometry is
 `1280x720`, the session has no desktop (or the stub ran) and the rest of that report says
 nothing. It cannot check the GUI, a real keypress, anything needing a real game, or the
@@ -78,45 +87,37 @@ repository contradicts itself, that is called out rather than resolved by prefer
 
 ## Ledger tallies
 
-Counting the distinct significant claims about the system made in §1–§4, each once at its
-**strongest** level (an item named in more than one table is counted once):
+**Recounted 2026-10-17.** The previous tally (19 / 23 / 6 / 0) was knowingly stale and had been
+patched by prose for weeks. This one was counted again from the level-bearing rows of the item
+tables in §2, §3, §4 and §8, with a row that names the same commit as an earlier row counted
+once, at the **strongest** level any of its rows gives it. The §1 measurement tables are the
+evidence behind §2's items, not extra claims, so they are not counted again.
 
 | Level | Count |
 |---|---|
-| Verified on Windows hardware | 19 |
-| Verified on the dev host | 23 |
-| Type-checked only | 6 |
-| Unverified | 0 |
+| Verified on Windows hardware | 11 |
+| Verified on the dev host | 34 |
+| Type-checked only | 4 |
+| Unverified | 4 |
+| **Distinct claims** | **53** |
 
-The per-item tables below are the source of truth; the tally is a summary. Three items the
-previous pass could not confirm — the scratch-cap value, whether the audio was non-silent,
-and whether the WGC `copy_out` fix produces real pixels — have since been **verified** by a
-read-only re-read of files retained on the box (see §1). They move from *Unverified* to
-*Verified on Windows hardware*: 16 → 19 Verified, 3 → 0 Unverified. The desktop shell's
-background half (§3, §8) then added three claims of its own: two at *verified on the dev
-host* — the background logic, and the trigger path driven through a real recording — and one
-at *type-checked only* — carrying `RegisterHotKey`'s failure back to the caller. (**That last
-one has since moved**, and the move is the 2026-09-24 session: see §10 — the branch does run,
-it runs on the *first* SSH login, and it is now verified rather than type-checked.) The measured-rate change (§4) added one at *verified on
-the dev host* — the rate decision, its new config key and the probe's own bounds are tested,
-and the startup lines were produced by real runs — while the *accuracy* of its measurement at
-4K on the target hardware was explicitly not claimed. The timeline fix (§1, §4) adds two more
-at the same level — that the media clock is the frames' arrival timestamps (a local A/B, a
-regression test that fails without it), and that the VFR output still splices, probes and
-plays (a splice test that decodes every frame) — and *demotes* the measured-rate claim to a
-pacing aid rather than a timeline guarantee: 20 → 23 Verified on the dev host.
+How to read it:
 
-**These counts are stale, and left stale on purpose.** The 2026-09-24 Windows session (§10)
-moves several items and adds a whole class of them — the recording engine, the storage policy,
-the game-presence code, the CLI and the bundled-SQLite store now *run* on Windows rather than
-being type-checked for it, and the hotkey-failure and self-test-trigger rows move to *Verified
-on Windows hardware*. The numbers above are therefore wrong **in the direction of
-under-claiming**. They have not been adjusted by estimate: a tally is worth having only if it
-was counted, and the per-item tables below are the source of truth — §10 is the evidence for
-whatever moved, and the next pass should recount from those tables rather than from this
-paragraph. Nothing after §10 has been folded in either: §11–§15 each add claims of their own
-that these counts do not include at all, and §15's — the zero-copy path's — are *Verified on
-Windows hardware*.
+* **It counts what the table cells say.** Where a later section (§10 onward) *moved* an item
+  without anyone editing its row, the row still holds the old level, and so does the count. The
+  Windows column is therefore still an under-claim for the recording engine, the storage policy
+  and the game-presence code (§10), and nothing from §11–§23 is in the 53.
+* **Unverified is no longer zero** because §8 (the desktop shell's background half) is now in
+  scope; its four unverified rows are real: the keypress itself, the tray existing at all, recording
+  while the window is hidden, and the registry write.
+* **The 4 type-checked items** are `discard_pending`, WASAPI engine-side conversion, the silence
+  detector and `Frame` move-on-submit. (§8 carries a fifth, the `RegisterHotKey` failure row, at
+  the stale level *type-checked only*; it is the same claim as the §3 row that §10 moved to
+  *Verified on Windows hardware*, so it is counted once, there.)
+* **One mixed row counts as dev-host**: "Close hides the window and never quits" is *verified on
+  the dev host* for the rule and *unverified* for the behaviour, and is counted at the first.
+
+The per-item tables remain the source of truth; this is a summary of them.
 
 ---
 
@@ -856,9 +857,10 @@ on purpose. **The bound did not move. What was fixed was the behaviour it bounds
 The list is shorter than it was, and every remaining item needs something a script cannot
 supply:
 
-* **The desktop GUI.** No window was opened on the box. The recording-wiring claims move from
-  *type-checked only* to nothing at all — they are still unexecuted, and §8 stands.
-* **`cargo xtask verify`** (`07b90fc`): never run on Windows. §10 is not a substitute — it ran
+* **The desktop GUI.** No window was opened on the box *in this session*. (Superseded: the app
+  was run on the box on 2026-09-26, see the correction in the headline; the tray, the keypress
+  and hide-on-close remain unobserved, and §8 stands for those.)
+* **`cargo xtask verify`** (`07b90fc`): never run on Windows *as of this session* (it first ran on 2026-10-15, §21). §10 is not a substitute — it ran
   the *tests*, not the acceptance harness, and the harness's own report is still the thing to
   read.
 * **A real game.** Both Phase 4 integrations remain unrun against one.

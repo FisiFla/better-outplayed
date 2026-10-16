@@ -18,6 +18,7 @@ pub mod background;
 pub mod clip_files;
 pub mod commands;
 pub mod config;
+pub mod health;
 mod log_file;
 
 use background::{
@@ -488,6 +489,50 @@ fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
     })
 }
 
+/// The health page: recorder, encoder, disk, event sources and the last problems the log holds.
+#[tauri::command(rename_all = "snake_case")]
+fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError> {
+    let status = state.recorder.raw_status();
+    let log_path = state.app_data_dir.join("logs").join("better-outplayed.log");
+    let clips_dir = state.paths.lock().map_err(|_| AppState::poisoned("the paths lock"))?.clips_dir.clone();
+    Ok(health::HealthDto {
+        recorder_state: health::recorder_state(&status),
+        recorder_error: status.error.clone(),
+        encoder: status.encoder.clone(),
+        ffmpeg_available: state.bins.is_some(),
+        disk: health::disk_health(&clips_dir),
+        event_sources: health::event_source_dtos(&state.recorder.event_reports()),
+        recent_errors: health::read_recent_problems(&log_path, 20),
+        log_path: log_path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Which of CS2 / Dota 2 are installed in a Steam library, and whether the cfg is in place.
+#[tauri::command(rename_all = "snake_case")]
+fn gsi_targets() -> Vec<health::GsiTarget> {
+    health::gsi_targets(&health::steam_libraries(&health::steam_roots()))
+}
+
+/// Write the GSI cfg for one game into its detected install folder.
+///
+/// The webview names only the game; the directory is found here, never supplied (spec §7.2,
+/// see `health.rs`).
+#[tauri::command(rename_all = "snake_case")]
+fn install_gsi_cfg(
+    state: State<'_, AppState>,
+    game: health::GsiGame,
+) -> Result<health::GsiInstallOutcome, CommandError> {
+    let install = health::find_install(game, &health::steam_libraries(&health::steam_roots()))
+        .ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!("{} was not found in any Steam library", game.label()),
+            )
+        })?;
+    let port = config::EngineOptionsConfig::load(&state.config_path())?.events.gsi_port;
+    health::install_gsi_cfg(game, &install, &state.app_data_dir, port)
+}
+
 /// The effective settings, for the settings panel: the file's values where it sets them,
 /// the example's where it does not.
 #[tauri::command(rename_all = "snake_case")]
@@ -735,6 +780,9 @@ pub fn run() {
             app_status,
             get_settings,
             update_settings,
+            health,
+            gsi_targets,
+            install_gsi_cfg,
             log_from_frontend
         ])
         .run(tauri::generate_context!())
