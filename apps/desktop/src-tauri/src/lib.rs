@@ -303,6 +303,25 @@ fn session_events(
     state.with_deps(|deps| commands::session_events(deps, session_id))
 }
 
+/// A session split into its matches (Full Match segments), with markers and scoreboards.
+#[tauri::command(rename_all = "snake_case")]
+fn session_matches(
+    state: State<'_, AppState>,
+    session_id: i64,
+) -> Result<Vec<commands::MatchDto>, CommandError> {
+    state.with_deps(|deps| commands::session_matches(deps, session_id))
+}
+
+/// Cut one match out of a finished session as a clip.
+#[tauri::command(rename_all = "snake_case")]
+fn extract_match(
+    state: State<'_, AppState>,
+    session_id: i64,
+    match_index: usize,
+) -> Result<ClipDto, CommandError> {
+    state.with_deps(|deps| commands::extract_match(deps, session_id, match_index))
+}
+
 /// Mark a session as a favourite, or clear it.
 #[tauri::command(rename_all = "snake_case")]
 fn set_session_favourite(
@@ -615,6 +634,8 @@ pub fn run() {
             list_sessions,
             session_detail,
             session_events,
+            session_matches,
+            extract_match,
             set_session_favourite,
             delete_session,
             extract_clip,

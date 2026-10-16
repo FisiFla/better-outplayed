@@ -5,6 +5,7 @@
 //! delete-before-unlink ordering the spec requires.
 
 pub mod cleanup;
+pub mod matches;
 pub mod retention;
 
 use anyhow::{Context, Result};

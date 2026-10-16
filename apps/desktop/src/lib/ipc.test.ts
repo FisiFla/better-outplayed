@@ -81,6 +81,8 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.listSessions())).toBe('list_sessions');
     expect(await wireName(() => tauriIpc.sessionDetail(1))).toBe('session_detail');
     expect(await wireName(() => tauriIpc.sessionEvents(1))).toBe('session_events');
+    expect(await wireName(() => tauriIpc.sessionMatches(1))).toBe('session_matches');
+    expect(await wireName(() => tauriIpc.extractMatch(1, 0))).toBe('extract_match');
     expect(await wireName(() => tauriIpc.setSessionFavourite(1, true))).toBe(
       'set_session_favourite',
     );
@@ -109,6 +111,8 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.listSessions()),
       await wireName(() => tauriIpc.sessionDetail(1)),
       await wireName(() => tauriIpc.sessionEvents(1)),
+      await wireName(() => tauriIpc.sessionMatches(1)),
+      await wireName(() => tauriIpc.extractMatch(1, 0)),
       await wireName(() => tauriIpc.setSessionFavourite(1, true)),
       await wireName(() => tauriIpc.deleteSession(1)),
       await wireName(() => tauriIpc.extractClip(1, 0, 1_000)),
@@ -154,6 +158,8 @@ describe('the argument keys', () => {
       list_sessions: await wireArgs(() => tauriIpc.listSessions()),
       session_detail: await wireArgs(() => tauriIpc.sessionDetail(3)),
       session_events: await wireArgs(() => tauriIpc.sessionEvents(3)),
+      session_matches: await wireArgs(() => tauriIpc.sessionMatches(3)),
+      extract_match: await wireArgs(() => tauriIpc.extractMatch(3, 0)),
       set_session_favourite: await wireArgs(() => tauriIpc.setSessionFavourite(3, true)),
       delete_session: await wireArgs(() => tauriIpc.deleteSession(3)),
       extract_clip: await wireArgs(() => tauriIpc.extractClip(3, 1_000, 2_000)),

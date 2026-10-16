@@ -58,6 +58,9 @@ pub struct Tracker {
     /// The game clock at the last document that described a game, for the `GameEnd`
     /// payload's "how long did it run" line.
     last_game_time: f64,
+    /// The scoreboard of the last document that described a game: the falling edge has no
+    /// document of its own, so the end-of-game scoreboard is the last one seen alive.
+    last_scoreboard: Value,
     /// How many in-progress events the last attach adopted without emitting. Exposed for
     /// the poller's log line, which is where a user finds out why the first clip is not
     /// preceded by forty others.
@@ -90,6 +93,7 @@ impl Tracker {
             return self.start_game(snapshot);
         }
 
+        self.last_scoreboard = snapshot.scoreboard();
         let names = snapshot.player_names();
         let mut out = Vec::new();
         for entry in snapshot.event_stream() {
@@ -112,7 +116,8 @@ impl Tracker {
                 "GameEnd" => {
                     self.in_game = false;
                     self.seen.clear();
-                    return vec![end_event(snapshot.game_time())];
+                    let result = entry.result.clone();
+                    return vec![end_event(snapshot.game_time(), snapshot.scoreboard(), result)];
                 }
                 name => {
                     self.seen.insert(key);
@@ -166,6 +171,7 @@ impl Tracker {
         self.seen.clear();
         self.adopted_on_attach = self.adopt(snapshot);
         self.last_game_time = snapshot.game_time();
+        self.last_scoreboard = snapshot.scoreboard();
         self.attached_map = snapshot.game_data.map_name.trim().to_string();
         vec![start_event(snapshot, self.adopted_on_attach)]
     }
@@ -179,7 +185,7 @@ impl Tracker {
         self.seen.clear();
         self.adopted_on_attach = 0;
         self.attached_map.clear();
-        let event = end_event(self.last_game_time);
+        let event = end_event(self.last_game_time, std::mem::take(&mut self.last_scoreboard), None);
         self.last_game_time = 0.0;
         vec![event]
     }
@@ -343,7 +349,12 @@ fn start_event(snapshot: &GameSnapshot, adopted: u64) -> GameEvent {
 
 /// The `GameEnd` payload. The endpoint simply stops answering, so the reason is stated in
 /// the record rather than left to be inferred from an absence.
-fn end_event(last_game_time: f64) -> GameEvent {
+///
+/// `scoreboard` (the last one seen) and `result` (`"Win"`/`"Lose"`, only when the document
+/// carried its own `GameEnd` line) ride along so the match keeps its end-of-game scoreboard;
+/// `result` is `null` rather than guessed when the endpoint just went quiet.
+fn end_event(last_game_time: f64, scoreboard: Value, result: Option<String>) -> GameEvent {
+    let scoreboard = if scoreboard.is_null() { json!([]) } else { scoreboard };
     GameEvent::new(
         Source::Lol,
         EventKind::GameEnd,
@@ -352,6 +363,8 @@ fn end_event(last_game_time: f64) -> GameEvent {
             "event": "GameEnd",
             "reason": "the Live Client stopped serving game data",
             "last_game_time_s": round_tenth(last_game_time),
+            "result": result,
+            "scoreboard": scoreboard,
         }),
     )
 }
@@ -686,6 +699,41 @@ mod tests {
         assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::GameEnd]);
         assert!(!tracker.in_game());
         assert!(tracker.observe(None).is_empty(), "the endpoint going quiet is not a second end");
+    }
+
+    #[test]
+    fn the_falling_edge_end_event_carries_the_last_scoreboard() {
+        let mut tracker = Tracker::default();
+        tracker.observe(snapshot(IN_PROGRESS).as_ref());
+        let ended = tracker.observe(None);
+        let value: serde_json::Value =
+            serde_json::from_str(ended[0].payload.as_deref().unwrap()).unwrap();
+        let rows = value["scoreboard"].as_array().expect("a scoreboard array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["champion"], "Ahri");
+        assert_eq!(rows[0]["kills"], 5);
+        assert_eq!(rows[0]["cs"], 142);
+        assert_eq!(rows[0]["is_local"], true);
+        assert_eq!(rows[1]["is_local"], false);
+        assert!(value["result"].is_null(), "no result is guessed from an absence");
+    }
+
+    #[test]
+    fn an_in_stream_game_end_carries_the_result_and_the_scoreboard() {
+        let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
+                       "activePlayer":{"summonerName":"FisiFla#EUW"},
+                       "allPlayers":[{"summonerName":"FisiFla#EUW","championName":"Ahri","team":"ORDER",
+                                      "scores":{"kills":7,"deaths":2,"assists":9,"creepScore":210,"wardScore":20.0}}],
+                       "events":{"Events":[{"EventID":40,"EventName":"GameEnd","EventTime":2400.0,"Result":"Win"}]}}"#;
+        let document = crate::lol::payload::parse(body).unwrap();
+        let mut tracker = Tracker::default();
+        tracker.observe(snapshot(IN_PROGRESS).as_ref());
+        let ended = tracker.observe(document.as_ref());
+        let value: serde_json::Value =
+            serde_json::from_str(ended[0].payload.as_deref().unwrap()).unwrap();
+        assert_eq!(value["result"], "Win");
+        assert_eq!(value["scoreboard"][0]["kills"], 7);
+        assert_eq!(value["scoreboard"][0]["is_local"], true);
     }
 
     #[test]

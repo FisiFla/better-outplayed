@@ -31,6 +31,7 @@
   import type {
     AppStatus,
     RecordingStatus,
+    MatchDto,
     SessionEvent,
     SettingsDto,
     SettingsUpdate,
@@ -60,6 +61,8 @@
   let sessions = $state<SessionView[]>([]);
   /** The markers of the selected session, read when it is selected. */
   let sessionEvents = $state<SessionEvent[]>([]);
+  /** The selected session split into matches. */
+  let sessionMatches = $state<MatchDto[]>([]);
   let stats = $state<StorageStats | null>(null);
   /** The engine's live counters; `null` until the first poll answers. */
   let recording = $state<RecordingStatus | null>(null);
@@ -101,6 +104,7 @@
       if (selectedSessionId !== null && !sessions.some((s) => s.id === selectedSessionId)) {
         selectedSessionId = null;
         sessionEvents = [];
+        sessionMatches = [];
       }
       error = null;
     } catch (err) {
@@ -317,8 +321,10 @@
     selectedId = null;
     selectedSessionId = id;
     sessionEvents = [];
+    sessionMatches = [];
     try {
       sessionEvents = await source.sessionEvents(id);
+      sessionMatches = await source.sessionMatches(id);
     } catch (err) {
       error = errorMessage(err);
     }
@@ -335,6 +341,22 @@
       void loadThumbnails();
       // Deliberately stays on the session: extracting several clips from one game is the
       // ordinary thing to do, and the notice names the clip that was just cut.
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function extractMatch(index: number) {
+    const session = selectedSession;
+    if (session === null) return;
+    busy = true;
+    try {
+      const written = await source.extractMatch(session.id, index);
+      notice = describeExtraction(session.title, written);
+      await refresh();
+      void loadThumbnails();
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -366,6 +388,7 @@
       if (outcome.row_deleted && selectedSessionId === id) {
         selectedSessionId = null;
         sessionEvents = [];
+        sessionMatches = [];
       }
       await refresh();
     } catch (err) {
@@ -419,6 +442,7 @@
         // One main pane: selecting a clip takes it back from a session.
         selectedSessionId = null;
         sessionEvents = [];
+        sessionMatches = [];
       }}
       onFavourite={toggleFavourite}
       onDelete={(id) => deleteClip(id, clipName(id))}
@@ -469,6 +493,8 @@
         <SessionDetail
           {session}
           events={sessionEvents}
+          matches={sessionMatches}
+          onExtractMatch={extractMatch}
           {busy}
           onExtract={extractClip}
           onFavourite={(favourite) => toggleSessionFavourite(session.id, favourite)}

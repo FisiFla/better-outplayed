@@ -1085,6 +1085,94 @@ pub fn session_events(
     Ok(events.iter().map(SessionEventDto::from).collect())
 }
 
+/// One match inside a session (Full Match splitting): a range of the session's media
+/// timeline, the markers inside it, and — for League — the end-of-game scoreboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchDto {
+    pub index: usize,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// A `game_end` marker closed it; `false` means the end is an inferred boundary.
+    pub complete: bool,
+    /// No `game_start` marker preceded the end; the start is an inferred boundary.
+    pub start_inferred: bool,
+    pub game_mode: Option<String>,
+    pub map: Option<String>,
+    /// `"Win"` / `"Lose"` when the game reported it; `None` is not a guess of either.
+    pub result: Option<String>,
+    /// The end-of-game scoreboard captured from the League Live Client (a GET); empty for
+    /// games and matches that have none.
+    pub scoreboard: Vec<serde_json::Value>,
+    pub events: Vec<SessionEventDto>,
+}
+
+impl From<&localplay_store::matches::MatchSegment> for MatchDto {
+    fn from(m: &localplay_store::matches::MatchSegment) -> Self {
+        let parse = |p: &Option<String>| {
+            p.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        };
+        let start = parse(&m.start_payload);
+        let end = parse(&m.end_payload);
+        let text = |v: &Option<serde_json::Value>, key: &str| {
+            v.as_ref().and_then(|v| v.get(key)).and_then(|v| v.as_str()).map(str::to_owned)
+        };
+        let scoreboard = end
+            .as_ref()
+            .and_then(|v| v.get("scoreboard"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            index: m.index,
+            start_ms: m.start_ms,
+            end_ms: m.end_ms,
+            complete: m.complete,
+            start_inferred: m.start_inferred,
+            game_mode: text(&start, "game_mode"),
+            map: text(&start, "map"),
+            result: text(&end, "result"),
+            scoreboard,
+            events: m.events.iter().map(SessionEventDto::from).collect(),
+        }
+    }
+}
+
+/// A session split into its matches, in timeline order. Empty is a real answer (a session
+/// with no game markers); a missing session is `session_not_found`.
+pub fn session_matches(deps: &Deps<'_>, session_id: i64) -> Result<Vec<MatchDto>, CommandError> {
+    let session = load_session(deps, session_id)?;
+    let events = deps
+        .store
+        .events_for_session(session_id)
+        .map_err(|e| CommandError::store("reading the session timeline", e))?;
+    let segments = localplay_store::matches::split_matches(&events, session.duration_ms);
+    Ok(segments.iter().map(MatchDto::from).collect())
+}
+
+/// Cut one match out of a finished session as a clip (a "Full Match"). The range is the
+/// match's own, clamped to the file's known length so a match that ran to the end of the
+/// recording does not fail the range check by a rounding millisecond.
+pub fn extract_match(
+    deps: &Deps<'_>,
+    session_id: i64,
+    match_index: usize,
+) -> Result<ClipDto, CommandError> {
+    let matches = session_matches(deps, session_id)?;
+    let Some(m) = matches.get(match_index) else {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("session #{session_id} has no match #{match_index} ({} found)", matches.len()),
+        ));
+    };
+    let session = load_session(deps, session_id)?;
+    let start = m.start_ms.max(0) as u64;
+    let mut end = m.end_ms.max(0) as u64;
+    if session.duration_ms > 0 {
+        end = end.min(session.duration_ms as u64);
+    }
+    extract_clip(deps, session_id, start, end)
+}
+
 /// Mark a session as a favourite, or clear it — the user's only way to protect one from the
 /// session retention rules, exactly as it is for a clip.
 pub fn set_session_favourite(
@@ -3612,6 +3700,75 @@ mod tests {
             vec![("kill", 200), ("death", 3_000)],
             "offset = at - media_epoch_ms (1000ms), not at - the wall start"
         );
+    }
+
+    fn add_event(f: &Fixture, session_id: i64, kind: &str, at_ms: u64, payload: Option<&str>) {
+        f.store
+            .insert_event(&localplay_store::NewEvent {
+                session_id: Some(session_id),
+                kind: kind.to_string(),
+                at_ms,
+                payload: payload.map(str::to_owned),
+                clip_id: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_session_splits_into_matches_carrying_the_scoreboard_and_result() {
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(4, 1_000);
+        add_event(&f, session_id, "game_start", 1_500, Some("{\"game_mode\":\"CLASSIC\",\"map\":\"Map11\"}"));
+        add_event(&f, session_id, "kill", 2_000, None);
+        add_event(
+            &f,
+            session_id,
+            "game_end",
+            4_000,
+            Some("{\"result\":\"Win\",\"scoreboard\":[{\"champion\":\"Ahri\",\"kills\":5,\"is_local\":true}]}"),
+        );
+
+        let matches = session_matches(&f.deps(), session_id).unwrap();
+        assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+        assert_eq!((m.start_ms, m.end_ms, m.complete), (500, 3_000, true));
+        assert_eq!(m.game_mode.as_deref(), Some("CLASSIC"));
+        assert_eq!(m.map.as_deref(), Some("Map11"));
+        assert_eq!(m.result.as_deref(), Some("Win"));
+        assert_eq!(m.scoreboard.len(), 1);
+        assert_eq!(m.scoreboard[0]["champion"], "Ahri");
+        assert_eq!(m.events.len(), 3);
+
+        let keys: Vec<String> = {
+            let v = serde_json::to_value(m).unwrap();
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys,
+            ["complete", "end_ms", "events", "game_mode", "index", "map", "result", "scoreboard", "start_inferred", "start_ms"]
+        );
+    }
+
+    #[test]
+    fn matches_of_a_missing_session_or_a_missing_match_are_refused() {
+        let f = Fixture::new();
+        assert_eq!(session_matches(&f.deps(), 9_999).unwrap_err().code, ErrorCode::SessionNotFound);
+        let (session_id, _) = f.add_finished_session(1, 0);
+        assert!(session_matches(&f.deps(), session_id).unwrap().is_empty());
+        assert_eq!(extract_match(&f.deps(), session_id, 0).unwrap_err().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn extracting_a_match_cuts_its_range_into_the_library() {
+        let f = Fixture::new();
+        let (session_id, _) = f.add_finished_session(4, 0);
+        add_event(&f, session_id, "game_start", 1_000, None);
+        add_event(&f, session_id, "game_end", 3_000, None);
+        let clip = extract_match(&f.deps(), session_id, 0).expect("the match is extracted");
+        assert!(PathBuf::from(&clip.path).is_file());
+        assert!((1_000..=3_000).contains(&clip.duration_ms), "got {}ms", clip.duration_ms);
     }
 
     #[test]
