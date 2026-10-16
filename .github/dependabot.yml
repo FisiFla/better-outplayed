@@ -9,6 +9,11 @@ updates:
   - package-ecosystem: npm
     directory: /apps/desktop
     schedule: { interval: weekly }
+    # `typescript` is deliberately held at ~6 with TypeScript 7 installed beside it as
+    # `@typescript/native` (svelte-check --tsgo needs both); a bare major bump breaks that.
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
