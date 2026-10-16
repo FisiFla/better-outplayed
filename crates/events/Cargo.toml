@@ -31,7 +31,7 @@ getrandom = "0.4"
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     # `CreateToolhelp32Snapshot` + `Process32FirstW`/`Process32NextW`: the process-name
     # snapshot `process::ProcessWatcher` compares against the configured watch list. The

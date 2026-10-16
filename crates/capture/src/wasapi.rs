@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::IUnknown;
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, BOOL, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -330,7 +330,7 @@ fn open_client() -> Result<Client> {
     // The event is auto-reset: each wait consumes one signal from the engine.
     // SAFETY: no security attributes and no name are needed for a private event.
     let event = unsafe {
-        CreateEventW(None, BOOL::from(false), BOOL::from(false), None)
+        CreateEventW(None, false, false, None)
             .context("CreateEventW for the WASAPI capture event")?
     };
     let event = EventHandle(event);
