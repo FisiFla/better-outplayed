@@ -32,6 +32,11 @@ mode = "buffer"
 pre_seconds = 30
 # How much footage after the trigger instant is written into the clip.
 post_seconds = 5
+# The longest pre-/post-roll ONE clip may ask for (a long-clip hotkey, a per-game length in
+# [events.lol] / [events.gsi]). 0 = no more than pre_seconds / post_seconds. These size the
+# ring; a request above them is clamped, never an error.
+max_pre_seconds = 0
+max_post_seconds = 0
 # Seconds per scratch segment. This also sets the keyframe interval, and
 # therefore the granularity of lossless trimming (cuts snap to <= this value).
 # Lower = more precise cuts, higher = larger files.
@@ -238,6 +243,14 @@ clip = "Ctrl+F8"
 # Desktop app only, off unless uncommented. Each must be a chord nothing else holds:
 #   toggle_recording = "Ctrl+F9"   # start / stop the recording
 #   bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
+#   clip_short = "Ctrl+F7"         # a short clip: short_pre_seconds / short_post_seconds
+#   clip_long = "Ctrl+Shift+F8"    # a long clip: long_pre_seconds / long_post_seconds
+# Clip lengths for the two chords above (seconds; clamped to [buffer] max_pre_seconds /
+# max_post_seconds). The long one only reaches past pre_seconds if max_pre_seconds allows.
+#   short_pre_seconds = 10
+#   short_post_seconds = 2
+#   long_pre_seconds = 60
+#   long_post_seconds = 10
 
 [app]
 # Start localplay with Windows (the desktop app; the CLI is never autostarted).
@@ -286,10 +299,19 @@ lol_poll_enabled = true
 gsi_port = 45671
 
 # Highlights that should be recorded on the session timeline but NOT take a clip. Tags are
-# kill, death, assist, objective, bomb_planted, bomb_defused, game_end. A typo is an error,
-# not a silent no-op. Example: only clip kills and the end of the game.
-#   mute_clips = ["death", "assist", "objective"]
+# kill, death, assist, objective, dragon, baron, herald, turret, inhibitor, bomb_planted,
+# bomb_defused, game_end. "objective" mutes every objective kind (dragon, baron, ... too);
+# a single kind mutes only itself. A typo is an error, not a silent no-op.
+# Example: only clip kills, dragons and barons.
+#   mute_clips = ["death", "assist", "objective"]  # then list nothing else to keep
+#   mute_clips = ["turret", "inhibitor"]           # just the structures
 mute_clips = []
+
+# Per-game clip length for event clips; an unset key uses [buffer]. Clamped to
+# [buffer] max_pre_seconds / max_post_seconds. [events.gsi] covers CS2 and Dota 2.
+#   [events.lol]
+#   pre_seconds = 25
+#   post_seconds = 8
 
 # --- What an event does -------------------------------------------------------------
 # A *highlight* (kill, death, assist, objective, bomb planted/defused, end of game) takes a

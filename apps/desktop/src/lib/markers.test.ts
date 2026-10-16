@@ -45,6 +45,24 @@ describe('the marker vocabulary', () => {
   });
 });
 
+describe('the objective sub-kinds', () => {
+  const kinds = ['objective', 'dragon', 'baron', 'herald', 'turret', 'inhibitor'];
+
+  it('knows, colours and names every sub-kind the events crate can emit', () => {
+    for (const kind of kinds) {
+      expect(isKnownKind(kind), kind).toBe(true);
+      expect(markerColor(kind), kind).not.toBe(NEUTRAL_MARKER_COLOR);
+    }
+    expect(markerLabel('herald')).toBe('rift herald');
+    expect(markerLabel('turret')).toBe('turret');
+  });
+
+  it('draws each sub-kind in a colour of its own', () => {
+    const colours = kinds.map(markerColor);
+    expect(new Set(colours).size).toBe(kinds.length);
+  });
+});
+
 describe('markerPercent', () => {
   it('places a marker proportionally along the track', () => {
     expect(markerPercent(0, 10_000)).toBe(0);

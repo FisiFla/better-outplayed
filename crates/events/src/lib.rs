@@ -62,9 +62,21 @@ pub enum EventKind {
     Kill,
     Death,
     Assist,
-    /// A game-level milestone: a League dragon/baron/herald/turret, or a Counter-Strike
-    /// multi-kill or ace.
+    /// A game-level milestone that has no sub-kind of its own: a League first blood, ace,
+    /// multi-kill or void grub, a Counter-Strike multi-kill or ace. Also the *group* tag
+    /// `mute_clips = ["objective"]` uses for every objective kind (see
+    /// [`EventKind::is_objective`]).
     Objective,
+    /// A League dragon taken (any type; the type is in the payload).
+    Dragon,
+    /// A League baron taken.
+    Baron,
+    /// A League rift herald taken.
+    Herald,
+    /// A League turret destroyed (or the first brick).
+    Turret,
+    /// A League inhibitor destroyed.
+    Inhibitor,
     GameStart,
     GameEnd,
     /// Counter-Strike: a new round's freezetime has begun.
@@ -79,11 +91,16 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for exhaustive tests and for a UI that wants to name them all.
-    pub const ALL: [EventKind; 11] = [
+    pub const ALL: [EventKind; 16] = [
         EventKind::Kill,
         EventKind::Death,
         EventKind::Assist,
         EventKind::Objective,
+        EventKind::Dragon,
+        EventKind::Baron,
+        EventKind::Herald,
+        EventKind::Turret,
+        EventKind::Inhibitor,
         EventKind::GameStart,
         EventKind::GameEnd,
         EventKind::RoundStart,
@@ -101,6 +118,11 @@ impl EventKind {
             EventKind::Death => "death",
             EventKind::Assist => "assist",
             EventKind::Objective => "objective",
+            EventKind::Dragon => "dragon",
+            EventKind::Baron => "baron",
+            EventKind::Herald => "herald",
+            EventKind::Turret => "turret",
+            EventKind::Inhibitor => "inhibitor",
             EventKind::GameStart => "game_start",
             EventKind::GameEnd => "game_end",
             EventKind::RoundStart => "round_start",
@@ -115,6 +137,21 @@ impl EventKind {
     /// build does not know: a row written by a newer version is not an error.
     pub fn from_tag(tag: &str) -> Option<EventKind> {
         EventKind::ALL.into_iter().find(|k| k.as_tag() == tag)
+    }
+
+    /// Whether this is [`EventKind::Objective`] or one of its sub-kinds. `mute_clips` treats the
+    /// tag `"objective"` as the whole group, so a player who muted objectives before the
+    /// sub-kinds existed still has every dragon and turret muted.
+    pub fn is_objective(self) -> bool {
+        matches!(
+            self,
+            EventKind::Objective
+                | EventKind::Dragon
+                | EventKind::Baron
+                | EventKind::Herald
+                | EventKind::Turret
+                | EventKind::Inhibitor
+        )
     }
 
     /// Whether this kind is worth a clip on its own.
@@ -139,6 +176,11 @@ impl EventKind {
             | EventKind::Death
             | EventKind::Assist
             | EventKind::Objective
+            | EventKind::Dragon
+            | EventKind::Baron
+            | EventKind::Herald
+            | EventKind::Turret
+            | EventKind::Inhibitor
             | EventKind::BombPlanted
             | EventKind::BombDefused
             | EventKind::GameEnd => true,
@@ -272,6 +314,11 @@ mod tests {
         // orphan every row already written.
         assert_eq!(EventKind::Kill.as_tag(), "kill");
         assert_eq!(EventKind::Objective.as_tag(), "objective");
+        assert_eq!(EventKind::Dragon.as_tag(), "dragon");
+        assert_eq!(EventKind::Baron.as_tag(), "baron");
+        assert_eq!(EventKind::Herald.as_tag(), "herald");
+        assert_eq!(EventKind::Turret.as_tag(), "turret");
+        assert_eq!(EventKind::Inhibitor.as_tag(), "inhibitor");
         assert_eq!(EventKind::GameEnd.as_tag(), "game_end");
         assert_eq!(EventKind::BombPlanted.as_tag(), "bomb_planted");
     }
@@ -280,6 +327,9 @@ mod tests {
     fn highlights_are_the_moments_a_hotkey_would_have_been_pressed_for() {
         for kind in [EventKind::Kill, EventKind::Death, EventKind::Assist, EventKind::Objective] {
             assert!(kind.is_highlight(), "{kind} is a highlight");
+        }
+        for kind in EventKind::ALL.into_iter().filter(|k| k.is_objective()) {
+            assert!(kind.is_highlight(), "the objective sub-kind {kind} is a highlight");
         }
         assert!(EventKind::BombPlanted.is_highlight());
         assert!(EventKind::BombDefused.is_highlight());

@@ -19,7 +19,7 @@ use localplay_events::lol::{self, LolConfig, LolHandle};
 use localplay_events::{EventKind, GameEvent};
 use serde::Deserialize;
 
-use crate::{ClipReason, RecordedClip, Recorder};
+use crate::{ClipReason, ClipWindow, RecordedClip, Recorder};
 
 /// `[events]` — which game-event sources to run (spec §7.1, §7.2).
 ///
@@ -39,6 +39,31 @@ pub struct EventsSection {
     /// timeline. Unknown tags are rejected at load, so a typo cannot silently mute nothing.
     #[serde(default)]
     pub mute_clips: Vec<String>,
+    /// `[events.lol]` — clip length for League events; unset keys use `[buffer]`.
+    #[serde(default)]
+    pub lol: GameClipSection,
+    /// `[events.gsi]` — clip length for Counter-Strike 2 / Dota 2 events (one GSI listener
+    /// serves both, so they share a length).
+    #[serde(default)]
+    pub gsi: GameClipSection,
+}
+
+/// A game's own clip length: `pre_seconds` before the event and `post_seconds` after it.
+///
+/// A fight in League wants a long lead-up; a Counter-Strike kill does not. Either key may be
+/// left out (that half uses `[buffer]`), and a value above `[buffer] max_pre_seconds` /
+/// `max_post_seconds` is clamped to it, not refused — see [`ClipWindow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct GameClipSection {
+    pub pre_seconds: Option<u64>,
+    pub post_seconds: Option<u64>,
+}
+
+impl GameClipSection {
+    pub fn window(self) -> ClipWindow {
+        ClipWindow { pre_seconds: self.pre_seconds, post_seconds: self.post_seconds }
+    }
 }
 
 impl EventsSection {
@@ -48,7 +73,7 @@ impl EventsSection {
             .iter()
             .map(|tag| {
                 EventKind::from_tag(tag).with_context(|| {
-                    format!("events.mute_clips: `{tag}` is not an event kind (kill, death, assist, objective, bomb_planted, bomb_defused, game_end, ...)")
+                    format!("events.mute_clips: `{tag}` is not an event kind (kill, death, assist, objective, dragon, baron, herald, turret, inhibitor, bomb_planted, bomb_defused, game_end, ...)")
                 })
             })
             .collect()
@@ -60,16 +85,37 @@ impl EventsSection {
 pub struct Policy {
     pub coalesce: Coalesce,
     pub muted: Vec<EventKind>,
+    /// Per-game clip lengths (`[events.lol]`, `[events.gsi]`).
+    pub lol: ClipWindow,
+    pub gsi: ClipWindow,
 }
 
 impl Policy {
     pub fn new(events: &EventsSection, pre_seconds: u64) -> Result<Self> {
-        Ok(Self { coalesce: Coalesce::for_pre_roll(pre_seconds), muted: events.muted_kinds()? })
+        Ok(Self {
+            coalesce: Coalesce::for_pre_roll(pre_seconds),
+            muted: events.muted_kinds()?,
+            lol: events.lol.window(),
+            gsi: events.gsi.window(),
+        })
     }
 
-    /// Whether this event takes a clip: a highlight that has not been muted.
+    /// Whether this event takes a clip: a highlight that has not been muted. Muting
+    /// `objective` mutes every objective sub-kind (dragon, baron, ...) too; muting a
+    /// sub-kind mutes only that one.
     pub fn clips(&self, event: &GameEvent) -> bool {
-        event.is_highlight() && !self.muted.contains(&event.kind)
+        event.is_highlight()
+            && !self.muted.contains(&event.kind)
+            && !(event.kind.is_objective() && self.muted.contains(&EventKind::Objective))
+    }
+
+    /// The clip length for an event from `source`: the game's own, else the buffer's.
+    pub fn window_for(&self, source: localplay_events::Source) -> ClipWindow {
+        match source {
+            localplay_events::Source::Lol => self.lol,
+            localplay_events::Source::Gsi => self.gsi,
+            localplay_events::Source::Manual => ClipWindow::default(),
+        }
     }
 }
 
@@ -77,7 +123,13 @@ impl Default for EventsSection {
     /// The values `config.example.toml` ships: a file with no `[events]` section behaves as
     /// the example does, which is also what the desktop shell relies on.
     fn default() -> Self {
-        Self { lol_poll_enabled: true, gsi_port: 45671, mute_clips: Vec::new() }
+        Self {
+            lol_poll_enabled: true,
+            gsi_port: 45671,
+            mute_clips: Vec::new(),
+            lol: GameClipSection::default(),
+            gsi: GameClipSection::default(),
+        }
     }
 }
 
@@ -238,10 +290,19 @@ fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Re
 /// The only decision here is highlight versus marker, and it is the vocabulary's
 /// ([`localplay_events::EventKind::is_highlight`]) rather than this loop's. Everything else is one call.
 pub fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<Option<RecordedClip>> {
+    act_on_event_in(recorder, event, ClipWindow::default())
+}
+
+/// [`act_on_event`] with the clip length the event's game asked for.
+pub fn act_on_event_in(
+    recorder: &Recorder,
+    event: GameEvent,
+    window: ClipWindow,
+) -> Result<Option<RecordedClip>> {
     if event.is_highlight() {
         let described = format!("{} {}", event.source, event.kind);
         recorder
-            .clip_now_with(ClipReason::GameEvent(event))
+            .clip_now_in(ClipReason::GameEvent(event), window)
             .map(|clip| {
                 tracing::info!("the {described} clip is {}", clip.metadata.path.display());
                 Some(clip)
@@ -334,7 +395,8 @@ pub fn act_on_burst(
     }
     let mut burst = gather_burst(first, rx, policy).into_iter();
     let head = burst.next().expect("a burst always holds its first event");
-    let result = act_on_event(recorder, head);
+    let window = policy.window_for(head.source);
+    let result = act_on_event_in(recorder, head, window);
     for rest in burst {
         // Marker-only: the clip above already covers these moments.
         if let Err(err) = recorder.note_event(rest) {
@@ -438,6 +500,8 @@ mod tests {
         Policy {
             coalesce: Coalesce { quiet: Duration::from_millis(60), max: Duration::from_millis(400) },
             muted: Vec::new(),
+            lol: ClipWindow::default(),
+            gsi: ClipWindow::default(),
         }
     }
 
@@ -450,6 +514,35 @@ mod tests {
         assert!(policy.clips(&kill()), "an unmuted highlight still clips");
         let bad = EventsSection { mute_clips: vec!["kil".into()], ..EventsSection::default() };
         assert!(bad.muted_kinds().unwrap_err().to_string().contains("kil"));
+    }
+
+    #[test]
+    fn muting_objective_mutes_every_sub_kind_and_a_sub_kind_mutes_only_itself() {
+        let all = EventsSection { mute_clips: vec!["objective".into()], ..EventsSection::default() };
+        let policy = Policy::new(&all, 30).unwrap();
+        for kind in EventKind::ALL.into_iter().filter(|k| k.is_objective()) {
+            assert!(!policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind)), "{kind}");
+        }
+        let some = EventsSection { mute_clips: vec!["turret".into()], ..EventsSection::default() };
+        let policy = Policy::new(&some, 30).unwrap();
+        let clips = |kind| policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind));
+        assert!(!clips(EventKind::Turret));
+        assert!(clips(EventKind::Dragon) && clips(EventKind::Baron) && clips(EventKind::Objective));
+    }
+
+    #[test]
+    fn per_game_clip_lengths_parse_and_reach_the_policy() {
+        let events: EventsSection = toml::from_str(
+            "lol_poll_enabled = true\ngsi_port = 0\n[lol]\npre_seconds = 25\npost_seconds = 8\n[gsi]\npre_seconds = 6\n",
+        )
+        .unwrap();
+        let policy = Policy::new(&events, 30).unwrap();
+        assert_eq!(policy.window_for(localplay_events::Source::Lol), ClipWindow::new(25, 8));
+        assert_eq!(
+            policy.window_for(localplay_events::Source::Gsi),
+            ClipWindow { pre_seconds: Some(6), post_seconds: None }
+        );
+        assert_eq!(policy.window_for(localplay_events::Source::Manual), ClipWindow::default());
     }
 
     #[test]
@@ -501,7 +594,16 @@ mod tests {
 
     #[test]
     fn a_missing_events_section_means_the_example_values() {
-        assert_eq!(EventsSection::default(), EventsSection { lol_poll_enabled: true, gsi_port: 45671, mute_clips: Vec::new() });
+        assert_eq!(
+            EventsSection::default(),
+            EventsSection {
+                lol_poll_enabled: true,
+                gsi_port: 45671,
+                mute_clips: Vec::new(),
+                lol: GameClipSection::default(),
+                gsi: GameClipSection::default(),
+            }
+        );
     }
 
     #[test]

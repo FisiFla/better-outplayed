@@ -212,14 +212,26 @@ impl MemoryRing {
         trigger_ms: u64,
         stem: &str,
     ) -> Result<localplay_replay::splice::ClipMetadata> {
+        self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
+    }
+
+    /// [`MemoryRing::trigger`] with this clip's own pre- and post-roll (a short or long clip, a
+    /// per-game length). The caller has already clamped them to what the ring can hold.
+    pub fn trigger_window(
+        &self,
+        trigger_ms: u64,
+        stem: &str,
+        pre_ms: u64,
+        post_ms: u64,
+    ) -> Result<localplay_replay::splice::ClipMetadata> {
         if let Some(why) = self.failure.lock().expect("the failure slot").clone() {
             bail!(
                 "the in-memory ring stopped reading the encoder's stream, so there is no footage \
                  to clip: {why}"
             );
         }
-        let start = trigger_ms.saturating_sub(self.pre_ms);
-        let end = trigger_ms.saturating_add(self.post_ms);
+        let start = trigger_ms.saturating_sub(pre_ms);
+        let end = trigger_ms.saturating_add(post_ms);
 
         // Assemble under the lock, splice outside it. See the module note.
         let (bytes, audio_tracks, window_ms, held_ms, oldest_ms, newest_ms) = {
@@ -238,7 +250,7 @@ impl MemoryRing {
                 tracing::warn!(
                     "only {}ms of pre-roll was buffered for a {}ms request",
                     window.duration_ms(),
-                    self.pre_ms
+                    pre_ms
                 );
             }
             let window_ms = window.duration_ms();
