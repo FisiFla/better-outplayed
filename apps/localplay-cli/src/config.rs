@@ -59,19 +59,7 @@ pub struct HotkeySection {
     pub clip: String,
 }
 
-/// `[events]` — which game-event sources to run (spec §7.1, §7.2).
-///
-/// Two settings, and no more: the endpoint the League poller uses is fixed by the spec, the
-/// GSI path is fixed, and the token is generated into the application data directory rather
-/// than written in a file a user edits (see `gsi::load_or_create_token`).
-#[derive(Debug, Deserialize)]
-pub struct EventsSection {
-    /// Poll the League Live Client Data API (spec §7.1). Harmless when no game is running:
-    /// a refused loopback connection is the normal state and is not an error.
-    pub lol_poll_enabled: bool,
-    /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
-    pub gsi_port: u16,
-}
+pub use localplay_recorder::event_driver::EventsSection;
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {

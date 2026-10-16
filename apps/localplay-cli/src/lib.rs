@@ -63,20 +63,19 @@
 pub mod config;
 
 use anyhow::{bail, Context, Result};
-use config::{Config, EventsSection};
+use config::Config;
 #[cfg(feature = "test-encoders")]
 use localplay_capture::stub::StubConfig;
-use localplay_events::gsi::{self, GsiConfig, GsiListener};
-use localplay_events::lol::{self, LolConfig, LolHandle};
-use localplay_events::{hotkey, GameEvent};
+use localplay_events::hotkey;
+use localplay_recorder::event_driver::{act_on_burst, start_event_sources, Coalesce, EventSources};
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::{
-    ClipReason, Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources,
+    Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources,
 };
 #[cfg(feature = "test-encoders")]
 use localplay_recorder::STUB_CAPTURE_SIZE;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// How long the hotkey wait blocks before the loop looks at the recorder again.
@@ -274,6 +273,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // `encode.fps`, because the engine may have measured that this machine cannot hold the
     // configured rate and is pacing to a lower one — see `RecorderStatus::effective_fps`.
     let (pre_seconds, post_seconds) = (buffer.pre_seconds, buffer.post_seconds);
+    let coalesce = Coalesce::for_pre_roll(pre_seconds);
     // `--mode` overrides the file (Phase 5), and the resolved value is what the CLI logs and
     // what the engine is told: one number, decided here, never re-derived below.
     let mode = opts.mode.unwrap_or(recorder.mode);
@@ -412,7 +412,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         // the same call the hotkey just made; a marker is recorded and takes no footage.
         // `try_recv` rather than `recv`, so a quiet game cannot make the hotkey wait.
         while let Ok(event) = sources.events.try_recv() {
-            if let Err(err) = act_on_event(&recorder, event) {
+            if let Err(err) = act_on_burst(&recorder, event, &sources.events, coalesce) {
                 // The same state as above: no recording exists to clip or to mark, and a
                 // game event that arrived while nothing is being recorded is not a reason
                 // to stop watching for a game.
@@ -487,124 +487,6 @@ fn self_test_clip(
     // Flush the encoder and close the capture session before exiting, so the process's
     // exit code is decided by the engine's own shutdown and not by a drop().
     recorder.stop()
-}
-
-/// The event sources a front-end was configured to run, and the channel they report on.
-///
-/// Dropping this stops the sources: each handle joins its own thread (see the handles'
-/// `Drop`), so nothing keeps polling a game or a port after the driver loop has ended. The
-/// handles are held here rather than in the loop for exactly that reason.
-struct EventSources {
-    /// Derived events, in the order the sources produced them.
-    events: Receiver<GameEvent>,
-    /// Kept alive (not read): dropping it stops the poller.
-    _lol: Option<LolHandle>,
-    /// The same for the GSI listener.
-    _gsi: Option<GsiListener>,
-}
-
-/// Start whatever `[events]` asked for, best effort.
-///
-/// Each source is independent and none is essential: a League poll is pointless on a machine
-/// with no League install, and a GSI listener needs a port and a token file, either of which
-/// can fail. A failure is a warning naming the setting, never a reason to refuse to record —
-/// the hotkey still works, and that is the fallback spec §7.4 describes.
-fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSources {
-    let (sink, events_rx) = mpsc::channel::<GameEvent>();
-
-    let lol = if events.lol_poll_enabled {
-        match lol::spawn(LolConfig::live_client(), sink.clone()) {
-            Ok(handle) => {
-                tracing::info!(
-                    "League of Legends: polling {} for game events (set \
-                     events.lol_poll_enabled = false to stop)",
-                    handle.endpoint().url()
-                );
-                Some(handle)
-            }
-            Err(err) => {
-                tracing::warn!("events.lol_poll_enabled is set but polling could not start: {err:#}");
-                None
-            }
-        }
-    } else {
-        tracing::info!("League of Legends polling is disabled (events.lol_poll_enabled = false)");
-        None
-    };
-
-    let gsi = if events.gsi_port == 0 {
-        tracing::info!("the CS2 / Dota 2 listener is disabled (events.gsi_port = 0)");
-        None
-    } else {
-        match start_gsi(app_dir, events.gsi_port, sink.clone()) {
-            Ok(listener) => Some(listener),
-            Err(err) => {
-                tracing::warn!("events.gsi_port is set but the listener could not start: {err:#}");
-                None
-            }
-        }
-    };
-
-    EventSources { events: events_rx, _lol: lol, _gsi: gsi }
-}
-
-/// Bring up the GSI listener and write out the file the user has to install (spec §7.2).
-///
-/// The application never writes into a game's installation directory: it generates the file
-/// into its own data directory and says where to copy it. The token is loaded from (or
-/// generated into) the data directory, so the file the user installed once keeps working
-/// across runs — and it is never logged, only the path it lives at.
-fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Result<GsiListener> {
-    let token_path = app_dir.join("gsi-token.txt");
-    let token = gsi::load_or_create_token(&token_path)?;
-
-    // One file per game, in its own directory: the two games subscribe different data
-    // blocks, and the file name has to be the same for both, so keeping them apart is the
-    // only way not to hand the user the wrong file.
-    let dirs = [
-        ("cs2", gsi::integration_cfg(port, &token), "Counter-Strike 2 / CS:GO"),
-        ("dota2", gsi::integration_cfg_dota(port, &token), "Dota 2"),
-    ];
-    for (game, text, name) in dirs {
-        let dir = app_dir.join("gsi").join(game);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join("gamestate_integration_localplay.cfg");
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))?;
-        tracing::info!(
-            "{name}: copy {} into the game's cfg directory and restart the game",
-            path.display()
-        );
-    }
-
-    let listener = gsi::spawn(GsiConfig::new(port, token), sink)?;
-    tracing::info!(
-        "the token the game must carry is in {} (never logged, and not in the config file)",
-        token_path.display()
-    );
-    Ok(listener)
-}
-
-/// Do what a derived event asks for.
-///
-/// The only decision here is highlight versus marker, and it is the vocabulary's
-/// ([`localplay_events::EventKind::is_highlight`]) rather than this loop's. Everything else is one call.
-fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<()> {
-    if event.is_highlight() {
-        let described = format!("{} {}", event.source, event.kind);
-        recorder
-            .clip_now_with(ClipReason::GameEvent(event))
-            .map(|clip| {
-                tracing::info!("the {described} clip is {}", clip.metadata.path.display());
-            })
-            .with_context(|| format!("taking a clip for a {described} event"))
-    } else {
-        let described = format!("{} {}", event.source, event.kind);
-        recorder
-            .note_event(event)
-            .map(|id| tracing::info!("recorded the {described} marker as event #{id}"))
-            .with_context(|| format!("recording a {described} marker"))
-    }
 }
 
 fn app_data_dir() -> PathBuf {

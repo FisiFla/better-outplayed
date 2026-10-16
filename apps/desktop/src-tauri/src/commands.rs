@@ -27,6 +27,7 @@ use localplay_capture::stub::StubConfig;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::event_driver::{Coalesce, EventDriver};
 use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecorderStatus, Sources};
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Session, SessionEvent, Store};
@@ -1483,11 +1484,16 @@ pub struct RecorderHost {
     /// is impossible and every start says so rather than failing somewhere deeper.
     bins: Option<FfmpegBinaries>,
     current: Mutex<Option<Arc<Recorder>>>,
+    /// The game-event sources and the thread that turns their events into clips, alive for
+    /// exactly as long as the recording they serve. Without it the League poller and the
+    /// CS2 / Dota 2 listener only ever ran under the CLI, so a desktop user got no
+    /// event-triggered clips at all.
+    events: Mutex<Option<EventDriver>>,
 }
 
 impl RecorderHost {
     pub fn new(app_data_dir: PathBuf, bins: Option<FfmpegBinaries>) -> Self {
-        Self { app_data_dir, bins, current: Mutex::new(None) }
+        Self { app_data_dir, bins, current: Mutex::new(None), events: Mutex::new(None) }
     }
 
     /// The `config.toml` a recording would be started from.
@@ -1530,7 +1536,7 @@ impl RecorderHost {
     /// backend, the ring, ffmpeg) happens here, on the caller's thread, so a machine that
     /// cannot record says so now instead of failing inside a background thread.
     pub fn start(&self, settings: &RecordingConfig) -> Result<RecordingStatusDto, CommandError> {
-        self.start_with(settings, Sources::Platform, false)
+        self.start_with(settings, Sources::Platform, false, true)
     }
 
     /// Start from the `config.toml` this host reads, exactly as the window's Start button
@@ -1553,6 +1559,7 @@ impl RecorderHost {
         settings: &RecordingConfig,
         sources: Sources,
         dev_software_encoder: bool,
+        with_events: bool,
     ) -> Result<RecordingStatusDto, CommandError> {
         let bins = self.bins.as_ref().ok_or_else(|| {
             CommandError::new(
@@ -1603,7 +1610,27 @@ impl RecorderHost {
             CommandError::new(ErrorCode::Recording, format!("could not start recording: {err:#}"))
         })?;
         let status = RecordingStatusDto::from(recorder.status());
-        *slot = Some(Arc::new(recorder));
+        let recorder = Arc::new(recorder);
+        *slot = Some(Arc::clone(&recorder));
+        drop(slot);
+
+        // Best effort, like everywhere else the events are started: a port that is taken or
+        // a missing League install is a warning, never a reason to refuse to record.
+        if with_events {
+            match EventDriver::spawn(
+                recorder,
+                &self.app_data_dir,
+                &engine.events,
+                Coalesce::for_pre_roll(settings.buffer.pre_seconds),
+            ) {
+                Ok(driver) => {
+                    if let Ok(mut held) = self.events.lock() {
+                        *held = Some(driver);
+                    }
+                }
+                Err(err) => tracing::warn!("the game-event sources could not start: {err:#}"),
+            }
+        }
         Ok(status)
     }
 
@@ -1623,7 +1650,7 @@ impl RecorderHost {
         settings: &RecordingConfig,
     ) -> Result<RecordingStatusDto, CommandError> {
         let stub = StubConfig { width: 1280, height: 720, fps: settings.encode.fps };
-        self.start_with(settings, Sources::Stub(stub), true)
+        self.start_with(settings, Sources::Stub(stub), true, false)
     }
 
     /// Stop the recording, flush the encoder and return the final status.
@@ -1635,6 +1662,10 @@ impl RecorderHost {
         // Held across the stop: the join returns within one frame poll, and holding it is
         // what makes "stop then start" a sequence rather than a race between a capture
         // session that is closing and one that is opening.
+        // The sources go first: nothing should ask a recorder for a clip while it flushes.
+        if let Ok(mut held) = self.events.lock() {
+            held.take();
+        }
         let taken = self.slot()?.take();
         let Some(recorder) = taken else {
             return Ok(RecordingStatusDto::from(RecorderStatus::stopped()));
