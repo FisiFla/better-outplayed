@@ -71,7 +71,8 @@ pub use localplay_recorder::event_driver::EventsSection;
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
-        let cfg: Self = toml::from_str(text).context("parsing config TOML")?;
+        let cfg: Self =
+            localplay_recorder::config_schema::parse(text).context("parsing config TOML")?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -144,6 +145,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_schema_version_is_refused_and_an_absent_one_is_accepted() {
+        let example = include_str!("../../../config.example.toml");
+        let newer = example.replace("schema_version = 1", "schema_version = 2");
+        assert_ne!(newer, example);
+        let err = Config::from_toml(&newer).expect_err("a layout from the future must not load");
+        assert!(format!("{err:#}").contains("schema version 2"), "{err:#}");
+
+        let legacy = example.replace("schema_version = 1\n", "");
+        assert!(Config::from_toml(&legacy).is_ok(), "files from before the field are version 1");
+    }
 
     #[test]
     fn parses_the_example_config() {

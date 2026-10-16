@@ -45,6 +45,7 @@
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
 use localplay_recorder::event_driver::EventsSection;
+use localplay_recorder::config_schema;
 use localplay_recorder::config::{BufferSection, CaptureSection, EncodeSection, MicSection, StorageSection};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -80,7 +81,7 @@ impl StorageConfig {
         struct File {
             storage: StorageConfig,
         }
-        toml::from_str::<File>(text)
+        config_schema::parse::<File>(text)
             .map(|f| f.storage)
             .map_err(|err| {
                 CommandError::new(
@@ -143,7 +144,7 @@ impl RecordingConfig {
     }
 
     pub fn from_toml(text: &str) -> Result<Self, CommandError> {
-        toml::from_str::<Self>(text).map_err(|err| {
+        config_schema::parse::<Self>(text).map_err(|err| {
             CommandError::new(
                 ErrorCode::InvalidInput,
                 format!(
@@ -241,7 +242,7 @@ impl BackgroundConfig {
             start_with_system: bool,
         }
 
-        let file: File = toml::from_str(text).map_err(|err| {
+        let file: File = config_schema::parse(text).map_err(|err| {
             CommandError::new(
                 ErrorCode::InvalidInput,
                 format!(
@@ -323,7 +324,7 @@ impl EngineOptionsConfig {
             #[serde(default)]
             events: EventsSection,
         }
-        toml::from_str::<File>(text)
+        config_schema::parse::<File>(text)
             .map(|f| Self { mic: f.mic, games: f.games, events: f.events })
             .map_err(|err| {
                 CommandError::new(
@@ -705,6 +706,12 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         );
         EXAMPLE_CONFIG.to_string()
     };
+    config_schema::check(&text).map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the config file {} could not be read: {err}", path.display()),
+        )
+    })?;
     let doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
         CommandError::new(
             ErrorCode::InvalidInput,
@@ -889,12 +896,26 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
     } else {
         EXAMPLE_CONFIG.to_string()
     };
+    // Refuse to rewrite a layout this build does not understand: an edit would stamp it as
+    // current and quietly corrupt whatever the newer version meant.
+    config_schema::check(&text).map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the config file {} was not changed: {err}", path.display()),
+        )
+    })?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
         CommandError::new(
             ErrorCode::InvalidInput,
             format!("the config file {} could not be parsed: {err}", path.display()),
         )
     })?;
+
+    // Stamp the layout version the file now follows. Absent means v1, which is also the
+    // current version, so no data migration is needed here; once a real migration exists
+    // this must apply it to `doc` before stamping.
+    doc[config_schema::SCHEMA_VERSION_KEY] =
+        toml_edit::value(i64::from(config_schema::CURRENT_SCHEMA_VERSION));
 
     for edit in edits {
         let (table_key, value_key, section) = match edit {
@@ -1476,6 +1497,41 @@ mod tests {
         let settings = read_effective_settings(&path).unwrap();
         assert_eq!(settings.fps, 60);
         assert!(!settings.auto_record);
+    }
+
+    #[test]
+    fn the_writer_stamps_the_schema_version_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[storage]\nclips_dir = \"\"\n").unwrap();
+
+        write_settings(&path, &[SettingEdit::MicEnabled(true)]).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("schema_version = 1"), "stamped: {text}");
+        assert!(text.contains("# mine"), "a hand-written comment survives: {text}");
+        assert!(read_effective_settings(&path).is_ok());
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_by_every_reader_and_the_writer_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let newer = "schema_version = 99\n[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\nmax_age_days = 1\n";
+        std::fs::write(&path, newer).unwrap();
+
+        for err in [
+            StorageConfig::load(&path).unwrap_err(),
+            RecordingConfig::load(&path).unwrap_err(),
+            BackgroundConfig::load(&path).unwrap_err(),
+            EngineOptionsConfig::load(&path).unwrap_err(),
+            read_effective_settings(&path).unwrap_err(),
+            write_settings(&path, &[SettingEdit::Fps(30)]).unwrap_err(),
+        ] {
+            assert_eq!(err.code, ErrorCode::InvalidInput);
+            assert!(err.message.contains("schema version 99"), "{}", err.message);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "the file is untouched");
     }
 
     #[test]
