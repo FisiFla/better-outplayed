@@ -11,7 +11,7 @@
 //! writes exactly one file (`gamestate_integration_localplay.cfg`), and the destination is
 //! never taken from the webview. The command receives a *game* (`cs2` or `dota2`); the
 //! install directory is found here from Steam's own library list, and the final path is run
-//! through [`ensure_within`] against that install directory before a byte is written, so a
+//! through [`crate::paths::ensure_new_file_within`] against that install directory before a byte is written, so a
 //! symlink or a `..` cannot walk the write out of the game's folder.
 
 use crate::commands::{CommandError, ErrorCode};
@@ -19,57 +19,10 @@ use localplay_events::gsi;
 use localplay_recorder::event_driver::{SourceReport, SourceState};
 use localplay_recorder::RecorderStatus;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// The file name both games read.
 pub const GSI_CFG_NAME: &str = "gamestate_integration_localplay.cfg";
-
-// ---------------------------------------------------------------------------------------
-// Path validation
-// ---------------------------------------------------------------------------------------
-
-/// Resolve `candidate` and prove it lies inside `root`.
-///
-/// Returns the resolved path, which is the one to write to (not the input), so the check
-/// and the use cannot disagree. `candidate` need not exist yet: the deepest existing
-/// ancestor is canonicalised (resolving symlinks) and the missing tail re-appended. A `..`
-/// in the candidate is refused outright rather than normalised, since there is no honest
-/// reason for an installer-built path to contain one.
-pub fn ensure_within(root: &Path, candidate: &Path) -> Result<PathBuf, CommandError> {
-    let refuse = |why: String| CommandError::new(ErrorCode::InvalidInput, why);
-    if candidate.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(refuse(format!("{} contains `..`", candidate.display())));
-    }
-    let root = root
-        .canonicalize()
-        .map_err(|e| refuse(format!("{} cannot be resolved: {e}", root.display())))?;
-
-    let mut existing = candidate;
-    let mut tail = Vec::new();
-    while !existing.exists() {
-        match (existing.file_name(), existing.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name.to_owned());
-                existing = parent;
-            }
-            _ => return Err(refuse(format!("{} has no existing parent", candidate.display()))),
-        }
-    }
-    let mut resolved = existing
-        .canonicalize()
-        .map_err(|e| refuse(format!("{} cannot be resolved: {e}", existing.display())))?;
-    resolved.extend(tail.iter().rev());
-
-    if resolved.starts_with(&root) {
-        Ok(resolved)
-    } else {
-        Err(refuse(format!(
-            "{} is outside the game directory {}",
-            resolved.display(),
-            root.display()
-        )))
-    }
-}
 
 // ---------------------------------------------------------------------------------------
 // Game directories
@@ -234,7 +187,9 @@ pub fn install_gsi_cfg(
     // Only the cfg *directory* of a game that is really installed: a half-deleted CS2 with
     // no `game/csgo` is not somewhere to start creating folders.
     let target = cfg_path(game, install);
-    let dest = ensure_within(install, &target)?;
+    let dest = crate::paths::ensure_new_file_within(install, &target).map_err(|why| {
+        CommandError::new(ErrorCode::InvalidInput, format!("{}: {why}", target.display()))
+    })?;
     let cfg_dir = dest.parent().unwrap_or(install);
     if game == GsiGame::Cs2 && !cfg_dir.is_dir() {
         return Err(CommandError::new(
@@ -372,34 +327,6 @@ pub fn read_recent_problems(log_path: &Path, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ensure_within_accepts_a_new_file_inside_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let inside = dir.path().join("a/b/c.cfg");
-        let resolved = ensure_within(dir.path(), &inside).unwrap();
-        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
-        assert!(resolved.ends_with("a/b/c.cfg"));
-    }
-
-    #[test]
-    fn ensure_within_refuses_dotdot_and_outside_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
-        let sneaky = dir.path().join("sub/../../escape.cfg");
-        assert!(ensure_within(dir.path(), &sneaky).is_err());
-        assert!(ensure_within(dir.path(), &other.path().join("x.cfg")).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ensure_within_refuses_a_symlink_that_leaves_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("cfg")).unwrap();
-        let err = ensure_within(dir.path(), &dir.path().join("cfg/x.cfg")).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidInput);
-    }
 
     fn fake_steam(root: &Path, game: GsiGame) -> PathBuf {
         let install = root.join("steamapps/common").join(game.folder());
