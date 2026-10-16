@@ -521,6 +521,16 @@ pub fn run() {
     let asset_roots = state.asset_roots();
 
     tauri::Builder::default()
+        // A second launch must hand over to the running instance (which owns the hotkey,
+        // the tray and the capture session) instead of fighting it for them. Registered
+        // first, as the plugin requires.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         // The settings panel's folder picker (open dialogs only — see
         // capabilities/default.json).
         .plugin(tauri_plugin_dialog::init())
