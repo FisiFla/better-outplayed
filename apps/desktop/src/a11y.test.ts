@@ -14,7 +14,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 const clip: ClipDto = {
   id: 1, path: '/c/a.mp4', started_at_ms: 0, duration_ms: 30_000, size_bytes: 5_000_000,
-  codec: 'h264', favourite: false, created_at_ms: 1_700_000_000_000,
+  codec: 'h264', favourite: false, title: null, game: 'Valorant', tags: [], created_at_ms: 1_700_000_000_000,
 };
 const session: SessionDto = {
   id: 1, game: 'Valorant', mode: 'session', started_at_ms: 1_700_000_000_000,
@@ -29,7 +29,8 @@ const stats: StorageStats = {
 const settings: SettingsDto = {
   clips_dir: '/c', clips_dir_resolved: '/c', fps: 60, output_size: '1080p', mic_enabled: false,
   auto_record: true, watch_titles: ['VALORANT'], defaulted: [], config_exists: true,
-  config_path: '/cfg/config.toml',
+  config_path: '/cfg/config.toml', bitrate_kbps: 8000, quality: 'balanced', capture_monitor: 0,
+  capture_window: '',
 };
 const recording: RecordingStatus = {
   running: false, frames: 0, segments: 0, bytes: 0, span_ms: 0, dropped: 0, dropped_audio: 0,
@@ -53,6 +54,11 @@ function fakeSource(): ClipSource {
         config_path: '/cfg/config.toml', config_exists: true, close_hint: 'Closing hides to the tray.',
       }),
     thumbnail: () => Promise.resolve({ clip_id: 1, path: '/t.jpg', at_ms: 0, cached: true }),
+    health: () =>
+      Promise.resolve({
+        recorder_state: 'idle', recorder_error: null, encoder: null, ffmpeg_available: true,
+        disk: null, event_sources: [], recent_errors: [], log_path: '/cfg/app.log',
+      }),
     assetUrl: (p: string) => `asset://${p}`,
   };
   return new Proxy(known, {

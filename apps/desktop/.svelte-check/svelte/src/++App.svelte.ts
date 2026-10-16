@@ -11,16 +11,30 @@
    */
 import { onMount } from 'svelte';
 import ClipDetail from './lib/components/ClipDetail.svelte';
+import ClipFilterBar from './lib/components/ClipFilterBar.svelte';
 import ClipList from './lib/components/ClipList.svelte';
+import HealthPanel from './lib/components/HealthPanel.svelte';
 import RecordingPanel from './lib/components/RecordingPanel.svelte';
 import SessionDetail from './lib/components/SessionDetail.svelte';
 import SessionList from './lib/components/SessionList.svelte';
 import SettingsPanel from './lib/components/SettingsPanel.svelte';
 import StoragePanel from './lib/components/StoragePanel.svelte';
-import { describeDelete, describeTrim, resolveSelection, thumbnailAtMs, toClipViews } from './lib/clips';
-import type { ClipView } from './lib/clips';
+import {
+    describeDelete,
+    describeTrim,
+    filterClips,
+    gameOptions,
+    isFiltering,
+    NO_FILTER,
+    resolveSelection,
+    tagOptions,
+    thumbnailAtMs,
+    toClipViews,
+  } from './lib/clips';
+import type { ClipFilter, ClipView } from './lib/clips';
 import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
 import type { ClipSource } from './lib/ipc';
+import { describeGsiInstall } from './lib/health';
 import { describeRecordedClip } from './lib/recording';
 import { describeSettingsUpdate } from './lib/settings';
 import {
@@ -31,7 +45,11 @@ import {
 import type { SessionView } from './lib/sessions';
 import type {
     AppStatus,
+    GsiGame,
+    GsiTarget,
+    Health,
     RecordingStatus,
+    MatchDto,
     SessionEvent,
     SettingsDto,
     SettingsUpdate,
@@ -63,6 +81,9 @@ import type {
   
   
   
+  
+  
+  
 
   /**
    * How often the recorder's counters are read.
@@ -74,6 +95,9 @@ import type {
    */
   const RECORDING_POLL_MS = 500;
 
+  /** The health page reads the log's tail and the disk, so it is polled far less often. */
+  const HEALTH_POLL_MS = 5000;
+
 
   let { source = tauriIpc }: Props = $props();
 
@@ -82,6 +106,8 @@ import type {
   let sessions = $state<SessionView[]>([]);
   /** The markers of the selected session, read when it is selected. */
   let sessionEvents = $state<SessionEvent[]>([]);
+  /** The selected session split into matches. */
+  let sessionMatches = $state<MatchDto[]>([]);
   let stats = $state<StorageStats | null>(null);
   /** The engine's live counters; `null` until the first poll answers. */
   let recording = $state<RecordingStatus | null>(null);
@@ -89,6 +115,10 @@ import type {
   let settings = $state<SettingsDto | null>(null);
   /** The clip hotkey and where the config came from; `null` until the first read answers. */
   let app = $state<AppStatus | null>(null);
+  /** The health page's data; `null` until the first read answers. */
+  let health = $state<Health | null>(null);
+  /** CS2 / Dota 2 as Steam has them, for the integration installer. */
+  let gsiTargets = $state<GsiTarget[]>([]);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   let selectedId = $state<number | null>(null);
@@ -101,6 +131,10 @@ import type {
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let loaded = $state(false);
+
+  /** Search text, game and tag filters over the library list. */
+  let filter = $state<ClipFilter>(NO_FILTER);
+  const visibleClips = $derived(filterClips(clips, filter));
 
   const selected = $derived(clips.find((clip) => clip.id === selectedId) ?? null);
   const selectedSession = $derived(
@@ -123,6 +157,7 @@ import type {
       if (selectedSessionId !== null && !sessions.some((s) => s.id === selectedSessionId)) {
         selectedSessionId = null;
         sessionEvents = [];
+        sessionMatches = [];
       }
       error = null;
     } catch (err) {
@@ -187,6 +222,37 @@ import type {
       app = await source.appStatus();
     } catch (err) {
       error = errorMessage(err);
+    }
+  }
+
+  async function refreshHealth() {
+    try {
+      health = await source.health();
+    } catch (err) {
+      // A failing health read must not raise the main banner every five seconds.
+      void source.logFromFrontend('warn', 'health read failed', errorMessage(err));
+    }
+  }
+
+  async function refreshGsiTargets() {
+    try {
+      gsiTargets = await source.gsiTargets();
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
+  async function installGsi(game: GsiGame) {
+    busy = true;
+    try {
+      const outcome = await source.installGsiCfg(game);
+      const label = gsiTargets.find((t) => t.game === game)?.label ?? game;
+      notice = describeGsiInstall(outcome, label);
+      await refreshGsiTargets();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
     }
   }
 
@@ -263,6 +329,39 @@ import type {
     }
   }
 
+  async function runClipAction(action: () => Promise<unknown>, done: string) {
+    busy = true;
+    try {
+      await action();
+      notice = done;
+      await refresh();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const renameClip = (id: number, title: string) =>
+    runClipAction(
+      () => source.setClipTitle(id, title),
+      title.trim() === '' ? 'Title cleared: showing the file name.' : 'Clip renamed.',
+    );
+
+  const setClipTags = (id: number, tags: string[]) =>
+    runClipAction(() => source.setClipTags(id, tags), 'Tags updated.');
+
+  // The OS actions change nothing in the library, so they neither hold the controls nor
+  // refresh; a failure is shown like any other command's.
+  async function osAction(action: () => Promise<unknown>, done: string | null) {
+    try {
+      await action();
+      if (done !== null) notice = done;
+    } catch (err) {
+      error = errorMessage(err);
+    }
+  }
+
   async function deleteClip(id: number, name: string) {
     busy = true;
     try {
@@ -299,7 +398,7 @@ import type {
   }
 
   function clipName(id: number): string {
-    return clips.find((clip) => clip.id === id)?.name ?? `clip #${id}`;
+    return clips.find((clip) => clip.id === id)?.displayName ?? `clip #${id}`;
   }
 
   /**
@@ -339,8 +438,10 @@ import type {
     selectedId = null;
     selectedSessionId = id;
     sessionEvents = [];
+    sessionMatches = [];
     try {
       sessionEvents = await source.sessionEvents(id);
+      sessionMatches = await source.sessionMatches(id);
     } catch (err) {
       error = errorMessage(err);
     }
@@ -357,6 +458,22 @@ import type {
       void loadThumbnails();
       // Deliberately stays on the session: extracting several clips from one game is the
       // ordinary thing to do, and the notice names the clip that was just cut.
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function extractMatch(index: number) {
+    const session = selectedSession;
+    if (session === null) return;
+    busy = true;
+    try {
+      const written = await source.extractMatch(session.id, index);
+      notice = describeExtraction(session.title, written);
+      await refresh();
+      void loadThumbnails();
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -388,6 +505,7 @@ import type {
       if (outcome.row_deleted && selectedSessionId === id) {
         selectedSessionId = null;
         sessionEvents = [];
+        sessionMatches = [];
       }
       await refresh();
     } catch (err) {
@@ -413,8 +531,14 @@ import type {
     void refreshApp();
     // The settings panel's values; re-read after every apply, which returns them anyway.
     void refreshSettings();
+    void refreshHealth();
+    void refreshGsiTargets();
     const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
-    return () => clearInterval(poll);
+    const healthPoll = setInterval(() => void refreshHealth(), HEALTH_POLL_MS);
+    return () => {
+      clearInterval(poll);
+      clearInterval(healthPoll);
+    };
   });
 ;
 async () => {
@@ -424,14 +548,19 @@ async () => {
      { const $$_lenaPgnidroceR2C = __sveltets_2_ensureComponent(RecordingPanel); new $$_lenaPgnidroceR2C({ target: __sveltets_2_any(), props: {            "status":recording,app,"busy":recordingBusy,"onStart":startRecording,"onStop":stopRecording,"onClip":saveClip,}});}
      { svelteHTML.createElement("div", { "class":`pane-head`,});
        { svelteHTML.createElement("h2", {});  }
-       { svelteHTML.createElement("span", { "class":`muted`,});clips.length;  }
+       { svelteHTML.createElement("span", { "class":`muted`,});
+        isFiltering(filter) ? `${visibleClips.length} of ${clips.length}` : clips.length; 
+       }
      }
-     { const $$_tsiLpilC2C = __sveltets_2_ensureComponent(ClipList); new $$_tsiLpilC2C({ target: __sveltets_2_any(), props: {          clips,thumbnails,selectedId,"onSelect":(id) => {
+     { const $$_raBretliFpilC2C = __sveltets_2_ensureComponent(ClipFilterBar); new $$_raBretliFpilC2C({ target: __sveltets_2_any(), props: {        filter,"games":gameOptions(clips),"tags":tagOptions(clips),"onChange":(next) => (filter = next),}});}
+     { const $$_tsiLpilC2C = __sveltets_2_ensureComponent(ClipList); new $$_tsiLpilC2C({ target: __sveltets_2_any(), props: {                   "clips":visibleClips,"filtering":isFiltering(filter),thumbnails,selectedId,"onSelect":(id) => {
         selectedId = id;
         // One main pane: selecting a clip takes it back from a session.
         selectedSessionId = null;
         sessionEvents = [];
-      },"onFavourite":toggleFavourite,"onDelete":(id) => deleteClip(id, clipName(id)),}});}
+        sessionMatches = [];
+      },"onFavourite":toggleFavourite,"onDelete":(id) => deleteClip(id, clipName(id)),"onCopy":(id) =>
+        osAction(() => source.copyClipToClipboard(id), 'Clip file copied to the clipboard.'),"onReveal":(id) => osAction(() => source.revealClip(id), null),"onDragOut":(id) => osAction(() => source.dragClipOut(id), null),}});}
      { svelteHTML.createElement("div", { "class":`pane-head`,});
        { svelteHTML.createElement("h2", {});  }
        { svelteHTML.createElement("span", { "class":`muted`,});sessions.length;  }
@@ -440,8 +569,11 @@ async () => {
     if(stats !== null){
        { const $$_lenaPegarotS2C = __sveltets_2_ensureComponent(StoragePanel); new $$_lenaPegarotS2C({ target: __sveltets_2_any(), props: { stats,}});}
     }
+    if(health !== null){
+       { const $$_lenaPhtlaeH2C = __sveltets_2_ensureComponent(HealthPanel); new $$_lenaPhtlaeH2C({ target: __sveltets_2_any(), props: { health,}});}
+    }
     if(settings !== null){
-       { const $$_lenaPsgnitteS2C = __sveltets_2_ensureComponent(SettingsPanel); new $$_lenaPsgnitteS2C({ target: __sveltets_2_any(), props: {      settings,recording,busy,"onApply":updateSettings,}});}
+       { const $$_lenaPsgnitteS2C = __sveltets_2_ensureComponent(SettingsPanel); new $$_lenaPsgnitteS2C({ target: __sveltets_2_any(), props: {         gsiTargets,"onInstallGsi":installGsi,settings,recording,busy,"onApply":updateSettings,}});}
     }
    }
 
@@ -464,12 +596,13 @@ async () => {
     if(selectedSession !== null){
       const session = selectedSession;
       session.id; {
-         { const $$_liateDnoisseS2C = __sveltets_2_ensureComponent(SessionDetail); new $$_liateDnoisseS2C({ target: __sveltets_2_any(), props: {           session,"events":sessionEvents,busy,"onExtract":extractClip,"onFavourite":(favourite) => toggleSessionFavourite(session.id, favourite),"onDelete":() => deleteSession(session.id),}});}
+         { const $$_liateDnoisseS2C = __sveltets_2_ensureComponent(SessionDetail); new $$_liateDnoisseS2C({ target: __sveltets_2_any(), props: {               session,"events":sessionEvents,"matches":sessionMatches,"onExtractMatch":extractMatch,busy,"onExtract":extractClip,"onFavourite":(favourite) => toggleSessionFavourite(session.id, favourite),"onDelete":() => deleteSession(session.id),}});}
       }
     } else if (selected !== null){
       const clip = selected;
       clip.id; {
-         { const $$_liateDpilC2C = __sveltets_2_ensureComponent(ClipDetail); new $$_liateDpilC2C({ target: __sveltets_2_any(), props: {        "clip":clip,busy,"onTrim":(range) => trimClip(clip.id, range),"onFavourite":(favourite) => toggleFavourite(clip.id, favourite),}});}
+         { const $$_liateDpilC2C = __sveltets_2_ensureComponent(ClipDetail); new $$_liateDpilC2C({ target: __sveltets_2_any(), props: {                "clip":clip,busy,"onTrim":(range) => trimClip(clip.id, range),"onFavourite":(favourite) => toggleFavourite(clip.id, favourite),"onRename":(title) => renameClip(clip.id, title),"onTags":(tags) => setClipTags(clip.id, tags),"onCopy":() =>
+            osAction(() => source.copyClipToClipboard(clip.id), 'Clip file copied to the clipboard.'),"onReveal":() => osAction(() => source.revealClip(clip.id), null),}});}
       }
     } else if (loaded){
        { svelteHTML.createElement("div", { "class":`empty-state`,});

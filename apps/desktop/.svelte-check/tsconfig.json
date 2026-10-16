@@ -27,7 +27,10 @@
   "exclude": [
     "../src/App.svelte",
     "../src/lib/components/ClipDetail.svelte",
+    "../src/lib/components/ClipFilterBar.svelte",
     "../src/lib/components/ClipList.svelte",
+    "../src/lib/components/HealthPanel.svelte",
+    "../src/lib/components/MatchTimeline.svelte",
     "../src/lib/components/RecordingPanel.svelte",
     "../src/lib/components/SessionDetail.svelte",
     "../src/lib/components/SessionList.svelte",

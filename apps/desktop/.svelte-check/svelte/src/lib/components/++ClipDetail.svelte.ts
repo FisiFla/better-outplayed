@@ -8,6 +8,7 @@
    * scrubbing works. There is no streaming code in this application and there must not be.
    */
 import Timeline from './Timeline.svelte';
+import { parseTagInput } from '../clips';
 import type { ClipView } from '../clips';
 import { formatDateTime } from '../time';
 import { fullRange, rangeLabel, rangeLengthLabel, validateRange } from '../trim';
@@ -20,6 +21,10 @@ import type { TrimRange } from '../types';
     busy: boolean;
     onTrim: (range: TrimRange) => void;
     onFavourite: (favourite: boolean) => void;
+    onRename: (title: string) => void;
+    onTags: (tags: string[]) => void;
+    onCopy: () => void;
+    onReveal: () => void;
   };function $$render() {
 
   
@@ -28,9 +33,27 @@ import type { TrimRange } from '../types';
   
   
   
+  
 
 
-  let { clip, busy, onTrim, onFavourite }: Props = $props();
+  let { clip, busy, onTrim, onFavourite, onRename, onTags, onCopy, onReveal }: Props = $props();
+
+  // svelte-ignore state_referenced_locally — keyed on the clip id by App (see `range`).
+  let titleDraft = $state(clip.title ?? '');
+  let tagDraft = $state('');
+
+  const titleChanged = $derived(titleDraft.trim() !== (clip.title ?? ''));
+
+  function saveTitle() {
+    if (titleChanged) onRename(titleDraft);
+  }
+
+  function addTags() {
+    const added = parseTagInput(tagDraft);
+    if (added.length === 0) return;
+    tagDraft = '';
+    onTags([...new Set([...clip.tags, ...added])]);
+  }
 
   let video = $state<HTMLVideoElement | null>(null);
   let playheadMs = $state(0);
@@ -78,7 +101,7 @@ async () => {
 
  { svelteHTML.createElement("header", { "class":`head`,});
    { svelteHTML.createElement("div", { "class":`titles`,});
-     { svelteHTML.createElement("h1", {});clip.name; }
+     { svelteHTML.createElement("h1", {});clip.displayName; }
      { svelteHTML.createElement("p", { "class":`mono muted`,});clip.path; }
    }
    { svelteHTML.createElement("button", {             "class":`star`,"type":`button`,"aria-pressed":clip.favourite,"title":clip.favourite ? 'Remove from favourites' : 'Protect this clip from cleanup',"onclick":() => onFavourite(!clip.favourite),"disabled":busy,});
@@ -87,10 +110,43 @@ async () => {
  }
 
  { svelteHTML.createElement("div", { "class":`facts`,});
+  if(clip.game){ { svelteHTML.createElement("span", { "class":`chip`,});clip.game; }}
    { svelteHTML.createElement("span", { "class":`chip`,});clip.durationLabel; }
    { svelteHTML.createElement("span", { "class":`chip`,});clip.sizeLabel; }
    { svelteHTML.createElement("span", { "class":`chip`,});clip.codec; }
    { svelteHTML.createElement("span", { "class":`chip`,});formatDateTime(clip.createdAtMs); }
+ }
+
+ { svelteHTML.createElement("section", { "class":`meta`,});
+   { svelteHTML.createElement("form", {     "class":`row`,"onsubmit":(e) => {
+      e.preventDefault();
+      saveTitle();
+    },});
+     { svelteHTML.createElement("input", {             "type":`text`,"aria-label":`Clip title`,"placeholder":clip.name,"maxlength":120,"bind:value":titleDraft,"disabled":busy,});/*Ωignore_startΩ*/() => titleDraft = __sveltets_2_any(null);/*Ωignore_endΩ*/}
+     { svelteHTML.createElement("button", {   "type":`submit`,"disabled":busy || !titleChanged,});  }
+   }
+   { svelteHTML.createElement("p", { "class":`muted note`,});             }
+
+   { svelteHTML.createElement("div", { "class":`row tagrow`,});
+       for(let tag of __sveltets_2_ensureArray(clip.tags)){tag;
+       { svelteHTML.createElement("span", { "class":`tag`,});
+        tag;
+         { svelteHTML.createElement("button", {          "type":`button`,"class":`x`,"aria-label":`Remove tag ${tag}`,"disabled":busy,"onclick":() => onTags(clip.tags.filter((t) => t !== tag)),});  }
+       }
+    }
+     { svelteHTML.createElement("form", {     "class":`row`,"onsubmit":(e) => {
+        e.preventDefault();
+        addTags();
+      },});
+       { svelteHTML.createElement("input", {             "type":`text`,"aria-label":`Add tags`,"placeholder":`Add tags, comma separated`,"maxlength":200,"bind:value":tagDraft,"disabled":busy,});/*Ωignore_startΩ*/() => tagDraft = __sveltets_2_any(null);/*Ωignore_endΩ*/}
+       { svelteHTML.createElement("button", {   "type":`submit`,"disabled":busy || parseTagInput(tagDraft).length === 0,});  }
+     }
+   }
+
+   { svelteHTML.createElement("div", { "class":`row`,});
+     { svelteHTML.createElement("button", {   "type":`button`,"onclick":onCopy,});  }
+     { svelteHTML.createElement("button", {   "type":`button`,"onclick":onReveal,});   }
+   }
  }
 
 
