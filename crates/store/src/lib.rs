@@ -330,6 +330,7 @@ impl Store {
             return Ok(());
         }
 
+        self.backup_before_migration(current)?;
         self.conn.execute_batch(V1_DDL)?;
         if current < 2 {
             self.upgrade_to_v2()?;
@@ -341,6 +342,52 @@ impl Store {
             self.upgrade_to_v4()?;
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    }
+
+    /// Copy an existing, populated database aside before upgrading it, so a bad migration
+    /// costs a restore rather than the library. The two newest backups are kept. In-memory
+    /// and brand-new databases have nothing to protect and are skipped. A backup that
+    /// cannot be written aborts the migration: nothing has been changed yet.
+    fn backup_before_migration(&self, current: i32) -> Result<()> {
+        let populated: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clips')",
+            [],
+            |r| r.get(0),
+        )?;
+        let Some(db_path) = self.conn.path().filter(|p| !p.is_empty()).map(PathBuf::from) else {
+            return Ok(());
+        };
+        if !populated {
+            return Ok(());
+        }
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(format!(".v{current}.bak"));
+        let backup = PathBuf::from(name);
+        let _ = std::fs::remove_file(&backup);
+        self.conn
+            .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            .with_context(|| format!("backing up the database to {} before migrating", backup.display()))?;
+
+        // Retention: keep the two newest `<db>.v*.bak`.
+        if let (Some(dir), Some(base)) = (db_path.parent(), db_path.file_name()) {
+            let prefix = format!("{}.v", base.to_string_lossy());
+            let mut backups: Vec<_> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with(&prefix) && n.ends_with(".bak")
+                })
+                .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+                .collect();
+            backups.sort();
+            let excess = backups.len().saturating_sub(2);
+            for (_, old) in backups.into_iter().take(excess) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
         Ok(())
     }
 
@@ -921,6 +968,54 @@ mod tests {
         };
         s.insert_clip(&clip).unwrap();
         assert!(s.insert_clip(&clip).is_err(), "path is UNIQUE");
+    }
+
+    #[test]
+    fn upgrading_a_populated_database_backs_it_up_first_and_keeps_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("localplay.db");
+        {
+            let s = Store::open(&db).unwrap();
+            s.migrate().unwrap();
+            s.insert_clip(&NewClip {
+                path: "/clips/a.mp4".into(),
+                started_at_ms: 1,
+                duration_ms: 1,
+                size_bytes: 1,
+                codec: "h264".into(),
+            })
+            .unwrap();
+        }
+        let backups = |dir: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".bak"))
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(backups(dir.path()).is_empty(), "a fresh database has nothing to back up");
+
+        // Pretend the file is one schema behind, three times over.
+        for version in [2, 3, 2] {
+            let s = Store::open(&db).unwrap();
+            s.conn.execute_batch(&format!("PRAGMA user_version = {version}")).unwrap();
+            drop(s);
+            let s = Store::open(&db).unwrap();
+            s.migrate().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let kept = backups(dir.path());
+        assert_eq!(kept.len(), 2, "only the two newest survive: {kept:?}");
+
+        // A backup is a real, openable copy that still has the clip.
+        let copy = dir.path().join(&kept[0]);
+        let n: i64 = rusqlite::Connection::open(copy)
+            .unwrap()
+            .query_row("SELECT count(*) FROM clips", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
