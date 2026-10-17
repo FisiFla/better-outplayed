@@ -171,15 +171,6 @@ code,
   overflow-y: auto;
 }
 
-/*
- * The clip page now sits under the recorder bar and a Back row, so its player gives up some
- * height to keep the timeline on screen at the default window; the clip page's own redesign
- * replaces this cap.
- */
-[data-region='clip-page'] video.player {
-  max-height: 40vh;
-}
-
 [data-region='storage'],
 [data-region='health'],
 [data-region='settings'] {
