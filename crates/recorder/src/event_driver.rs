@@ -1,10 +1,8 @@
 //! Starting the game-event integrations and acting on what they derive.
 //!
-//! Both front-ends (the CLI and the desktop shell) need the same thing: run the League
-//! poller and the CS2 / Dota 2 listener the `[events]` section asked for, and turn each event
-//! they derive into a clip (a highlight) or a marker (everything else). It lives here, beside
-//! the engine it drives, so the two cannot drift apart — the desktop shell used to have none
-//! of it, which meant an event-triggered clip only ever happened under the CLI.
+//! Both front-ends run the League poller and the CS2 / Dota 2 listener the `[events]` section asked
+//! for, and turn each derived event into a clip (a highlight) or a marker. It lives beside the
+//! engine it drives so the two front-ends cannot drift apart.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,38 +19,34 @@ use serde::Deserialize;
 
 use crate::{ClipReason, ClipWindow, RecordedClip, Recorder};
 
-/// `[events]` — which game-event sources to run (spec §7.1, §7.2).
+/// `[events]`: which game-event sources to run.
 ///
-/// Two settings, and no more: the endpoint the League poller uses is fixed by the spec, the
-/// GSI path is fixed, and the token is generated into the application data directory rather
-/// than written in a file a user edits (see `gsi::load_or_create_token`).
+/// The League endpoint and the GSI path are fixed; the GSI token is generated into the application
+/// data directory rather than a user-edited file (see `gsi::load_or_create_token`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EventsSection {
-    /// Poll the League Live Client Data API (spec §7.1). Harmless when no game is running:
-    /// a refused loopback connection is the normal state and is not an error.
+    /// Poll the League Live Client Data API. Harmless with no game running: a refused loopback
+    /// connection is the normal state.
     pub lol_poll_enabled: bool,
     /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
     pub gsi_port: u16,
-    /// Event kinds that must **not** take a clip even though they are highlights — the tags
-    /// from `EventKind::as_tag`, e.g. `["objective", "assist"]` for a player who wants their
-    /// kills and not every turret. A muted kind is still recorded as a marker on the session
-    /// timeline. Unknown tags are rejected at load, so a typo cannot silently mute nothing.
+    /// Highlight kinds that must not take a clip (tags from `EventKind::as_tag`, e.g.
+    /// `["objective", "assist"]`). A muted kind is still recorded as a marker. Unknown tags are
+    /// rejected at load, so a typo cannot silently mute nothing.
     #[serde(default)]
     pub mute_clips: Vec<String>,
-    /// `[events.lol]` — clip length for League events; unset keys use `[buffer]`.
+    /// `[events.lol]`: clip length for League events; unset keys use `[buffer]`.
     #[serde(default)]
     pub lol: GameClipSection,
-    /// `[events.gsi]` — clip length for Counter-Strike 2 / Dota 2 events (one GSI listener
-    /// serves both, so they share a length).
+    /// `[events.gsi]`: clip length for CS2 / Dota 2 events (one listener serves both).
     #[serde(default)]
     pub gsi: GameClipSection,
 }
 
-/// A game's own clip length: `pre_seconds` before the event and `post_seconds` after it.
+/// A game's own clip length: `pre_seconds` before the event and `post_seconds` after.
 ///
-/// A fight in League wants a long lead-up; a Counter-Strike kill does not. Either key may be
-/// left out (that half uses `[buffer]`), and a value above `[buffer] max_pre_seconds` /
-/// `max_post_seconds` is clamped to it, not refused — see [`ClipWindow`].
+/// Either key may be omitted (that half uses `[buffer]`); values above `[buffer] max_pre_seconds` /
+/// `max_post_seconds` are clamped, not refused (see [`ClipWindow`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(default)]
 pub struct GameClipSection {
@@ -100,9 +94,8 @@ impl Policy {
         })
     }
 
-    /// Whether this event takes a clip: a highlight that has not been muted. Muting
-    /// `objective` mutes every objective sub-kind (dragon, baron, ...) too; muting a
-    /// sub-kind mutes only that one.
+    /// Whether this event takes a clip: a highlight that is not muted. Muting `objective` mutes every
+    /// objective sub-kind; muting a sub-kind mutes only that one.
     pub fn clips(&self, event: &GameEvent) -> bool {
         event.is_highlight()
             && !self.muted.contains(&event.kind)
@@ -120,8 +113,7 @@ impl Policy {
 }
 
 impl Default for EventsSection {
-    /// The values `config.example.toml` ships: a file with no `[events]` section behaves as
-    /// the example does, which is also what the desktop shell relies on.
+    /// The values `config.example.toml` ships, so a file with no `[events]` section behaves as the example does.
     fn default() -> Self {
         Self {
             lol_poll_enabled: true,
@@ -135,9 +127,8 @@ impl Default for EventsSection {
 
 /// The event sources a front-end was configured to run, and the channel they report on.
 ///
-/// Dropping this stops the sources: each handle joins its own thread (see the handles'
-/// `Drop`), so nothing keeps polling a game or a port after the driver loop has ended. The
-/// handles are held here rather than in the loop for exactly that reason.
+/// Dropping this stops the sources: each handle joins its own thread on `Drop`, so they are held
+/// here so nothing keeps polling a game or a port after the driver loop ends.
 pub struct EventSources {
     /// Derived events, in the order the sources produced them.
     pub events: Receiver<GameEvent>,
@@ -145,19 +136,15 @@ pub struct EventSources {
     pub _lol: Option<LolHandle>,
     /// The same for the GSI listener.
     pub _gsi: Option<GsiListener>,
-    /// What starting each source concluded, for a health readout. Empty when the sources
-    /// were assembled by hand (a test, the CLI's fake).
+    /// What starting each source concluded, for a health readout; empty when assembled by hand.
     pub reports: Vec<SourceReport>,
 }
 
 /// How a source came out of startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceState {
-    /// Listening / polling.
     Running,
-    /// Switched off by its `[events]` setting.
     Disabled,
-    /// Asked for, but it could not start; the `detail` says why.
     Failed,
 }
 
@@ -171,10 +158,9 @@ pub struct SourceReport {
 
 /// Start whatever `[events]` asked for, best effort.
 ///
-/// Each source is independent and none is essential: a League poll is pointless on a machine
-/// with no League install, and a GSI listener needs a port and a token file, either of which
-/// can fail. A failure is a warning naming the setting, never a reason to refuse to record —
-/// the hotkey still works, and that is the fallback spec §7.4 describes.
+/// Sources are independent and none is essential (no League install, or a GSI port or token file
+/// that fails). A failure is a warning naming the setting, never a reason to refuse to record;
+/// the hotkey is the fallback.
 pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSources {
     let (sink, events_rx) = mpsc::channel::<GameEvent>();
 
@@ -247,20 +233,17 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
     EventSources { events: events_rx, _lol: lol, _gsi: gsi, reports }
 }
 
-/// Bring up the GSI listener and write out the file the user has to install (spec §7.2).
+/// Bring up the GSI listener and write out the file the user has to install.
 ///
-/// This function never writes into a game's installation directory: it generates the file
-/// into its own data directory and says where to copy it (the desktop app's settings button
-/// is the one, user-triggered, path that installs it for them). The token is loaded from (or
-/// generated into) the data directory, so the file the user installed once keeps working
-/// across runs — and it is never logged, only the path it lives at.
+/// Never writes into a game's installation directory: it generates the file into its own data
+/// directory and says where to copy it (the desktop settings button is the one user-triggered
+/// installer). The token is persisted so the installed file keeps working across runs, and is
+/// never logged.
 fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Result<GsiListener> {
     let token_path = app_dir.join("gsi-token.txt");
     let token = gsi::load_or_create_token(&token_path)?;
 
-    // One file per game, in its own directory: the two games subscribe different data
-    // blocks, and the file name has to be the same for both, so keeping them apart is the
-    // only way not to hand the user the wrong file.
+    // One file per game in its own directory: the games subscribe different data blocks but the file name is the same.
     let dirs = [
         ("cs2", gsi::integration_cfg(port, &token), "Counter-Strike 2 / CS:GO"),
         ("dota2", gsi::integration_cfg_dota(port, &token), "Dota 2"),
@@ -285,10 +268,8 @@ fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Re
     Ok(listener)
 }
 
-/// Do what a derived event asks for.
-///
-/// The only decision here is highlight versus marker, and it is the vocabulary's
-/// ([`localplay_events::EventKind::is_highlight`]) rather than this loop's. Everything else is one call.
+/// Do what a derived event asks for. The only decision, highlight versus marker, is the
+/// vocabulary's ([`localplay_events::EventKind::is_highlight`]).
 pub fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<Option<RecordedClip>> {
     act_on_event_in(recorder, event, ClipWindow::default())
 }
@@ -321,14 +302,11 @@ pub fn act_on_event_in(
 }
 
 
-/// How long a burst of highlights is allowed to grow before it becomes one clip.
+/// How long a burst of highlights may grow before it becomes one clip.
 ///
-/// A pentakill is five kills inside ten seconds. Answering each with its own pre-roll clip
-/// gave five overlapping files for one moment; waiting for the burst to settle and cutting
-/// **one** clip over all of it gives one file that contains every kill. The cut happens
-/// `quiet` after the last highlight, or `max` after the first, whichever is sooner — and
-/// `max` is kept inside the pre-roll so the *first* event is still on the buffered side of
-/// the cut.
+/// A pentakill is five kills in ten seconds; one clip over the settled burst replaces five
+/// overlapping files. The cut happens `quiet` after the last highlight or `max` after the first,
+/// whichever is sooner, and `max` stays inside the pre-roll so the first event is still buffered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Coalesce {
     /// How long without another highlight ends a burst.
@@ -338,8 +316,8 @@ pub struct Coalesce {
 }
 
 impl Coalesce {
-    /// Sized from the buffer's pre-roll: a burst may run for 60 % of it, and ends after a
-    /// third of that without news (never under a second, never over six).
+    /// Sized from the buffer's pre-roll: a burst may run 60% of it and ends after a third of that
+    /// without news (never under a second, never over six).
     pub fn for_pre_roll(pre_seconds: u64) -> Self {
         let max = Duration::from_millis(pre_seconds.saturating_mul(600));
         let quiet = (max / 3).clamp(Duration::from_secs(1), Duration::from_secs(6));
@@ -347,10 +325,8 @@ impl Coalesce {
     }
 }
 
-/// Everything in one burst, `first` included, in arrival order.
-///
-/// Non-highlights (markers) that arrive meanwhile are collected but neither extend nor end
-/// the burst. The channel closing ends it, because nothing further can arrive.
+/// Everything in one burst, `first` included, in arrival order. Markers arriving meanwhile are
+/// collected but neither extend nor end the burst; the channel closing ends it.
 fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> Vec<GameEvent> {
     let c = policy.coalesce;
     let started = std::time::Instant::now();
@@ -376,10 +352,8 @@ fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> 
     }
 }
 
-/// [`act_on_event`] with burst coalescing: a highlight waits for its burst to settle, then
-/// one clip is cut for the burst (reason: the first highlight) and every other event in it
-/// is recorded as a marker, so nothing is lost from the session's timeline. Returns the clip
-/// when one was taken.
+/// [`act_on_event`] with burst coalescing: a highlight waits for its burst to settle, then one clip
+/// is cut (reason: the first highlight) and every other event is recorded as a marker. Returns the clip if one was taken.
 pub fn act_on_burst(
     recorder: &Recorder,
     first: GameEvent,
@@ -406,15 +380,12 @@ pub fn act_on_burst(
     result
 }
 
-/// Called with every clip the driver takes, on the driver's thread — the desktop shell's way
-/// to tell the player a clip landed without the recorder crate knowing about notifications.
+/// Called with every clip the driver takes, on the driver's thread, so the desktop shell can notify
+/// the player without the recorder knowing about notifications.
 pub type ClipHook = Box<dyn Fn(&RecordedClip) + Send + 'static>;
 
-/// The thread that turns derived events into clips while a recording runs (the desktop
-/// shell's counterpart of the CLI's driver loop).
-///
-/// Dropping it stops the thread and then the sources, so nothing keeps polling a game or
-/// holding a port once the recording it served has ended.
+/// The thread that turns derived events into clips while a recording runs. Dropping it stops the
+/// thread and then the sources.
 pub struct EventDriver {
     reports: Vec<SourceReport>,
     stop: Arc<AtomicBool>,
@@ -470,8 +441,7 @@ fn drive(
     while !stop.load(Ordering::Acquire) {
         match sources.events.recv_timeout(DRIVER_POLL) {
             Ok(event) => {
-                // Nothing is being recorded yet (armed for a game, or already stopped): a
-                // game event then is a state, not a failure.
+                // Nothing is recording (armed for a game, or stopped): an event then is a state, not a failure.
                 if !recorder.is_running() {
                     tracing::info!("a game event arrived while nothing is being recorded; ignored");
                     continue;

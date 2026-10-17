@@ -1,114 +1,60 @@
-//! The recording engine: capture → audio → encode → segment ring → clip.
+//! The recording engine: capture -> audio -> encode -> segment ring -> clip.
 //!
-//! # Why this crate exists
+//! Both front-ends (the CLI and the desktop shell) are drivers over [`Recorder`]. It owns the
+//! capture and audio backends, the encoder, the ring (RAM for a replay buffer, files for a
+//! session), the [`FramePacer`], the capture clock, the pump thread and the clip-index insertion.
+//! It owns no hotkey and no UI, and reads no config file: front-ends hand it a [`RecorderConfig`].
 //!
-//! Recording used to be orchestration inside the CLI binary: the capture loop, the
-//! post-roll wait, the trigger, the clip index write and the storage pass all lived in
-//! `apps/localplay-cli/src/lib.rs`. That made the CLI the only thing in the project that
-//! could record — and the CLI is a headless PoC front-end, not the application a user
-//! runs. The desktop shell could browse, trim and delete clips but could not produce one.
+//! # Triggers
 //!
-//! So the orchestration moved here, unchanged and behind a small API, and both front-ends
-//! are drivers over it:
+//! A trigger carries a [`ClipReason`]. A manual clip records only the clip; a clip an integration
+//! asked for also writes the reason into the `events` table, linked to the clip. Both go through
+//! [`Recorder::clip_now_with`], so they share pre-roll, post-roll and media-time semantics. A
+//! marker event ([`EventKind::is_highlight`] false) is recorded without a clip via
+//! [`Recorder::note_event`].
 //!
-//! * the CLI parses its config, starts a [`Recorder`], installs the global hotkey and
-//!   calls [`Recorder::clip_now`] on a press;
-//! * the desktop shell holds one in `AppState` and exposes start/stop/status/clip over
-//!   IPC.
+//! # Threads
 //!
-//! # What it owns, and what it deliberately does not
+//! [`Recorder::start`] runs the whole startup handshake on the calling thread (index, storage
+//! policy, encoder smoke test, capture backend, ring, ffmpeg) and returns its errors there, so an
+//! unusable machine fails at startup. Only the pump loop runs on the spawned thread.
+//! [`Recorder::clip_now`] hands the trigger to that thread because the trigger must pump the
+//! encoder and may wait [`POST_ROLL_MARGIN`] plus the post-roll; [`Recorder::status`] only reads
+//! atomics and never blocks the loop.
 //!
-//! It owns the capture backend, the audio backend, the encoder, the ring (in RAM for a replay
-//! buffer, files for a session), the
-//! [`FramePacer`], the capture clock, the background thread that pumps them, and the clip
-//! index insertion. It owns **no** hotkey (a driver's business — the CLI installs one, the
-//! GUI calls [`Recorder::clip_now`] from a button) and **no** UI, and it reads no
-//! configuration file: the front-ends hand it a [`RecorderConfig`].
+//! # Modes, microphone, game watcher
 //!
-//! # Why a clip was taken
+//! * [`RecordingMode`]: [`RecordingMode::ReplayBuffer`] (default) or [`RecordingMode::FullSession`],
+//!   which writes a per-session directory exempt from the scratch cap and concatenates it into
+//!   one `session-<timestamp>.mp4` at stop (see [`session`]). Both open a `sessions` row managed
+//!   by retention.
+//! * Microphone ([`MicSection`], off by default): a second audio input, so clips carry two audio
+//!   tracks. If it cannot start, the recording fails at start rather than producing a silent voice track.
+//! * Game watcher ([`localplay_events::process::GamesSection`], `[games] auto_record`, off by
+//!   default): a recording starts and stops with a watched game. With it off no watcher thread
+//!   exists at all.
 //!
-//! A trigger carries a [`ClipReason`]. A manual clip records nothing but the clip; a clip an
-//! integration asked for writes the reason into the `events` table (spec §5.5) linked to the
-//! clip it produced, so the session timeline says *why* the footage exists. Both paths are
-//! the same trigger — [`Recorder::clip_now_with`] is [`Recorder::clip_now`] with a reason —
-//! which is what keeps an event-triggered clip subject to the same pre-roll, post-roll and
-//! media-time semantics as a hotkey press.
+//! [`Recorder::start`] is [`Recorder::start_with_options`] with [`RecorderOptions::default`].
+//! [`RecorderConfig`] has one defaulted field ([`RecorderConfig::audio_bitrate_kbps`]) because the
+//! desktop shell constructs it field by field; other settings travel in [`RecorderOptions`].
 //!
-//! An event that is a *marker* rather than a highlight ([`EventKind::is_highlight`]) is
-//! recorded without a clip, through [`Recorder::note_event`]. No second trigger path is
-//! involved in either case.
+//! # Invariants that must not regress
 //!
-//! # The thread
-//!
-//! [`Recorder::start`] does the whole startup handshake on the calling thread — open the
-//! index, apply the storage policy, resolve and smoke-test the encoder, create the capture
-//! backend, build the ring, spawn ffmpeg — and returns its errors *there*, so a machine
-//! that cannot encode fails at startup rather than inside a thread nobody is watching.
-//! Only the pump loop runs on the background thread it spawns.
-//!
-//! [`Recorder::clip_now`] hands the trigger to that thread, because the trigger has to
-//! pump the encoder — it is the same capture/encoder/ring the loop owns, and it may wait
-//! [`POST_ROLL_MARGIN`] plus the post-roll for the footage to be written. Everything else
-//! ([`Recorder::status`]) reads atomics and never blocks the loop.
-//! # The two modes, the microphone and the game watcher
-//!
-//! Phase 5 added three things to the engine, and each is opt-in or additive:
-//!
-//! * [`RecordingMode`] (spec §6, `[recorder] mode`). [`RecordingMode::ReplayBuffer`] is the
-//!   ring this crate has always run and remains the default; [`RecordingMode::FullSession`]
-//!   writes the session into a per-session directory that the scratch cap does **not**
-//!   apply to, and concatenates it into one `session-<timestamp>.mp4` at stop (see
-//!   [`session`]). Both modes open a `sessions` row and are managed by the retention pass.
-//! * The microphone ([`MicSection`], `[mic] enabled`, off by default). When it is on, the
-//!   encoder is configured with a second audio input and the microphone's blocks are fed to
-//!   it, so a clip — and a session file — carries two audio tracks. When it is on and the
-//!   backend cannot start, the recording fails at start rather than producing video with a
-//!   silent voice track.
-//! * The game watcher ([`localplay_events::process::GamesSection`], `[games] auto_record`,
-//!   off by default). With it on, [`Recorder::start`] starts **nothing** game-related
-//!   watching-wise except the watcher itself: a recording is started when a watched game
-//!   starts and stopped when it stops. With it off (the default) no watcher thread, no
-//!   process enumeration and no request exist at all — it is not a flag on a watcher that
-//!   runs anyway.
-//!
-//! # The one rate every path shares
-//!
-//! [`Recorder::start`] is [`Recorder::start_with_options`] with [`RecorderOptions::default`]
-//! (replay buffer, no microphone, nothing watched), which is what both front-ends' existing
-//! code means; the options struct carries the Phase 5 settings. The configuration struct
-//! [`RecorderConfig`] carries the recorder's own sections plus one defaulted field,
-//! [`RecorderConfig::audio_bitrate_kbps`]: the desktop shell is a separate workspace that
-//! constructs `RecorderConfig` field by field, so a *required* field there would break a
-//! crate this work may not touch, while an `Option` it sets to `None` cannot. Every other
-//! setting that is not part of the recorder's own sections travels in [`RecorderOptions`].
-//!
-//! [`Recorder::clip_now`] hands the trigger to that thread, because the trigger has to
-//! pump the encoder — it is the same capture/encoder/ring the loop owns, and it may wait
-//! [`POST_ROLL_MARGIN`] plus the post-roll for the footage to be written. Everything else
-//! ([`Recorder::status`]) reads atomics and never blocks the loop.
-//!
-//! # Properties that must not regress
-//!
-//! Each of these was paid for once, and each has a test:
-//!
-//! * The trigger is expressed in the **ledger's media time** (`span_ms`), never the wall
-//!   clock, and the post-roll budget is `post_ms + margin`. Media time is the footage the ring
-//!   can prove is on disk, which is the only clock a splice can be cut on — a wall-clock
-//!   trigger asked for footage the encoder might not have written yet.
-//! * The pacer decides **before** the frame is materialised, and non-due frames are
-//!   drained with [`CaptureBackend::discard_pending`] so the GPU readback is skipped.
-//! * The encoder is smoke-tested **before** any capture backend is created, so an
-//!   unusable encoder never opens a capture session on the user's display. The microphone is
-//!   built and started on the same side of that line (see `Prepared::begin`).
-//! * Clips are spliced losslessly (`-c copy`) and indexed with the row written before the
-//!   file could ever be evicted (spec §8.2).
-//! * The storage cleanup pass runs at startup and every [`CLEANUP_INTERVAL`], over clips
-//!   **and** sessions independently ([`cleanup_pass`]).
+//! * The trigger is expressed in the ring's media time (`span_ms`), never the wall clock, and the
+//!   post-roll budget is `post_ms + margin`; a wall-clock trigger could ask for footage not yet written.
+//! * The pacer decides before the frame is materialised, and non-due frames are drained with
+//!   [`CaptureBackend::discard_pending`] so the GPU readback is skipped.
+//! * The encoder is smoke-tested before any capture backend exists, so an unusable encoder never
+//!   opens a capture session on the display. The microphone is built on the same side of that
+//!   line (see `Prepared::begin`).
+//! * Clips are spliced losslessly (`-c copy`) and the index row is written before the file could
+//!   be evicted.
+//! * Cleanup runs at startup and every [`CLEANUP_INTERVAL`], over clips and sessions independently
+//!   ([`cleanup_pass`]).
 //! * The status line (`frames= segments= bytes= span= dropped= dropped_audio= dropped_mic=
-//!   skipped= fps=`) stays observable, and `running`/counters stay readable from another
-//!   thread.
-//! * One writer thread per input: the pump submits video, game audio and microphone from its
-//!   own thread into the encoder's per-input queues, never writing two inputs synchronously
+//!   skipped= fps=`) stays observable, and counters stay readable from other threads.
+//! * One writer thread per input: the pump submits video, game audio and microphone into the
+//!   encoder's per-input queues, never writing two inputs synchronously
 //!   ([`pump_once_counted_with_mic`]).
 
 pub mod config;
@@ -163,54 +109,30 @@ use std::time::{Duration, Instant};
 
 /// The frame size the synthetic capture backend produces off Windows.
 ///
-/// Real Windows capture (WGC) reports the primary monitor's native resolution; there
-/// is no monitor to query on macOS, so the stub stands in at a fixed, representative
-/// size. It is deliberately not the old 1920x1080 encoder default, so a macOS run
-/// makes it plain that the rawvideo pipe is sized from the backend, not a constant.
+/// Deliberately not 1920x1080, so the rawvideo pipe is visibly sized from the backend.
 pub const STUB_CAPTURE_SIZE: (u32, u32) = (1280, 720);
 
-/// How often the scratch ring is scanned, the status published, and the status line
-/// emitted while the buffer runs.
+/// How often the scratch ring is scanned, the status published, and the status line emitted.
 ///
-/// One tick for all three: the scan is what makes new segments visible, and the counters
-/// that are published and logged (`segments=`, `bytes=`, `span=`) only move when a
-/// segment is finalised, so scanning and reporting at the same instant costs nothing
-/// extra and keeps the log line's numbers exactly the ones the ring reported.
+/// One tick for all three: the counters only move when a segment finalises.
 pub const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 
 /// At most one "the encoder cannot sustain the configured fps" warning per this long.
 ///
-/// The condition it reports (`dropped=` rising) is evaluated every [`STATUS_INTERVAL`], and
-/// a machine that genuinely cannot encode at the configured rate stays in that state for
-/// the whole run: warning once per log line would bury everything else in the log. The
-/// `debug` status line remains the continuous record; this is the part that must not be
-/// missable.
+/// A machine in that state stays there all run; the `debug` status line is the continuous record.
 pub const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How often the storage policy is re-applied once the buffer is running (spec §8.1).
+/// How often the storage policy is re-applied to the clips directory while running.
 ///
-/// This is the **clips** directory's rule, not a recording's: the in-memory ring drops its
-/// oldest footage by construction when it fills, while a clip is written once
-/// and — before this — kept forever. The clips directory therefore only grows when a clip
-/// is triggered, and one pass costs a `list_clips` plus a `SUM`, i.e. a few hundred
-/// microseconds on a library of thousands of rows. Five minutes is long enough that the
-/// cost is invisible in a capture path that submits 30-60 frames a second, and short
-/// enough that a session's clips cannot drift far past `storage.max_total_bytes` before
-/// they are managed. A fresh run applies the policy at startup, so anything a previous
-/// session left over is handled immediately rather than five minutes in.
+/// Clips only accumulate when triggered and a pass is cheap (a `list_clips` plus a `SUM`), so five
+/// minutes keeps a session's clips from drifting far past `storage.max_total_bytes`. Startup also applies it.
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Where the frames come from.
 ///
-/// [`Sources::Platform`] is the shipping path and the only one that ever touches a
-/// display: on Windows it is Windows Graphics Capture and WASAPI loopback, and elsewhere
-/// it is the synthetic stubs (see `localplay_capture::platform`, which refuses to fall
-/// back to a stub on Windows so a broken capture never looks like a working one).
-///
-/// [`Sources::Stub`] selects the synthetic sources **explicitly**. It exists so this
-/// crate's tests can drive the whole engine — pacer, encoder, ring, trigger, index —
-/// without touching the host's screen or its audio, and it is never reachable from a
-/// configuration file.
+/// [`Sources::Platform`] is the shipping path (WGC and WASAPI loopback on Windows; stubs elsewhere,
+/// and `localplay_capture::platform` refuses a stub fallback on Windows). [`Sources::Stub`] selects
+/// the synthetic sources explicitly for tests and is never reachable from a config file.
 #[derive(Debug, Clone, Copy)]
 pub enum Sources {
     Platform,
@@ -219,47 +141,33 @@ pub enum Sources {
 
 /// Everything [`Recorder::start`] needs, resolved by the front-end.
 ///
-/// The three sections are `config.toml`'s, verbatim ([`config`]), and the paths are the
-/// application data directory plus whatever the sections overrode — the recorder applies
-/// the "empty means the default" rule itself, so both front-ends resolve `scratch/`,
-/// `clips/` and `localplay.db` the same way.
+/// Sections are `config.toml`'s verbatim; the recorder applies the "empty means default" path rule
+/// itself so both front-ends resolve `scratch/`, `clips/` and `localplay.db` identically.
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
-    /// Where ffmpeg and ffprobe live: discovered by the front-end (spec §5.4), so a
-    /// missing sidecar is reported by the thing that knows where to look for it.
+    /// Where ffmpeg and ffprobe live, discovered by the front-end.
     pub bin: FfmpegBinaries,
-    /// The application data directory. `scratch/`, `clips/` and `localplay.db` live here
-    /// unless `[buffer].scratch_dir` / `[storage].clips_dir` name somewhere else.
+    /// The application data directory; `scratch/`, `clips/` and `localplay.db` live here unless overridden.
     pub app_data_dir: PathBuf,
     pub buffer: BufferSection,
     pub encode: EncodeSection,
     pub storage: StorageSection,
     /// `[capture]` — which monitor or window `Sources::Platform` records.
     pub capture: CaptureSection,
-    /// `[audio] bitrate_kbps` — the game-audio track's bitrate, in kbps, as the CLI read it
-    /// out of `config.toml`.
+    /// `[audio] bitrate_kbps`, as the CLI read it.
     ///
-    /// It rides here rather than in [`EncodeSection`] because `[audio]` is that setting's one
-    /// home in the file: a second key under `[encode]` would be a second source of truth for
-    /// one number. `None` means the front-end carries no value — the desktop shell does not
-    /// parse `[audio]` — and resolves to
-    /// [`localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] (192 kbps) in
-    /// [`build_encode_config`], which is what this pipeline recorded before the key was read.
+    /// Lives here, not in [`EncodeSection`], so `[audio]` stays that setting's only home. `None` (the
+    /// desktop shell does not parse `[audio]`) resolves to
+    /// [`localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] in [`build_encode_config`].
     pub audio_bitrate_kbps: Option<u32>,
-    /// `[audio] enabled` — whether this recording carries the game-audio track at all.
+    /// `[audio] enabled`: whether this recording carries the game-audio track.
     ///
-    /// `None` carries no value, which is the desktop shell (it does not parse `[audio]`) and
-    /// means `true`: every recording this pipeline has made carried the game audio. `Some(false)`
-    /// is a video-only recording, and then nothing about the game audio exists — no loopback
-    /// backend is created, the encoder declares no audio input, and the container has no audio
-    /// stream. Read through [`RecorderConfig::game_audio`], because two places need the same
-    /// answer.
+    /// `None` (the desktop shell) means `true`. `Some(false)` is video-only: no loopback backend, no
+    /// audio input, no audio stream. Read it through [`RecorderConfig::game_audio`].
     pub audio_enabled: Option<bool>,
     pub sources: Sources,
-    /// Encode with libx264 instead of a hardware vendor. This is the CLI's
-    /// `--dev-software-encoder`: it exists for pipeline smoke tests on a host with no GPU
-    /// encoder, needs no vendor at all, and is only reachable from a build with the
-    /// `test-encoders` feature — never from a configuration file (spec §3.2).
+    /// Encode with libx264 (the CLI's `--dev-software-encoder`) for smoke tests on a host with no GPU
+    /// encoder. Only reachable from a build with `test-encoders`, never from a config file.
     pub dev_software_encoder: bool,
 }
 
@@ -269,18 +177,14 @@ impl RecorderConfig {
         resolve_dir(&self.app_data_dir, "scratch", &self.buffer.scratch_dir)
     }
 
-    /// The clips directory this configuration writes into — the same rule the desktop
-    /// shell's `AppPaths` applies, which is what makes the two operate on one library.
+    /// The clips directory this configuration writes into (the same rule as the desktop `AppPaths`).
     pub fn clips_dir(&self) -> PathBuf {
         resolve_dir(&self.app_data_dir, "clips", &self.storage.clips_dir)
     }
 
-    /// The sessions area: where a full session's segment directory and its concatenated
-    /// file live ([`RecordingMode::FullSession`], `session`).
+    /// The sessions area: a full session's segment directory and its concatenated file.
     ///
-    /// Its own directory rather than a corner of `scratch/`, because a session directory is only
-    /// ever removed by its own finalise or by the retention rules through its session row:
-    /// nothing drops segments out of it while it is recording.
+    /// Its own directory, not a corner of `scratch/`: nothing drops segments out of it while recording.
     pub fn sessions_dir(&self) -> PathBuf {
         resolve_dir(&self.app_data_dir, "sessions", &self.storage.sessions.sessions_dir)
     }
@@ -291,7 +195,7 @@ impl RecorderConfig {
     }
 }
 
-/// An empty setting means "under the application data directory" (spec §10).
+/// An empty setting means "under the application data directory".
 fn resolve_dir(app_data_dir: &Path, default_name: &str, setting: &str) -> PathBuf {
     if setting.is_empty() {
         app_data_dir.join(default_name)
@@ -300,84 +204,56 @@ fn resolve_dir(app_data_dir: &Path, default_name: &str, setting: &str) -> PathBu
     }
 }
 
-/// Everything [`Recorder::start_with_options`] needs that is not in the configuration file's
-/// recording sections.
+/// Everything [`Recorder::start_with_options`] needs that is not in the recording sections.
 ///
-/// [`Recorder::start`] is this struct's [`Default`]: replay buffer, no microphone, nothing
-/// watched — the behaviour every caller had before Phase 5. It exists as its own struct
-/// rather than as more fields on [`RecorderConfig`] because the desktop shell is a separate
-/// workspace that builds a `RecorderConfig` field by field, and a new required field there
-/// would break a crate this work does not touch. A front-end that wants a setting here
-/// passes it; one that does not keeps compiling and keeps behaving exactly as it did.
+/// Its own struct (not more `RecorderConfig` fields) because the desktop shell builds that field
+/// by field and a new required field would break it. [`Recorder::start`] passes the `Default`.
 #[derive(Debug, Clone, Default)]
 pub struct RecorderOptions {
     /// What to record: the rolling buffer, or the whole session (see [`RecordingMode`]).
     pub mode: RecordingMode,
     /// The optional microphone track ([`MicSection`]; off by default).
     pub mic: MicSection,
-    /// `[games]` — whether a watched game starting is itself a reason to record, and which
-    /// titles count ([`GamesSection`]). `auto_record` defaults to `false`, and with it off
-    /// nothing game-related is started at all.
+    /// `[games]`: whether a watched game starting is itself a reason to record, and which titles count.
     pub games: GamesSection,
-    /// The game a driver detected, written into the `sessions` row this recording opens.
-    /// `None` for a recording a person started (a hotkey, a button, the CLI's run).
+    /// The game a driver detected, written into the `sessions` row; `None` for a person-started recording.
     pub game: Option<String>,
 }
 
-// `Default` is derived, and it is the pre-Phase-5 behaviour by construction: `RecordingMode`
-// defaults to the replay buffer, `MicSection` to off, `GamesSection` to `auto_record = false`
-// and `game` to `None` — every field's own default. `Recorder::start` passes it, so a caller
-// that has never heard of Phase 5 gets exactly what it always got.
+// `Default` is the replay buffer, no microphone, no watcher, no game.
 
 /// What the recording engine is doing right now.
 ///
-/// Read from another thread while the loop runs: every field is an atomic load (plus, for
-/// `error`, a short-lived mutex), so a status read never waits for the capture loop and
-/// the capture loop never waits for a reader.
+/// Read from other threads: atomic loads plus a short-lived mutex for `error`, so a read never
+/// waits on the capture loop and vice versa.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecorderStatus {
-    /// `false` once `stop()` has returned, and once the loop has failed. A front-end that
-    /// is polling this can tell "recording" from "stopped" without owning the thread.
+    /// `false` once `stop()` has returned or the loop has failed.
     pub running: bool,
     /// Video frames submitted to the encoder (the status line's `frames=`).
     pub frames: u64,
     /// Completed segments in the ring.
     pub segments: u64,
-    /// Bytes the ring is holding.
-    ///
-    /// **In RAM** for a replay buffer, which writes nothing while it is only buffering, and on
-    /// **disk** for a full session. Which one follows from `mode` in the same status and is not
-    /// distinguishable from the number alone, so a caller that shows this to a user should show
-    /// the mode beside it.
+    /// Bytes the ring is holding: in RAM for a replay buffer, on disk for a full session (show `mode` beside it).
     pub bytes: u64,
-    /// Media time the ring can prove it holds, in ms — the position the trigger is taken from,
-    /// and the clock the post-roll wait advances against.
+    /// Media time the ring can prove it holds, in ms; the trigger position and the post-roll clock.
     pub span_ms: u64,
     /// Encoder video frames dropped because its queue was full.
     pub dropped: u64,
     /// The same for audio blocks.
     pub dropped_audio: u64,
-    /// The same for microphone blocks. Zero when this recording has no microphone track,
-    /// and zero — not absent — when it has one and nothing was dropped.
+    /// The same for microphone blocks; zero when there is no microphone track.
     pub dropped_mic_audio: u64,
     /// Whether this recording carries a microphone track at all (`[mic] enabled`).
     pub mic: bool,
-    /// The loopback port the encoder's microphone input is declared on, when there is one.
-    /// `None` means the second input does not exist, which is what the encoder's own
-    /// `mic_port()` answers — reported so a front-end can say *which* input is in use
-    /// rather than believing the configuration.
+    /// The loopback port of the encoder's microphone input; `None` means no second input exists.
     pub mic_port: Option<u16>,
     /// The mode this recorder was started in ([`RecordingMode`]).
     pub mode: RecordingMode,
-    /// The game being recorded, when a watched game triggered this recording
-    /// (`[games] auto_record = true`); `None` while nothing is being recorded, and for a
-    /// recording a person started.
+    /// The game being recorded when a watched game triggered it; `None` otherwise.
     pub game: Option<String>,
-    /// Whether a game watcher is armed for this recorder. `false` unless `[games]
-    /// auto_record` was on at start — with it off there is no watcher at all, which is what
-    /// this reports. While it is `true` and `running` is `false`, the recorder is **armed
-    /// and waiting for a game**: a front-end's "is it recording?" question is `running`,
-    /// and "is it going to?" is this.
+    /// Whether a game watcher is armed (`[games] auto_record` was on at start). While `true` with
+    /// `running` false, the recorder is armed and waiting for a game.
     pub watching_games: bool,
     /// Frames the backend offered that the pacer skipped *without* reading them back.
     pub skipped: u64,
@@ -385,32 +261,25 @@ pub struct RecorderStatus {
     pub fps: f64,
     /// What `encode.fps` asked for, so the two can be shown side by side.
     pub configured_fps: u32,
-    /// The rate the pipeline is actually running at — the pacer's rate and the encoder
-    /// child's `-framerate`, one number. Below `configured_fps` when the startup probe
-    /// measured that this machine cannot hold the configured rate and adaptation is on
-    /// (startup logs that in as many words). It is the rate an achieved-rate readout should
-    /// be compared against; the media timeline does not depend on it (frames carry their
-    /// arrival timestamps).
+    /// The rate the pipeline actually runs at (the pacer's rate and the encoder's `-framerate`).
+    /// Below `configured_fps` when the startup probe found the machine cannot hold the configured
+    /// rate and adaptation is on. Compare an achieved-rate readout against this.
     pub effective_fps: u32,
-    /// Wall clock minus media time, in ms. Positive means the footage the ring can prove it
-    /// has is behind the wall clock — the ring can only count *finished* segments, so this
-    /// includes the encoder's lag as well as any clock divergence. Expected to stay near its
-    /// start-up offset (ffmpeg's start-up plus one segment) on a healthy machine; the
-    /// trigger's media-time arithmetic is anchored to `span_ms`, so it is worth watching.
+    /// Wall clock minus media time, in ms. Positive means the provable footage is behind the wall
+    /// clock (only finished segments count, so this includes encoder lag). Expected to stay near
+    /// its start-up offset (ffmpeg start-up plus one segment) on a healthy machine.
     pub drift_ms: i64,
     /// Clips this session has written.
     pub clips: u64,
     /// Set when the loop stopped because of a failure, so a front-end can say why.
     pub error: Option<String>,
-    /// The encoder the most recent recording actually ran (`h264_nvenc`, `libx264`, ...);
-    /// `None` until one has started. It outlives the recording, so a health readout can say
-    /// what the last run used even after it stopped.
+    /// The encoder the most recent recording ran (`h264_nvenc`, `libx264`, ...); `None` until one
+    /// has started. Outlives the recording.
     pub encoder: Option<String>,
 }
 
 impl RecorderStatus {
-    /// The status of an engine that is not running, for a front-end that has never
-    /// started one. `configured_fps` is 0 because nothing has been configured.
+    /// The status of an engine that has never been started; `configured_fps` is 0.
     pub fn stopped() -> Self {
         Self {
             running: false,
@@ -438,21 +307,15 @@ impl RecorderStatus {
     }
 }
 
-/// Why a clip was taken.
+/// Why a clip was taken; the seam through which game integrations enter.
 ///
-/// This is the difference between "a clip exists" and "the session timeline knows why",
-/// which is what spec §5.5's `events` table is for. It is also the seam the two game
-/// integrations come in through (spec §7.1, §7.2): a driver hands the engine a derived
-/// [`GameEvent`], and the engine takes the clip through exactly the path a hotkey press
-/// takes — one trigger, one window, one splice.
+/// A driver hands the engine a derived [`GameEvent`] and the clip goes through the same path as a
+/// hotkey press: one trigger, one window, one splice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipReason {
-    /// A hotkey press or a button. No `events` row is written: there is no game event to
-    /// record, and a synthetic one would put a marker on the session timeline at which
-    /// nothing happened.
+    /// A hotkey press or a button. No `events` row is written.
     Manual,
-    /// A game event derived by an integration. The reason is written to `events` and linked
-    /// to the clip it produced (or to nothing, if the clip could not be indexed).
+    /// A game event derived by an integration; written to `events` and linked to the clip it produced.
     GameEvent(GameEvent),
 }
 
@@ -482,10 +345,9 @@ impl From<GameEvent> for ClipReason {
 
 /// How much footage one clip takes, when it is not the configured `[buffer]` window.
 ///
-/// `None` fields mean "the configured `pre_seconds` / `post_seconds`". A request is **clamped**
-/// to the buffer's ceiling (`[buffer] max_pre_seconds` / `max_post_seconds`, never below the
-/// configured window) rather than refused: the footage beyond the ring does not exist, and a
-/// clip a little shorter than asked for is better than no clip when the key was pressed.
+/// `None` fields mean the configured `pre_seconds` / `post_seconds`. Requests are clamped to the
+/// buffer's ceiling (`max_pre_seconds` / `max_post_seconds`) rather than refused: a slightly
+/// shorter clip beats none when the key was pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClipWindow {
     pub pre_seconds: Option<u64>,
@@ -497,9 +359,8 @@ impl ClipWindow {
         Self { pre_seconds: Some(pre_seconds), post_seconds: Some(post_seconds) }
     }
 
-    /// The effective `(pre_ms, post_ms)`: the request (or `default_*`) clamped to `max_*`. An
-    /// empty window (both zero) falls back to one second of post-roll, because a clip needs
-    /// at least one frame to exist.
+    /// The effective `(pre_ms, post_ms)`: the request (or `default_*`) clamped to `max_*`. An empty
+    /// window falls back to one second of post-roll, because a clip needs at least one frame.
     pub fn resolve(
         self,
         default_pre_ms: u64,
@@ -523,38 +384,30 @@ impl ClipWindow {
 pub struct RecordedClip {
     /// The file that was written, with what the splice measured it at.
     pub metadata: ClipMetadata,
-    /// The `clips` row, when the index write succeeded. `None` means the file is on disk
-    /// and unindexed — the case [`index_clip`] logs at ERROR and never hides.
+    /// The `clips` row id when the index write succeeded. `None` means the file is on disk
+    /// unindexed, which [`index_clip`] logs at ERROR.
     pub id: Option<i64>,
-    /// The clip's first frame on the ledger's media timeline, which is what the index
-    /// row's `started_at` carries.
+    /// The clip's first frame on the ring's media timeline (the index row's `started_at`).
     pub started_at_ms: u64,
 }
 
-/// A running recording session.
-///
-/// [`Recorder::start`] returns one with the pump loop already running on its own thread;
-/// dropping it stops that thread (see [`Recorder::stop`]).
+/// A running recording session. [`Recorder::start`] returns one with the pump loop already
+/// running on its own thread; dropping it stops that thread (see [`Recorder::stop`]).
 pub struct Recorder {
-    /// Commands to the recording that is running **now**, if one is.
+    /// Commands to the recording running now, if any.
     ///
-    /// A game-driven recorder replaces this on every start and clears it on every stop
-    /// (see [`RecorderOptions::games`]), so [`Recorder::clip_now`] always reaches the
-    /// recording that exists — and answers with a clear error when none does, which is a
-    /// different state from "stopped": armed and waiting for a game is a state, not a
-    /// recording. Dropping the last sender disconnects the loop, which is how a dropped
-    /// `Recorder` stops its capture even if `stop()` is never called.
+    /// A game-driven recorder replaces this on every start and clears it on every stop, so
+    /// [`Recorder::clip_now`] errors clearly when none exists. Dropping the last sender disconnects
+    /// the loop, which is how a dropped `Recorder` stops capture without `stop()`.
     commands: Arc<Mutex<Option<Sender<Command>>>>,
-    /// The engine thread of a recording this `Recorder` started itself. Games mode leaves
-    /// this `None`: the supervisor owns the thread, because it is the thing that starts and
-    /// stops recordings ([`Recorder::stop`] signals the supervisor instead).
+    /// The engine thread of a recording this `Recorder` started itself. Games mode leaves this
+    /// `None`: the supervisor owns the thread ([`Recorder::stop`] signals the supervisor instead).
     thread: Mutex<Option<JoinHandle<Store>>>,
-    /// The game-presence supervisor, when a front-end asked for one. `None` otherwise — and
-    /// that `None` is the structural half of "with `auto_record = false` nothing is watched":
-    /// there is no receiver, no handle and no thread to gate.
+    /// The game-presence supervisor, if a front-end asked for one. `None` is what guarantees that
+    /// with `auto_record = false` nothing is watched.
     supervisor: Mutex<Option<Supervisor>>,
     status: Arc<SharedStatus>,
-    /// The mode this recorder was started in, reported by [`Recorder::status`].
+    /// The mode this recorder was started in (reported by [`Recorder::status`]).
     mode: RecordingMode,
     /// Whether this recorder was started with a microphone track ([`MicSection::enabled`]).
     mic: bool,
@@ -573,9 +426,8 @@ enum Command {
 
 /// The counters the loop publishes for [`Recorder::status`].
 ///
-/// Every field is independent of every other, and a reader never uses one to decide
-/// whether another is meaningful, so `Relaxed` is the honest ordering: no reader may
-/// block the capture loop, and none of these values gates a memory access.
+/// The fields are independent and none gates a memory access, so `Relaxed` is sufficient and no
+/// reader can block the capture loop.
 #[derive(Debug)]
 struct SharedStatus {
     running: AtomicBool,
@@ -590,22 +442,19 @@ struct SharedStatus {
     drift_ms: AtomicI64,
     /// The achieved rate, as `f64::to_bits` (there is no `AtomicF64`).
     fps: AtomicU64,
-    /// The rate the encoder was told and the rate the configuration asked for, published per
-    /// recording — so a recorder that starts its recordings later (a game watcher) reports
-    /// the numbers of the recording that is running, not of the one before it.
+    /// The rates the encoder was told and the configuration asked for, published per recording so a
+    /// watcher-started recorder reports the running recording's numbers.
     configured_fps: AtomicU64,
     effective_fps: AtomicU64,
     /// Microphone blocks the encoder's queue dropped (`Encoder::dropped_mic_audio_blocks`).
     dropped_mic: AtomicU64,
-    /// The encoder's microphone loopback port; 0 means "no microphone input". A port is
-    /// never 0, so the sentinel cannot collide with a real one.
+    /// The encoder's microphone loopback port; 0 means no microphone input (a port is never 0).
     mic_port: AtomicU64,
     /// Whether a game watcher is armed (set while the supervisor thread lives).
     watching: AtomicBool,
     /// The game being recorded, if a watcher started this recording.
     game: Mutex<Option<String>>,
-    /// The failure the loop stopped for, if any. A mutex rather than an atomic because it
-    /// is a string and is written at most once per run — never on the hot path.
+    /// The failure the loop stopped for, if any. A mutex since it is a string written at most once per run.
     error: Mutex<Option<String>>,
     /// The encoder the latest recording ran; kept after the recording ends.
     encoder: Mutex<Option<String>>,
@@ -653,9 +502,8 @@ impl SharedStatus {
         self.drift_ms.store(drift_ms, Ordering::Relaxed);
     }
 
-    /// The microphone input's own drop counter, kept apart from the other two: it is read
-    /// from a different encoder method and is only meaningful when this recording has a
-    /// microphone at all (see [`RecorderStatus::mic`]).
+    /// The microphone's own drop counter; only meaningful when the recording has a microphone
+    /// ([`RecorderStatus::mic`]).
     fn publish_mic(&self, dropped_mic: u64) {
         self.dropped_mic.store(dropped_mic, Ordering::Relaxed);
     }
@@ -666,8 +514,7 @@ impl SharedStatus {
         self.span_ms.store(span_ms, Ordering::Relaxed);
     }
 
-    /// Publish the per-recording numbers: the two rates, and the microphone's port (so a
-    /// front-end can tell a recording with a microphone input from one without).
+    /// Publish the per-recording numbers: the two rates and the microphone's port.
     fn publish_recording(&self, configured_fps: u32, effective_fps: u32, mic_port: Option<u16>) {
         self.configured_fps.store(u64::from(configured_fps), Ordering::Relaxed);
         self.effective_fps.store(u64::from(effective_fps), Ordering::Relaxed);
@@ -685,57 +532,42 @@ impl SharedStatus {
 }
 
 impl Recorder {
-    /// Start recording, with the behaviour every caller had before Phase 5: a replay buffer,
-    /// no microphone, nothing watched. Exactly
+    /// Start recording with a replay buffer, no microphone, nothing watched: exactly
     /// [`Recorder::start_with_options`] with [`RecorderOptions::default`].
     ///
-    /// The whole startup handshake runs on this thread, in this order, because the order
-    /// is the point:
+    /// The startup handshake runs on this thread, and the order is the point:
     ///
-    /// 1. open (and migrate) the clip index — the one step that fails hard;
-    /// 2. apply the storage policy once, so a previous session's leftovers are managed now,
-    ///    and recover whatever a crash left behind (`session::recover_sessions`);
-    /// 3. resolve the encoder's vendor with a one-frame smoke test, **before** any capture
-    ///    backend exists, so an unusable encoder never opens a session on the display;
-    /// 4. create the capture backend and read its native size — and, when a microphone was
-    ///    asked for, create and start it **before** that, so a microphone that cannot start
-    ///    fails the recording instead of leaving it with a voice track nothing feeds;
-    /// 5. build the encoder configuration from that size, **measure what the machine can
-    ///    sustain at that size** and decide the rate the pipeline runs at
-    ///    ([`FpsDecision`]), start the ring (or the session's own segment store), adopt what
-    ///    is already on disk, decide the encoder's first segment number, spawn ffmpeg, and
-    ///    open the `sessions` row this recording will be closed through;
+    /// 1. open (and migrate) the clip index, the one step that fails hard;
+    /// 2. apply the storage policy and recover what a crash left behind (`session::recover_sessions`);
+    /// 3. resolve the encoder's vendor with a one-frame smoke test, before any capture backend
+    ///    exists, so an unusable encoder never opens a session on the display;
+    /// 4. create the capture backend and read its native size; when a microphone was asked for,
+    ///    create and start it before that, so one that cannot start fails the recording;
+    /// 5. build the encoder config from that size, measure what the machine can sustain and decide
+    ///    the pipeline rate ([`FpsDecision`]), start the ring, adopt what is on disk, pick the
+    ///    first segment number, spawn ffmpeg and open the `sessions` row;
     /// 6. start capture and audio;
     /// 7. spawn the pump loop.
     ///
-    /// Nothing is captured before step 6, so the segment numbering decided in step 5
-    /// cannot miss footage — and the throughput probe in step 5 runs before the capture
-    /// session exists, so a probe failure costs a startup error rather than a session on
-    /// the user's display.
+    /// Nothing is captured before step 6, so segment numbering cannot miss footage, and the probe
+    /// runs before the capture session exists, so a probe failure costs only a startup error.
     pub fn start(cfg: RecorderConfig) -> Result<Recorder> {
         Self::start_with_options(cfg, RecorderOptions::default())
     }
 
-    /// [`Recorder::start`], with the Phase 5 settings: the recording mode, the microphone,
-    /// and whether a watched game starting is a reason to record.
+    /// [`Recorder::start`] with the recording mode, the microphone and the game watcher.
     ///
-    /// With [`RecorderOptions::games`]' `auto_record` off (the default, and what
-    /// [`Recorder::start`] passes) this begins recording immediately, exactly as it always
-    /// has. With it on, this records **nothing yet**: it resolves everything that can be
-    /// resolved without touching the display (steps 1–3 above), starts the game watcher, and
-    /// returns a recorder that is *armed* — [`Recorder::status`]`().running` is `false` and
-    /// `watching_games` is `true` — until a watched game starts. The rest of the handshake
-    /// happens at that moment, because on Windows creating the video backend opens a Windows
-    /// Graphics Capture session on the user's primary monitor: starting a recording is not
-    /// something to do to somebody who is not playing.
+    /// With `auto_record` off (the default, and what [`Recorder::start`] passes) it begins recording
+    /// immediately. With it on it records nothing yet: it runs steps 1-3 above, starts the watcher and
+    /// returns an armed recorder (`running` false, `watching_games` true). The rest of the handshake
+    /// runs when a watched game starts, because creating the video backend starts screen capture,
+    /// which must not happen to someone who is not playing.
     ///
-    /// In that mode each game session is recorded on its own: a `sessions` row is opened when
-    /// the game starts and closed when it stops (a full session is also concatenated then),
-    /// and the retention pass runs between game sessions, on the supervisor's thread.
+    /// Each game session is recorded on its own: a `sessions` row opens when the game starts and closes
+    /// when it stops (a full session is concatenated then), and retention runs between game sessions on
+    /// the supervisor's thread.
     pub fn start_with_options(cfg: RecorderConfig, opts: RecorderOptions) -> Result<Recorder> {
-        // The shipping measurement: the selected encoder, at the capture's own size, for a
-        // bounded budget. The binaries are cloned into the closure so the probe does not
-        // borrow `cfg` while it is being moved into `start_inner`.
+        // The shipping measurement; binaries are cloned so the probe does not borrow `cfg` while it moves into `start_inner`.
         let bin = cfg.bin.clone();
         let measure = move |encode_cfg: &EncodeConfig| {
             localplay_encoder::throughput::measure_sustainable_fps(
@@ -749,46 +581,25 @@ impl Recorder {
             // `auto_record = false` is structural, not a flag a watcher checks.
             return Self::start_inner(cfg, opts, &measure, None);
         }
-        // `GamesSection::start` is the events crate's opt-in: it starts a watcher when
-        // `auto_record` is on and returns `Ok(None)` — starting nothing — when it is off.
-        // This branch only runs when `watching()` already said yes, and the `Option` is
-        // handled rather than unwrapped so the two can never disagree silently.
+        // `GamesSection::start` returns `Ok(None)` when `auto_record` is off; handle the `Option` so the two cannot disagree silently.
         let (sink, changes) = mpsc::channel();
         let watch = opts.games.start(sink)?;
         Self::start_inner(cfg, opts, &measure, Some((changes, watch)))
     }
 
-    /// [`Recorder::start`], with the throughput measurement injected.
+    /// [`Recorder::start`] with the throughput measurement injected (a `cfg(test)` hook).
     ///
-    /// A test hook, and `cfg(test)` because of it: production reaches the same handshake
-    /// through [`Recorder::start_with_options`], which passes the shipping probe.
-    ///
-    /// Split out so the *decision* — and, with it, the pairing of the pacer's rate with the
-    /// encoder child's — can be tested without a machine whose encoder is slow: a test hands
-    /// in a measurement of its own and asserts what the pipeline did with it. Production
-    /// passes [`localplay_encoder::throughput::measure_sustainable_fps`].
+    /// Lets a test hand in a measurement and assert what the pipeline did with it; production passes
+    /// [`localplay_encoder::throughput::measure_sustainable_fps`]. The injected measurement applies
+    /// only to the recording this call starts; a game-driven recorder measures with the shipping probe.
     ///
     /// # The one rate
     ///
-    /// [`FpsDecision::effective`] is written into `encode_cfg.fps` **once**, and both
-    /// consumers read that field:
-    ///
-    /// * [`spawn_encoder`] hands the whole configuration to
-    ///   [`localplay_encoder::FfmpegEncoder::spawn`], whose `-framerate` comes from
-    ///   `EncodeConfig::fps` (`localplay_encoder::video_input_args` — the same function the
-    ///   probe itself used, so the number measured and the number recorded are one argument);
-    /// * the [`FramePacer`] is built from `encode_cfg.fps` — the encoder's own field, not
-    ///   `cfg.encode.fps` and not a second computation of the minimum.
-    ///
-    /// That is deliberate and it is the whole of the fix: the pacer admits what the encoder
-    /// was told, so the pipeline cannot declare a rate it does not deliver. If they are ever
-    /// computed separately they can disagree — that is how issues #1 and #2 happened — so
-    /// there is one binding, and `tests::the_pacer_and_the_encoder_are_told_the_same_rate`
-    /// fails if a second one appears.
-    ///
-    /// The injected measurement applies to the recording this call starts. A game-driven
-    /// recorder measures with the shipping probe instead, because its recording begins later,
-    /// on the supervisor's thread, where a caller's closure is not there to borrow.
+    /// [`FpsDecision::effective`] is written into `encode_cfg.fps` once, and both consumers read that
+    /// field: [`spawn_encoder`] (its `-framerate`, via `localplay_encoder::video_input_args`, the
+    /// same function the probe used) and the [`FramePacer`]. The pacer therefore admits exactly what
+    /// the encoder was told; computing the two separately is how the declared rate once diverged from
+    /// the delivered one. `tests::the_pacer_and_the_encoder_are_told_the_same_rate` guards it.
     #[cfg(test)]
     fn start_with_measure(
         cfg: RecorderConfig,
@@ -799,33 +610,27 @@ impl Recorder {
 
     /// [`Recorder::start_with_options`]'s body, with the presence channel injected.
     ///
-    /// `presence` is `Some` exactly when a game watcher is to drive this recorder: the
-    /// changes the watcher reports (production: `GamesSection::start`; a test: a channel it
-    /// owns) plus the watcher's handle, which is kept alive for as long as the supervisor
-    /// runs. `None` means "record now".
+    /// `presence` is `Some` when a game watcher drives this recorder: the watcher's changes plus its
+    /// handle, kept alive as long as the supervisor runs. `None` means "record now".
     fn start_inner(
         cfg: RecorderConfig,
         opts: RecorderOptions,
         measure: &dyn Fn(&EncodeConfig) -> Result<ThroughputMeasurement>,
         presence: Option<(Receiver<PresenceChange>, Option<WatchHandle>)>,
     ) -> Result<Recorder> {
-        // The sections this run reads, resolved once: the mode does not change them, and the
-        // session directory is derived from the sessions area (see `Prepared::begin`).
+        // Resolved once; the session directory is derived from the sessions area (see `Prepared::begin`).
         let scratch_dir = cfg.scratch_dir();
         let clips_dir = cfg.clips_dir();
         let sessions_dir = cfg.sessions_dir();
 
-        // 1. The index — the one step that fails hard (see `open_clip_index`).
+        // 1. The index, the one step that fails hard (see `open_clip_index`).
         let store = open_clip_index(&cfg.db_path())?;
 
-        // 2. The storage policy, once, so a previous run's leftovers are managed now — over
-        //    clips and sessions both, with the session rules the config carries.
+        // 2. The storage policy, once, over clips and sessions, so a previous run's leftovers are managed now.
         let mut cleanup = CleanupReport::default();
         cleanup_pass(&store, &cfg.storage, &mut cleanup);
 
-        // 2b. What a crash left behind, before this run creates anything that recovery
-        //     could confuse for its own: an unfinalised session is finished (or reported and
-        //     retried next time), and a stray row is closed.
+        // 2b. Crash recovery, before this run creates anything recovery could confuse for its own.
         let recovery = session::recover_sessions(
             &store,
             &sessions_dir,
@@ -835,10 +640,8 @@ impl Recorder {
         );
         log_recovery(&recovery);
 
-        // 3. The encoder is resolved — and smoke-tested — before any capture backend exists
-        //    (see `resolve_encoder` for why that order is load-bearing). In games mode this
-        //    is the whole of the eager check: a machine that cannot encode says so now rather
-        //    than when the first game starts.
+        // 3. Resolve and smoke-test the encoder before any capture backend exists (see `resolve_encoder`).
+        // In games mode this is the whole eager check.
         let (codec, vendor) = resolve_encoder(&cfg.bin, &cfg.encode, cfg.dev_software_encoder)?;
 
         let status = Arc::new(SharedStatus::new());
@@ -925,44 +728,32 @@ impl Recorder {
 
     /// Take a clip now: wait for the post-roll, splice it losslessly, index it.
     ///
-    /// The trigger instant is the **ledger's** media time, taken inside the recording
-    /// loop at the moment the trigger is handled — not a wall-clock instant sampled here.
-    /// That is the hard-won part: the ledger only counts finished segments, so a wall-clock
-    /// trigger can name footage the encoder has not written yet — on the measured 4K box
-    /// (media then running at 0.81x, issue #2) it sat beyond anything the ledger could reach
-    /// and every press timed out.
+    /// The trigger instant is the ring's media time, taken inside the loop when the trigger is
+    /// handled, not a wall-clock instant sampled here: the ring only counts finished segments, so a
+    /// wall-clock trigger can name footage the encoder has not written yet and time out.
     ///
-    /// Blocks until the clip is written: the post-roll alone is `post_seconds` of media,
-    /// and the wait covers it plus a margin. A caller that must stay responsive should run
-    /// this off its own event loop (the desktop shell does).
-    ///
-    /// Equivalent to [`Recorder::clip_now_with`] with [`ClipReason::Manual`] — the hotkey's
-    /// path, unchanged.
+    /// Blocks until the clip is written (the post-roll plus a margin); run it off a UI event loop.
+    /// Equivalent to [`Recorder::clip_now_with`] with [`ClipReason::Manual`].
     pub fn clip_now(&self) -> Result<RecordedClip> {
         self.clip_now_with(ClipReason::Manual)
     }
 
     /// The same trigger, with the reason recorded.
     ///
-    /// This is the single entry point for both manual and automatic clipping: a game event
-    /// takes a clip through *this* call, so it inherits the media-time trigger instant, the
-    /// post-roll wait and the lossless splice rather than reimplementing any of them. What
-    /// the reason adds is one `events` row (spec §5.5) naming what happened, written after
-    /// the clip is indexed and linked to it.
+    /// The single entry point for manual and automatic clipping, so a game event inherits the
+    /// media-time trigger, post-roll wait and lossless splice. The reason adds one `events` row,
+    /// written after the clip is indexed and linked to it.
     pub fn clip_now_with(&self, reason: ClipReason) -> Result<RecordedClip> {
         self.clip_now_in(reason, ClipWindow::default())
     }
 
-    /// [`Recorder::clip_now_with`] with this clip's own [`ClipWindow`]: the short and long clip
-    /// hotkeys and the per-game lengths come in here.
+    /// [`Recorder::clip_now_with`] with this clip's own [`ClipWindow`] (short/long hotkeys, per-game lengths).
     pub fn clip_now_in(&self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
             .send(Command::Clip { reason, window, reply })
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?;
-        // Cannot hang: the loop answers every queued command, and if it stops first its
-        // receiver is dropped — which drops this command and its reply channel, making
-        // this a disconnection error rather than a wait.
+        // Cannot hang: if the loop stops first its receiver drops this command and reply, giving a disconnection error.
         answer
             .recv()
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?
@@ -970,14 +761,9 @@ impl Recorder {
 
     /// Record a derived event that did not ask for a clip, and return its `events` row id.
     ///
-    /// Markers — a game starting or ending, a round boundary (see [`EventKind::is_highlight`])
-    /// — are part of what happened in a session, so the session timeline should show them;
-    /// they are not worth `pre_seconds` of footage each, so no clip is taken. The row's `at`
-    /// is the trigger instant's position on the ledger timeline, the same clock a clip's
-    /// `started_at` is on, so a marker and a clip can be compared directly. `clip_id` is
-    /// NULL: no clip produced this.
-    ///
-    /// Blocking, and cheap — a single INSERT on the loop thread.
+    /// Markers (a game or round boundary, see [`EventKind::is_highlight`]) belong on the session
+    /// timeline but are not worth a clip. `at` is the trigger's position on the ring's media timeline,
+    /// the same clock as a clip's `started_at`; `clip_id` is NULL. Blocking but cheap: one INSERT.
     pub fn note_event(&self, event: GameEvent) -> Result<i64> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
@@ -988,14 +774,10 @@ impl Recorder {
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could note the event"))?
     }
 
-    /// The command channel of the recording that is running **now**, or the error a caller
-    /// gets when there is none.
+    /// The command channel of the recording running now, or the error when there is none.
     ///
-    /// Two states answer with an error, and they are different states: a recorder that has
-    /// stopped, and a game-driven recorder that is armed and waiting for a game
-    /// ([`Recorder::is_armed`]). Both mean there is no footage to clip, and the message says
-    /// which — a caller that assumed "running" would otherwise splice a clip out of a
-    /// recording that does not exist.
+    /// Stopped and armed-and-waiting ([`Recorder::is_armed`]) are different states with different
+    /// messages; both mean there is no footage to clip.
     fn command_sender(&self) -> Result<Sender<Command>> {
         let guard = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
@@ -1008,35 +790,23 @@ impl Recorder {
         }
     }
 
-    /// Stop recording: flush the encoder, close the capture and audio sources, join the
-    /// loop — and, in [full-session mode](RecordingMode::FullSession), concatenate the
-    /// session's segments into its file and close its `sessions` row first.
+    /// Stop recording: flush the encoder, close the sources, join the loop, and in
+    /// [full-session mode](RecordingMode::FullSession) concatenate the session and close its row first.
     ///
-    /// Idempotent — a second call is a no-op that reports the same outcome — and safe
-    /// from a shared `Arc<Recorder>`, because a stop that runs concurrently with another
-    /// waits for the shutdown to finish rather than returning early.
-    ///
-    /// In games mode this also stops the watcher: with nothing watching, an armed recorder
-    /// has nothing left to do. It is deliberately the same call for both modes, so a
-    /// front-end that has one "stop" button does not have to know which mode it started.
-    ///
-    /// Returns the failure the loop stopped for, if it stopped for one — including a session
-    /// that could not be concatenated, whose segments are kept and whose row is left open for
-    /// the next start to finish (see [`session::recover_sessions`]).
+    /// Idempotent, and safe from a shared `Arc<Recorder>`: a concurrent stop waits for the shutdown
+    /// rather than returning early. In games mode it also stops the watcher. Returns the failure the
+    /// loop stopped for, including a session that could not be concatenated (its segments are kept and
+    /// its row left open for the next start; see [`session::recover_sessions`]).
     pub fn stop(&self) -> Result<()> {
-        // The supervisor first: it is what stops a game-driven recording, and it joins that
-        // recording's thread itself. Taking the handle under the lock and joining outside it
-        // keeps this callable from two threads at once, with the second waiting for the same
-        // join rather than racing it.
+        // Supervisor first: it stops a game-driven recording and joins that thread. Take the handle
+        // under the lock and join outside it so two concurrent stops wait on the same join.
         let supervisor = self.supervisor.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(supervisor) = supervisor {
             supervisor.shutdown();
         }
 
-        // Then a recording this `Recorder` started itself (or the one the supervisor just
-        // stopped: its sender is gone, so this is a no-op). The guard is held across the
-        // join, so two concurrent stops cannot both see the handle and one of them return
-        // before the thread is gone.
+        // Then a recording this `Recorder` started itself. The guard is held across the join so a
+        // concurrent stop cannot see the handle and return before the thread is gone.
         let mut guard = self.thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(thread) = guard.take() {
             // A disconnected loop has already stopped; `send` failing is not an error.
@@ -1054,17 +824,14 @@ impl Recorder {
         status.error.map_or(Ok(()), |why| Err(anyhow::anyhow!(why)))
     }
 
-    /// Whether the loop thread is still running — a cheap check for a driver's loop.
-    ///
-    /// `false` for an armed game-driven recorder that is waiting for a game: it is not
-    /// recording, and [`Recorder::is_armed`] is the other half of the answer.
+    /// Whether the loop thread is still running; `false` for an armed recorder waiting for a game
+    /// (see [`Recorder::is_armed`]).
     pub fn is_running(&self) -> bool {
         self.status.running.load(Ordering::Relaxed)
     }
 
-    /// Whether this recorder is armed: a game watcher is running and a recording will begin
-    /// when a watched game does. Always `false` unless [`RecorderOptions::games`] had
-    /// `auto_record` on at start.
+    /// Whether a game watcher is running and a recording will begin when a watched game does
+    /// (`[games] auto_record` was on at start).
     pub fn is_armed(&self) -> bool {
         self.status.watching.load(Ordering::Relaxed)
     }
@@ -1072,36 +839,29 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Never leave a capture session and an ffmpeg child behind a dropped handle. The
-        // recorder ignores the result: a drop has nowhere to report an error to, and the
-        // failure (if any) is already in the status for whoever reads it next.
+        // Never leave a capture session and an ffmpeg child behind a dropped handle; a drop cannot
+        // report an error, and the status already holds it.
         if let Err(err) = self.stop() {
             tracing::warn!("the recorder did not shut down cleanly: {err:#}");
         }
     }
 }
 
-/// How long the supervisor waits for a presence change before checking its stop flag.
-///
-/// Bounds how long a [`Recorder::stop`] can be held by a watcher that has nothing to report:
-/// the loop wakes at least this often.
+/// How long the supervisor waits for a presence change before checking its stop flag; bounds how long a [`Recorder::stop`] can wait.
 const SUPERVISOR_TICK: Duration = Duration::from_millis(200);
 
-/// One microphone block, in ms — the pipeline's convention, and the length
-/// `MICROPHONE_FORMAT` and the encoder's `MicAudioSpec` both describe.
+/// One microphone block, in ms; matches `MICROPHONE_FORMAT` and the encoder's `MicAudioSpec`.
 const MIC_BLOCK_MS: u64 = 10;
 
-/// Everything a start resolved **before** a recording begins, and everything a second
-/// recording needs in order to begin: a game watcher records one session per game, and each
-/// repeats the handshake that does not touch the display.
+/// Everything a start resolved before a recording begins, reusable by a second recording (a game
+/// watcher records one session per game, repeating only the handshake that does not touch the display).
 struct Prepared {
     cfg: RecorderConfig,
     opts: RecorderOptions,
     codec: VideoCodec,
     vendor: Option<Vendor>,
-    /// Taken by a recording when it begins and given back when it ends: one SQLite
-    /// connection, moved between the engine's thread and — in games mode — the supervisor's.
-    /// (`rusqlite::Connection` is `Send` and not `Sync`, so it is moved rather than shared.)
+    /// Taken by a recording when it begins and given back when it ends: one SQLite connection
+    /// (`Send` but not `Sync`), moved between the engine thread and the games-mode supervisor.
     store: Option<Store>,
     /// The shared scratch directory (ring mode's segments, and where the clip path looks).
     scratch_dir: PathBuf,
@@ -1119,20 +879,17 @@ struct Active {
 }
 
 impl Prepared {
-    /// The startup handshake for one recording — steps 4 to 7 of
-    /// [`Recorder::start_with_options`]'s list, in the same order and for the same reasons.
+    /// The startup handshake for one recording: steps 4 to 7 of [`Recorder::start_with_options`].
     ///
-    /// `game` is the watched game that triggered this recording, written into the session
-    /// row; `measure` is the throughput probe (the caller's, for a recording `start` begins
-    /// itself; the shipping one, when a watcher begins it later on its own thread).
+    /// `game` is the watched game that triggered it (written to the session row); `measure` is the
+    /// throughput probe (the caller's, or the shipping one when a watcher starts it later).
     fn begin(
         &mut self,
         game: Option<String>,
         measure: &dyn Fn(&EncodeConfig) -> Result<ThroughputMeasurement>,
         status: &Arc<SharedStatus>,
     ) -> Result<Active> {
-        // Cloned once per recording: a `RecorderConfig` is a handful of paths and small
-        // numbers, and a local copy keeps the borrow checker out of the rest of this function.
+        // Cloned once per recording to keep the borrow checker out of the rest of this function.
         let cfg = self.cfg.clone();
         let mode = self.opts.mode;
         let store = self
@@ -1146,29 +903,23 @@ impl Prepared {
             clips_dir: self.clips_dir.clone(),
         };
 
-        // The directory this recording's segments go into. Ring mode: the shared scratch
-        // directory. Session mode: a directory of its own under the sessions area, named
-        // from the wall clock and created by the attempt (`create_dir`, which fails rather
-        // than overwrites), so two processes starting in the same second cannot mix their
-        // footage into one session file.
-        // One wall-clock instant decides the session row's `started_at`, the directory's
-        // name and (at stop) the file's: `now_ms()` is read once, here.
+        // Ring mode uses the shared scratch directory. Session mode uses its own directory under the
+        // sessions area, made with `create_dir` (fails rather than overwrites) so two processes starting
+        // in the same second cannot mix footage. `now_ms()` is read once and decides the row's
+        // `started_at`, the directory name and the final file's name.
         let session_started_ms = now_ms();
         let segment_dir = if mode.is_full_session() {
             session::create_session_dir(&self.sessions_dir, session_started_ms)?
         } else {
             self.scratch_dir.clone()
         };
-        // A new recording's failure state is its own: last game's error must not make this
-        // one look failed (a watcher records many sessions through one `Recorder`).
+        // A new recording's failure state is its own: the last game's error must not make this one look failed.
         *status.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
-        // The microphone is created **before** the capture backend exists: on Windows
-        // creating the video backend opens a Windows Graphics Capture session on the user's
-        // primary monitor, and a recording that cannot start its microphone must not have
-        // touched the display first. This is the fail-loud half of `[mic] enabled` — an
-        // encoder configured with a microphone input that nothing feeds would record a
-        // silent voice track while claiming one.
+        // Create the microphone before the capture backend: creating the video backend opens a WGC
+        // session on the user's monitor, and a recording that cannot start its microphone must not touch
+        // the display first. This is the fail-loud half of `[mic] enabled`: a mic input nothing feeds
+        // would record a silent voice track.
         let mut mic = if self.opts.mic.enabled {
             Some(build_microphone(cfg.sources).with_context(|| {
                 "mic.enabled = true, but the microphone backend could not be created; \
@@ -1179,19 +930,13 @@ impl Prepared {
         };
         let microphone = mic.is_some();
 
-        // Only now create the capture backend: the encoder's rawvideo pipe is declared
-        // from the backend's own frame geometry (`native_size` — the monitor under WGC,
-        // the configured size for the stub), so the size-dependent half of the encoder
-        // config has to wait until the backend exists.
-        // The game audio's presence is one rule, read here and in the encoder's configuration
-        // below, so it is asked of the configuration rather than decided a second time.
+        // Only now create the capture backend: the rawvideo pipe is declared from its frame geometry
+        // (`native_size`), so the size-dependent encoder config waits for it.
+        // Game-audio presence is asked of the configuration once (`game_audio`), here and in the encoder config.
         let game_audio = cfg.game_audio();
-        // The two audio tracks are named by position and this build names a one-track
-        // container's track `Game Audio` (`localplay_media::edit::audio_titles`), so a microphone
-        // with the game audio off is not a recording this build can label: the file would carry
-        // the microphone under the name of a track it does not have. Refused here, before
-        // anything is opened, rather than mislabelled downstream. The encoder refuses it too, as
-        // the backstop for a front-end that reaches `spawn` without passing through here.
+        // Tracks are named by position and a one-track container's track is `Game Audio`
+        // (`localplay_media::edit::audio_titles`), so a microphone without game audio would be
+        // mislabelled. Refused here before anything opens; the encoder refuses it too as a backstop.
         if !game_audio && self.opts.mic.enabled {
             bail!(
                 "[audio] enabled = false with [mic] enabled = true cannot be recorded: this build \
@@ -1205,17 +950,13 @@ impl Prepared {
 
         let mut encode_cfg = build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
         if microphone {
-            // Turn the encoder's second audio input on. `MicAudioSpec::default()` is the
-            // canonical 48kHz stereo s16le — the same format `MICROPHONE_FORMAT` publishes and
-            // the same one the game-audio input has always been declared with — so the two
-            // tracks are declared by one rule and cannot drift apart.
+            // Enable the encoder's second audio input; the default spec is the same 48kHz stereo s16le as
+            // `MICROPHONE_FORMAT` and the game-audio input.
             encode_cfg.mic_audio = Some(MicAudioSpec::default());
         }
 
-        // The rate decision, and the point where the pipeline stops declaring a rate it
-        // cannot deliver. The probe (when it runs) is given the configuration that declares
-        // the *configured* rate — that is part of the invocation being measured — and the
-        // rate it reports is what the whole pipeline then uses.
+        // The rate decision. The probe measures the configuration that declares the configured rate,
+        // and the rate it reports is what the whole pipeline then uses.
         let decision = if cfg.encode.adapt_fps {
             let measurement = measure(&encode_cfg).with_context(|| {
                 format!(
@@ -1232,25 +973,18 @@ impl Prepared {
         encode_cfg.fps = decision.effective();
         log_rate_decision(&decision, encode_cfg.encoder_name(), native);
 
-        // The two modes build their ledger and their encoder in the opposite order, and each
-        // order is forced:
-        //
-        // * a **session**'s ring indexes files the encoder is about to write, so it has to exist
-        //   first — the segment number the encoder continues from is one of ffmpeg's arguments;
-        // * a **replay buffer**'s ring is fed by the encoder's own stdout, so the encoder has to
-        //   exist first and the ring is built around the pipe it hands over.
-        //
-        // The adoption and numbering steps therefore live inside the session arm rather than
-        // after both: for an in-memory ring they have no meaning at all, and running them
-        // unconditionally would pretend the two are more alike than they are.
+        // The two modes build ledger and encoder in opposite, forced orders:
+        // * a session's ring indexes files the encoder is about to write, and the encoder's start
+        //   segment number is a ffmpeg argument, so the ring comes first;
+        // * a replay buffer's ring is fed by the encoder's stdout, so the encoder comes first.
+        // Adoption and numbering live in the session arm: they are meaningless for an in-memory ring.
         let mut ledger;
         let encoder;
         let encoder_name;
         match mode {
             RecordingMode::ReplayBuffer => {
-                // Fragmented MP4 on the child's stdout: **no file is written while buffering**,
-                // which is the whole point of this mode. `scratch_dir` is deliberately left in
-                // the config unconsumed: it is session mode's segment directory, not this one.
+                // Fragmented MP4 on stdout: no file is written while buffering. `scratch_dir` is left
+                // unconsumed (it is session mode's segment directory).
                 encode_cfg.output = localplay_encoder::EncodeOutput::FragmentedStream;
                 let (mut enc, name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
                 let stream = enc.take_output_stream().context(
@@ -1262,14 +996,10 @@ impl Prepared {
                     memory_ring::RingSetup {
                         bin: cfg.bin.clone(),
                         clips_dir: buffer_cfg.clips_dir.clone(),
-                        // The RAM safety net: the number that keeps this process from being
-                        // killed by the operating system.
+                        // The RAM safety net that keeps the OS from killing this process.
                         ram_cap_bytes: cfg.buffer.ram_cap_bytes,
-                        // The duration cap is what a trigger can actually ask for — the window,
-                        // plus one segment so a fragment boundary landing unluckily cannot
-                        // truncate a clip. Deliberately not larger: nothing can ask for more
-                        // footage than `pre + post`, and the buffer's *length* is the user's
-                        // `pre_seconds`. A longer buffer is that key, not a second knob here.
+                        // The duration cap is what a trigger can ask for: the window plus one segment, so an unlucky
+                        // fragment boundary cannot truncate a clip. The buffer's length is the user's `pre_seconds`.
                         cap_ms: cfg.buffer.max_pre_ms() + cfg.buffer.max_post_ms() + buffer_cfg.segment_ms,
                         pre_ms: buffer_cfg.pre_ms,
                         post_ms: buffer_cfg.post_ms,
@@ -1305,17 +1035,12 @@ impl Prepared {
         }
         tracing::info!("encoding with {encoder_name}");
         *status.encoder.lock().unwrap_or_else(|p| p.into_inner()) = Some(encoder_name.clone());
-        // The pacer's rate is read back out of the encoder object — i.e. out of the
-        // configuration ffmpeg was actually spawned with — instead of being taken from
-        // `encode_cfg.fps` a second time. That is the structural half of the fix: the pacer
-        // cannot pace to a number the encoder child was not told, whichever way a future edit
-        // rearranges the code around it, and the published rate is then the child's own
-        // number rather than a belief about it. Read here, before the encoder is moved into
-        // the engine.
+        // Read the pacer's rate back out of the spawned encoder rather than `encode_cfg.fps` a second
+        // time, so the pacer cannot pace to a number the child was not told. Read before the encoder
+        // moves into the engine.
         let encoder_fps = encoder.input_fps();
-        // The microphone's second check: the encoder must actually have opened the second
-        // input. `mic_audio` being set and a port existing are two halves of one fact, and a
-        // mismatch means the recording would claim a track nothing feeds.
+        // Second mic check: `mic_audio` set and a port existing are two halves of one fact; a mismatch
+        // would claim a track nothing feeds.
         let mic_port = encoder.mic_port();
         if microphone && mic_port.is_none() {
             bail!(
@@ -1323,10 +1048,7 @@ impl Prepared {
                  carry a voice track nothing feeds (the encode configuration asked for one)"
             );
         }
-        // One-line capture-geometry summary so a reader can see the resolution being
-        // captured and that the frame counter starts from zero (criterion 1). The rate is
-        // the one the pipeline is running at; when it is below the configured rate, the
-        // adaptation line above says so and why.
+        // Capture-geometry summary; the rate is the one the pipeline runs at (the adaptation line says why if lower).
         tracing::info!(
             "capture geometry {}x{} at {}fps (frame counter starts at 0){}",
             native.0,
@@ -1335,21 +1057,16 @@ impl Prepared {
             match (game_audio, microphone) {
                 (true, true) => format!(", plus a microphone track on port {mic_port:?}"),
                 (true, false) => String::new(),
-                // Refused above, before anything was opened: see the `[mic]`/`[audio]` check.
+                // Refused above: see the `[mic]`/`[audio]` check.
                 (false, true) => unreachable!("a microphone without the game audio is refused"),
                 (false, false) => ", video only: no audio track".to_string(),
             }
         );
-        // The session row, before anything is captured: a crash mid-recording then always
-        // leaves a row for the next start to find, and the retention rules manage the segment
-        // directory through this row (`scratch_dir`, `size_bytes`, `ended_at`).
-        //
-        // `started_at` is the **wall** clock — what ages the session, orders the store and
-        // named the directory above. `media_epoch_ms` is where the ledger stands *now*, which
-        // is the position an event's `at` is measured from. Two clocks, on purpose: the
-        // timeline is media minus media, and the age is wall. Passing the wall clock as the
-        // epoch — or nothing at all, as this used to — is what put the events of a session
-        // that adopted segments from a previous run in the wrong place on the scrubber.
+        // Write the session row before capturing anything, so a crash mid-recording leaves a row for the
+        // next start to find; retention manages the segment directory through it.
+        // `started_at` is the wall clock (ages the session, named the directory); `media_epoch_ms` is where
+        // the ledger stands now, the origin of an event's `at`. Using the wall clock as the epoch put
+        // events of a session that adopted older segments in the wrong place on the scrubber.
         let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()?) as i64;
         let session = match store.start_session(
             game.as_deref(),
@@ -1360,7 +1077,7 @@ impl Prepared {
         ) {
             Ok(id) => id,
             Err(err) => {
-                // Nothing has been captured; the directory that was created for it goes.
+                // Nothing was captured; remove the directory created for it.
                 if mode.is_full_session() {
                     session::remove_session_dir(&segment_dir);
                 }
@@ -1378,10 +1095,8 @@ impl Prepared {
             if mode.is_full_session() { " (the scratch cap does not apply)" } else { "" }
         );
 
-        // Start the sources. The microphone first — it is the input whose failure the user
-        // cannot see in the picture — then the display, then the game audio when this
-        // recording has one at all; on any failure everything already started is stopped
-        // again, and the session row is closed so nothing is left half-open.
+        // Start the sources: microphone first (its failure is invisible in the picture), then the
+        // display, then game audio if present. On failure everything started is stopped and the session row closed.
         let started = (|| -> Result<()> {
             if let Some(mic) = mic.as_mut() {
                 mic.start().context("starting the microphone")?;
@@ -1413,15 +1128,11 @@ impl Prepared {
             post_ms: buffer_cfg.post_ms,
             max_pre_ms: cfg.buffer.max_pre_ms(),
             max_post_ms: cfg.buffer.max_post_ms(),
-            // Only the RAM budget is carried. The scratch cap bounded a directory a replay
-            // buffer no longer has (it is session mode's, and session mode deletes nothing), so
-            // the cap the engine checks a run against is the in-memory one.
+            // Only the RAM budget is carried: a replay buffer has no scratch directory to cap.
             ram_cap_bytes: cfg.buffer.ram_cap_bytes,
             storage: cfg.storage.clone(),
             cleanup: CleanupReport::default(),
-            // The pacer paces to the rate the encoder child was told — read back from the
-            // encoder itself, so the two cannot disagree. See `Recorder::start_with_measure`:
-            // that agreement is the whole fix.
+            // Paced to the rate read back from the encoder itself (see `Recorder::start_with_measure`).
             pacer: FramePacer::new(encoder_fps),
             capture,
             audio,
@@ -1466,34 +1177,28 @@ impl Prepared {
 
 /// The game watcher's driver: one recording per game session, in the configured mode.
 ///
-/// It owns the presence changes, the watcher's handle (which must stay alive for the watcher
-/// to keep running), the prepared start state, and the recording that is running — if there
-/// is one. Everything about *detection* belongs to `localplay-events` (including its
-/// two-poll debounce); everything about *what a detection means for recording* is here.
+/// Owns the presence changes, the watcher's handle (dropping it stops the watcher), the prepared
+/// start state and the running recording. Detection belongs to `localplay-events`; what a
+/// detection means for recording is here.
 struct Supervisor {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Supervisor {
-    /// Ask the loop to stop and wait for it — including for the recording it stops on the way
-    /// out. Takes `&self` so [`Recorder::stop`] can call it through the mutex, twice if a
-    /// caller stops a recorder twice.
+    /// Ask the loop to stop and wait for it, including the recording it stops on the way out.
+    /// Takes `&self` so [`Recorder::stop`] can call it through the mutex.
     fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            // A poll in flight finishes (it is bounded by its own tick), and the join is what
-            // makes "stopped" mean it.
+            // A poll in flight finishes (bounded by its tick); the join makes "stopped" true.
             let _ = thread.join();
         }
     }
 }
 
-/// Start the supervisor thread (see [`Supervisor`]).
-///
-/// The channel and the watcher both come from the caller: production's are
-/// `GamesSection::start`'s, a test's are its own (which is how the game start/stop path is
-/// exercised without a process list or a Live Client API).
+/// Start the supervisor thread (see [`Supervisor`]). The channel and watcher come from the caller
+/// (production: `GamesSection::start`; tests: their own), so start/stop is testable without a process list.
 fn spawn_supervisor(
     prepared: Prepared,
     presence: Receiver<PresenceChange>,
@@ -1503,14 +1208,12 @@ fn spawn_supervisor(
 ) -> Result<Supervisor> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    // Armed the moment this returns: a front-end that asks "is this recorder watching?" right
-    // after `Recorder::start` gets the answer, not a race with a thread that has not run yet.
+    // Armed as this returns, so "is this recorder watching?" right after `start` is not a race.
     status.watching.store(true, Ordering::SeqCst);
     let thread = std::thread::Builder::new()
         .name("localplay-games".to_string())
         .spawn(move || {
-            // Kept alive for the whole loop: dropping the handle stops the watcher, which is
-            // the one thing this thread cannot live without.
+            // Kept alive for the whole loop: dropping the handle stops the watcher.
             let _watch = watch;
             let mut prepared = prepared;
             tracing::info!(
@@ -1530,9 +1233,7 @@ fn spawn_supervisor(
                             );
                             continue;
                         }
-                        // The shipping measurement, because this recording begins on this
-                        // thread: a caller's injected probe belongs to the recording
-                        // `Recorder::start` begins itself.
+                        // The shipping measurement: this recording begins on this thread, not the caller's.
                         let bin = prepared.cfg.bin.clone();
                         let measure = move |encode_cfg: &EncodeConfig| {
                             localplay_encoder::throughput::measure_sustainable_fps(
@@ -1554,9 +1255,7 @@ fn spawn_supervisor(
                                 running = Some((game.name, active.thread));
                             }
                             Err(err) => {
-                                // Reported, and the watcher keeps watching: the next game may
-                                // well record, and a machine that cannot encode has already
-                                // been told so by the startup check.
+                                // Reported; the watcher keeps watching (the next game may record, and startup already vetted the encoder).
                                 tracing::error!(
                                     "{game} started, but the recording could not start: {err:#}"
                                 );
@@ -1568,29 +1267,21 @@ fn spawn_supervisor(
                     Ok(PresenceChange::Stopped(game)) => {
                         let Some((name, thread)) = running.take() else { continue };
                         if name != game.name {
-                            // A game that was not the one being recorded stopped; the
-                            // recording continues.
+                            // A game other than the recorded one stopped; keep recording.
                             running = Some((name, thread));
                             continue;
                         }
                         tracing::info!("{game} stopped: closing the recording");
-                        // Cleared *before* the shutdown below, not after it: `matched_game` is
-                        // documented as `None` while nothing is being recorded, and the engine
-                        // clears `running` as its own shutdown returns — so a clear placed after
-                        // the join leaves a window, the retention pass included, in which the
-                        // status names a game that is not being recorded. That window is what the
-                        // recorder's own test caught, and it widens with the size of the library
-                        // the retention pass has to walk.
+                        // Clear before the shutdown below, not after: `matched_game` must be `None` while nothing is
+                        // recorded, and the engine clears `running` as its shutdown returns, so clearing after the join
+                        // leaves a window (widened by the retention pass) where status names a game not being recorded.
                         status.set_game(None);
-                        // Clearing the command channel drops the engine's last sender, which
-                        // ends its loop; the join waits for the shutdown that does the work —
-                        // the encoder flush, the session file, the row's end.
+                        // Clearing the command channel drops the engine's last sender, ending its loop; the join waits for the shutdown work.
                         *commands.lock().unwrap_or_else(|p| p.into_inner()) = None;
                         match thread.join() {
                             Ok(store) => {
                                 prepared.store = Some(store);
-                                // The retention pass between game sessions (spec §8.1): the
-                                // session that just ended is the one it now manages.
+                                // The retention pass between game sessions manages the session that just ended.
                                 let mut report = CleanupReport::default();
                                 if let Some(store) = &prepared.store {
                                     cleanup_pass(store, &prepared.cfg.storage, &mut report);
@@ -1603,13 +1294,12 @@ fn spawn_supervisor(
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {}
-                    // Nothing is watching any more: rather than capture for nobody, stop.
+                    // Nothing is watching any more: stop rather than capture for nobody.
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
 
-            // Leaving: a recording that is still running (the application is shutting down)
-            // is stopped, so nothing keeps capturing.
+            // Leaving (application shutting down): stop a recording still running.
             if let Some((name, thread)) = running.take() {
                 tracing::info!("stopping the recording of {name}: the recorder is shutting down");
                 *commands.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -1627,13 +1317,9 @@ fn spawn_supervisor(
 
 /// The microphone backend for the configured sources.
 ///
-/// The same rule the video and audio backends follow (`localplay_capture::platform`): with
-/// [`Sources::Platform`] it is the platform's own backend — real WASAPI on Windows, and a
-/// clear **error** everywhere else, because there is no microphone backend off Windows and a
-/// synthetic stand-in selected at runtime would make the recorder look like it is capturing a
-/// voice track while recording nothing — and with [`Sources::Stub`] it is
-/// [`StubMicrophone`], which is what lets the whole microphone path be exercised on a machine
-/// with no WASAPI (the crate's tests, CI, and the CLI's `--dev-stub-sources`).
+/// [`Sources::Platform`] gives real WASAPI on Windows and an error elsewhere (a synthetic stand-in
+/// would claim to capture a voice track while recording nothing); [`Sources::Stub`] gives
+/// [`StubMicrophone`] for tests, CI and `--dev-stub-sources`.
 fn build_microphone(sources: Sources) -> Result<Box<dyn AudioBackend>> {
     match sources {
         Sources::Stub(_) => Ok(Box::new(StubMicrophone::new(MICROPHONE_FORMAT, MIC_BLOCK_MS))),
@@ -1641,11 +1327,7 @@ fn build_microphone(sources: Sources) -> Result<Box<dyn AudioBackend>> {
     }
 }
 
-/// Say what the crash-recovery pass found, in the log's own terms.
-///
-/// The detail lines are `recover_sessions`'s; this is the one line that says whether the pass
-/// changed anything at all, so a start is never silent about finding a previous run's
-/// footage.
+/// Log what the crash-recovery pass found, so a start is never silent about a previous run's footage.
 fn log_recovery(recovery: &session::Recovery) {
     if recovery.is_empty() {
         return;
@@ -1668,125 +1350,84 @@ struct Engine {
     /// The ceilings a per-clip [`ClipWindow`] is clamped to (`[buffer] max_*_seconds`).
     max_pre_ms: u64,
     max_post_ms: u64,
-    /// The in-memory ring's byte budget, carried so the ring can be checked against the number it
-    /// was configured with rather than re-reading a config the engine has already been built from.
+    /// The in-memory ring's byte budget, carried so the ring is checked against the configured number.
     ram_cap_bytes: u64,
     storage: StorageSection,
     cleanup: CleanupReport,
     pacer: FramePacer,
     capture: Box<dyn CaptureBackend>,
-    /// The game-audio backend, when this recording has the game-audio track. `None` is a
-    /// video-only recording (`[audio] enabled = false`): nothing is captured, the encoder is
-    /// told about no audio input and the pump has nothing to drain. Taken (stopped) during
-    /// shutdown, which is why the *fact* that this recording has the game audio is a field of
-    /// its own ([`Engine::game_audio`]).
+    /// The game-audio backend; `None` for a video-only recording (`[audio] enabled = false`). Taken
+    /// (stopped) during shutdown, hence [`Engine::game_audio`] records the fact separately.
     audio: Option<Box<dyn AudioBackend>>,
-    /// The microphone backend, when this recording has a microphone track. Drained by the
-    /// same pump iteration as the game audio, into the encoder's own second input queue —
-    /// one writer thread per input, which is why this is a second backend and not a second
-    /// write from this thread. Taken (stopped) during shutdown, which is why the *fact* that
-    /// this recording has a microphone is a field of its own ([`Engine::microphone`]).
+    /// The microphone backend, drained by the same pump iteration into the encoder's own second
+    /// input queue. Taken (stopped) during shutdown, hence [`Engine::microphone`] records the fact.
     mic: Option<Box<dyn AudioBackend>>,
-    /// Whether this recording has a microphone track. Read by the shutdown path — which runs
-    /// after [`Engine::mic`] has been taken and stopped — to decide how the session's
-    /// segments and a clip's segments are concatenated (with a second audio track they need
-    /// `-map 0`; without it, the splicer's own concat is used).
+    /// Whether this recording has a microphone track. Read by the shutdown path, after [`Engine::mic`]
+    /// is taken, to choose the concatenation (a second audio track needs `-map 0`).
     microphone: bool,
     encoder: Box<dyn Encoder>,
-    /// Where the segments live and how the trigger finds them: the replay ring (which
-    /// evicts to the cap) or the session's own segment store (which never evicts).
+    /// The segments and how the trigger finds them: the replay ring (evicts to the cap) or the
+    /// session's store (never evicts).
     ledger: Ledger,
     /// The mode this recording runs in ([`RecordingMode`]).
     mode: RecordingMode,
-    /// The `sessions` row this recording opened. Always `Some` in practice: a recording
-    /// with no row would be footage nothing can manage.
+    /// The `sessions` row this recording opened; footage without a row could not be managed.
     session: i64,
-    /// When the session started, on the wall clock (`sessions.started_at`), kept as an i64
-    /// ms epoch value for the session file's name and the row's timestamps.
+    /// Session start on the wall clock (`sessions.started_at`), an i64 ms epoch.
     session_started_ms: i64,
     /// The sessions area, where a session's file is written at stop.
     sessions_dir: PathBuf,
-    /// Whether a failed `set_session_size` has been reported already: the tick that makes
-    /// the number current runs every [`STATUS_INTERVAL`], and a database that cannot take
-    /// the update is worth one line, not five per second.
+    /// Whether a failed `set_session_size` was already reported: the tick runs every
+    /// [`STATUS_INTERVAL`] and a database that cannot take the update deserves one line, not five a second.
     size_warning_reported: bool,
-    /// The name of the encoder that actually ran (`h264_nvenc`, `libx264`, …), recorded on
-    /// the clips and the session file this engine writes (spec §11 criterion 5).
+    /// The encoder that actually ran (`h264_nvenc`, `libx264`, ...), recorded on clips and the session file.
     encoder_name: String,
     store: Store,
     clock: CaptureClock,
     status: Arc<SharedStatus>,
     rate: RateMeter,
-    /// Video frames submitted to the encoder, including the ones the post-roll wait of a
-    /// trigger submitted (`frames=` on the status line).
+    /// Video frames submitted to the encoder, including those the post-roll wait submitted (`frames=`).
     frames: u64,
-    /// Frames the backend offered and the pacer threw away *without* the readback
-    /// ([`CaptureBackend::discard_pending`]). Logged next to `frames=` because the two
-    /// together are the whole accounting of what the source produced, and because a
-    /// non-zero `skipped=` next to a `frames=` holding the configured rate is the
-    /// signature of this optimisation working: the surplus is being skipped cheaply
-    /// instead of being copied and then dropped.
+    /// Frames the backend offered that the pacer threw away without the readback
+    /// ([`CaptureBackend::discard_pending`]). With `frames=` it accounts for everything the source produced.
     skipped: u64,
-    /// What `encode.fps` asked for. Reported (`RecorderStatus::configured_fps`), and used
-    /// in the drop warning to say *why* the rate in use may be lower than requested —
-    /// never to pace or to configure the encoder, which is [`Engine::effective_fps`]'s job.
+    /// What `encode.fps` asked for. Reported, and used by the drop warning to explain a lower rate in
+    /// use; never used to pace or configure the encoder ([`Engine::effective_fps`] does that).
     configured_fps: u32,
-    /// The rate the pipeline is actually running at: the pacer's interval and the encoder
-    /// child's `-framerate`. The status line's denominator is this value, and the drop warning
-    /// compares the achieved rate against it, because "the encoder cannot sustain the rate it
-    /// was told" is the condition that warning exists for — frames captured and never encoded,
-    /// which the picture holds through.
+    /// The rate the pipeline actually runs at (the pacer interval and the encoder's `-framerate`).
+    /// The status denominator, and what the drop warning compares the achieved rate against.
     effective_fps: u32,
     /// The last rate a window closed on, published on every pump and logged on every tick.
     achieved: f64,
     /// Time spent inside the capture backend, accumulated over the run
-    /// ([`localplay_recorder::pump::PumpCounts::capture`]).
-    ///
-    /// Kept because this is the number that decides issue #1: at 3840x2160 the backend copies
-    /// 33.2MB out of the GPU and into system memory for every frame, and whether that is the
-    /// cost or the encode is a question about this figure against the run's wall clock — not
-    /// something to infer from a total CPU percentage, which cannot say which half it is in.
+    /// ([`localplay_recorder::pump::PumpCounts::capture`]): the GPU readback cost, reported against wall clock.
     capture_time: Duration,
     /// Time spent inside the encoder's submit, i.e. waiting for its bounded queue to drain.
-    /// Its complement to the wall clock is the time this thread actually spent working.
     submit_time: Duration,
-    /// When the pump's counters started, so the two above can be reported as a share of wall
-    /// clock. Set when the engine is built, because that is the first pump.
+    /// When the pump's counters started, so the two above can be reported as a share of wall clock.
     pump_started: Instant,
-    /// The dropped count as of the last time each of the two consumers looked at it: the
-    /// rate meter ([`Engine::last_counted_dropped`]) and the warning
-    /// ([`Engine::last_warned_dropped`]). Both are cumulative counters, so each drop must
-    /// be subtracted exactly once.
+    /// The dropped count as of the last look by the rate meter ([`Engine::last_counted_dropped`])
+    /// and by the warning ([`Engine::last_warned_dropped`]); each subtracts a cumulative drop exactly once.
     last_counted_dropped: u64,
-    /// The dropped count as of the last warning, so "still dropping" can be told from "was
-    /// dropping once, an hour ago".
+    /// The dropped count as of the last warning, to tell "still dropping" from "dropped once, an hour ago".
     last_warned_dropped: u64,
     last_drop_warning: Option<Instant>,
 }
 
 /// The segments a recording's trigger and shutdown work against.
 ///
-/// Two shapes, one timeline: the in-memory ring is a bounded window by definition and drops its
-/// oldest footage when it fills, while the full session's own store never evicts — a whole
-/// session is footage that was asked for
-/// at all ([`crate::session`] explains why that is structural rather than a large cap).
+/// Two shapes, one timeline: the in-memory ring is a bounded window that drops its oldest footage
+/// when full; the full session's store never evicts (see [`crate::session`]).
 enum Ledger {
-    /// The rolling replay buffer, held **in RAM**.
-    ///
-    /// Buffer mode is in memory so that an idle buffer writes nothing to the SSD. The footage
-    /// exists to be thrown away unless a trigger saves it, so a file per second for material
-    /// nobody keeps is pure churn — the thing this mode exists to remove. The cost is that a
-    /// crash loses the buffer, which is the deal; session mode ([`Ledger::Session`]) keeps its
-    /// files precisely because a whole recording is worth surviving a crash for.
+    /// The rolling replay buffer, held in RAM so an idle buffer writes nothing to the SSD. A crash
+    /// loses it; session mode ([`Ledger::Session`]) keeps files because a whole recording is worth surviving one.
     Memory(MemoryRing),
     /// A full session's segment directory.
     Session(crate::session::SessionRing),
 }
 
 impl Ledger {
-    /// Find newly written segments — a no-op for the memory ring, which is fed by its own reader
-    /// thread rather than by scanning a directory, and which therefore never has a file that is
-    /// still being appended to.
+    /// Find newly written segments; a no-op for the memory ring, which is fed by its own reader thread.
     fn scan(&mut self) -> Result<()> {
         match self {
             Ledger::Memory(_) => Ok(()),
@@ -1794,11 +1435,9 @@ impl Ledger {
         }
     }
 
-    /// Index every segment, the newest included. Called at shutdown, after the encoder has been
-    /// flushed and its child has exited, so the last file is complete and must not be dropped
-    /// (the live scan deliberately does not trust the newest file while ffmpeg is appending to
-    /// it). Meaningless for the memory ring, whose reader has already ingested everything the
-    /// encoder wrote — waiting for the stream to end is what proves the newest fragment.
+    /// Index every segment, the newest included. Called at shutdown after the encoder has exited, so
+    /// the last file is complete (the live scan does not trust the newest file while ffmpeg appends
+    /// to it). Meaningless for the memory ring, whose reader already ingested everything.
     fn scan_all(&mut self) -> Result<()> {
         match self {
             Ledger::Memory(_) => Ok(()),
@@ -1808,13 +1447,9 @@ impl Ledger {
 
     /// What this ring holds, in the shape the status line uses.
     ///
-    /// `bytes_on_disk` is deliberately left 0 for the memory ring: the number that matters there
-    /// is RAM, and it is reported by [`Ledger::buffered_bytes`]. Keeping them separate is what
-    /// stops the sessions row's `size_bytes` — a claim about disk — from silently becoming a
-    /// claim about memory.
-    ///
-    /// Fallible because the memory ring's numbers come from a lock its reader thread holds, and
-    /// a ring that cannot be read must not report zero footage as if it were empty.
+    /// `bytes_on_disk` is left 0 for the memory ring (RAM is reported by [`Ledger::buffered_bytes`]),
+    /// so the sessions row's `size_bytes`, a disk claim, never becomes a memory claim. Fallible: a ring
+    /// that cannot be read must not report zero footage as if it were empty.
     fn stats(&self) -> Result<BufferStats> {
         Ok(match self {
             Ledger::Memory(ring) => BufferStats {
@@ -1830,12 +1465,8 @@ impl Ledger {
         })
     }
 
-    /// Bytes the ring is holding, **wherever** it is holding them: on disk for a session, in RAM
-    /// for a replay buffer.
-    ///
-    /// One accessor rather than two because the status line has one `bytes=` field and it must
-    /// mean "how much footage is buffered". Which medium that is follows from the mode, and the
-    /// mode is in the same status.
+    /// Bytes the ring holds wherever it holds them (disk for a session, RAM for a replay buffer):
+    /// the single `bytes=` field means "how much footage is buffered"; the medium follows from the mode.
     fn buffered_bytes(&self) -> Result<u64> {
         match self {
             Ledger::Memory(ring) => ring.bytes(),
@@ -1851,8 +1482,7 @@ impl Ledger {
     /// The ledger's own position of this run's zero.
     fn origin_ms(&self) -> u64 {
         match self {
-            // A memory ring starts at zero every run: nothing is adopted, because nothing was
-            // ever written.
+            // A memory ring starts at zero every run; nothing is adopted.
             Ledger::Memory(ring) => ring.origin_ms(),
             Ledger::Session(session) => session.origin_ms(),
         }
@@ -1866,10 +1496,7 @@ impl Ledger {
         }
     }
 
-    /// Index what is already on disk, before the encoder is spawned.
-    ///
-    /// A memory ring adopts nothing: it starts empty every run by construction, which is also
-    /// why there is no segment number to continue.
+    /// Index what is already on disk before the encoder is spawned. A memory ring adopts nothing.
     fn adopt_existing(&mut self) -> Result<usize> {
         match self {
             Ledger::Memory(_) => Ok(0),
@@ -1877,8 +1504,7 @@ impl Ledger {
         }
     }
 
-    /// Reserve the sequence number the encoder must start writing at. Zero for the memory ring:
-    /// it writes no files, so there is no numbering to continue.
+    /// Reserve the sequence number the encoder must start at; zero for the memory ring (no files).
     fn reserve_number(&mut self) -> Result<u64> {
         match self {
             Ledger::Memory(_) => Ok(0),
@@ -1896,25 +1522,19 @@ impl Ledger {
 }
 
 impl Engine {
-    /// The pump loop. Returns when it is told to stop, when the last `Recorder` is
-    /// dropped, or when the capture/encode path fails — and hands the store back, because a
-    /// game-driven recorder opens the *next* recording with the same connection.
+    /// The pump loop. Returns when told to stop, when the last `Recorder` is dropped, or when the
+    /// capture/encode path fails, and hands the store back (a game-driven recorder reuses the connection).
     ///
-    /// Everything the recording writes is closed before this returns: the encoder flushed,
-    /// the sources stopped, the `sessions` row ended and (in full-session mode) the session
-    /// file written.
+    /// Everything is closed before it returns: encoder flushed, sources stopped, `sessions` row
+    /// ended and, in full-session mode, the session file written.
     fn run(mut self, commands: Receiver<Command>) -> Store {
-        // What the encoder needs, told to capture before it is started. **One question with one
-        // answer**, because the two halves cannot be allowed to disagree about a recording: an
-        // encoder handed pixels it cannot use refuses them by name, and one expecting a texture and
-        // given none has nothing to encode at all. Asked here rather than at construction because
-        // this is where both exist, and given before `start` because capture remembers the answer
-        // and carries it into the session it builds.
+        // Tell capture what the encoder accepts (textures or pixels) before it starts; capture remembers
+        // the answer for the session it builds. One question with one answer: a mismatch leaves an
+        // encoder with pixels it refuses or a texture it cannot use.
         self.capture.deliver_textures(self.encoder.accepts_textures());
 
         let mut last_scan = Instant::now();
-        // Next storage-policy pass. Measured in wall clock from the last one, because the
-        // policy is about a directory that fills at whatever rate the user clips.
+        // Next storage-policy pass, in wall clock from the last one.
         let mut last_cleanup = Instant::now();
 
         loop {
@@ -1922,8 +1542,7 @@ impl Engine {
                 Ok(Command::Stop) => break,
                 Ok(Command::Clip { reason, window, reply }) => {
                     let taken = self.take_clip(reason, window);
-                    // The caller may have given up (a window closed, a test finished);
-                    // that is its business, not the loop's.
+                    // The caller may have given up (window closed, test finished); not the loop's business.
                     let _ = reply.send(taken);
                 }
                 Ok(Command::Note { event, reply }) => {
@@ -1931,8 +1550,7 @@ impl Engine {
                     let _ = reply.send(noted);
                 }
                 Err(TryRecvError::Empty) => {}
-                // Every `Recorder` was dropped: nothing can ask for a clip any more, so
-                // the loop stops instead of capturing for nobody.
+                // Every `Recorder` was dropped: stop instead of capturing for nobody.
                 Err(TryRecvError::Disconnected) => break,
             }
 
@@ -1950,8 +1568,7 @@ impl Engine {
             }
         }
 
-        // Flush and shut down. On the failure path this is best effort: the encoder may
-        // be the thing that failed, and its `finish` reports that rather than blocking.
+        // Flush and shut down; best effort on the failure path, since the encoder may be what failed.
         if let Err(err) = self.shutdown() {
             self.fail(err);
         }
@@ -1972,58 +1589,33 @@ impl Engine {
         Ok(())
     }
 
-    /// The ~200ms tick: scan the ledger, publish and log the status, keep the session row's
-    /// size current, enforce the scratch cap (ring mode only), warn about a starving
-    /// encoder, and apply the storage policy on its own interval.
+    /// The ~200ms tick: scan the ledger, publish and log status, keep the session row's size current,
+    /// enforce the scratch cap (ring mode only), warn about a starving encoder, and run the storage
+    /// policy on its own interval.
     fn tick(&mut self, last_cleanup: &mut Instant) -> Result<()> {
         self.ledger.scan().context("scanning for new segments")?;
-        // No ledger file is saved any more. It existed to remember which segment files a previous
-        // run had written and could adopt, and neither ring keeps files to remember: a session's
-        // segments *are* its record (the directory listing), and the in-memory ring has nothing
-        // on disk at all.
 
         let stats = self.ledger.stats()?;
-        // Read once and used twice. `stats.bytes_on_disk` is deliberately not the number: it is
-        // 0 for a replay buffer, which holds its footage in RAM, and a line reporting `bytes=0`
-        // for a ring full of footage is a lie about the one number a soak watches to see the
-        // buffer settle. Measured on the box: `bytes=0` against 84,335,007 bytes actually held.
+        // `stats.bytes_on_disk` is 0 for a RAM replay buffer, so `bytes=` uses `buffered_bytes` (one
+        // read, used twice); otherwise the line reports `bytes=0` for a full ring.
         let buffered = self.ledger.buffered_bytes()?;
         self.status.publish_ring(
             stats.segments as u64,
-            // The bytes the ring is holding, wherever it is holding them: RAM for a replay
-            // buffer, disk for a session. `stats.bytes_on_disk` is deliberately NOT used here —
-            // it is 0 for the memory ring, and a status line reporting `bytes=0` for a ring full
-            // of footage would be a lie about the one number the panel exists to show.
+            // Bytes held wherever they live (RAM or disk), not `stats.bytes_on_disk`.
             buffered,
             stats.span_ms,
         );
-        // The `sessions` row's size, on the tick that already measured it: a multi-hour
-        // recording has to be visible to the sessions retention cap *before* it stops
-        // (spec §8.1).
+        // Update the `sessions` row's size on the tick that measured it, so a multi-hour recording is
+        // visible to the sessions retention cap before it stops.
         self.report_session_size(stats.bytes_on_disk);
         let dropped = self.encoder.dropped_frames();
 
-        // `dropped=` is the encoder's own count of frames it had to discard because its
-        // queue was full (it cannot slow the capture down, see the queue note in
-        // `localplay-encoder`). It belongs next to `frames=` because the two together say
-        // whether the pipeline is keeping up: a run that quietly loses a third of its
-        // frames must not look like a clean one. `dropped_audio=` is the same count for
-        // audio blocks; it is logged separately because a drop there is a hole in the
-        // sound rather than a repeated picture, and the two have different acceptable rates.
-        //
-        // `skipped=` and `frames=` are one account: every frame the backend offered was
-        // either submitted to the encoder or skipped without the readback, so `frames=` +
-        // `skipped=` is the source's own rate. `fps=` is the achieved rate over the last
-        // `RATE_WINDOW` — the frames that actually reached the encoder per second —
-        // printed against the rate the pipeline is running at, so a shortfall is readable at
-        // a glance instead of inferred from a counter's slope. `configured=` carries what
-        // `encode.fps` asked for, which differs from that rate exactly when the startup
-        // probe measured less and adaptation is on (the startup line says so in words).
-        // `capture=` is one number for the whole of the backend's `next_frame`, and one number
-        // cannot answer the question the zero-copy work turns on: is that time spent copying a frame
-        // out of VRAM, or waiting for the display to produce one? A backend that measures it says
-        // both, as shares of wall clock like the numbers around them. `unmeasured` is the honest
-        // answer for one that does not, and a placeholder zero would not be.
+        // `dropped=` / `dropped_audio=` are the encoder's counts of discarded video frames / audio blocks
+        // (queue full; see `localplay-encoder`); a drop in audio is a sound hole, so they are separate.
+        // `frames=` + `skipped=` is the source's own rate; `fps=` is the achieved rate over `RATE_WINDOW`,
+        // printed against the pipeline rate; `configured=` differs from it exactly when the startup probe
+        // measured less and adaptation is on. `capture=` is a share of wall clock, split into copy vs wait
+        // when the backend measures it; `unmeasured` is the honest answer when it does not.
         let split = match self.capture.frame_timings() {
             Some(timings) => {
                 let elapsed = self.pump_started.elapsed().as_secs_f64();
@@ -2045,9 +1637,7 @@ impl Engine {
              dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}% {}",
             self.frames,
             stats.segments,
-            // The bytes the ring is holding, wherever it holds them — RAM for a replay buffer,
-            // disk for a session. The same number the status publishes, read once, so the line
-            // and the panel cannot disagree about a buffer that is not on disk at all.
+            // Same buffered-bytes number the status publishes, so line and panel agree.
             buffered,
             stats.span_ms,
             dropped,
@@ -2057,23 +1647,15 @@ impl Engine {
             self.achieved,
             self.effective_fps,
             self.configured_fps,
-            // Shares of wall clock since the first pump, so they can be read against the
-            // process's own CPU figure: `capture=` is the readback and the copy, `submit=` is
-            // waiting for ffmpeg, and what is left is the audio drains, the tick and the loop.
+            // Shares of wall clock since the first pump: `capture=` is readback and copy, `submit=` is waiting
+            // for ffmpeg, and the rest is audio drains, the tick and the loop.
             Self::share(self.capture_time, self.pump_started.elapsed()),
             Self::share(self.submit_time, self.pump_started.elapsed()),
             split,
         );
-        // The cap the ring is held to is **RAM**, not scratch (spec §8.1): a rolling buffer
-        // holds unclipped footage in memory, so a bounded window that overruns its budget is the
-        // process being killed by the operating system, not a disk filling up. The ring evicts
-        // to stay inside it on every push, so this is a check on that eviction rather than a
-        // threshold a run can approach — it fires only if eviction has stopped working, which is
-        // worth failing loudly over because the alternative is an OOM kill with no explanation.
-        //
-        // A full session is not a window — its segments are the recording the user asked for —
-        // so no cap applies to it, and that is structural, not a cap set high enough to be
-        // missed.
+        // The ring is held to a RAM cap, not scratch: overrunning it means the OS kills the process. The
+        // ring evicts on every push, so this only fires if eviction stopped working, which is worth failing
+        // loudly over. A full session has no cap, structurally (its segments are the recording).
         if let Ledger::Memory(ring) = &self.ledger {
             let held = ring.bytes()?;
             if held > self.ram_cap_bytes {
@@ -2084,30 +1666,17 @@ impl Engine {
             }
         }
 
-        // A rising `dropped=` means the encoder's queue is overflowing while the pacer
-        // admits at most the rate the pipeline is running at: the machine cannot encode that
-        // rate *now* — after a startup measurement said it could, and after the pacer was
-        // set to it. That must be loud rather than inferred, because it is a *capture* fact,
-        // not a quality setting: every dropped frame is a moment of the recording that will
-        // be held on the previous picture instead of shown.
-        //
-        // What it is NOT any more is a timeline warning. The media clock is the frames'
-        // arrival timestamps (`-fps_mode passthrough`, see `localplay_encoder::ffmpeg`), so
-        // the `span=` in the status line keeps tracking the wall clock and a `pre_seconds`
-        // window is still that many real seconds even while this warning is firing: measured
-        // on the dev host, a 4K output fed at ~45fps against a declared 120 (1172 of 1801
-        // frames dropped by the queue) still wrote one 1s segment per second of wall clock
-        // and a 3-segment clip covering ~2.8s of real footage. The warning is therefore
-        // about the picture, and the wording below says so.
+        // A rising `dropped=` means the encoder queue is overflowing although the pacer admits only the
+        // pipeline rate: the machine cannot encode that rate now, despite the startup measurement. Make it
+        // loud: each dropped frame holds the previous picture. It is not a timeline warning, since the
+        // media clock is the frames' arrival timestamps (`-fps_mode passthrough`, see
+        // `localplay_encoder::ffmpeg`) and `span=` keeps tracking the wall clock.
         let dropped_since_last = dropped.saturating_sub(self.last_warned_dropped);
         let warn_due = self
             .last_drop_warning
             .is_none_or(|t| t.elapsed() >= DROP_WARN_INTERVAL);
-        // `achieved > 0.0` means a rate has been measured at all: before the first window
-        // closes there is no number to quote, so the warning waits for one. Nothing is
-        // lost by waiting — `dropped_since_last` stays non-zero until a warning is
-        // actually emitted, which is also what keeps this from being printed once per
-        // log line.
+        // `achieved > 0.0` means a window has closed, so there is a rate to quote. Waiting loses nothing:
+        // `dropped_since_last` stays non-zero until a warning is emitted, which also prevents one per log line.
         if dropped_since_last > 0 && warn_due && self.achieved > 0.0 {
             tracing::warn!(
                 "the encoder cannot sustain the {}fps it was told: only {:.1} frames per \
@@ -2126,9 +1695,7 @@ impl Engine {
             self.last_warned_dropped = dropped;
         }
 
-        // Periodic storage-policy pass (spec §8.1), on the same tick as the scratch scan
-        // that gates it. `cleanup_pass` is silent when there is nothing to do, which is
-        // every pass in the ordinary case.
+        // Periodic storage-policy pass on the same tick; `cleanup_pass` is silent when there is nothing to do.
         if last_cleanup.elapsed() >= CLEANUP_INTERVAL {
             cleanup_pass(&self.store, &self.storage, &mut self.cleanup);
             *last_cleanup = Instant::now();
@@ -2136,61 +1703,37 @@ impl Engine {
         Ok(())
     }
 
-    /// The trigger path (spec §6.2), run on the loop thread because it pumps.
+    /// The trigger path, run on the loop thread because it pumps.
     fn take_clip(&mut self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
         let (pre_ms, post_ms) =
             window.resolve(self.pre_ms, self.post_ms, self.max_pre_ms, self.max_post_ms);
-        // The trigger is "now" on the LEDGER's timeline — media time — not on the wall
-        // clock, and that is deliberate: the two clocks only agree while the pipeline
-        // keeps up with `encode.fps`, and on real 4K hardware it does not. Measured on
-        // the box (RTX 3090, 3840x2160): segments were written at 0.81/s while each one
-        // contained exactly 1.000000s of media, so the media timeline advanced at ~0.81x
-        // of the wall clock. A wall-clock `trigger_ms` made `need_ms` unreachable — the
-        // ledger can never catch up to a target derived from a clock running ~19% ahead
-        // of it — which is exactly the measured failure this replaces: `timed out ...
-        // waiting for post-roll (span=27000ms need=29236ms)`. `span_ms` is the end of the
-        // footage the ring can prove is on disk, i.e. the media-time position of "now";
-        // `need_ms` and the splice window `[trigger_ms - pre_ms, trigger_ms + post_ms]`
-        // are then all on that same clock, so the post-roll target is reachable by
-        // construction.
+        // The trigger is "now" on the ledger's media timeline, not the wall clock. The clocks only agree
+        // while the pipeline keeps up, and a wall-clock `trigger_ms` makes `need_ms` unreachable (the
+        // ledger can never catch a target derived from a faster clock; the post-roll wait times out).
+        // `span_ms` is the end of the footage the ring can prove is on disk, and `need_ms` and the splice
+        // window `[trigger_ms - pre_ms, trigger_ms + post_ms]` share that clock, so the target is
+        // reachable by construction.
         //
-        // Consequence of measuring in media time: `pre_seconds` means seconds of *recorded
-        // footage*, and a clip is spliced from whole segments, so it can run up to one
-        // segment past the request but cannot fall short of it (the post-roll is waited for).
-        // Since the timeline fix (frames carry their arrival timestamps, see
-        // `localplay_encoder::ffmpeg`) media time and the wall clock advance together, so
-        // "10s of footage" and "10 real seconds" now agree on a machine of any speed — the
-        // earlier divergence, media at 0.81x, is what the ledger records as fixed. If the
-        // buffer holds less than `pre_ms` of media at the trigger, the ring's `trigger`
-        // already warns and splices the truncated front — that path is unchanged.
+        // `pre_seconds` therefore means seconds of recorded footage; clips splice whole segments, so a
+        // clip can run up to one segment past the request but never short of it. If the buffer holds less
+        // than `pre_ms`, the ring's `trigger` warns and splices the truncated front.
         let trigger_ms = self.ledger.span_ms()?;
-        // Wall-clock value, kept for telemetry only: nothing below reads it, because mixing
-        // the two clocks is what made the post-roll unreachable. Logged next to the media
-        // value so the two can be compared in a soak: `drift` is wall minus media and should
-        // sit still (at the encoder's start-up offset plus the segment ffmpeg is still
-        // appending to) rather than grow.
+        // Wall clock, telemetry only (logged beside the media value; `drift` should sit still). Mixing
+        // the two clocks is what made the post-roll unreachable, so nothing below reads it.
         let wall_ms = self.clock.ms_at(Instant::now());
-        // The line describes the instant of the trigger, which is the same whether a
-        // hotkey, a button or a game event asked for the clip; what the reason adds is who
-        // asked. A manual clip logs exactly what it always logged.
+        // The line describes the trigger instant, identical for a hotkey, button or game event; the reason adds who asked.
         tracing::info!(
             "{}: media={trigger_ms}ms wall={wall_ms}ms (drift {}ms); waiting for post-roll",
             reason.describe(),
             wall_ms as i64 - trigger_ms as i64
         );
 
-        // Wait for the post-roll to be written before splicing (spec §6.2 step 2).
-        //
-        // The budget is `post_ms` + a margin, never a constant: the trigger instant is "now"
-        // on the media timeline and the wait covers the whole post-roll, which is `post_ms` of
-        // media — real seconds, one for one, but still invisible to the ring until ffmpeg has
-        // finished the segment carrying them. The margin absorbs that segment plus the
-        // encoder's own lag (see `POST_ROLL_MARGIN`).
+        // Wait for the post-roll to be written before splicing. The budget is `post_ms` plus a margin,
+        // never a constant: those media seconds stay invisible to the ring until ffmpeg finishes the
+        // segment carrying them (see `POST_ROLL_MARGIN`).
         let need_ms = trigger_ms + post_ms;
         let budget = Duration::from_millis(post_ms) + POST_ROLL_MARGIN;
-        // One wait loop for both modes and for the microphone: which ledger the span comes
-        // from, and whether a second input is drained alongside the game audio, are the only
-        // two things that differ (see `pump_until_span_on`).
+        // One wait loop for both modes and the microphone (see `pump_until_span_on`).
         let counts = pump_until_span_on(
             &mut self.pacer,
             self.ledger.as_ring(),
@@ -2213,14 +1756,11 @@ impl Engine {
             clip.encoder
         );
 
-        // Spec §6.2 step 6: index the clip that was just written. `trigger_ms` is
-        // run-relative media time and the window starts `pre_ms` before it;
-        // `ledger_origin_ms` moves that onto the ledger's timeline, which is the timeline
-        // segment numbering — and so the footage itself — is measured on.
+        // Index the clip just written. `started_at_ms` is on the ledger's timeline (`ledger_origin_ms`
+        // plus the run-relative window start), the timeline the footage is measured on.
         let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(pre_ms);
         let id = index_clip(&self.store, &clip, started_at_ms);
-        // Schema v5: the clip carries the game its recording session matched, so the library
-        // can filter by game without joining. Best effort: a failure costs a filter label.
+        // The clip carries its recording session's game so the library can filter without a join. Best effort.
         if let Some(id) = id {
             if let Ok(Some(game)) = self.store.get_session(self.session).map(|s| s.and_then(|s| s.game)) {
                 if let Err(err) = self.store.set_clip_game(id, Some(&game)) {
@@ -2229,13 +1769,9 @@ impl Engine {
             }
         }
 
-        // Spec §5.5: an event-triggered clip says *why* it exists, and so does a manual one —
-        // the bookmark is the user's own marker, and without it a session's timeline showed
-        // the game's kills and none of the moments they chose. The row's `at` is the trigger
-        // instant (which is `pre_ms` into the clip, not its start), so the marker lands on the
-        // moment that caused it. A failed insert is reported and not fatal, for the same
-        // reason a failed clip insert is not: the footage is what the user asked for, and the
-        // clip file is on disk either way.
+        // An event-triggered clip says why it exists, and so does a manual one (the user's own bookmark).
+        // `at` is the trigger instant (`pre_ms` into the clip), so the marker lands on the moment that
+        // caused it. A failed insert is reported, not fatal: the clip file is on disk either way.
         let at_ms = self.ledger.origin_ms() + trigger_ms;
         let session_id = Some(self.session);
         let recorded = match reason.event() {
@@ -2259,15 +1795,11 @@ impl Engine {
         index_event(&self.store, event, at_ms, None, Some(self.session))
     }
 
-    /// Keep the `sessions` row's `size_bytes` current (spec §8.1, Phase 5).
+    /// Keep the `sessions` row's `size_bytes` current.
     ///
-    /// The retention cap counts `sessions.size_bytes`, so without this a multi-hour
-    /// recording would be invisible to it until it stopped — and a session that is still
-    /// recording is exactly the one nothing may evict (its scratch directory is footage
-    /// that exists nowhere else). Runs on the tick that already scanned the ledger, so the
-    /// number is the same one the status line prints and nothing extra is measured. A
-    /// failure is reported once rather than five times a second: the tick is every
-    /// [`STATUS_INTERVAL`].
+    /// Retention counts `sessions.size_bytes`, so without this a multi-hour recording is invisible to
+    /// it until it stops. Runs on the tick that already scanned the ledger; a failure is reported
+    /// once, since the tick fires every [`STATUS_INTERVAL`].
     fn report_session_size(&mut self, bytes: u64) {
         if let Err(err) = self.store.set_session_size(self.session, bytes as i64) {
             if !self.size_warning_reported {
@@ -2284,10 +1816,8 @@ impl Engine {
 
     /// `part` as a percentage of `whole`, for the periodic line's two attributions.
     ///
-    /// A share of **wall clock**, not of the process's CPU time, because that is the figure the
-    /// two can be read against: `capture=71.2% submit=12.0%` on a run the OS reports as 88.9% of
-    /// one core says the readback is most of it and waiting for ffmpeg is not. A zero-length
-    /// window — the first tick — reports 0 rather than dividing by it.
+    /// A share of wall clock (not process CPU time) so it reads against the OS's CPU figure; a
+    /// zero-length window (the first tick) reports 0.
     fn share(part: Duration, whole: Duration) -> f64 {
         let whole = whole.as_secs_f64();
         if whole <= 0.0 {
@@ -2301,14 +1831,11 @@ impl Engine {
     fn account(&mut self, counts: PumpCounts) {
         self.frames += counts.submitted;
         self.skipped += counts.skipped;
-        // The two halves of what this thread does per frame, accumulated where every pump's
-        // counts already pass through — the steady-state loop and the post-roll wait both.
+        // Accumulated where every pump's counts pass: the steady-state loop and the post-roll wait.
         self.capture_time += counts.capture;
         self.submit_time += counts.submit;
-        // Frames that reached ffmpeg: everything handed to the encoder, minus whatever its
-        // bounded queue dropped because it could not keep up. This, not `frames=`, is "the
-        // achieved rate" — it is the rate the recorded footage actually carries. The count
-        // is cumulative, so only the newly-visible drops are taken out of the meter.
+        // Frames that reached ffmpeg: submitted minus what the bounded queue dropped. This, not `frames=`,
+        // is the achieved rate. The count is cumulative, so only new drops come out of the meter.
         let dropped = self.encoder.dropped_frames();
         let reached = counts.submitted.saturating_sub(dropped.saturating_sub(self.last_counted_dropped));
         self.last_counted_dropped = dropped;
@@ -2322,28 +1849,23 @@ impl Engine {
             self.achieved,
             self.drift_ms(),
         );
-        // The microphone's drop counter lives on the same status surface as the other two:
-        // it is the same kind of fact (the encoder's bounded queue dropped a block), and a
-        // voice track quietly losing blocks is exactly what a user needs to see.
+        // The mic's drop counter shares the status surface: a voice track quietly losing blocks must be visible.
         self.status.publish_mic(self.encoder.dropped_mic_audio_blocks());
     }
 
     /// Wall clock minus media time, in ms.
     fn drift_ms(&self) -> i64 {
-        // Telemetry only, so a ring that cannot be read contributes no media position and the
-        // difference comes out as the wall clock alone. That is obviously wrong rather than
-        // quietly plausible, which is the point: the reader's own error is logged once, and a
-        // `drift` that has jumped to the age of the process is a second, unmissable sign.
+        // Telemetry only: an unreadable ring contributes no media position, so the result is the wall
+        // clock alone, which is visibly wrong rather than quietly plausible (the reader's error is logged once).
         self.clock.ms_at(Instant::now()) as i64 - self.ledger.span_ms().unwrap_or(0) as i64
     }
 
     /// Flush the encoder, close the sources, and close the session.
     ///
-    /// Every step is attempted even if an earlier one failed: a shutdown that gave up
-    /// halfway would leave the display captured or ffmpeg writing.
+    /// Every step is attempted even if an earlier one failed, so a failure never leaves the display
+    /// captured or ffmpeg writing.
     fn shutdown(&mut self) -> Result<()> {
-        // The encoder first: the segment it is still appending to has to be closed before
-        // the ledger is scanned, or the last footage of the session is never indexed.
+        // The encoder first: its last segment must be closed before the ledger is scanned, or it is never indexed.
         let flushed = self.encoder.finish().context("flushing the encoder");
         let scanned = if flushed.is_ok() {
             self.ledger.scan().context("scanning for new segments at shutdown")
@@ -2351,21 +1873,16 @@ impl Engine {
             Ok(())
         };
         let ledger = match &mut self.ledger {
-            // Nothing on disk to save: the replay buffer lives in RAM, so when the process stops
-            // the footage stops existing — which is what "unclipped footage is never written"
-            // means. The reader thread is joined here because the encoder has been flushed and
-            // its child has exited by now, so the stream has ended and the join returns; a reader
-            // that stopped early is reported rather than passed over.
+            // Nothing on disk to save: the replay buffer lives in RAM. The reader is joined here because the
+            // flushed encoder's child has exited, so the stream has ended; an early-stopped reader is reported.
             Ledger::Memory(ring) => ring.join(),
-            // A session writes no ledger file: its segments are the directory listing, which
-            // is exactly what makes them recoverable after a crash (see `crate::session`).
+            // A session writes no ledger file: its segments are the directory listing, which makes them recoverable.
             Ledger::Session(_) => Ok(()),
         };
-        // The sources are closed *before* the session is concatenated: a multi-gigabyte copy
-        // must not keep the user's display under a Windows Graphics Capture session.
+        // Sources close before the session is concatenated: a multi-gigabyte copy must not keep the display under a WGC session.
         let audio = match &mut self.audio {
             Some(audio) => audio.stop().context("stopping audio capture"),
-            // A video-only recording has no audio backend to stop, and that is not a failure.
+            // A video-only recording has no audio backend to stop.
             None => Ok(()),
         };
         let capture = self.capture.stop().context("stopping screen capture");
@@ -2377,37 +1894,28 @@ impl Engine {
         flushed.and(scanned).and(ledger).and(audio).and(capture).and(mic).and(session)
     }
 
-    /// Close this recording's `sessions` row — concatenating a full session first.
+    /// Close this recording's `sessions` row, concatenating a full session first.
     ///
-    /// * Buffer mode: the row is closed with the bytes the ring holds and **no file**
-    ///   (spec §5.5's buffer-mode session: the ring evicts by its own cap and there is
-    ///   nothing else to name).
-    /// * Full-session mode: the segments are concatenated losslessly into
-    ///   `sessions/session-<start>.mp4` (never re-encoded — see [`session::finalise`]), the
-    ///   row names it with its real size, and the temporary segments are removed.
+    /// * Buffer mode: the row is closed with the bytes the ring holds and no file.
+    /// * Full-session mode: the segments are concatenated losslessly into `sessions/session-<start>.mp4`
+    ///   ([`session::finalise`]), the row names it with its real size, and the segments are removed.
     ///
-    /// # When the concatenation fails, and what is on disk afterwards
+    /// # When the concatenation fails
     ///
-    /// A whole session needs transiently about **twice its own bytes** (the file is written
-    /// in full before the segments go), so a volume that filled up during the recording
-    /// cannot finish it. Nothing is lost to that, and nothing is hidden either:
+    /// A session needs transiently about twice its own bytes (the file is written in full before the
+    /// segments go), so a volume that filled during recording cannot finish it. Then:
     ///
-    /// * every segment is kept — nothing is deleted on the way to a failure;
-    /// * the partial output is removed, because it is not a session and it occupies the space
-    ///   a retry needs;
-    /// * the row is left **running** (`ended_at IS NULL`) on purpose: a running session is
-    ///   never an eviction candidate, so the retention pass cannot delete the only copy of
-    ///   footage that has no session file yet — and the next start's recovery pass
-    ///   ([`session::recover_sessions`]) finishes the job once there is room;
-    /// * the error is returned, so `stop()` — and a CLI's exit code — reports it.
+    /// * every segment is kept;
+    /// * the partial output is removed (it is not a session and holds the space a retry needs);
+    /// * the row is left running (`ended_at IS NULL`) on purpose: a running session is never an
+    ///   eviction candidate, so retention cannot delete the only copy, and the next start's recovery
+    ///   pass ([`session::recover_sessions`]) finishes the job once there is room;
+    /// * the error is returned, so `stop()` and a CLI's exit code report it.
     fn finish_session(&mut self) -> Result<()> {
         match self.mode {
             RecordingMode::ReplayBuffer => {
                 let stats = self.ledger.stats()?;
-                // `size_bytes` stays 0 because it is a claim about **disk**, and a RAM buffer
-                // occupies none — the footage is dropped when the process stops. The bytes that
-                // were held go to the log, where they are a fact about RAM and cannot be mistaken
-                // for a file's size.
+                // `size_bytes` stays 0: it is a disk claim and a RAM buffer occupies none. The held bytes go to the log.
                 self.store
                     .end_session(self.session, now_ms(), None, 0, 0)
                     .with_context(|| format!("closing session #{}", self.session))?;
@@ -2421,9 +1929,8 @@ impl Engine {
                 Ok(())
             }
             RecordingMode::FullSession => {
-                // The encoder has been flushed and its child has exited, so the newest
-                // segment file is complete and belongs in the session (the live scan
-                // deliberately does not trust the newest file while ffmpeg is writing it).
+                // The flushed encoder's child has exited, so the newest segment is complete and belongs in the
+                // session (the live scan does not trust it while ffmpeg writes it).
                 self.ledger.scan_all()?;
                 let (segments, directory, bin) = match &self.ledger {
                     Ledger::Session(session) => (
@@ -2439,9 +1946,8 @@ impl Engine {
                 let out = session::session_file_path(&self.sessions_dir, self.session_started_ms);
                 let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
                 if segments.is_empty() {
-                    // A recording that never produced a segment — a start that failed after
-                    // the row was opened, a game that started and stopped inside ffmpeg's
-                    // start-up. Closed honestly, with no file to name.
+                    // A recording that never produced a segment (a start that failed after the row opened, or a game
+                    // that ended inside ffmpeg's start-up): closed with no file to name.
                     self.store
                         .end_session(self.session, now_ms(), None, 0, 0)
                         .with_context(|| format!("closing empty session #{}", self.session))?;
@@ -2475,9 +1981,7 @@ impl Engine {
                         now_ms(),
                         Some(&meta.path.display().to_string()),
                         meta.size_bytes as i64,
-                        // The probed length of the file just written: the axis a review
-                        // timeline is drawn on, and the one number in the row that is the
-                        // recorded media rather than the window it was recorded in.
+                        // The probed length of the written file: the recorded media, not the window it was recorded in.
                         meta.duration_ms as i64,
                     )
                     .with_context(|| format!("closing session #{}", self.session))?;
@@ -2496,9 +2000,7 @@ impl Engine {
         }
     }
 
-    /// Record a failure and let the loop end. The message is both logged and kept in the
-    /// status, because a front-end that only polls `status()` must still be able to say
-    /// what happened.
+    /// Record a failure and let the loop end. Logged and kept in the status for front-ends that only poll `status()`.
     fn fail(&mut self, err: anyhow::Error) {
         let message = format!("{err:#}");
         tracing::error!("the recorder stopped: {message}");
@@ -2507,27 +2009,17 @@ impl Engine {
     }
 }
 
-/// Resolve the encoder's codec and vendor — proving this machine can actually encode —
-/// **before** any capture backend is created.
+/// Resolve the encoder's codec and vendor, proving this machine can encode, before any capture
+/// backend is created.
 ///
-/// WHY THIS RUNS FIRST. On Windows, creating the video backend opens a Windows Graphics
-/// Capture session on the primary monitor: it starts capturing the user's screen. The
-/// vendor cannot be known to work until `select_vendor` has driven a one-frame smoke test
-/// of the candidate encoder, and that smoke test is exactly where an
-/// advertised-but-unusable vendor is caught (the measured `h264_amf` on a box with no AMD
-/// driver, which otherwise died mid-capture with "video writer thread has stopped"). If
-/// the smoke test ran *after* the backend was created, a machine whose encoder cannot
-/// start would have had its screen captured before the process discovered it could encode
-/// nothing. Resolving the vendor first turns that into a fast, actionable startup failure
-/// that never touches the display. Nothing is lost by moving it earlier: the smoke test
-/// encodes its own synthetic frame, so it needs no real capture size.
+/// On Windows, creating the video backend starts capturing the user's screen. The vendor is only
+/// known to work after `select_vendor` drives a one-frame smoke test, which catches advertised but
+/// unusable vendors (e.g. `h264_amf` with no AMD driver, otherwise dying mid-capture with "video
+/// writer thread has stopped"). Running it first makes that a fast startup failure that never touches
+/// the display; the smoke test encodes its own synthetic frame, so it needs no capture size.
 ///
-/// The size-dependent half of the encoder decision does still need the backend (the
-/// rawvideo pipe is declared from the backend's `native_size`), so it stays in
-/// [`build_encode_config`] and runs once the backend exists.
-///
-/// The returned vendor is `None` for `dev_software_encoder`, the libx264 smoke-test path,
-/// which needs no GPU vendor at all and must not be gated behind a hardware check.
+/// The size-dependent half needs the backend's `native_size`, so it stays in [`build_encode_config`].
+/// The returned vendor is `None` for `dev_software_encoder` (libx264), which needs no GPU vendor.
 fn resolve_encoder(
     bin: &FfmpegBinaries,
     encode: &EncodeSection,
@@ -2547,30 +2039,19 @@ fn resolve_encoder(
     Ok((codec, Some(select_vendor(bin, &encode.vendor, codec)?)))
 }
 
-/// The rate decision, said out loud.
+/// Log the rate decision; this line is a deliverable, not a debug aid.
 ///
-/// This line is a deliverable, not a debug aid. It is the difference between "capture is
-/// running at 24fps" as an unexplained number and as a measured fact about *this* machine at
-/// *this* resolution — and it is the number that decides how much of the capture work is
-/// spent on frames the encoder will keep.
+/// It turns "capture runs at 24fps" into a measured fact about this machine at this resolution.
+/// It is not the timeline guarantee: the media timeline is the frames' arrival timestamps and does
+/// not depend on this measurement (see `localplay_encoder::throughput`). Adapting saves the capture
+/// work of frames that would be dropped and warns before recording rather than after. The
+/// effective rate is printed, never the configured one when they differ.
 ///
-/// It is **not** the timeline guarantee, and the text below must not claim to be: the media
-/// timeline is the frames' arrival timestamps and does not depend on this measurement at all
-/// (see `localplay_encoder::throughput` for the 62-measured-vs-8-achieved measurement that
-/// settled that). What adapting buys is the capture work of frames that would be dropped, and
-/// a warning a user can act on before recording instead of after.
-///
-/// Nothing here is printed from the *configured* value when the effective one differs: a
-/// reader must never have to work out which of the two is in force.
-///
-/// * **Reduced** (`WARN`) — the configured rate is not achievable here. It says what was
-///   measured, what the pipeline therefore runs at, how a user who wants a higher rate can get
-///   one (a smaller output size, or a lower fps), plus the escape hatch (`adapt_fps = false`)
-///   and what it costs (dropped frames: moments of the recording held on the previous frame).
-/// * **Not reduced** (`INFO`) — one short line, because there is nothing to warn about and a
-///   user should still be able to see that the measurement happened and what it said.
-/// * **Not measured at all** (`INFO`) — adaptation is off; say so, since the absence of a
-///   measurement is itself a decision someone made.
+/// * Reduced (`WARN`): says what was measured, what the pipeline runs at, how to get a higher
+///   rate (smaller output or lower fps) and the `adapt_fps = false` escape hatch with its cost
+///   (dropped frames hold the previous picture).
+/// * Not reduced (`INFO`): one short line showing the measurement happened.
+/// * Not measured (`INFO`): adaptation is off; the absence of a measurement is itself a decision.
 fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) {
     let Some(m) = decision.measurement() else {
         tracing::info!(
@@ -2586,9 +2067,7 @@ fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) 
         return;
     };
 
-    // The size is spelled out from the measurement rather than from the configuration: the
-    // number is a property of the geometry it was taken at, and when the output is scaled
-    // both sizes are part of what was measured (the frames fed *and* the frames encoded).
+    // The size comes from the measurement, not the config: when output is scaled, both sizes (frames fed and encoded) were measured.
     let where_measured = if m.source_size == m.output_size {
         format!("at {}x{}", m.source_size.0, m.source_size.1)
     } else {
@@ -2631,8 +2110,7 @@ fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) 
     }
 }
 
-/// The video codec the config asks for. Machine-independent, so it is resolved alongside
-/// the vendor, before any capture backend exists.
+/// The video codec the config asks for; machine-independent, so resolved before any capture backend exists.
 pub fn parse_codec(spec: &str) -> Result<VideoCodec> {    match spec {
         "h264" => Ok(VideoCodec::H264),
         "hevc" => Ok(VideoCodec::Hevc),
@@ -2640,8 +2118,7 @@ pub fn parse_codec(spec: &str) -> Result<VideoCodec> {    match spec {
     }
 }
 
-/// `"1920x1080"`, or `None` for the empty string (documented as "native capture
-/// resolution", config.example.toml / spec §10).
+/// `"1920x1080"`, or `None` for the empty string (native capture resolution).
 pub fn parse_output_size(spec: &str) -> Result<Option<(u32, u32)>> {
     if spec.trim().is_empty() {
         return Ok(None);
@@ -2656,10 +2133,8 @@ pub fn parse_output_size(spec: &str) -> Result<Option<(u32, u32)>> {
 
 /// Whether this recording carries the game-audio track.
 ///
-/// `[audio] enabled` is the setting and the CLI is the only front-end that reads it; an absent
-/// value (the desktop shell, which does not parse the section) is `true`, which is what every
-/// recording made before the key meant. One function because two places need the same answer:
-/// the encoder's configuration and the capture backends.
+/// `[audio] enabled` is read only by the CLI; absent (the desktop shell) means `true`. One
+/// function because the encoder config and the capture backends need the same answer.
 impl RecorderConfig {
     pub fn game_audio(&self) -> bool {
         self.audio_enabled.unwrap_or(true)
@@ -2668,9 +2143,8 @@ impl RecorderConfig {
 
 /// The capture and audio backends for the configured [`Sources`].
 ///
-/// The audio backend is built only when `game_audio` is set. A video-only recording must not
-/// open the loopback at all: a capture whose blocks are discarded is still a capture, costing
-/// what it costs and — on Windows — holding a WASAPI session the user asked not to have.
+/// The audio backend is built only when `game_audio` is set: a video-only recording must not open
+/// the loopback (on Windows that holds a WASAPI session the user asked not to have).
 #[allow(clippy::type_complexity)]
 fn build_sources(
     sources: Sources,
@@ -2679,9 +2153,7 @@ fn build_sources(
     game_audio: bool,
 ) -> Result<(Box<dyn CaptureBackend>, Option<Box<dyn AudioBackend>>)> {
     match sources {
-        // The backend is chosen per platform: real WGC/WASAPI capture on Windows, the
-        // synthetic stubs elsewhere. On Windows a missing capture backend is a hard error
-        // there is no stub fallback to hide it behind.
+        // Real WGC/WASAPI capture on Windows, synthetic stubs elsewhere. On Windows a missing backend is a hard error, with no stub fallback.
         Sources::Platform => {
             let stub = StubConfig { width: STUB_CAPTURE_SIZE.0, height: STUB_CAPTURE_SIZE.1, fps };
             let capture = default_video_backend(stub, &capture_section.target())?;
@@ -2692,8 +2164,7 @@ fn build_sources(
             };
             Ok((capture, audio))
         }
-        // Explicitly the synthetic pair. Only a test (or a front-end that says so out
-        // loud) asks for these; nothing about them touches the display or the speakers.
+        // Explicitly the synthetic pair, for tests or a front-end that says so; touches neither display nor speakers.
         Sources::Stub(cfg) => {
             let audio: Option<Box<dyn AudioBackend>> = if game_audio {
                 Some(Box::new(StubAudio::new(AudioFormat::default())))
@@ -2705,22 +2176,15 @@ fn build_sources(
     }
 }
 
-/// Build the encoder's configuration from the already-resolved codec and vendor plus the
-/// capture backend's own frame geometry — without starting the encoder. Hardware is the
-/// only shipping path.
+/// Build the encoder's configuration from the resolved codec and vendor plus the capture
+/// backend's frame geometry, without starting the encoder. Hardware is the only shipping path.
 ///
-/// The vendor is resolved earlier, before the capture backend exists (see
-/// [`resolve_encoder`]); `None` here is the `dev_software_encoder` (libx264) path.
-/// `native_size` is the capture backend's own frame geometry: the monitor for WGC, the
-/// configured size for the stub. The encoder's rawvideo pipe is declared from it, which is
-/// why this size-dependent step has to run *after* the backend exists. Empty
-/// `encode.output_size` means "encode at native resolution" (config.example.toml, spec
-/// §10); any other value is the output size, scaled from the native frames.
+/// `None` vendor is the `dev_software_encoder` (libx264) path. `native_size` (the monitor for WGC,
+/// the configured size for the stub) declares the rawvideo pipe, so this runs after the backend
+/// exists. Empty `encode.output_size` means native resolution; any other value is scaled from it.
 ///
-/// Separate from [`spawn_encoder`] because the engine has to know the encoder's name (for
-/// the ring's clip metadata) and, more importantly, has to decide the segment numbering
-/// from the scratch directory *before* the child starts: the number is an ffmpeg argument,
-/// so it cannot be changed afterwards.
+/// Separate from [`spawn_encoder`] because the segment numbering is decided from the scratch
+/// directory before the child starts (it is an ffmpeg argument and cannot change afterwards).
 fn build_encode_config(
     cfg: &RecorderConfig,
     scratch_dir: &Path,
@@ -2731,8 +2195,7 @@ fn build_encode_config(
     let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
     let segment_ms = cfg.buffer.segment_time * 1000;
 
-    // Mutable only on Windows, where the hybrid sets `video` below; the guard is unconditional so
-    // that a configuration this platform cannot honour is refused here rather than at capture time.
+    // Mutable only on Windows, where the hybrid sets `video`; the guard is unconditional so a configuration this platform cannot honour is refused here, not at capture time.
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut encode_cfg = match vendor {
         Some(vendor) => EncodeConfig::hardware(
@@ -2745,14 +2208,11 @@ fn build_encode_config(
             segment_ms,
             scratch_dir.to_path_buf(),
         ),
-        // `vendor` is `None` only for `dev_software_encoder`, which is only reachable from
-        // a build that carries the software encoder (see [`resolve_encoder`]).
+        // `None` only for `dev_software_encoder`, reachable only from a build with the software encoder (see [`resolve_encoder`]).
         None => {
             #[cfg(any(test, feature = "test-encoders"))]
             {
-                // The message names the CLI's flag, which is the only way a user can
-                // reach this path (there is no configuration setting for it, spec §3.2).
-                // Kept verbatim so the move into this crate did not change the CLI's log.
+                // Names the CLI's flag, the only way to reach this path (there is no config setting for it); kept verbatim from the CLI's log.
                 tracing::warn!(
                     "--dev-software-encoder: using libx264. This is for smoke-testing \
                      the pipeline only and is NOT a supported configuration."
@@ -2765,8 +2225,7 @@ fn build_encode_config(
                     scratch_dir.to_path_buf(),
                     segment_ms,
                 );
-                // The dev encoder scales the same way the hardware one does: frames
-                // arrive at the native size, the output is `output_size`.
+                // Scales like the hardware encoder: frames arrive at native size, output is `output_size`.
                 c.output_size = output_size;
                 c
             }
@@ -2777,35 +2236,25 @@ fn build_encode_config(
         }
     };
 
-    // The game track's bitrate. `[audio] bitrate_kbps` is the setting and the CLI carries it
-    // here; `None` — the desktop shell, which does not parse `[audio]` — is the default this
-    // pipeline has always recorded at. Set on every path (hardware and test software) so the
-    // file records what the config says rather than what a constructor happened to pick.
+    // The game track's bitrate: `[audio] bitrate_kbps` (CLI) or the default (desktop shell). Set on
+    // every path so the file records what the config says.
     encode_cfg.audio_bitrate_kbps =
         cfg.audio_bitrate_kbps.unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
 
-    // Whether the game-audio track exists at all, from the same rule the capture backends were
-    // built from (`RecorderConfig::game_audio`): `false` declares no audio input, so the
-    // encoder never binds its loopback listener and the container carries no audio stream.
+    // Whether the game-audio track exists, from the same rule the capture backends used
+    // (`RecorderConfig::game_audio`): `false` declares no audio input and no loopback listener.
     encode_cfg.game_audio = cfg.game_audio();
 
-    // The hybrid, when it was asked for and this machine can do it. Both refusals happen here
-    // rather than later, because both are *configuration* contradictions and a recording that
-    // silently ran a different pipeline than the one configured is worse than one that does not
-    // start: this project has already paid for a quiet divergence between what was asked for and
-    // what ran (issues #1 and #2).
-    // What the key means, resolved in one place so the guards below and the log lines agree.
-    //
-    // `Some(true)` is a deliberate request: it *requires* the hardware path, and the guards below
-    // refuse the run when the machine cannot provide it. `None` is the default and is not a request
-    // — it is "use it if you can", which on a host without the hardware means the ordinary path
-    // rather than a refusal.
+    // The hybrid, when asked for and possible. Both refusals are configuration contradictions caught
+    // here, because a recording that silently ran a different pipeline than configured is worse than
+    // one that does not start.
+    // `Some(true)` is a deliberate request that requires the hardware path; `None` is "use it if you
+    // can", which on a host without the hardware means the ordinary path rather than a refusal.
     let zero_copy_required = cfg.encode.zero_copy == Some(true);
-    // **`auto` asks the hardware, not the registry.** `MFTEnumEx` says which encoders exist; it cannot
-    // say whether one will open for this codec at this size, and on this machine those are different
-    // questions — its HEVC encoder MFT is enumerated, activates, and refuses the output type at 4K
-    // (`0xC00D6D76`) while accepting the same one at 640x480. Choosing the path on the strength of the
-    // enumeration would produce a recording with no video in it and a warning in a log.
+    // `auto` asks the hardware, not the registry: `MFTEnumEx` says which encoders exist, not whether
+    // one opens for this codec at this size (an HEVC MFT enumerates, activates, then refuses the
+    // output type at 4K with `0xC00D6D76` while accepting 640x480). Choosing on enumeration alone would
+    // record no video.
     #[cfg(windows)]
     let openable = vendor.is_some()
         && localplay_encoder::mft::can_encode_with_textures(codec, native_size, cfg.encode.bitrate_kbps);
@@ -2833,9 +2282,7 @@ fn build_encode_config(
         );
     }
 
-    // An explicit request that the hardware cannot honour is an error, not a quiet downgrade: a
-    // recording that silently used a different pipeline than the one asked for is the failure this
-    // project has already paid for twice (issues #1 and #2).
+    // An explicit request the hardware cannot honour is an error, not a quiet downgrade.
     #[cfg(windows)]
     if zero_copy_required && !openable {
         bail!(
@@ -2851,9 +2298,8 @@ fn build_encode_config(
         #[cfg(windows)]
         {
             encode_cfg.video = localplay_encoder::VideoInput::EncodedBitstream;
-            // Said out loud, with the consequence, because this changes what the child is told to
-            // do with the video: it copies rather than encodes, and the keyframe interval that used
-            // to be ffmpeg's is now the MFT's.
+            // Said out loud because it changes what the child does with video: it copies rather than encodes,
+            // and the keyframe interval is the MFT's, not ffmpeg's.
             tracing::info!(
                 "zero-copy: captured textures go straight to the hardware encoder, and ffmpeg \
                  copies the {} stream instead of encoding it ({})",
@@ -2866,9 +2312,7 @@ fn build_encode_config(
             );
         }
     } else if cfg.encode.zero_copy.is_none() {
-        // The default, on a machine that cannot run it. Said out loud, because the alternative —
-        // saying nothing — is how a configured pipeline and a running one drift apart, which this
-        // project has already paid for twice (issues #1 and #2).
+        // The default on a machine that cannot run it; said out loud so the configured and running pipelines cannot silently drift apart.
         tracing::info!(
             "zero-copy is off for this run: it needs Windows, a detected hardware encoder, and one \
              that will open for {codec:?} at this size. One of those is missing, so frames are read \
@@ -2877,9 +2321,8 @@ fn build_encode_config(
         );
     }
 
-    // The rawvideo pipe is declared from `source_size`; if it did not equal the backend's
-    // native size ffmpeg would mis-read every frame. This derives it from `native_size`,
-    // so this guards against a future edit breaking that link.
+    // The rawvideo pipe is declared from `source_size`; if it differed from the backend's native size
+    // ffmpeg would mis-read every frame. Guards against a future edit breaking that link.
     if encode_cfg.source_size != native_size {
         bail!(
             "encoder source size {}x{} does not match the capture backend's native size \
@@ -2894,8 +2337,8 @@ fn build_encode_config(
     Ok(encode_cfg)
 }
 
-/// Start the ffmpeg child for a configuration whose `start_number` has already been
-/// decided (see [`build_encode_config`] and the ledger's reserved segment number).
+/// Start the ffmpeg child for a configuration whose `start_number` is already decided (see
+/// [`build_encode_config`] and the ledger's reserved segment number).
 fn spawn_encoder(
     bin: &FfmpegBinaries,
     encode_cfg: &EncodeConfig,

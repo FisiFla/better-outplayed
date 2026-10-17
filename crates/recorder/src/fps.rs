@@ -1,54 +1,29 @@
 //! The rate the pipeline runs at: one number, decided once, used by both consumers.
 //!
-//! # Why this type exists
+//! The rate is declared in two places, the encoder child's `-framerate` and the
+//! [`crate::pump::FramePacer`] that decides how often a frame is taken off the capture backend.
+//! It is decided once from the configured value and what the encoder was measured to sustain, and
+//! `Recorder::start_with_measure` writes it into [`localplay_encoder::EncodeConfig::fps`] and builds
+//! the pacer from the same field, so the two cannot come from different inputs.
 //!
-//! The pipeline declares its frame rate in two places at once — the encoder child's
-//! `-framerate`, and the [`crate::pump::FramePacer`] that decides how often a frame may be
-//! taken off the capture backend. While those two numbers were *both* the configured
-//! `encode.fps`, a machine that could not encode that rate dropped the surplus in the
-//! encoder's bounded queue: measured on real 4K hardware, ~24fps sustained against a
-//! configured 30 with ~45% of delivered frames dropped (issue #1).
+//! This is a pacing decision, not the timeline guarantee: paying a readback for frames the encoder
+//! will drop is waste. The media timeline tracks real time independently, via
+//! `-fps_mode passthrough` in `localplay_encoder::ffmpeg::video_output_args`.
 //!
-//! What made that a *timeline* defect was **not** the rate either consumer was told. It was
-//! ffmpeg's default constant-rate frame conversion, which turned the declared rate into a
-//! clock: the arrival timestamps were resampled onto a `1/R` grid, missing frames were
-//! invented to fill it, and the media the ring could see advanced at (frames the encoder
-//! could emit) ÷ R — measured on the dev host at 0.64–0.69x of real time against a declared
-//! 120fps with a software 4K encoder. That is fixed in
-//! `localplay_encoder::ffmpeg::video_output_args` (`-fps_mode passthrough`), by construction
-//! and independently of throughput. What is left here is the *pacing* decision: paying a
-//! readback for frames the encoder will throw away is waste, and this is where that is
-//! avoided.
-//!
-//! So the rate is decided **once**, from the configured value and what the encoder was
-//! actually measured to sustain, and that one value is threaded to both consumers:
-//! `Recorder::start_with_measure` writes it into [`localplay_encoder::EncodeConfig::fps`] —
-//! which is what builds the child's `-framerate` — and builds the pacer from the *same*
-//! field, so the two cannot be computed from different inputs. See that function for where
-//! the invariant lives.
-//!
-//! # What "adapting" is, and what it is not
-//!
-//! * The configured rate is never exceeded: the effective rate is `min(configured, measured)`.
-//! * When the measurement is **at or above** the configured rate the pipeline behaves exactly
-//!   as it always did — the configured rate wins, and nothing is quietly degraded on a
-//!   machine that can keep up.
-//! * `encode.adapt_fps = false` skips the measurement entirely (saving its ~1.5s of startup)
-//!   and declares the configured rate regardless. That is the escape hatch, and it is also
-//!   how a user *forces* a rate the probe would otherwise reduce. Its cost is dropped frames
-//!   and the capture work spent on them — no longer a media timeline that drifts.
+//! * The effective rate is `min(configured, measured)`; the configured rate is never exceeded.
+//! * A measurement at or above the configured rate changes nothing.
+//! * `encode.adapt_fps = false` skips the measurement (~1.5s of startup) and declares the
+//!   configured rate regardless; the cost is dropped frames and the capture work spent on them.
 
 use localplay_encoder::ThroughputMeasurement;
 
 /// The rate this recording runs at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FpsDecision {
-    /// What `encode.fps` asked for. Reported to the user and never used to pace or to
-    /// configure the encoder — that is [`FpsDecision::effective`]'s job alone.
+    /// What `encode.fps` asked for; reported only, never used to pace or configure the encoder.
     configured: u32,
-    /// What the throughput probe measured, when one ran. `None` with adaptation off (no
-    /// probe is taken at all) and with adaptation on... only if startup did not fail: a
-    /// probe that cannot produce a number is an error, never a guess.
+    /// What the throughput probe measured. `None` with adaptation off; a probe that cannot produce a
+    /// number is a startup error, never a guess.
     measurement: Option<ThroughputMeasurement>,
     /// The rate the pacer paces to and the encoder child is told. `<= configured` always.
     effective: u32,
@@ -57,15 +32,10 @@ pub struct FpsDecision {
 impl FpsDecision {
     /// Decide the rate from what the user asked for and what the probe measured.
     ///
-    /// `adapt` is `encode.adapt_fps`: with it off, the configured rate wins and any
-    /// measurement (there is none in that case) is ignored. With it on, a measurement below
-    /// the configured rate *reduces* the effective rate, rounded **down** — the pipeline must
-    /// never declare more than the machine was measured to sustain, which is the whole point;
-    /// the floor is 1, because a rate of zero is not a pipeline.
+    /// With `adapt` off the configured rate wins. With it on, a lower measurement reduces the rate,
+    /// rounded down (never declare more than was measured), with a floor of 1.
     pub fn decide(configured: u32, adapt: bool, measurement: Option<ThroughputMeasurement>) -> Self {
-        // A zero configured rate drives ffmpeg's `-framerate` and `1 / fps` arithmetic; the
-        // config reader refuses it, and this clamp keeps the decision total for a caller that
-        // constructs one directly (a test, or a front-end with its own validation).
+        // Zero would break `-framerate` and `1 / fps`; the config reader refuses it, and the clamp keeps this total for direct callers.
         let configured = configured.max(1);
         let effective = match (adapt, measurement) {
             (true, Some(m)) if m.fps < f64::from(configured) => (m.fps.floor() as u32).max(1),
@@ -74,8 +44,7 @@ impl FpsDecision {
         Self { configured, measurement, effective }
     }
 
-    /// The rate both consumers are given: the pacer's interval, and the encoder child's
-    /// `-framerate`.
+    /// The rate both consumers are given: the pacer's interval and the encoder child's `-framerate`.
     pub fn effective(&self) -> u32 {
         self.effective
     }
@@ -85,13 +54,12 @@ impl FpsDecision {
         self.configured
     }
 
-    /// What the probe measured, if it ran — the number the log line and the report quote.
+    /// What the probe measured, if it ran.
     pub fn measurement(&self) -> Option<ThroughputMeasurement> {
         self.measurement
     }
 
-    /// Whether adaptation reduced the rate, i.e. whether this machine could not hold what the
-    /// configuration asked for. Startup says so out loud when this is true.
+    /// Whether adaptation reduced the rate, i.e. the machine could not hold the configured one.
     pub fn reduced(&self) -> bool {
         self.effective < self.configured
     }
@@ -114,8 +82,7 @@ mod tests {
 
     const PROBE: Duration = Duration::from_millis(1500);
 
-    /// The ordinary case on a machine that keeps up: the configured rate wins, unchanged, and
-    /// nothing is quietly degraded. This is the "behaviour must be exactly as today" rule.
+    /// A machine that keeps up gets the configured rate, unchanged.
     #[test]
     fn a_machine_that_keeps_up_runs_at_exactly_the_configured_rate() {
         for measured_fps in [400.0, 60.0, 30.1] {
@@ -130,8 +97,7 @@ mod tests {
         }
     }
 
-    /// A measurement *at* the configured rate is not a shortfall: the effective rate stays
-    /// the configured one, so a machine that is exactly on the line is not shaved down.
+    /// A measurement at the configured rate is not a shortfall.
     #[test]
     fn a_measurement_exactly_at_the_configured_rate_keeps_the_configured_rate() {
         let d = FpsDecision::decide(30, true, measured(30.0, (3840, 2160)));
@@ -139,8 +105,7 @@ mod tests {
         assert!(!d.reduced(), "there is no shortfall to report");
     }
 
-    /// Below the configured rate, the measurement wins — rounded down, never up, because a
-    /// declared rate above what was measured is the bug this whole module exists for.
+    /// Below the configured rate the measurement wins, rounded down, never up.
     #[test]
     fn a_measurement_below_the_configured_rate_reduces_the_rate_and_rounds_down() {
         let d = FpsDecision::decide(30, true, measured(24.3, (3840, 2160)));
@@ -150,15 +115,12 @@ mod tests {
         let m = d.measurement().expect("the measurement is kept for the log line");
         assert_eq!(m.source_size, (3840, 2160), "and it says what resolution it was taken at");
 
-        // A rate below 1fps is a broken pipeline rather than a rate of zero: the pacer and
-        // ffmpeg's `-framerate` both need a positive integer.
+        // Below 1fps is a broken pipeline, not a rate of zero.
         let d = FpsDecision::decide(30, true, measured(0.4, (3840, 2160)));
         assert_eq!(d.effective(), 1);
     }
 
-    /// Adaptation off is the escape hatch: the configured rate is declared as it always was,
-    /// the ~1.5s of startup is not spent measuring, and the pipeline accepts that the encoder
-    /// may drop frames on a machine that cannot hold it.
+    /// Adaptation off declares the configured rate and spends no startup time measuring.
     #[test]
     fn with_adaptation_off_the_configured_rate_is_declared_whatever_was_measured() {
         let d = FpsDecision::decide(30, false, measured(12.0, (3840, 2160)));
@@ -169,9 +131,7 @@ mod tests {
         assert!(d.measurement().is_none(), "no probe ran");
     }
 
-    /// Adaptation on with no measurement: no reduction, because there is no number to reduce
-    /// to. (The shipping path never reaches this — a probe that fails stops startup — but the
-    /// decision has to be total for a caller that hands it nothing.)
+    /// Adaptation on with no measurement: no reduction, since there is nothing to reduce to.
     #[test]
     fn no_measurement_means_no_reduction() {
         let d = FpsDecision::decide(60, true, None);
@@ -179,8 +139,7 @@ mod tests {
         assert!(!d.reduced());
     }
 
-    /// A configured zero is clamped rather than propagated into `1 / fps` arithmetic and
-    /// ffmpeg's `-framerate 0`.
+    /// A configured zero is clamped rather than propagated into `1 / fps` and `-framerate 0`.
     #[test]
     fn a_zero_configured_rate_is_clamped_to_one() {
         assert_eq!(FpsDecision::decide(0, true, None).effective(), 1);
