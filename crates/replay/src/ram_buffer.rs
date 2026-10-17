@@ -1,26 +1,22 @@
 //! The in-memory replay ring: the last N seconds of footage, held in RAM.
 //!
-//! A file-based ring asks ffmpeg to write one MP4 per second into a
-//! scratch directory and then deletes the old ones, so an idle replay buffer is a continuous
-//! trickle of SSD writes for footage that is usually thrown away unclipped. This ring holds the
-//! same footage as a queue of fragments in memory instead, and **nothing is written to disk
-//! until a clip is saved**.
+//! A file-based ring has ffmpeg write one MP4 a second into a scratch directory and deletes old
+//! ones, so an idle buffer is a continuous trickle of SSD writes for footage usually thrown
+//! away. This ring holds the same footage as a queue of fragments in memory, and nothing is
+//! written to disk until a clip is saved.
 //!
 //! It is fed by [`crate::MemoryRingBuffer::push`] with whatever bytes the reader thread just got
-//! from ffmpeg's fragmented-MP4 output (see `localplay_media::fragments`, which does the box
-//! parsing). The reading itself is deliberately *not* here: taking bytes rather than a stream is
-//! what lets every rule below be tested without a pipe, a child process or a file.
+//! from ffmpeg's fragmented-MP4 output (box parsing is `localplay_media::fragments`). Taking
+//! bytes rather than a stream lets every rule here be tested without a pipe, child or file.
 //!
-//! # The two rules it borrows from the file ledger, and why
+//! Two rules borrowed from the file ledger:
 //!
-//! * **A segment's end is proved by the next segment's start.** A fragment's own bytes do not
-//!   say where it ends without parsing its sample table, and the next fragment's `tfdt` says it
-//!   exactly. So the newest fragment is held but its end is not claimed — the same rule the
-//!   file ledger uses ("a segment is only trusted once a strictly later one exists"), and the
-//!   reason `span_ms` lags the newest fragment by one.
-//! * **Eviction never empties the ring.** A ring with nothing in it can never satisfy a later
-//!   trigger, so being slightly over budget is better than being unable to clip at all — which
-//!   is also what `SegmentLedger::evict_to_cap` decides, for the same reason.
+//! * A segment's end is proved by the next segment's start. A fragment's bytes do not say where
+//!   it ends without parsing its sample table, while the next `tfdt` says exactly. So the
+//!   newest fragment is held but its end is not claimed (the file ledger's "trusted once a
+//!   strictly later one exists"), and `span_ms` lags the newest fragment by one.
+//! * Eviction never empties the ring. An empty ring can never satisfy a later trigger, so
+//!   slightly over budget beats unable to clip (as `SegmentLedger::evict_to_cap` decides).
 
 use anyhow::Result;
 use localplay_media::FragmentSplitter;
@@ -29,18 +25,17 @@ use std::collections::VecDeque;
 /// One fragment of the ring: a `moof`+`mdat` pair, and where it sits on the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySegment {
-    /// Sequence number, counted from 0 as the ring received fragments.
-    ///
-    /// Not an index: eviction removes from the front, so this is how a clip's range is talked
-    /// about without worrying about what has been dropped.
+    /// Sequence number, counted from 0 as the ring received fragments. Not an index: eviction
+    /// removes from the front, so this is how a clip's range is named regardless of what was
+    /// dropped.
     pub seq: u64,
     /// Where this fragment's first sample decodes, in run-relative media time.
     pub start_ms: u64,
-    /// Where its samples end — **equal to `start_ms` until the next fragment arrives**, because
-    /// it is the next fragment's `start_ms` that proves it. See the module note.
+    /// Where its samples end: equal to `start_ms` until the next fragment arrives and proves it.
+    /// See the module note.
     pub end_ms: u64,
-    /// Whether the fragment starts on a keyframe. True for every fragment this ring ingests
-    /// (`frag_keyframe`), carried so that a clip's first fragment can be *asserted* to be one.
+    /// Whether the fragment starts on a keyframe. True for every fragment ingested
+    /// (`frag_keyframe`), carried so a clip's first fragment can be asserted to be one.
     pub keyframe: bool,
     /// The fragment's bytes: its `moof` and its `mdat`, nothing else.
     pub bytes: Vec<u8>,
@@ -57,8 +52,8 @@ impl MemorySegment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryStats {
     pub segments: usize,
-    /// **RAM**, not disk. Named for what it is rather than reusing `bytes_on_disk`, so a status
-    /// line reading `bytes=` cannot be mistaken for a claim about the scratch directory.
+    /// RAM, not disk. Named so a status line reading `bytes=` is not mistaken for a claim about the
+    /// scratch directory.
     pub ram_bytes: u64,
     /// Media time the ring can prove it holds, run-relative. Lags the newest fragment by one,
     /// by the rule in the module note.
@@ -74,33 +69,31 @@ pub struct MemoryWindow<'a> {
     pub header: &'a [u8],
     /// The fragments, oldest first, all of them closed (a clip is a range of complete footage).
     pub segments: Vec<&'a MemorySegment>,
-    /// True when the requested range starts before the oldest footage the ring still holds —
-    /// the pre-roll the user asked for is longer than the buffer. Reported rather than hidden,
-    /// exactly as [`crate::window::SegmentWindow::truncated_front`] is.
+    /// True when the requested range starts before the oldest footage the ring holds: the pre-roll
+    /// asked for is longer than the buffer. Reported, as
+    /// [`crate::window::SegmentWindow::truncated_front`] is.
     pub truncated_front: bool,
-    /// Audio tracks the footage carries, from the header. Carried so the save path can re-name
-    /// them: a `-c copy` to a file drops per-stream metadata.
+    /// Audio tracks the footage carries, from the header, so the save path can re-name them: a
+    /// `-c copy` to a file drops per-stream metadata.
     pub audio_tracks: usize,
 }
 
 impl MemoryWindow<'_> {
-    /// The checks a splice must pass, so that a caller which assembles the bytes itself runs the
-    /// same ones.
+    /// The checks a splice must pass, so a caller assembling the bytes itself runs the same ones.
     ///
-    /// That is not a hypothetical caller: a recorder holds its ring behind a lock, and a window
-    /// borrows the ring, so it cannot outlive the lock. Assembling under the lock and splicing
-    /// outside it is the only safe order — holding the lock across ffmpeg would block the reader
-    /// thread for as long as the muxer takes, which fills the pipe, which stops ffmpeg draining
-    /// stdin, which stalls the recording. Splitting these two steps is what lets both paths
-    /// check the same invariants.
+    /// A recorder holds its ring behind a lock and a window borrows the ring, so it cannot outlive
+    /// the lock. Assembling under the lock and splicing outside is the only safe order: holding it
+    /// across ffmpeg would block the reader thread, filling the pipe, stopping ffmpeg draining
+    /// stdin and stalling the recording. Splitting the steps lets both paths check the same
+    /// invariants.
     ///
-    /// Each check is a *silent-damage* case rather than an error ffmpeg would raise:
+    /// Each is silent damage rather than an ffmpeg error:
     ///
     /// * a window with no fragments has nothing to cut;
-    /// * a first fragment that is not a keyframe opens the clip mid-GOP, and its first frames
-    ///   decode as garbage or not at all;
-    /// * an unclosed fragment has no proven end, so the clip's duration would be a claim rather
-    ///   than a measurement.
+    /// * a non-keyframe first fragment opens the clip mid-GOP, its first frames decoding as
+    ///   garbage or not at all;
+    /// * an unclosed fragment has no proven end, so the clip's duration would be a claim, not a
+    ///   measurement.
     pub fn validate(&self) -> anyhow::Result<()> {
         let Some(first) = self.segments.first() else {
             anyhow::bail!("cannot splice an empty in-memory window");
@@ -122,10 +115,9 @@ impl MemoryWindow<'_> {
         Ok(())
     }
 
-    /// The bytes to hand ffmpeg: the header once, then each fragment in order.
-    ///
-    /// This is a valid fragmented-MP4 stream, which is the whole trick — `ffmpeg -i this
-    /// -c copy out.mp4` turns it into an ordinary clip without re-encoding anything.
+    /// The bytes to hand ffmpeg: the header once, then each fragment in order. A valid
+    /// fragmented-MP4 stream, so `ffmpeg -i this -c copy out.mp4` makes an ordinary clip without
+    /// re-encoding.
     pub fn assemble(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             self.header.len() + self.segments.iter().map(|s| s.bytes.len()).sum::<usize>(),
@@ -145,8 +137,8 @@ impl MemoryWindow<'_> {
         }
     }
 
-    /// How many audio tracks the footage carries — the count `edit::audio_titles` needs, because
-    /// a `-c copy` to a file does not carry the names the encoder put on them.
+    /// How many audio tracks the footage carries, which `edit::audio_titles` needs because a
+    /// `-c copy` to a file loses the names the encoder set.
     pub fn audio_tracks(&self) -> usize {
         self.audio_tracks
     }
@@ -156,8 +148,8 @@ impl MemoryWindow<'_> {
 pub struct MemoryRingBuffer {
     splitter: FragmentSplitter,
     segments: VecDeque<MemorySegment>,
-    /// Summed `segments[i].bytes.len()`, kept rather than recomputed: the eviction loop asks
-    /// for it after every fragment, and at 256MB that sum is not something to walk.
+    /// Summed `segments[i].bytes.len()`, kept rather than recomputed: the eviction loop asks after
+    /// every fragment, and at 256MB that sum is not something to walk.
     bytes: u64,
     cap_bytes: u64,
     cap_ms: u64,
@@ -166,12 +158,9 @@ pub struct MemoryRingBuffer {
 }
 
 impl MemoryRingBuffer {
-    /// A ring holding at most `cap_bytes` of RAM and at most `cap_ms` of media.
-    ///
-    /// Both caps apply; whichever bites first evicts. `cap_bytes` is the one that keeps the
-    /// application from being killed by the operating system, so it is the one to size
-    /// carefully — see `BufferConfig::ram_cap_bytes`, whose default is deliberately a fraction
-    /// of a typical machine's memory rather than all of it.
+    /// A ring holding at most `cap_bytes` of RAM and at most `cap_ms` of media; whichever bites
+    /// first evicts. `cap_bytes` keeps the OS from killing the application, so size it carefully:
+    /// see `BufferConfig::ram_cap_bytes`, whose default is a fraction of a typical machine's memory.
     pub fn new(cap_bytes: u64, cap_ms: u64) -> Self {
         Self {
             splitter: FragmentSplitter::new(),
@@ -186,19 +175,17 @@ impl MemoryRingBuffer {
 
     /// Feed bytes just read from the encoder's stream; returns how many fragments completed.
     ///
-    /// The caller passes whatever a `read()` gave it — a partial box, three boxes, half a
-    /// fragment — and the splitter holds the remainder until it is complete. A fragment is only
-    /// admitted once its `mdat` has arrived in full, so nothing in this queue is a fragment
-    /// with truncated samples.
+    /// The caller passes whatever a `read()` gave it (a partial box, three boxes, half a fragment)
+    /// and the splitter holds the remainder. A fragment is admitted only once its `mdat` has fully
+    /// arrived, so nothing queued has truncated samples.
     pub fn push(&mut self, chunk: &[u8]) -> Result<usize> {
         let fragments = self.splitter.push(chunk)?;
         let added = fragments.len();
         for fragment in fragments {
-            // A predecessor whose own sample table could not be read is closed by this
-            // fragment's start. That rule — the file ledger's — is now only a fallback: a
-            // fragment normally arrives knowing its own length (`Fragment::duration_ms`), and
-            // waiting for the next one to prove it would make `span_ms` lag a whole fragment
-            // behind the footage the ring is actually holding.
+            // A predecessor whose sample table could not be read is closed by this fragment's start (the
+            // file ledger's rule). It is now a fallback: a fragment normally knows its own length
+            // (`Fragment::duration_ms`), and waiting for the next to prove it would make `span_ms` lag a
+            // whole fragment behind the held footage.
             if let Some(previous) = self.segments.back_mut() {
                 if !previous.is_closed() {
                     previous.end_ms = fragment.start_ms;
@@ -208,9 +195,9 @@ impl MemoryRingBuffer {
             self.segments.push_back(MemorySegment {
                 seq: self.next_seq,
                 start_ms: fragment.start_ms,
-                // The fragment's own sample durations. Zero when they could not be read, which
-                // leaves `is_closed` false and makes this segment as untrusted as the file
-                // ledger's newest — the honest answer when the length is not known.
+                // The fragment's own sample durations. Zero when unreadable, leaving `is_closed` false so this
+                // segment is as untrusted as the file ledger's newest: the honest answer when the length is
+                // unknown.
                 end_ms: fragment.start_ms.saturating_add(fragment.duration_ms),
                 keyframe: fragment.keyframe,
                 bytes: fragment.bytes,
@@ -223,11 +210,9 @@ impl MemoryRingBuffer {
         Ok(added)
     }
 
-    /// Drop fragments off the front until both caps are satisfied, keeping at least one.
-    ///
-    /// Called after every push rather than on a timer: the moment a fragment arrives is the only
-    /// moment the ring can newly exceed a cap, and doing it here means the peak is one fragment
-    /// over the budget instead of one tick's worth over it.
+    /// Drop fragments off the front until both caps are satisfied, keeping at least one. Called
+    /// after every push: a fragment arriving is the only moment the ring can newly exceed a cap,
+    /// so the peak is one fragment over budget rather than a timer tick's worth.
     fn enforce_caps(&mut self) {
         while self.segments.len() > 1 {
             let (oldest_start, oldest_bytes) = {
@@ -246,10 +231,8 @@ impl MemoryRingBuffer {
         }
     }
 
-    /// The `ftyp`+`moov` header, once the splitter has seen it.
-    ///
-    /// `None` until then. Kept whole and never evicted: it is a kilobyte, and it is the one part
-    /// a clip cannot be assembled without.
+    /// The `ftyp`+`moov` header once the splitter has seen it, `None` until then. Never evicted: a
+    /// kilobyte, and the one part a clip cannot be assembled without.
     pub fn header(&self) -> Option<&[u8]> {
         self.splitter.header()
     }
@@ -265,14 +248,12 @@ impl MemoryRingBuffer {
 
     /// Media time the ring can prove it holds, run-relative.
     ///
-    /// The newest fragment's **end** — its start plus its own measured duration. Nothing is
-    /// guessed: a fragment carries its sample durations, so the ring knows how much footage it
-    /// holds the moment the bytes arrive. (When a sample table cannot be read the end falls back
-    /// to the fragment's start until the next fragment supplies it, which is why
+    /// The newest fragment's end: its start plus its own measured duration. Nothing is guessed, as
+    /// a fragment carries its sample durations. (When a sample table cannot be read the end falls
+    /// back to the start until the next fragment supplies it; that is why
     /// [`MemorySegment::is_closed`] exists.)
     ///
-    /// This is the number a trigger's range is resolved against, and the in-memory counterpart
-    /// of a file ring's `stats().span_ms`.
+    /// A trigger's range is resolved against this, as against a file ring's `stats().span_ms`.
     pub fn span_ms(&self) -> u64 {
         self.segments.back().map(|s| s.end_ms).unwrap_or(0)
     }
@@ -287,16 +268,15 @@ impl MemoryRingBuffer {
         self.segments.iter()
     }
 
-    /// The fragments covering `[start_ms, end_ms)`, with the header to write them ahead of.
+    /// The fragments covering `[start_ms, end_ms)`, with the header to write ahead of them.
     ///
-    /// `None` when there is nothing to cut from — no header yet, or no fragment overlaps the
-    /// range. A caller that gets `None` has a real answer ("this trigger cannot be served from
-    /// this ring") rather than an empty clip.
+    /// `None` when there is nothing to cut from (no header yet, or no fragment overlaps the range):
+    /// a real answer, "this trigger cannot be served from this ring", not an empty clip.
     ///
-    /// **Only closed fragments are selected.** A clip is a range of complete footage, and the
-    /// newest fragment's length is not yet claimed; including it would put a fragment with an
-    /// unproven end at the tail of a file whose duration then lies. A trigger that wants right
-    /// up to the newest moment waits for the post-roll, exactly as the file path does.
+    /// Only closed fragments are selected. A clip is a range of complete footage, and including the
+    /// newest, whose length is unclaimed, would put an unproven end at the tail of a file whose
+    /// duration then lies. A trigger wanting right up to the newest moment waits for the
+    /// post-roll, as the file path does.
     pub fn window(&self, start_ms: u64, end_ms: u64) -> Option<MemoryWindow<'_>> {
         let header = self.header()?;
         let selected: Vec<&MemorySegment> = self
@@ -308,9 +288,9 @@ impl MemoryRingBuffer {
         if selected.is_empty() {
             return None;
         }
-        // The pre-roll reached further back than the ring still holds. Reported, not hidden:
-        // it is the difference between "a clip of the size you asked for" and "a shorter one,
-        // because the buffer is shorter than the window".
+        // The pre-roll reached further back than the ring holds. Reported, not hidden: it is the
+        // difference between a clip of the requested size and a shorter one because the buffer is
+        // shorter than the window.
         let truncated_front = selected.first().is_some_and(|s| s.start_ms > start_ms);
         Some(MemoryWindow {
             header,
@@ -325,11 +305,9 @@ impl MemoryRingBuffer {
 mod tests {
     use super::*;
 
-    /// A real fragmented-MP4 stream, generated rather than pasted.
-    ///
-    /// Every test below is about agreeing with what ffmpeg actually emits — fragment boundaries,
-    /// `tfdt` spacing, `moof`+`mdat` pairing — so a hand-built byte string would test the ring
-    /// against my idea of the format instead.
+    /// A real fragmented-MP4 stream, generated rather than pasted: every test here is about
+    /// agreeing with what ffmpeg emits (fragment boundaries, `tfdt` spacing, `moof`+`mdat`
+    /// pairing), which a hand-built byte string would not test.
     fn stream(seconds: u32) -> Vec<u8> {
         let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
         let out = localplay_media::sidecar_command(&bin.ffmpeg)
@@ -392,21 +370,18 @@ mod tests {
                 "and that end is the successor's start — the segments are contiguous"
             );
         }
-        // The newest fragment is closed too: a fragment's own sample durations carry its length,
-        // so the ring knows how much footage it holds as soon as the bytes arrive — it does not
-        // have to wait for a successor to prove it. `is_closed` therefore stops meaning "has a
-        // successor" and meaning what it says, with the fallback only for a sample table this
-        // build cannot read.
+        // The newest fragment is closed too: its own sample durations carry its length, so the ring
+        // knows how much footage it holds as soon as the bytes arrive, without a successor. The
+        // successor-based fallback is only for a sample table this build cannot read.
         assert!(
             segments.last().unwrap().is_closed(),
             "the newest fragment claims its own measured length, so it is closed on arrival"
         );
         assert!(segments.iter().all(|s| s.keyframe), "every fragment starts a GOP");
 
-        // `span_ms` is the newest fragment's END — the media time the ring holds, not the media
-        // time of its last boundary. Reading a fragment's length here instead of borrowing the
-        // next fragment's start is worth one whole fragment of span, and a clip's window is
-        // resolved against the span.
+        // `span_ms` is the newest fragment's end, the media time the ring holds, not its last
+        // boundary. Reading a fragment's length here instead of borrowing the next fragment's start is
+        // worth a whole fragment of span, and a clip's window is resolved against it.
         assert_eq!(ring.span_ms(), segments.last().unwrap().end_ms);
         assert!(
             ring.span_ms() > 2_000,
@@ -439,8 +414,8 @@ mod tests {
         );
         assert!(ring.stats().evicted > 0, "eviction is reported, not silent");
 
-        // The newest footage is what survives — an eviction from the wrong end would keep the
-        // oldest second and drop the moment the user just triggered on.
+        // The newest footage survives: eviction from the wrong end would keep the oldest second and
+        // drop the moment the user triggered on.
         assert_eq!(
             ring.segments().last().unwrap().start_ms,
             one.segments().last().unwrap().start_ms,
@@ -482,8 +457,8 @@ mod tests {
 
     #[test]
     fn pushing_one_byte_at_a_time_builds_the_same_ring() {
-        // A pipe does not deliver whole boxes, and a reader thread reads whatever is there.
-        // How the bytes arrive must not change what the ring holds.
+        // A pipe does not deliver whole boxes. How the bytes arrive must not change what the ring
+        // holds.
         let data = stream(3);
         let mut whole = MemoryRingBuffer::new(u64::MAX, u64::MAX);
         whole.push(&data).unwrap();
@@ -540,10 +515,9 @@ mod tests {
 
     #[test]
     fn a_range_before_the_ring_began_is_reported_as_truncated() {
-        // A ring that has already evicted. This matters: with a fresh 3s stream the oldest
-        // fragment starts at 0, so a "long pre-roll" is not reaching past anything and the
-        // truncated flag would be *correctly* false — the situation only exists once the front
-        // has been dropped, which is exactly when a long pre-roll runs into it.
+        // A ring that has already evicted. With a fresh 3s stream the oldest fragment starts at 0, so
+        // a "long pre-roll" reaches past nothing and the truncated flag is correctly false; the case
+        // only exists once the front has been dropped.
         let mut ring = MemoryRingBuffer::new(u64::MAX, 2_000);
         ring.push(&stream(5)).expect("the stream pushes");
 

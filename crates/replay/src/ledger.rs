@@ -1,7 +1,5 @@
-//! The scratch ring index.
-//!
-//! This is the only thing that survives a crash. Media itself is plain appended
-//! segment files — deliberately not memory-mapped (spec §6.4).
+//! The scratch ring index: the only thing that survives a crash. Media itself is plain appended
+//! segment files, deliberately not memory-mapped.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -65,10 +63,8 @@ impl SegmentLedger {
         self.segments.last().map(Segment::end_ms).unwrap_or(0)
     }
 
-    /// Drop oldest segments until `total_bytes <= cap`.
-    ///
-    /// Retains at least one segment: an empty ring can never satisfy a later trigger,
-    /// so being slightly over budget is preferable to being unable to clip at all.
+    /// Drop oldest segments until `total_bytes <= cap`. Retains at least one segment: an empty ring
+    /// can never satisfy a later trigger, so slightly over budget beats unable to clip.
     pub fn evict_to_cap(&mut self, cap: u64) -> Vec<Segment> {
         let mut evicted = Vec::new();
         while self.total_bytes > cap && self.segments.len() > 1 {
@@ -94,8 +90,8 @@ impl SegmentLedger {
         Ok(l)
     }
 
-    /// Persist atomically via temp file + rename, so a crash mid-write cannot
-    /// leave a truncated ledger.
+    /// Persist atomically via temp file + rename, so a crash mid-write cannot leave a truncated
+    /// ledger.
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         let text = self.to_toml()?;
         let tmp = path.with_extension("toml.tmp");

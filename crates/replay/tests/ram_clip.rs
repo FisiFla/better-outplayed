@@ -19,16 +19,12 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Build a ring from `seconds` of synthetic footage, and return it with the (empty) scratch
-/// directory the tests assert stays that way.
+/// Build a ring from `seconds` of synthetic footage, with the scratch directory the tests
+/// assert stays empty.
 ///
-/// The stream is the shape the live encoder produces (`empty_moov+frag_keyframe+default_base_moof`,
-/// a keyframe a second, H.264 + AAC) but is made **offline**: ffmpeg renders it faster than real
-/// time from lavfi sources. The earlier version fed a real-time stub capture through the real
-/// encoder, so how much footage the ring held, and whether the encoder's bounded shutdown killed
-/// it under load (SIGKILL), depended on the host's speed (`docs/verification-status.md` §20, §22).
-/// Nothing here depends on wall time, so the span and the fragments are exact. The real-time
-/// capture -> encoder -> ring path keeps its own test below.
+/// The stream is made offline (ffmpeg from lavfi sources, `empty_moov+frag_keyframe+default_base_moof`,
+/// a keyframe a second, H.264 + AAC), so the span and fragments do not depend on host speed.
+/// The real-time capture -> encoder -> ring path keeps its own test below.
 fn ring_of_stub_capture(seconds: u64) -> (MemoryRingBuffer, tempfile::TempDir) {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -304,12 +300,8 @@ fn a_window_inside_the_held_footage_covers_the_whole_request() {
         PRE + POST
     );
 
-    // Anchored at the ring's reported front, not at `span`. Frame timestamps are arrival
-    // times, so on a loaded runner the footage can contain a hole; a window measured back
-    // from `span` may then start inside the hole and honestly report a truncated front.
-    // Starting exactly at the front keeps the request wholly inside the held footage by
-    // construction, whatever the host's timing was (this test failed intermittently on
-    // CI before it was anchored this way — docs/verification-status.md §20).
+    // Anchored at the ring's reported front, not at `span`: frame timestamps are arrival times,
+    // so a loaded runner can leave a hole that makes a window measured back from `span` truncate.
     let start = front;
     let t = start + PRE;
     let window = ring
