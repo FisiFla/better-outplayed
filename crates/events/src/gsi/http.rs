@@ -1,19 +1,17 @@
 //! What the GSI listener accepts on the wire, and what it answers with.
 //!
-//! The listener is a server on a socket any process on this machine can reach, so this
-//! module is written as a gate rather than as a convenience: the request must be a `POST`
-//! to the configured path, it must declare its body length, and the body is bounded before
-//! a single byte of it is read. Everything that fails is answered with a status and a
-//! closed connection — nothing is logged here at all, because at this point in the request
-//! every byte is attacker-controlled, and the logging decision belongs to
-//! [`crate::gsi`], which knows what it is allowed to say.
+//! The listener is a server on a socket any local process can reach, so this module is a
+//! gate: the request must be a `POST` to the configured path, declare its body length, and the
+//! body is bounded before a byte of it is read. Every failure is answered with a status and a
+//! closed connection. Nothing is logged here, because every byte is still attacker-controlled
+//! and the logging decision belongs to [`crate::gsi`].
 
 use crate::wire::{Framed, Head};
 use std::io::Read;
 
-/// The largest body accepted. A CS2 payload with `allplayers` is a few hundred kilobytes;
-/// Dota 2's is smaller. Two megabytes is generous for a loopback POST from a game client
-/// and still bounds what a local process can make the recorder parse.
+/// The largest body accepted. A CS2 payload with `allplayers` is a few hundred KB and Dota 2's
+/// is smaller; 2 MB is generous for a loopback POST and still bounds what a local process can
+/// make the recorder parse.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// A request that got as far as the token gate.
@@ -22,19 +20,17 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
-/// Why a request was refused before it could be looked at.
-///
-/// Each variant carries the status the connection is answered with. `MethodNotAllowed` and
-/// `NotFound` are 405/404 because a wrong method or path is a client mistake; the rest are
-/// refusals of a body localplay will not read.
+/// Why a request was refused before it could be looked at. Each variant carries the status the
+/// connection is answered with: 405/404 for a wrong method or path (a client mistake), the
+/// rest refuse a body localplay will not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     /// Not a `POST`.
     MethodNotAllowed,
     /// A path other than the configured one.
     NotFound,
-    /// No `Content-Length`, or a chunked body. GSI sends a length; refusing anything else
-    /// keeps the listener from having to guess when a request ends.
+    /// No `Content-Length`, or a chunked body. GSI sends a length; refusing anything else means
+    /// the listener never guesses where a request ends.
     LengthRequired,
     /// A body over [`MAX_BODY_BYTES`], or one that is shorter than it claims.
     TooLarge,
@@ -199,8 +195,7 @@ mod tests {
             Reject::LengthRequired,
             Reject::TooLarge,
         ] {
-            // Every refusal explains itself, because a user debugging an installation sees
-            // these in the log.
+            // Every refusal explains itself, since a user debugging an install sees these in the log.
             assert!(!reject.to_string().is_empty());
         }
     }

@@ -1,31 +1,26 @@
 //! The `allgamedata` response, as typed Rust.
 //!
-//! Everything here is a description of *Riot's* document, and it is treated as untrusted
-//! input: every field is optional, every default is the empty value, and nothing in this
-//! module can fail except the JSON parse itself. That is deliberate — the Live Client's
-//! payload differs between game modes, patches and whether the game is in the loading
-//! screen, and a parser that insisted on a field would stop integrating with a game that
-//! is running perfectly well.
+//! This describes Riot's document and treats it as untrusted: every field is optional, every
+//! default is empty, and only the JSON parse itself can fail. The payload differs between game
+//! modes, patches and the loading screen, and a parser insisting on a field would stop
+//! integrating with a game running perfectly well.
 //!
-//! Two things the document does *not* give us cleanly, both handled here:
+//! Two things the document does not give cleanly:
 //!
-//! * **Who the watched player is.** Event lines carry summoner names
-//!   (`KillerName`, `VictimName`, `Assisters`), while `activePlayer` may carry a summoner
-//!   name or a Riot ID depending on the patch. [`GameSnapshot::player_names`] therefore
-//!   returns *every* name the payload offers for the local player, and the classifier in
+//! * Who the watched player is. Event lines carry summoner names (`KillerName`, `VictimName`,
+//!   `Assisters`) while `activePlayer` may carry a summoner name or a Riot ID depending on the
+//!   patch. [`GameSnapshot::player_names`] returns every name offered, and the classifier in
 //!   [`crate::lol::derive`] matches against all of them.
-//! * **Whether a game is in progress at all.** [`GameSnapshot::game_present`] answers that
-//!   from the fields a game always has; an empty object (which the client has been known to
-//!   serve for a moment) reads as "no game".
+//! * Whether a game is in progress. [`GameSnapshot::game_present`] answers from the fields a
+//!   game always has; an empty object (which the client briefly serves) reads as "no game".
 
 use serde::Deserialize;
 
 /// Parse the body of a `liveclientdata/allgamedata` response.
 ///
-/// `Ok(None)` means the body was the JSON literal `null` — a documented way for the
-/// endpoint to say "no game", distinct from an empty object. A body that is not JSON at
-/// all is an error; [`crate::lol::poller`] treats that as a failed poll and keeps the state
-/// it had, rather than as the end of a game.
+/// `Ok(None)` is the JSON literal `null`, a documented "no game", distinct from an empty
+/// object. A body that is not JSON is an error; [`crate::lol::poller`] treats it as a failed
+/// poll and keeps its state rather than ending the game.
 pub fn parse(body: &[u8]) -> Result<Option<GameSnapshot>, serde_json::Error> {
     serde_json::from_slice::<Option<GameSnapshot>>(body)
 }
@@ -41,12 +36,11 @@ pub struct GameSnapshot {
 }
 
 impl GameSnapshot {
-    /// Whether this document describes a game that is being played.
+    /// Whether this document describes a game being played.
     ///
-    /// A game always names its map and reports a non-zero clock (`gameTime` is negative
-    /// while the loading screen runs, and counts up from there). An empty document — which
-    /// is what a client that is up but between games has been seen to send — fails both,
-    /// and is read as "no game" rather than as a game with no data.
+    /// A game names its map and reports a non-zero clock (`gameTime` is negative during the
+    /// loading screen and counts up from there). An empty document, as a client between games has
+    /// been seen to send, fails both and reads as "no game", not as a game with no data.
     pub fn game_present(&self) -> bool {
         !self.game_data.map_name.trim().is_empty() || self.game_data.game_time != 0.0
     }
@@ -56,10 +50,9 @@ impl GameSnapshot {
         &self.events.events
     }
 
-    /// Every name the document gives the watched player, if it names one at all.
-    ///
-    /// Deduplicated and empty-string-free, because it is matched against every event line:
-    /// an empty name present in the list would match an event line with no killer.
+    /// Every name the document gives the watched player, deduplicated and without empty strings:
+    /// the list is matched against every event line, and an empty name would match a line with no
+    /// killer.
     pub fn player_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = Vec::new();
         for candidate in [
@@ -77,11 +70,10 @@ impl GameSnapshot {
         names
     }
 
-    /// The end-of-game scoreboard: one row per entry of `allPlayers`, as a JSON array.
-    ///
-    /// Read from the same `allgamedata` document every poll already fetches (a GET; nothing
-    /// is ever sent to the client). `is_local` marks the watched player by matching the
-    /// names [`GameSnapshot::player_names`] offers. Empty when the document lists no players.
+    /// The end-of-game scoreboard: one row per entry of `allPlayers`, as a JSON array, read from
+    /// the `allgamedata` document every poll already fetches (a GET; nothing is sent to the
+    /// client). `is_local` marks the watched player by matching [`GameSnapshot::player_names`].
+    /// Empty when the document lists no players.
     pub fn scoreboard(&self) -> serde_json::Value {
         let names = self.player_names();
         let rows: Vec<serde_json::Value> = self
@@ -134,10 +126,9 @@ pub struct Events {
     pub events: Vec<StreamEvent>,
 }
 
-/// One line of the client's event log.
-///
-/// The fields that only some event names carry (`MonsterType`, `KillStreak`, …) are
-/// optional; unknown keys are ignored, which is what keeps this working across patches.
+/// One line of the client's event log. Fields only some events carry (`MonsterType`,
+/// `KillStreak`, ...) are optional, and unknown keys are ignored, which keeps this working
+/// across patches.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct StreamEvent {
@@ -206,8 +197,8 @@ pub struct Scoreboard {
 mod tests {
     use super::*;
 
-    /// A game in progress: the shape the live endpoint serves (spec §7.1's endpoint),
-    /// trimmed to the parts this crate reads.
+    /// A game in progress: the shape the live endpoint serves, trimmed to the parts this crate
+    /// reads.
     const IN_PROGRESS: &str = include_str!("../../tests/fixtures/lol_in_progress.json");
 
     #[test]
@@ -246,8 +237,8 @@ mod tests {
     #[test]
     fn names_the_watched_player_by_every_name_the_document_offers() {
         let snapshot = parse(IN_PROGRESS.as_bytes()).unwrap().unwrap();
-        // The fixture fills both fields with the same player under the two naming schemes
-        // a patch may use; both must match an event line, and neither may appear twice.
+        // The fixture gives the same player under both naming schemes a patch may use; both must
+        // match an event line and neither may appear twice.
         let names = snapshot.player_names();
         assert!(names.contains(&"TestPlayer#EUW"), "got {names:?}");
         assert!(names.contains(&"TestPlayer"), "got {names:?}");
@@ -292,8 +283,7 @@ mod tests {
 
     #[test]
     fn unknown_and_missing_fields_are_ignored() {
-        // A future patch adding fields, and a partial document missing them, must both
-        // parse: this parser describes what it reads and ignores everything else.
+        // A future patch adding fields and a partial document missing them must both parse.
         let body = br#"{
             "gameData": {"gameMode": "ARAM", "mapName": "Map12", "somethingNew": [1,2,3]},
             "events": {"Events": [{"EventID": 7, "EventName": "Ace", "EventTime": 300.5,
@@ -310,8 +300,8 @@ mod tests {
 
     #[test]
     fn a_payload_whose_types_disagree_is_an_error() {
-        // The Live Client has served numbers where strings belong and vice versa; a wrong
-        // type must be a parse error rather than a silently zeroed field.
+        // The Live Client has served numbers where strings belong and vice versa; a wrong type must
+        // be a parse error, not a silently zeroed field.
         assert!(parse(br#"{"gameData": {"gameTime": "soon"}}"#).is_err());
         assert!(parse(br#"{"allPlayers": {"not": "an array"}}"#).is_err());
     }

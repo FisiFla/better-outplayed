@@ -1,33 +1,26 @@
-//! CS2 / Dota 2 — Valve Game State Integration (spec §7.2).
+//! CS2 / Dota 2: Valve Game State Integration.
 //!
-//! A listener on `127.0.0.1` that consumes the JSON the game POSTs, derives events and
-//! hands them to a driver. The user installs the generated
-//! `gamestate_integration_localplay.cfg` into the game's `cfg` directory; the application
-//! never writes there itself ([`integration`] produces the text and nothing else).
+//! A listener on `127.0.0.1` that consumes the JSON the game POSTs, derives events and hands
+//! them to a driver. The user installs the generated `gamestate_integration_localplay.cfg`
+//! into the game's `cfg` directory; the application never writes there ([`integration`]
+//! produces the text only).
 //!
-//! # The three constraints the spec puts on this listener
+//! Three constraints:
 //!
-//! 1. **Loopback only, by construction.** [`bind`] refuses any address that is not
-//!    loopback, and the only other way in is [`bind_loopback`], which takes a port and
-//!    nothing else. There is no configuration setting for a bind address, so "discouraged"
-//!    never enters into it: a listener on `0.0.0.0` cannot be expressed.
-//! 2. **A token, checked in constant time.** The token travels in the payload's `auth`
-//!    block (that is how GSI's `"auth"` section works; there is no header), and a request
-//!    whose token is missing or different is refused and dropped — see [`token_matches`].
-//!    The listener answers `403` and reads nothing further.
-//! 3. **No attacker-controlled content in the log.** A refused or unreadable request is
-//!    *counted*, and the log line says how many and what kind. The request's body, its
-//!    headers and its token are never written anywhere.
+//! 1. Loopback only, by construction. [`bind`] refuses any non-loopback address and the only
+//!    other way in, [`bind_loopback`], takes a port alone. No setting names a bind address, so
+//!    a listener on `0.0.0.0` cannot be expressed.
+//! 2. A token, checked in constant time. It travels in the payload's `auth` block (GSI has no
+//!    header), and a request with a missing or different token is refused with `403` and
+//!    nothing further is read ([`token_matches`]).
+//! 3. No attacker-controlled content in the log. A refused or unreadable request is counted,
+//!    and the log line says how many and what kind; the body, headers and token are never
+//!    written.
 //!
-//! # What it does not do
-//!
-//! It does not distinguish a Dota 2 client from a CS2 client by anything other than the
-//! payload (the app id, then the provider name — see [`derive::Game`]). It does not react
-//! to the game exiting: if the process is killed there is no final POST and no event, so a
+//! The game is told apart only by payload (app id, then provider name; see [`derive::Game`]).
+//! The listener cannot react to the game exiting: a killed process sends no final POST, so
 //! `GameEnd` is only derived from a payload that says so (`map.phase == "gameover"`, Dota's
-//! `POST_GAME`). That gap is real, and
-//! is why the League integration's end-of-game signal (the endpoint going quiet) is
-//! different from this one.
+//! `POST_GAME`). That is why League's end-of-game signal (the endpoint going quiet) differs.
 
 pub mod derive;
 pub mod http;
@@ -52,25 +45,24 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
-/// How long one request may take to arrive and be read. A game POSTs a small body to
-/// loopback; two seconds is generous, and it is what bounds a connection that stalls.
+/// How long one request may take to arrive and be read. A game POSTs a small body to loopback,
+/// so 2 s is generous and bounds a stalled connection.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The most connections the listener will serve in one [`RATE_WINDOW`]. A game POSTs a handful
-/// of times a second (CS2 throttles to 0.1 s at its busiest); anything past this is not the
-/// game, and is answered `429` without its request being read, so a local process hammering
-/// the port cannot keep the single-threaded accept loop busy or flood the log.
+/// The most connections served in one [`RATE_WINDOW`]. A game POSTs a handful of times a
+/// second (CS2 throttles to 0.1 s at busiest); anything past this is not the game and is
+/// answered `429` unread, so a local process hammering the port cannot keep the
+/// single-threaded accept loop busy or flood the log.
 pub const MAX_REQUESTS_PER_WINDOW: u32 = 100;
 
 /// The length of the fixed window [`MAX_REQUESTS_PER_WINDOW`] is counted in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// The most wall-clock time one request may take in total. [`REQUEST_TIMEOUT`] bounds each
-/// *read*, which a peer trickling one byte at a time resets forever; this bounds the sum.
+/// read, which a peer trickling one byte at a time resets forever; this bounds the sum.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How often the accept loop looks at its stop flag. The listener is idle almost all the
-/// time, so this is a sleep, not a spin.
+/// How often the accept loop checks its stop flag: a sleep, not a spin.
 const ACCEPT_SLICE: Duration = Duration::from_millis(25);
 
 /// A fixed-window request counter: [`MAX_REQUESTS_PER_WINDOW`] per [`RATE_WINDOW`].
@@ -99,8 +91,8 @@ impl RateLimiter {
     }
 }
 
-/// A reader over the connection that fails once [`REQUEST_DEADLINE`] has passed in total,
-/// re-arming the socket's read timeout with whatever time is left before every read.
+/// A reader that fails once [`REQUEST_DEADLINE`] has passed in total, re-arming the socket's
+/// read timeout with the time left before every read.
 struct DeadlineReader<'a> {
     stream: &'a mut TcpStream,
     deadline: Instant,
@@ -120,7 +112,7 @@ impl std::io::Read for DeadlineReader<'_> {
 /// Everything the listener needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GsiConfig {
-    /// The port from `[events] gsi_port` (spec §10).
+    /// The port from `[events] gsi_port`.
     pub port: u16,
     /// The token from the user's `gamestate_integration_localplay.cfg`. Never logged.
     pub token: String,
@@ -135,11 +127,9 @@ impl GsiConfig {
     }
 }
 
-/// Bind a listener, refusing any address that is not loopback.
-///
-/// The check is the point of this function existing rather than a bare `TcpListener::bind`:
-/// `0.0.0.0` is the mistake worth preventing, because it is the one that silently exposes
-/// the game's state to the network.
+/// Bind a listener, refusing any address that is not loopback. This check is why the function
+/// exists instead of a bare `TcpListener::bind`: `0.0.0.0` would silently expose the game's
+/// state to the network.
 pub fn bind(addr: SocketAddr) -> Result<TcpListener> {
     if !addr.ip().is_loopback() {
         bail!("the GSI listener is a loopback service and refuses to bind {addr}");
@@ -152,14 +142,13 @@ pub fn bind_loopback(port: u16) -> Result<TcpListener> {
     bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
-/// Whether `snapshot` carries the expected token (spec §7.2).
+/// Whether `snapshot` carries the expected token.
 ///
-/// Fails closed in three ways: no token in the payload, a token of a different length, and
-/// a token of the right length that differs by one byte are all `false`. The comparison is
-/// constant time ([`subtle`]) so that a local process cannot learn the token one byte at a
-/// time by measuring how long a rejection takes. An empty *expected* token is a
-/// programming error and is also refused: a listener configured with no token would
-/// otherwise accept every payload that declares an empty one.
+/// Fails closed: no token, a token of a different length, and a right-length token differing
+/// by one byte are all `false`. The comparison is constant time ([`subtle`]) so a local
+/// process cannot learn the token byte by byte from rejection timing. An empty expected token
+/// is a programming error and is also refused, since it would accept every payload declaring
+/// an empty one.
 pub fn token_matches(expected: &str, snapshot: &GsiSnapshot) -> bool {
     if expected.is_empty() {
         return false;
@@ -178,8 +167,8 @@ pub struct GsiListener {
 }
 
 impl GsiListener {
-    /// The address actually bound. Inside a test this is an ephemeral port; the property
-    /// that matters is that its IP is loopback.
+    /// The address actually bound (an ephemeral port in tests); what matters is that its IP is
+    /// loopback.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -206,8 +195,8 @@ impl Drop for GsiListener {
 /// Start the listener. Every derived event goes to `sink` until the handle is dropped.
 pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
     if config.token.is_empty() {
-        // Refused at startup rather than failing every request later: a listener that
-        // cannot authenticate anything is a listener that should not be running.
+        // Refused at startup rather than failing every request later: a listener that cannot
+        // authenticate anything should not be running.
         bail!("the GSI listener needs a token; generate one and put it in the game's cfg file");
     }
     let listener = bind_loopback(config.port)?;
@@ -229,9 +218,9 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
     Ok(GsiListener { stop, thread: Some(thread), addr })
 }
 
-/// The accept loop. One connection at a time: GSI traffic is a handful of POSTs a second
-/// from a single client, and a connection is bounded by [`REQUEST_TIMEOUT`], so a queue of
-/// worker threads would cost more than it buys.
+/// The accept loop. One connection at a time: GSI is a handful of POSTs a second from one
+/// client and each connection is bounded by [`REQUEST_TIMEOUT`], so worker threads would cost
+/// more than they buy.
 fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &AtomicBool) {
     let mut tracker = Tracker::default();
     let mut counters = Counters::default();
@@ -240,8 +229,7 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Ato
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _peer)) => {
-                // `_peer` is not logged: on a loopback bind it is `127.0.0.1` by
-                // definition, and it is not what a reader of the log needs.
+                // `_peer` is not logged: on a loopback bind it is `127.0.0.1` by definition.
                 if !limiter.allow(Instant::now()) {
                     counters.rate_limited();
                     turn_away(&mut stream);
@@ -264,8 +252,8 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Ato
 }
 
 /// Answer `429` without reading the request, then swallow a bounded amount of what the peer
-/// already sent: closing a socket that still holds unread data resets the connection, and the
-/// reset can destroy the response before the peer reads it.
+/// already sent: closing a socket holding unread data resets the connection, and the reset can
+/// destroy the response before the peer reads it.
 fn turn_away(stream: &mut TcpStream) {
     use std::io::Read;
     let _ = stream.set_nonblocking(false);
@@ -281,8 +269,7 @@ fn turn_away(stream: &mut TcpStream) {
     }
 }
 
-/// Serve one connection. Returns `Err` when the sink is gone, which is how the listener
-/// learns that the application is shutting down.
+/// Serve one connection. `Err` means the sink is gone, i.e. the application is shutting down.
 fn handle(
     stream: &mut TcpStream,
     config: &GsiConfig,
@@ -290,13 +277,11 @@ fn handle(
     sink: &EventSink,
     counters: &mut Counters,
 ) -> Result<()> {
-    // `accept` inherits the listener's non-blocking flag on macOS/*BSD (unlike Linux and
-    // Windows), and a non-blocking socket *ignores* the read/write timeouts set below: every
-    // read that finds no buffered data fails with `WouldBlock` at once, which `http` reads as
-    // a malformed request (400) instead of the 403/200 the client should see. Put the
-    // accepted socket back into blocking mode first, so the timeouts below are the
-    // connection's real bound — which is exactly the design the accept loop documents. On
-    // Windows and Linux `accept` already yields a blocking socket, so this is a no-op there.
+    // `accept` inherits the listener's non-blocking flag on macOS/*BSD (not Linux or Windows), and
+    // a non-blocking socket ignores the read/write timeouts set below: every read with no buffered
+    // data fails with `WouldBlock`, which `http` reads as a malformed request (400) instead of the
+    // 403/200 the client should see. Put the accepted socket back into blocking mode first so the
+    // timeouts are the connection's real bound. A no-op on Windows and Linux.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
@@ -315,9 +300,9 @@ fn handle(
     let snapshot = match payload::parse(&request.body) {
         Ok(snapshot) => snapshot,
         Err(_) => {
-            // Deliberately silent about *what* was wrong: the body is attacker-controlled
-            // at this point (the token gate has not run), and `serde_json`'s message can
-            // quote it. The size and the count are enough to debug an installation.
+            // Deliberately silent about what was wrong: the body is attacker-controlled before the token
+            // gate runs and `serde_json`'s message can quote it. The size and count suffice to debug an
+            // install.
             counters.malformed(request.body.len());
             let _ = write_response(stream, 400);
             return Ok(());
@@ -334,7 +319,7 @@ fn handle(
     counters.accepted();
     for event in events {
         log_event(&event);
-        // A disconnected sink means the driver is gone; there is nothing to listen for.
+        // A disconnected sink means the driver is gone.
         if sink.send(event).is_err() {
             return Err(anyhow::anyhow!("the GSI event sink is disconnected"));
         }
@@ -344,9 +329,9 @@ fn handle(
     Ok(())
 }
 
-/// One line per derived event, at the level it deserves: the transitions of a game are
-/// `info`, each kill is `debug`. The payload is written by [`derive`], never echoed from
-/// the request, so quoting it here is safe.
+/// One line per derived event at the level it deserves: game transitions `info`, each kill
+/// `debug`. The payload is written by [`derive`], never echoed from the request, so quoting it
+/// is safe.
 fn log_event(event: &GameEvent) {
     match event.kind {
         crate::EventKind::GameStart => {
@@ -358,7 +343,7 @@ fn log_event(event: &GameEvent) {
 }
 
 /// How many requests of each kind the listener has seen, so a condition is stated once and
-/// then counted. Without this, anything scanning loopback ports could fill the log.
+/// then counted; otherwise anything scanning loopback ports could fill the log.
 #[derive(Debug, Default)]
 struct Counters {
     accepted: u64,
@@ -388,8 +373,8 @@ impl Counters {
         }
     }
 
-    /// A well-formed payload whose token did not match: the case a user hits when the
-    /// generated cfg file was not re-installed after the token changed.
+    /// A well-formed payload whose token did not match: what a user hits when the generated cfg
+    /// was not re-installed after the token changed.
     fn refused_token(&mut self) {
         self.refused_tokens += 1;
         if self.refused_tokens == 1 {
@@ -474,8 +459,7 @@ mod tests {
 
     #[test]
     fn the_listener_binds_loopback_and_an_ephemeral_port() {
-        // Port 0: an ephemeral port, which is what keeps a test suite from fighting over a
-        // fixed one. The address is still loopback.
+        // Port 0 (ephemeral) keeps a test suite from fighting over a fixed port; still loopback.
         let listener = bind_loopback(0).expect("a loopback listener");
         let addr = listener.local_addr().unwrap();
         assert!(addr.ip().is_loopback(), "bound to {addr}");
@@ -511,9 +495,8 @@ mod tests {
 
     #[test]
     fn the_token_is_compared_over_the_whole_value() {
-        // A timing test would be flaky; what is asserted instead is the property the
-        // constant-time comparison exists for — that no prefix of a token is ever accepted,
-        // at any length, so there is no early-accept path to time.
+        // A timing test would be flaky. Assert instead what constant time exists for: no prefix of a
+        // token is ever accepted at any length, so there is no early-accept path to time.
         let expected = "abcdef0123456789abcdef0123456789";
         for end in 0..expected.len() {
             let prefix = &expected[..end];

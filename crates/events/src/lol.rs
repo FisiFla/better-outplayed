@@ -1,41 +1,33 @@
-//! League of Legends — Live Client Data API (spec §7.1).
+//! League of Legends: the Live Client Data API.
 //!
 //! Riot's game client serves a JSON snapshot of the running game on
-//! `https://127.0.0.1:2999/liveclientdata/allgamedata` and stops serving it when the game
-//! is over. This module polls it about once a second and derives [`GameEvent`]s from the
-//! difference between consecutive snapshots.
+//! `https://127.0.0.1:2999/liveclientdata/allgamedata` and stops when the game is over. This
+//! module polls it about once a second and derives [`GameEvent`]s from the difference between
+//! consecutive snapshots.
 //!
-//! # Layout: pure logic first, I/O at the edge
+//! Pure logic first, I/O at the edge:
 //!
 //! | file | what it owns | I/O |
 //! |---|---|---|
 //! | [`endpoint`] | where the API lives, and the type that cannot point anywhere else | none |
 //! | [`payload`] | the response document as typed Rust | none |
-//! | [`derive`] | snapshot → events, as a pure state machine | none |
+//! | [`derive`] | snapshot to events, as a pure state machine | none |
 //! | [`client`] | the one HTTPS client, pinned to the endpoint | sockets |
 //! | [`poller`] | the loop, the logging discipline, the event sink | sockets |
 //!
-//! The split is what makes the interesting half testable: `derive` is covered against
-//! canned payloads in `crates/events/tests/fixtures/`, and the network layer is exercised
-//! against a local HTTPS mock server (`tests/lol_mock.rs`) that speaks the same dialect as
-//! Riot's — a self-signed certificate on `127.0.0.1`.
+//! `derive` is covered against canned payloads in `tests/fixtures/`; the network layer against
+//! a local HTTPS mock (`tests/lol_mock.rs`) with a self-signed certificate on `127.0.0.1`.
 //!
-//! # What is *not* verified, and cannot be from this machine
+//! No real League client has been checked against these shapes: the game runs kernel-level
+//! anti-cheat and was never contacted. Payload shapes come from the documented API and are
+//! untrusted input: every field is optional and no payload can panic the parser.
 //!
-//! No League client was contacted while writing any of this, by requirement: the game runs
-//! with kernel-level anti-cheat and the machine it is installed on was not available. The
-//! payload shapes here come from the documented API and are treated as untrusted input —
-//! every field is optional and no payload, however malformed, can panic the parser. What
-//! that leaves unproven is that no real client has been checked against these shapes.
-//!
-//! # The security arrangement, in one place
-//!
-//! The endpoint is a loopback address *by type*: [`Endpoint::loopback`] refuses anything
-//! that is not, and there is no other constructor. The client ([`client::LoopbackClient`])
-//! trusts only Riot's pinned root certificate and skips just the host-name match; it is built
-//! from an `Endpoint` and from nothing else, so it can only ever be pointed at this machine.
-//! `tests/no_egress.rs` asserts statically that `danger_accept_invalid_certs` appears nowhere
-//! and `danger_accept_invalid_hostnames` only in `lol/client.rs`.
+//! Security: the endpoint is loopback by type ([`Endpoint::loopback`] refuses anything else and
+//! is the only constructor). The client ([`client::LoopbackClient`]) trusts only Riot's pinned
+//! root and skips just the host-name match; it is built from an `Endpoint` alone, so it can
+//! only be pointed at this machine. `tests/no_egress.rs` asserts statically that
+//! `danger_accept_invalid_certs` appears nowhere and `danger_accept_invalid_hostnames` only in
+//! `lol/client.rs`.
 
 pub mod client;
 pub mod derive;

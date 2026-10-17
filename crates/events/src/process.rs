@@ -1,70 +1,58 @@
 //! Is a watched game running? Two signals, one answer.
 //!
-//! Auto-record switches itself on when a game starts, which needs exactly one fact: *is a
-//! watched title running right now*. There are two honest ways to learn that, so this
-//! module has two sources behind one trait ([`GamePresence`]):
+//! Auto-record needs one fact: is a watched title running now. Two sources answer it behind
+//! one trait ([`GamePresence`]):
 //!
 //! | source | how it answers | what it can see |
 //! |---|---|---|
 //! | [`ProcessWatcher`] | a `CreateToolhelp32Snapshot` process list, compared by image name | any title whose executable is configured |
-//! | [`LiveClientPresence`] | Riot's own Live Client Data API, a `GET` on loopback | League of Legends, for as long as a match is actually being played |
+//! | [`LiveClientPresence`] | Riot's Live Client Data API, a `GET` on loopback | League of Legends, while a match is being played |
 //!
-//! Both are polled on a timer ([`spawn`], [`DEFAULT_POLL_INTERVAL`]) and both answer the
-//! same [`Presence`], so the debounce, the "already running when we started" case and the
-//! "report a change exactly once" rule are written once ([`PresenceTracker`]) rather than
-//! twice, and are tested without a clock, a socket or a process list.
+//! Both are polled on a timer ([`spawn`], [`DEFAULT_POLL_INTERVAL`]) and answer the same
+//! [`Presence`], so debounce, the "already running at start" case and "report a change exactly
+//! once" are written once ([`PresenceTracker`]) and tested without a clock, socket or process
+//! list.
 //!
-//! # Which signal for which title, and why that is not a free choice
+//! # Which signal for which title
 //!
-//! Riot publishes a *game-state* API for exactly one title on the default watch list:
-//! League of Legends' Live Client Data API, which is served on `127.0.0.1:2999` while a
-//! match is running (it is not up in the client, in the lobby or in champ select) and stops
-//! answering when the match ends. League is therefore detected through that — a read-only
-//! `GET` to Riot's own documented endpoint, a signal that by construction cannot fire
-//! outside a game.
+//! Riot publishes a game-state API for one title on the default list: League's Live Client Data
+//! API, served on `127.0.0.1:2999` only while a match runs (not in the client, lobby or champ
+//! select). League is detected through that read-only `GET`, which cannot fire outside a game.
 //!
-//! Everything else is recognised by its executable name, because nothing else on the list
-//! publishes such an API. That includes **Valorant**, which is a Riot title but has no
-//! documented local *game-state* service: what exists is the **Riot Client's** local HTTP
-//! API behind a lockfile password — a different thing entirely (it reports the launcher's
-//! session, not a match), undocumented, and not used here. Valorant is watched by
-//! `VALORANT-Win64-Shipping.exe`, which is the *game* process, present only while a match
-//! runs — not `VALORANT.exe`, which is the launcher and would be a false positive all
-//! evening. The same distinction holds for League (`League of Legends.exe`, not
-//! `LeagueClient.exe`) and for Counter-Strike 2 (`cs2.exe`, not `steam.exe`).
+//! Everything else is recognised by executable name. That includes Valorant: Riot publishes no
+//! local game-state service for it (the Riot Client's lockfile-protected HTTP API reports the
+//! launcher's session, not a match, is undocumented, and is not used). Valorant is watched by
+//! `VALORANT-Win64-Shipping.exe`, the game process present only during a match, not
+//! `VALORANT.exe`, the launcher that would be a false positive all evening. Likewise
+//! `League of Legends.exe` not `LeagueClient.exe`, and `cs2.exe` not `steam.exe`.
 //!
-//! # What the process watcher does, and what it deliberately does not
+//! # What the process watcher does and does not do
 //!
 //! [`ProcessWatcher`] calls `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` and walks the
-//! resulting `PROCESSENTRY32W` records — the same enumeration Task Manager performs. It:
+//! `PROCESSENTRY32W` records, the enumeration Task Manager performs. It:
 //!
-//! * never calls `OpenProcess`: nothing about a process is opened, and no access right is
-//!   requested over any of them. A name is copied out of the snapshot and compared to the
-//!   configured list;
-//! * therefore reads no memory, injects nothing, hooks nothing, and touches no module,
-//!   window, thread or handle belonging to another process;
-//! * opens no socket, and sends nothing anywhere: `tests/no_egress.rs` asserts statically
-//!   that the tree's only socket clients are the loopback modules, and this file is not one
-//!   of them;
+//! * never calls `OpenProcess`: no process is opened and no access right requested; a name is
+//!   copied out of the snapshot and compared to the configured list;
+//! * so reads no memory, injects nothing, hooks nothing and touches no module, window, thread
+//!   or handle of another process;
+//! * opens no socket (`tests/no_egress.rs` asserts the only socket clients are the loopback
+//!   modules);
 //! * holds no handle between polls: the snapshot handle is closed before `poll` returns.
 //!
-//! That matters on a machine running kernel-level anti-cheat. Enumerating image names is
-//! what every launcher, overlay and task manager already does, and it is the least invasive
-//! mechanism that answers the question — but it is still a new capability, so it is off by
-//! default: [`GamesSection::auto_record`] is `false`, and with it off nothing is polled,
-//! no snapshot is taken and no request is made ([`GamesSection::start`] returns `None`).
+//! This matters next to kernel-level anti-cheat. Enumerating image names is what every
+//! launcher and overlay does and is the least invasive way to answer the question, but it is
+//! still a new capability, so it is off by default: [`GamesSection::auto_record`] is `false`,
+//! and with it off nothing is polled, no snapshot taken and no request made
+//! ([`GamesSection::start`] returns `None`).
 //!
-//! # What is not verified here, and cannot be from this machine
+//! # Unverified on Windows
 //!
-//! [`image_names`] is the only part of this module that has never executed: it is
-//! type-checked against `x86_64-pc-windows-msvc`, but no Windows machine was available, so
-//! the syscall half is unproven. It is deliberately four calls wide
-//! (`CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `CloseHandle`) so that
-//! what is unproven is small and obvious, and everything that decides anything
-//! ([`presences_in`]) is pure and tested on any platform. The same shadow covers whether a
-//! *protected* process's image name appears in a snapshot under kernel anti-cheat; if it
-//! did not, the result would be a game that is never detected — a false negative, never a
-//! wrong match, because a match requires an equal file name.
+//! [`image_names`] is type-checked against `x86_64-pc-windows-msvc` but its syscalls are
+//! unproven here. It is kept to four calls (`CreateToolhelp32Snapshot`, `Process32FirstW`,
+//! `Process32NextW`, `CloseHandle`) so the unproven part is small, and everything that decides
+//! anything ([`presences_in`]) is pure and tested everywhere. If a protected process's image
+//! name were absent from a snapshot under kernel anti-cheat, the result would be a game never
+//! detected: a false negative, never a wrong match, since a match requires an equal file name.
 
 use crate::lol::{Endpoint, LoopbackClient, Response};
 use anyhow::{anyhow, bail, Result};
@@ -76,41 +64,34 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How often a game is looked for when nothing says otherwise.
-///
-/// A few seconds is the whole point of the number. It is far below the time it takes to
-/// reach a game from a launch, and the replay buffer's `pre_seconds` covers the gap on the
-/// way in, so a start noticed a couple of seconds late still has its footage.
+/// How often a game is looked for by default. A few seconds is far below the time to reach a
+/// game from launch, and the replay buffer's `pre_seconds` covers the gap, so a start noticed
+/// a couple of seconds late keeps its footage.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(2_500);
 
 /// The same interval, as the `poll_ms` a `config.toml` writes.
 pub const DEFAULT_POLL_MS: u64 = 2_500;
 
-/// The shortest interval a *configured* `poll_ms` can produce.
+/// The shortest interval a configured `poll_ms` can produce.
 ///
-/// The floor is not politeness. At a few milliseconds the watcher would enumerate the
-/// process list in a tight loop, which is a CPU burn on the user's machine and — on a
-/// machine running kernel anti-cheat — a process hammering `CreateToolhelp32Snapshot`
-/// hundreds of times a second, which is exactly the profile of a tool nobody wants running
-/// next to their game. A configuration mistake must not be able to produce that, so the
-/// clamp lives in the one function that turns configuration into an interval
-/// ([`clamp_interval`]) and is tested.
+/// At a few milliseconds the watcher would burn CPU enumerating processes in a tight loop and,
+/// under kernel anti-cheat, hammer `CreateToolhelp32Snapshot` hundreds of times a second, the
+/// profile of a tool nobody wants beside their game. The clamp lives in the one function
+/// turning configuration into an interval ([`clamp_interval`]) and is tested.
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The longest interval a *configured* `poll_ms` can produce: half a minute still notices a
-/// game, and past that the feature is not doing the job it was switched on for.
+/// The longest interval a configured `poll_ms` can produce: past half a minute the feature no
+/// longer does its job.
 pub const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How many consecutive polls must agree before a *change* is believed.
+/// How many consecutive polls must agree before a change is believed.
 ///
-/// Two, so that one flickering poll cannot start or end a session: a snapshot taken while a
-/// game is restarting a worker, or during the moment a process is exiting, is not a game
-/// that stopped. At the default interval the cost is one extra interval (~2.5 s) of latency
-/// on a transition, which is inside the capture buffer's pre-roll.
+/// Two, so one flickering poll (a game restarting a worker, a process mid-exit) cannot start
+/// or end a session. The cost is one extra interval (~2.5 s) of transition latency, inside the
+/// capture buffer's pre-roll.
 pub const CONFIRMATIONS: u32 = 2;
 
-/// How long [`WatchHandle`]'s thread sleeps at a time, so that `stop` does not wait a whole
-/// interval. The sleep is a sleep, not a spin.
+/// How long [`WatchHandle`]'s thread sleeps at a time so `stop` does not wait a whole interval.
 const STOP_SLICE: Duration = Duration::from_millis(50);
 
 /// A game this build knows how to recognise.
@@ -120,12 +101,9 @@ pub struct WatchedGame {
     pub name: String,
     /// Windows executable to compare against, case-insensitively: "League of Legends.exe".
     pub exe: String,
-    /// How this title is detected. Riot titles that expose the official Live Client Data
-    /// API use [`Signal::LiveClientApi`]; everything else uses [`Signal::Process`].
-    ///
-    /// Absent from a configuration entry, it is [`Signal::Process`] — the general
-    /// mechanism. The Live Client Data API is the exception and is named explicitly,
-    /// because only a title that publishes one can be detected that way.
+    /// How this title is detected: [`Signal::LiveClientApi`] for Riot titles exposing the official
+    /// Live Client Data API, otherwise [`Signal::Process`], the default when a configuration entry
+    /// omits it. Only a title that publishes the API can be detected that way.
     #[serde(default)]
     pub signal: Signal,
 }
@@ -141,8 +119,8 @@ impl WatchedGame {
         Self { name: name.into(), exe: exe.into(), signal: Signal::LiveClientApi }
     }
 
-    /// The file name this title is compared by — the `exe` with any path removed and any
-    /// surrounding whitespace trimmed, which is the form the matcher compares.
+    /// The file name this title is compared by: the `exe` with any path removed and surrounding
+    /// whitespace trimmed.
     pub fn file_name(&self) -> &str {
         file_name(&self.exe)
     }
@@ -154,21 +132,18 @@ impl fmt::Display for WatchedGame {
     }
 }
 
-/// How a title is detected.
-///
-/// The two variants are not interchangeable *for a given title*: Riot serves the Live
-/// Client Data API for League of Legends and for nothing else on the default list, and a
-/// title with no such API cannot be found by asking for one. Whoever configures a title
-/// picks the mechanism that title actually offers.
+/// How a title is detected. The variants are not interchangeable for a given title: Riot serves
+/// the Live Client Data API for League and nothing else on the default list, and a title with
+/// no such API cannot be found by asking for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Signal {
-    /// By executable name, from a process-list snapshot. The only mechanism available for
-    /// a title that publishes nothing on loopback.
+    /// By executable name from a process-list snapshot, the only mechanism for a title that
+    /// publishes nothing on loopback.
     #[default]
     Process,
-    /// Riot's Live Client Data API on loopback, which is served only while a match is
-    /// running. League of Legends publishes one; no other title on the default list does.
+    /// Riot's Live Client Data API on loopback, served only while a match runs. League publishes
+    /// one; no other default title does.
     LiveClientApi,
 }
 
@@ -181,27 +156,22 @@ pub struct Presence {
 
 /// A detector polled on a timer.
 ///
-/// Implementations must be cheap: [`spawn`] calls [`GamePresence::poll`] every few seconds
-/// for the whole life of the tray process, and what it does must not be visible in Task
-/// Manager. Neither implementation here holds a handle, a socket or a connection open
-/// between polls, and neither allocates anything that outlives one.
+/// Implementations must be cheap: [`spawn`] polls every few seconds for the life of the tray
+/// process and must not show in Task Manager. Neither implementation holds a handle, socket or
+/// connection between polls, or allocates anything outliving one.
 ///
-/// The `Result` is how a detector says "I could not look this time" as opposed to "I looked,
-/// and there is nothing there" — a distinction [`GameWatcher::poll_once`] relies on, since
-/// only the second is evidence about a game.
+/// The `Result` separates "I could not look this time" from "I looked and nothing is there";
+/// [`GameWatcher::poll_once`] relies on it, since only the second is evidence about a game.
 pub trait GamePresence: Send {
     fn poll(&mut self) -> Result<Vec<Presence>>;
 }
 
 /// Which of `watched` are present in this snapshot of image names?
 ///
-/// This is the whole decision a process watcher makes, as a pure function over
-/// `&[String]`: it reads no system state, takes no lock, touches no clock and can be driven
-/// exhaustively from a test on any platform. [`ProcessWatcher::poll`] exists only to hand
-/// it the names.
-///
-/// Every watched game gets an answer, present or not, so the result is the same length as
-/// `watched` and a caller never has to distinguish "not running" from "not asked about".
+/// The whole decision a process watcher makes, as a pure function over `&[String]` with no
+/// system state, lock or clock, so it can be driven exhaustively on any platform.
+/// [`ProcessWatcher::poll`] only hands it the names. Every watched game gets an answer, present
+/// or not, so the result is as long as `watched`.
 pub fn presences_in(watched: &[WatchedGame], observed: &[String]) -> Vec<Presence> {
     watched
         .iter()
@@ -212,34 +182,25 @@ pub fn presences_in(watched: &[WatchedGame], observed: &[String]) -> Vec<Presenc
         .collect()
 }
 
-/// Whether an observed image name is the file `configured` names.
+/// Whether an observed image name is the file `configured` names. Exactly:
 ///
-/// The comparison is between **file names**, exactly:
-///
-/// * both sides are reduced to their file name first, so a snapshot that reported a full
-///   path (`C:\...\cs2.exe`, which `PROCESSENTRY32W` is not documented to do but is not
-///   documented not to) and a configuration value pasted as a path both mean the file they
-///   name;
-/// * case-insensitively, and **ASCII-only** on purpose: Windows' file-name
-///   case-insensitivity is ASCII, and a Unicode case fold would make `СS2.EXE`, written
-///   with a Cyrillic С, match `cs2.exe`. That is the one false positive that really costs
-///   something here — a false positive starts a recording nobody asked for;
-/// * never by substring: `notcs2.exe`, `cs2.exe.bak` and `mycs2.exe` are all different
-///   files from `cs2.exe`.
+/// * both sides are reduced to a file name first, so a snapshot reporting a full path and a
+///   configuration value pasted as a path both mean the file they name;
+/// * case-insensitive and ASCII-only on purpose: Windows' file-name case-insensitivity is
+///   ASCII, and a Unicode fold would make a Cyrillic-С `СS2.EXE` match `cs2.exe`, a false
+///   positive that starts a recording nobody asked for;
+/// * never by substring: `notcs2.exe`, `cs2.exe.bak` and `mycs2.exe` differ from `cs2.exe`.
 fn image_name_matches(configured: &str, observed: &str) -> bool {
     let configured = file_name(configured);
     let observed = file_name(observed);
-    // An empty file name names no file, on either side, and matches nothing — not even
-    // another empty name. A snapshot entry that could not be read must not become a match
-    // for a configuration value that could not be written.
+    // An empty file name names no file on either side and matches nothing, not even another empty
+    // name: an unreadable snapshot entry must not match an unwritable configuration value.
     !configured.is_empty() && configured.eq_ignore_ascii_case(observed)
 }
 
-/// The file-name part of a name that may be a path.
-///
-/// A name that is nothing but separators is returned unchanged: there is no file name to
-/// find in it, and returning the empty tail would silently match nothing at all (or worse,
-/// look like a match for an equally empty configuration value).
+/// The file-name part of a name that may be a path. A name that is only separators is returned
+/// unchanged: there is no file name in it, and returning the empty tail would match nothing or
+/// look like a match for an equally empty configuration value.
 fn file_name(name: &str) -> &str {
     let name = name.trim();
     match name.rsplit(['\\', '/']).next() {
@@ -250,18 +211,13 @@ fn file_name(name: &str) -> &str {
 
 /// The process-name watcher: compare a snapshot of image names against the configured list.
 ///
-/// This type is the thin half of the detection. The comparison itself is [`presences_in`],
-/// which takes plain strings and is tested everywhere; what is left here is one snapshot
-/// call, one walk and one handle close, all of which live in [`image_names`].
+/// The thin half of detection: the comparison is [`presences_in`]; what remains is one
+/// snapshot call, one walk and one handle close, in [`image_names`].
 ///
-/// # Cost, stated
-///
-/// One poll is one `CreateToolhelp32Snapshot` plus a walk of the process list (a few hundred
-/// entries on a desktop) and copies each entry's image name into a vector that is dropped
-/// before `poll` returns. Nothing about a process is opened, read or held: there is no
-/// handle between polls, no thread kept alive and no growing allocation — the vector is
-/// per-poll and transient, and the only long-lived state is the configured list itself.
-/// Measured cost is a few hundred microseconds, once every [`DEFAULT_POLL_INTERVAL`].
+/// One poll is one `CreateToolhelp32Snapshot` plus a walk of a few hundred entries, copying
+/// each image name into a vector dropped before `poll` returns. Nothing about a process is
+/// opened, read or held; the only long-lived state is the configured list. Measured at a few
+/// hundred microseconds per [`DEFAULT_POLL_INTERVAL`].
 #[derive(Debug)]
 pub struct ProcessWatcher {
     watched: Vec<WatchedGame>,
@@ -270,9 +226,8 @@ pub struct ProcessWatcher {
 impl ProcessWatcher {
     /// Watch `watched` by executable name.
     ///
-    /// The list is validated here rather than at match time (see [`validate_watch_list`]):
-    /// a duplicate or nameless entry is a configuration mistake, and a watcher that starts
-    /// up and silently watches nothing is the worst way to learn about one.
+    /// The list is validated here (see [`validate_watch_list`]): a duplicate or nameless entry is a
+    /// configuration mistake, and a watcher silently watching nothing is the worst way to learn it.
     pub fn new(watched: Vec<WatchedGame>) -> Result<Self> {
         validate_watch_list(&watched)?;
         Ok(Self { watched })
@@ -293,9 +248,8 @@ impl GamePresence for ProcessWatcher {
         }
         #[cfg(not(windows))]
         {
-            // Not an empty list: "we cannot look" and "nothing is there" are different
-            // answers, and only one of them is true here. An empty list would be read by a
-            // driver as every game being stopped, which is a lie it may act on.
+            // Not an empty list: "we cannot look" differs from "nothing is there", and an empty list would
+            // be read as every game stopped, a lie a driver may act on.
             bail!(
                 "watching for a game by executable name needs the Windows process-list \
                  snapshot (CreateToolhelp32Snapshot), which this platform does not have; \
@@ -305,17 +259,14 @@ impl GamePresence for ProcessWatcher {
     }
 }
 
-/// One snapshot of every process's image name — the only Windows code in this module.
+/// One snapshot of every process's image name: the only Windows code in this module.
 ///
-/// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` is the enumeration Task Manager
-/// performs: the kernel hands back a copy of the process list as `PROCESSENTRY32W` records,
-/// and this function copies the image names out of them. It opens **no** process: there is
-/// no `OpenProcess` call, so no access right is requested over any running game, no memory
-/// is read, and no module, thread or window is touched. The only handle is the snapshot's
-/// own, and it is closed before this returns, so no handle is held between polls.
-///
-/// The walk is deliberately tiny — four calls — because this half cannot be tested on the
-/// machine the project is developed on (see the module docs).
+/// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` is Task Manager's enumeration: the kernel
+/// returns a copy of the process list as `PROCESSENTRY32W` records and this copies the image
+/// names out. It opens no process (no `OpenProcess`), so no access right is requested over
+/// any game, no memory is read, and no module, thread or window is touched. The only handle
+/// is the snapshot's own, closed before return. Kept to four calls because this half cannot
+/// be tested on the development machine.
 #[cfg(windows)]
 fn image_names() -> Result<Vec<String>> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -329,8 +280,7 @@ fn image_names() -> Result<Vec<String>> {
 
     impl Drop for Snapshot {
         fn drop(&mut self) {
-            // Best effort: a close that fails is not something a caller can act on, and
-            // there is nothing else to do with the value.
+            // Best effort: a failed close is not actionable.
             let _ = unsafe { CloseHandle(self.0) };
         }
     }
@@ -340,30 +290,29 @@ fn image_names() -> Result<Vec<String>> {
             .map_err(|e| anyhow!("taking a process-list snapshot: {e}"))?,
     );
 
-    // `dwSize` is the structure's size and is checked by the API; a zeroed entry is how
-    // the reference example hands it over.
+    // `dwSize` is the structure's size and checked by the API; a zeroed entry is how the
+    // reference example passes it.
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
 
-    // A first entry that cannot be read is an *error*, not an empty list: the snapshot was
-    // created successfully, so this is a genuine failure to look, and `poll_once` treats a
-    // failure as "no observation" instead of "everything stopped".
+    // A first entry that cannot be read is an error, not an empty list: the snapshot was created,
+    // so this is a genuine failure to look, and `poll_once` treats failure as "no observation",
+    // not "everything stopped".
     unsafe { Process32FirstW(snapshot.0, &mut entry) }
         .map_err(|e| anyhow!("reading the first process of the snapshot: {e}"))?;
 
     let mut names = Vec::new();
     loop {
-        // The name is a NUL-terminated UTF-16 buffer, and the terminator is not always the
-        // last unit; a buffer that somehow has none is taken whole rather than truncated.
+        // The name is a NUL-terminated UTF-16 buffer and the terminator is not always the last unit;
+        // a buffer with none is taken whole rather than truncated.
         let name = match entry.szExeFile.iter().position(|unit| *unit == 0) {
             Some(len) => String::from_utf16_lossy(&entry.szExeFile[..len]),
             None => String::from_utf16_lossy(&entry.szExeFile),
         };
         names.push(name);
-        // A failure here is the documented end of the list ("no more entries"), which is
-        // how a `Process32*` walk always terminates.
+        // A failure here is the documented end of the list, how a `Process32*` walk always ends.
         if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
             break;
         }
@@ -371,15 +320,12 @@ fn image_names() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Refuse a watch list that cannot mean what it says.
+/// Refuse a watch list that cannot mean what it says. Two mistakes get a startup error:
 ///
-/// Two mistakes are worth a startup error rather than silent behaviour:
-///
-/// * an `exe` that is empty names no file, so it can never match anything — a title the
-///   user believes is watched and is not;
-/// * the same `exe` twice is one game, and `exe` is the identity the matcher and the
-///   tracker key on (case-insensitively, because that is how matching works), so a repeat
-///   is a mistake rather than two watches.
+/// * an empty `exe` names no file and can never match, so a title the user believes is watched
+///   is not;
+/// * the same `exe` twice is one game (`exe` is the identity the matcher and tracker key on,
+///   case-insensitively), so a repeat is a mistake, not two watches.
 pub fn validate_watch_list(watched: &[WatchedGame]) -> Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(watched.len());
     for game in watched {
@@ -397,40 +343,32 @@ pub fn validate_watch_list(watched: &[WatchedGame]) -> Result<()> {
 
 /// League of Legends, via the API Riot publishes for it.
 ///
-/// This is a *game-state* signal, not a "some Riot process exists" signal. The Live Client
-/// Data API is served on `127.0.0.1:2999` while a match is running and stops answering when
-/// it ends, so `running: true` means a game is being played. That is why the user's
-/// instruction — "using the official local api riot provides to record it should be safe to
-/// auto start" — is what this type implements, rather than a process name.
+/// A game-state signal, not "some Riot process exists": the Live Client Data API answers on
+/// `127.0.0.1:2999` while a match runs and stops when it ends, so `running: true` means a game
+/// is being played.
 ///
-/// The client is the crate's existing one ([`LoopbackClient`]), which is address-pinned to
-/// an [`Endpoint`] that cannot be built for anything but a loopback address. This adds no
-/// HTTP client, no socket, no second place that relaxes TLS verification and no new request
-/// path: it asks for the same `/liveclientdata/allgamedata` the event poller asks for, and
-/// reads only the *status* of the answer.
+/// It reuses the crate's [`LoopbackClient`], pinned to an [`Endpoint`] that can only be
+/// loopback: no new HTTP client, no second place relaxing TLS, no new request path. It asks for
+/// the same `/liveclientdata/allgamedata` as the event poller and reads only the answer's
+/// status.
 ///
-/// # What it cannot tell apart
-///
-/// The endpoint is the game's, so a *replay* or a spectated game served by the same client
-/// looks the same as a match being played: the API cannot distinguish them. This is a limit
-/// of the signal Riot provides, and it is written down rather than papered over. It is not
-/// the expensive kind of false positive — it is still a game the user opened.
+/// Limit: the endpoint is the game's, so a replay or spectated game served by the same client
+/// looks like a match being played. It is still a game the user opened, so not the costly kind
+/// of false positive.
 pub struct LiveClientPresence {
     client: LoopbackClient,
     watching: Vec<WatchedGame>,
 }
 
 impl LiveClientPresence {
-    /// The real thing: Riot's endpoint, and the titles configured for it.
-    ///
-    /// Titles whose signal is [`Signal::Process`] are not this source's business and are
-    /// left out — [`CompositePresence`] hands each title to exactly one source.
+    /// The real thing: Riot's endpoint and the titles configured for it. Titles whose signal is
+    /// [`Signal::Process`] are left out; [`CompositePresence`] hands each title to one source.
     pub fn new(watched: &[WatchedGame]) -> Result<Self> {
         Self::for_endpoint(watched, Endpoint::live_client())
     }
 
-    /// The same detector against any loopback endpoint: how a test reaches a mock, and how
-    /// a front-end with its own endpoint would build one.
+    /// The same detector against any loopback endpoint, for a test mock or a front-end with its
+    /// own endpoint.
     pub fn for_endpoint(watched: &[WatchedGame], endpoint: Endpoint) -> Result<Self> {
         let watching = watched
             .iter()
@@ -454,23 +392,20 @@ impl LiveClientPresence {
 impl GamePresence for LiveClientPresence {
     fn poll(&mut self) -> Result<Vec<Presence>> {
         if self.watching.is_empty() {
-            // Nothing to answer for means not even the request: an unused source must not
-            // put traffic on the loopback socket every few seconds.
+            // Nothing to answer for means not even the request: an unused source must not put traffic on
+            // loopback every few seconds.
             return Ok(Vec::new());
         }
 
         let running = match self.client.get() {
-            // A body means the API is serving a game. What the document says is not this
-            // module's business: `lol::derive` turns it into events.
+            // A body means the API is serving a game; what it says is `lol::derive`'s business.
             Ok(Response::Body(_)) => true,
             // 404: the API is up and reports no game.
             Ok(Response::NotServing) => false,
-            // A refused or timed-out connection on loopback is the ordinary "no game is
-            // running" answer (spec §7.1), not a failure.
+            // A refused or timed-out loopback connection is the ordinary "no game is running" answer.
             Err(err) if err.is_no_game() => false,
-            // A peer that is not the live client — not speaking TLS, or answering
-            // something that is not HTTP — is a failure to look, and saying so is better
-            // than inventing either answer.
+            // A peer that is not the Live Client (not TLS, or not HTTP) is a failure to look; say so
+            // rather than invent either answer.
             Err(err) => {
                 return Err(anyhow!("the League Live Client could not be read: {err}"));
             }
@@ -487,10 +422,10 @@ impl GamePresence for LiveClientPresence {
 
 /// Both signals behind one [`GamePresence`].
 ///
-/// The watch list is partitioned by its own [`Signal`], so each title is looked for by the
-/// mechanism it is configured for and nothing is polled twice. The process source exists
-/// only where the enumeration does: on a platform without it, the titles that would need it
-/// are named once at construction, and no failing poll is invented every interval.
+/// The watch list is partitioned by [`Signal`], so each title is found by its configured
+/// mechanism and nothing is polled twice. The process source exists only where the enumeration
+/// does: elsewhere, titles needing it are named once at construction and no failing poll is
+/// invented every interval.
 pub struct CompositePresence {
     process: Option<ProcessWatcher>,
     live: Option<LiveClientPresence>,
@@ -514,9 +449,8 @@ impl CompositePresence {
         } else if cfg!(windows) {
             Some(ProcessWatcher::new(by_process)?)
         } else {
-            // Once, at startup, where the user can see it: a log line is the difference
-            // between "this title is not watched on this platform" and a game that never
-            // starts a recording for no visible reason.
+            // Once, at startup, where the user can see it: otherwise a title silently unwatched on this
+            // platform looks like a game that never starts a recording.
             let names = by_process
                 .iter()
                 .map(|game| game.exe.as_str())
@@ -567,12 +501,9 @@ impl GamePresence for CompositePresence {
     }
 }
 
-/// One change in what is running.
-///
-/// The two directions are variants rather than a `bool` field because the two callers do
-/// different things with them: a start is "arm the capture", a stop is "the session is
-/// over". Neither carries a timestamp: the driver knows when it received it, and a clock in
-/// here would make the tracker un-testable without one.
+/// One change in what is running. The directions are variants, not a `bool`, because a start
+/// is "arm the capture" and a stop is "the session is over". Neither carries a timestamp: the
+/// driver knows when it received it, and a clock here would make the tracker untestable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresenceChange {
     /// The game is running now.
@@ -620,24 +551,20 @@ struct Tracked {
 
 /// What is believed to be running, and the debounce that keeps a flicker out of it.
 ///
-/// The rules, in one place:
+/// * The first observation of a game is believed immediately: a watcher started mid-session
+///   (the normal tray case) says what is running now instead of waiting for a transition that
+///   already happened.
+/// * A later change is believed after [`CONFIRMATIONS`] consecutive polls (or what
+///   [`PresenceTracker::with_confirmations`] asks for), so an alternating snapshot produces no
+///   changes rather than one per poll.
+/// * A game a snapshot does not mention is not evidence. Only an explicit `running: false`
+///   counts as stopped, so a partial snapshot (the Live Client's answer on a platform with no
+///   process enumeration) cannot end a session.
+/// * A change is reported exactly once: the believed state is compared, so a game staying
+///   stopped does not stop again, nor one staying running start again.
 ///
-/// * **The first observation of a game is believed immediately.** A watcher that starts in
-///   the middle of a session — the normal case for a tray application — says what is
-///   running now instead of waiting for a transition that already happened.
-/// * **A later change is believed after [`CONFIRMATIONS`] consecutive polls** (or however
-///   many [`PresenceTracker::with_confirmations`] asks for), so a snapshot that alternates
-///   between answers produces no changes at all rather than one per poll.
-/// * **A game a snapshot does not mention is not evidence.** Only an explicit
-///   `running: false` counts as stopped, so a partial snapshot — the Live Client's answer
-///   on a platform with no process enumeration, say — cannot end a session.
-/// * **A change is reported exactly once.** What is compared is the believed state, so a
-///   game that stays stopped does not stop again, and one that stays running does not start
-///   again.
-///
-/// The tracker is pure: no clock, no I/O, no logging, no allocation beyond the changes it
-/// answers with. That is deliberate — this is the half worth testing exhaustively, and it
-/// is the half every platform shares.
+/// Pure: no clock, I/O or logging, so the half worth testing exhaustively is the half every
+/// platform shares.
 #[derive(Debug)]
 pub struct PresenceTracker {
     confirmations: u32,
@@ -647,15 +574,14 @@ pub struct PresenceTracker {
 impl PresenceTracker {
     /// Track `watched` with the default debounce ([`CONFIRMATIONS`]).
     ///
-    /// The list is the identity: an `exe` names a game once, case-insensitively (that is
-    /// how matching works). A repeat is kept the first time and ignored afterwards, so a
-    /// caller that did not validate its list still gets one answer per game.
+    /// The list is the identity: an `exe` names a game once, case-insensitively. A repeat is kept
+    /// the first time and ignored afterwards, so an unvalidated list still gets one answer per game.
     pub fn new(watched: &[WatchedGame]) -> Self {
         Self::with_confirmations(watched, CONFIRMATIONS)
     }
 
-    /// The same, with an explicit debounce. `0` is read as `1` — a tracker that believed
-    /// nothing would never report anything at all.
+    /// The same with an explicit debounce. `0` is read as `1`, as a tracker believing nothing would
+    /// never report anything.
     pub fn with_confirmations(watched: &[WatchedGame], confirmations: u32) -> Self {
         let mut tracked: Vec<Tracked> = Vec::with_capacity(watched.len());
         for game in watched {
@@ -754,10 +680,8 @@ impl PresenceTracker {
 }
 
 /// The poll loop: ask the detector, fold the answer through the tracker, report the changes.
-///
-/// Split from the thread for the same reason `lol::LolPoller::poll_once` is: the half worth
-/// testing is "what does this sequence of polls mean", and it can be driven directly, with
-/// no clock and no syscalls.
+/// Split from the thread, like `lol::LolPoller::poll_once`, so "what does this sequence of
+/// polls mean" can be driven with no clock or syscalls.
 pub struct GameWatcher {
     detector: Box<dyn GamePresence>,
     tracker: PresenceTracker,
@@ -766,20 +690,16 @@ pub struct GameWatcher {
 }
 
 impl GameWatcher {
-    /// Watch `games` with both signals, for real.
-    ///
-    /// The interval is bounded by [`clamp_interval`] here, so no configuration value can
-    /// reach this constructor and turn the watcher into a tight loop over the process list.
+    /// Watch `games` with both signals, for real. The interval is bounded by [`clamp_interval`]
+    /// here, so no configuration value can turn the watcher into a tight loop over the process list.
     pub fn new(games: Vec<WatchedGame>, interval: Duration) -> Result<Self> {
         let detector = CompositePresence::new(games.clone())?;
         Ok(Self::with_detector(Box::new(detector), &games, clamp_interval(interval)))
     }
 
-    /// The same loop around any [`GamePresence`]: how the tests drive it, and how a
-    /// front-end with a source of its own would use it.
-    ///
-    /// The interval is used as given — this is the deliberate seam, and a test that wants
-    /// ten polls a second is not a configuration mistake.
+    /// The same loop around any [`GamePresence`], for tests and front-ends with a source of their
+    /// own. The interval is used as given: the deliberate seam, so a test may poll ten times a
+    /// second.
     pub fn with_detector(
         detector: Box<dyn GamePresence>,
         watched: &[WatchedGame],
@@ -805,9 +725,9 @@ impl GameWatcher {
 
     /// Poll once and answer what changed.
     ///
-    /// Never fails. A detector that could not answer is a log line — the first of a run, at
-    /// `warn` — and **not** a transition: a failed snapshot is not a game that stopped, and
-    /// ending a recording over one is the mistake this method exists to prevent.
+    /// Never fails. A detector that could not answer is a log line (the first of a run, at `warn`)
+    /// and not a transition: a failed snapshot is not a game that stopped, and ending a recording
+    /// over one is the mistake this method prevents.
     pub fn poll_once(&mut self) -> Vec<PresenceChange> {
         let snapshot = match self.detector.poll() {
             Ok(snapshot) => {
@@ -838,17 +758,13 @@ impl GameWatcher {
     }
 }
 
-/// Where a watcher sends what changed. Unbounded, for the reason [`crate::EventSink`] is:
-/// the volume is a handful of changes an hour, and a full queue must never drop one.
+/// Where a watcher sends what changed. Unbounded for the reason [`crate::EventSink`] is: a
+/// handful of changes an hour, and a full queue must never drop one.
 pub type PresenceSink = Sender<PresenceChange>;
 
-/// A running watcher, on its own thread.
-///
-/// Dropping it stops the thread and waits for it, so a stopped application leaves no thread
-/// behind and a test can be sure no poll is still in flight.
-///
-/// Which is also the one way to hold this type wrong: a caller has to *keep* the handle for
-/// as long as it wants to be told about games, and the attribute is here to say so out loud.
+/// A running watcher, on its own thread. Dropping it stops the thread and waits for it, so a
+/// stopped application leaves no thread behind. A caller must keep the handle for as long as it
+/// wants to hear about games, which the attribute below states.
 #[must_use = "dropping the watch handle stops the watcher"]
 pub struct WatchHandle {
     stop: Arc<AtomicBool>,
@@ -864,8 +780,7 @@ impl WatchHandle {
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
-            // A poll in flight finishes — it is bounded by its own syscall — and the join
-            // is what makes "stopped" mean it.
+            // A poll in flight finishes (bounded by its own syscall); the join makes "stopped" real.
             let _ = thread.join();
         }
     }
@@ -879,14 +794,12 @@ impl Drop for WatchHandle {
 
 /// Start watching on a thread of its own.
 ///
-/// Every change goes to `sink` until the handle is dropped. A sink the driver has dropped
-/// ends the loop: there is nobody left to tell, so there is nothing left to poll.
+/// Every change goes to `sink` until the handle is dropped. A sink the driver dropped ends the
+/// loop: nobody is left to tell.
 ///
-/// # The interval is a floor, not a wait
-///
-/// [`sleep_until`] sleeps [`STOP_SLICE`] at a time so that `stop` does not have to wait out
-/// a whole interval, and a poll that took longer than the interval starts the next one
-/// straight away. It never spins: between polls the thread is asleep.
+/// The interval is a floor, not a wait: [`sleep_until`] sleeps [`STOP_SLICE`] at a time so
+/// `stop` need not wait out an interval, and a poll that overran starts the next straight away.
+/// It never spins.
 pub fn spawn(watcher: GameWatcher, sink: PresenceSink) -> Result<WatchHandle> {
     let interval = watcher.interval();
     let stop = Arc::new(AtomicBool::new(false));
@@ -930,20 +843,15 @@ fn sleep_until(deadline: Instant, stop: &AtomicBool) {
     }
 }
 
-/// Bound a configured interval into [`MIN_POLL_INTERVAL`]..=[`MAX_POLL_INTERVAL`].
-///
-/// The one place configuration becomes an interval, so that the floor protecting the user's
-/// machine (see [`MIN_POLL_INTERVAL`]) cannot be bypassed by a field that is read somewhere
-/// else.
+/// Bound a configured interval into [`MIN_POLL_INTERVAL`]..=[`MAX_POLL_INTERVAL`]. The one
+/// place configuration becomes an interval, so the floor protecting the user's machine cannot
+/// be bypassed by a field read elsewhere.
 pub fn clamp_interval(requested: Duration) -> Duration {
     requested.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
 }
 
-/// Keeps a repeating condition from writing a line every poll.
-///
-/// The same discipline `lol::poller` uses for "no game is being served": the first of a run
-/// is news, a *changed* condition is news, and the repetitions are not — which is what
-/// keeps a two-second poll from filling a log file with one identical failure.
+/// Keeps a repeating condition from writing a line every poll, with `lol::poller`'s
+/// discipline: the first of a run and a changed condition are news, repetitions are not.
 #[derive(Debug, Default)]
 struct RunQuiet {
     active: Option<String>,
@@ -967,10 +875,9 @@ impl RunQuiet {
     }
 }
 
-/// The `[games]` section of `config.toml`: what to watch, and whether to watch.
-///
-/// The types live here because the crate that polls owns the names it accepts; the file
-/// itself is read by the configuration layer, which deserialises this struct.
+/// The `[games]` section of `config.toml`: what to watch, and whether to watch. The types live
+/// here because the polling crate owns the names it accepts; the configuration layer
+/// deserialises this struct.
 ///
 /// ```toml
 /// [games]
@@ -983,21 +890,18 @@ impl RunQuiet {
 /// signal = "live_client_api"
 /// ```
 ///
-/// **`auto_record` defaults to `false`, and that is the whole safety posture of this
-/// feature.** With it off, [`GamesSection::start`] starts nothing: no process list is
-/// enumerated, no snapshot is taken and no request is made to the Live Client Data API. A
-/// machine that never turns it on never has anything watched on its behalf — which is what
-/// the user asked for, and the right default on a box running kernel-level anti-cheat.
+/// `auto_record` defaults to `false`, the whole safety posture of the feature. With it off,
+/// [`GamesSection::start`] starts nothing: no process list, no snapshot, no Live Client
+/// request. A machine that never turns it on has nothing watched on its behalf, the right
+/// default next to kernel-level anti-cheat.
 ///
-/// `poll_ms` is clamped by [`GamesSection::interval`]; a value of `0` there is `250`, not a
-/// tight loop over the process list.
+/// `poll_ms` is clamped by [`GamesSection::interval`]; `0` becomes `250`, not a tight loop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamesSection {
     /// Whether a watched game starting is on its own a reason to start recording.
     pub auto_record: bool,
-    /// How often to look, in milliseconds. Read through [`GamesSection::interval`], which
-    /// bounds it.
+    /// How often to look, in milliseconds. Read through [`GamesSection::interval`], which bounds it.
     pub poll_ms: u64,
     /// The titles to recognise.
     pub watch: Vec<WatchedGame>,
@@ -1016,11 +920,9 @@ impl Default for GamesSection {
 
 impl GamesSection {
     /// The poll interval this section asks for, bounded into
-    /// [`MIN_POLL_INTERVAL`]..=[`MAX_POLL_INTERVAL`].
-    ///
-    /// Read the interval through this rather than through `poll_ms`: the clamp is what
-    /// stops a `0` in a configuration file from becoming a watcher that enumerates the
-    /// process list as fast as the CPU allows.
+    /// [`MIN_POLL_INTERVAL`]..=[`MAX_POLL_INTERVAL`]. Read it through this, not `poll_ms`: the
+    /// clamp stops a `0` in a config file becoming a watcher that enumerates processes as fast as
+    /// the CPU allows.
     pub fn interval(&self) -> Duration {
         clamp_interval(Duration::from_millis(self.poll_ms))
     }
@@ -1030,15 +932,11 @@ impl GamesSection {
         self.auto_record
     }
 
-    /// Start the watcher this section describes — or `None` when `auto_record` is off,
-    /// which it is by default.
+    /// Start the watcher this section describes, or `None` when `auto_record` is off (the
+    /// default). The `None` makes the opt-in real: with the default section nothing is polled.
     ///
-    /// The `None` is the important half of the contract: with the default section nothing
-    /// is polled, so the opt-in is real rather than a flag on a watcher that runs anyway.
-    ///
-    /// The changes arrive on `sink` as they happen; drop the receiver to end the watcher,
-    /// or drop (or [`WatchHandle::stop`]) the handle to stop it deliberately. A caller that
-    /// wants the changes has to keep the handle alive — dropping it stops the watcher.
+    /// Changes arrive on `sink`; drop the receiver to end the watcher, or drop (or
+    /// [`WatchHandle::stop`]) the handle. A caller wanting changes must keep the handle alive.
     ///
     /// ```no_run
     /// # fn main() -> anyhow::Result<()> {
@@ -1066,11 +964,10 @@ impl GamesSection {
 
 /// The titles a fresh configuration watches, and how each is recognised.
 ///
-/// Only League of Legends is recognised by Riot's Live Client Data API, because it is the
-/// only title here that publishes one. Everything else is recognised by its **game**
-/// executable — the process that exists only while the game itself is running, never the
-/// launcher's — which is what keeps a process-name match from firing all evening on a
-/// client somebody left open:
+/// Only League is recognised by Riot's Live Client Data API, the only title here publishing
+/// one. Everything else is recognised by its game executable (present only while the game runs,
+/// never the launcher's), so a process-name match does not fire all evening on a client left
+/// open:
 ///
 /// | title | executable | signal |
 /// |---|---|---|
@@ -1081,11 +978,8 @@ impl GamesSection {
 /// | Valorant | `VALORANT-Win64-Shipping.exe` (not `VALORANT.exe`) | process name |
 /// | Overwatch 2 | `Overwatch.exe` | process name |
 ///
-/// Valorant is the interesting row: it is a Riot title, and the honest statement about it
-/// is that Riot publishes no local game-state API for it. The Riot *Client* has an
-/// undocumented local HTTP API behind a lockfile password, but that reports the launcher's
-/// session rather than a match, and this project does not use it. So Valorant is watched by
-/// the name of the game process, which exists only while a match is running.
+/// Valorant is a Riot title with no published local game-state API, so it is watched by the
+/// game process, which exists only while a match runs.
 pub fn default_watch() -> Vec<WatchedGame> {
     vec![
         WatchedGame::by_live_client_api("League of Legends", "League of Legends.exe"),
@@ -1181,8 +1075,8 @@ mod tests {
 
     #[test]
     fn a_unicode_lookalike_is_not_a_match() {
-        // Cyrillic С (U+0421), which is not the Latin C. Windows' file-name
-        // case-insensitivity is ASCII, and a Unicode case fold would call these equal.
+        // Cyrillic С (U+0421), not Latin C. Windows' file-name case-insensitivity is ASCII; a Unicode
+        // fold would call these equal.
         let watch = vec![WatchedGame::by_process("Counter-Strike 2", "cs2.exe")];
         assert_eq!(
             running_of(&presences_in(&watch, &observed(&["\u{421}S2.EXE"])), "cs2.exe"),
@@ -1228,8 +1122,8 @@ mod tests {
 
     #[test]
     fn a_configuration_value_that_is_only_a_path_separator_matches_nothing() {
-        // `exe` cannot be empty or separators-only in a validated list, and the matcher
-        // must not turn a separator into an empty file name that equals another empty one.
+        // `exe` cannot be empty or separators-only in a validated list, and the matcher must not turn
+        // a separator into an empty file name equal to another empty one.
         assert_eq!(file_name(r"\\"), r"\\");
         assert!(!image_name_matches("", ""));
         assert!(!image_name_matches("   ", ""));
@@ -1253,8 +1147,8 @@ mod tests {
 
     #[test]
     fn a_game_already_running_is_running_by_the_first_poll() {
-        // The tray is usually started while the client is already open: the first answer
-        // must be the truth about now, not a wait for a transition that already happened.
+        // The tray usually starts with the client already open: the first answer must be the truth
+        // about now, not a wait for a transition that already happened.
         let watch = default_watch();
         let mut tracker = PresenceTracker::new(&watch);
         let changes = tracker.observe(&poll_of(&watch, &["cs2.exe"]));
@@ -1310,9 +1204,8 @@ mod tests {
 
     #[test]
     fn a_flapping_snapshot_produces_no_event_storm() {
-        // A process list that alternates between "there" and "not there" — a game
-        // restarting a worker, a snapshot taken mid-exit — must not become one change per
-        // poll, which is one recording per poll downstream.
+        // A process list alternating between "there" and "not there" (a worker restart, a snapshot
+        // mid-exit) must not become one change, and so one recording, per poll.
         let watch = default_watch();
         let mut tracker = PresenceTracker::new(&watch);
         assert!(tracker.observe(&poll_of(&watch, &[])).is_empty());
@@ -1356,8 +1249,8 @@ mod tests {
 
     #[test]
     fn a_snapshot_that_does_not_mention_a_game_leaves_it_alone() {
-        // The shape a partial snapshot takes: the Live Client answers on a platform with
-        // no process enumeration. Silence about a game is not evidence about a game.
+        // A partial snapshot: the Live Client answers on a platform with no process enumeration.
+        // Silence about a game is not evidence about a game.
         let watch = default_watch();
         let mut tracker = PresenceTracker::new(&watch);
         assert_eq!(
@@ -1398,8 +1291,8 @@ mod tests {
 
     #[test]
     fn a_change_of_game_is_not_a_change_of_state() {
-        // The tracker keys on the executable, which is what the matcher keys on, so a
-        // renamed display name is the same game and is not a second start.
+        // The tracker keys on the executable, as the matcher does, so a renamed display name is the
+        // same game, not a second start.
         let original = WatchedGame::by_process("Counter-Strike 2", "cs2.exe");
         let mut tracker = PresenceTracker::new(std::slice::from_ref(&original));
         let renamed = WatchedGame::by_process("CS2", "cs2.exe");
@@ -1429,8 +1322,8 @@ mod tests {
 
     impl GamePresence for Scripted {
         fn poll(&mut self) -> Result<Vec<Presence>> {
-            // Running out of script is a failure of the test, and saying so loudly beats
-            // a detector that quietly answers "nothing" for the rest of the run.
+            // Running out of script is a test failure; saying so loudly beats a detector quietly answering
+            // "nothing" for the rest of the run.
             self.answers
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("the script has no answer left")))
@@ -1505,8 +1398,8 @@ mod tests {
 
     #[test]
     fn a_refused_loopback_connection_is_no_game_and_not_a_failure() {
-        // Port 1 on loopback: nothing listens there, which is what between-games looks
-        // like. The answer must be `false`, never an error and never a panic.
+        // Port 1 on loopback: nothing listens, as between games. The answer must be `false`, never an
+        // error or panic.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().expect("a socket address");
         let endpoint =
             Endpoint::loopback(addr, "/liveclientdata/allgamedata").expect("a loopback endpoint");
@@ -1522,8 +1415,8 @@ mod tests {
 
     #[test]
     fn a_source_with_nothing_to_answer_for_does_not_even_ask() {
-        // No title uses the API: the endpoint is never contacted, which is what makes an
-        // unused source free. Port 1 would refuse if it were asked.
+        // No title uses the API, so the endpoint is never contacted, which makes an unused source
+        // free. Port 1 would refuse if asked.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().expect("a socket address");
         let endpoint =
             Endpoint::loopback(addr, "/liveclientdata/allgamedata").expect("a loopback endpoint");
@@ -1574,9 +1467,8 @@ mod tests {
 
     #[test]
     fn a_configuration_file_without_the_games_section_gets_the_default_one() {
-        // The shape the configuration layer parses: the section is optional, so a file
-        // that predates the feature — or a user who removed the section — still gets a
-        // well-formed one, with auto-record off.
+        // The shape the configuration layer parses: the section is optional, so a file predating the
+        // feature, or one with the section removed, still gets a well-formed one with auto-record off.
         #[derive(Deserialize)]
         struct ConfigFile {
             #[serde(default)]
@@ -1664,8 +1556,8 @@ mod tests {
         assert_eq!(clamp_interval(Duration::ZERO), MIN_POLL_INTERVAL);
         assert_eq!(clamp_interval(Duration::from_secs(3_600)), MAX_POLL_INTERVAL);
 
-        // And the production constructor is behind the same floor, so no path into the
-        // watcher can produce a tight loop over the process list.
+        // The production constructor is behind the same floor, so no path into the watcher can
+        // produce a tight loop over the process list.
         let watcher = GameWatcher::new(default_watch(), Duration::ZERO).expect("a watcher");
         assert_eq!(watcher.interval(), MIN_POLL_INTERVAL);
         assert_eq!(
@@ -1717,8 +1609,7 @@ mod tests {
         assert_eq!(first.game().name, "Dota 2");
         assert!(first.is_start() && !first.is_stop());
 
-        // Stopping joins the thread, which drops its end of the channel: that is the
-        // proof that nothing is still polling after `stop`.
+        // Stopping joins the thread, dropping its end of the channel: proof nothing polls after `stop`.
         handle.stop();
         assert!(
             changes.recv().is_err(),
@@ -1736,9 +1627,8 @@ mod tests {
         let (sink, changes) = std::sync::mpsc::channel();
         let handle = spawn(watcher, sink).expect("a watcher thread");
         drop(changes); // the driver is gone
-        // Dropping the handle joins the thread; if the thread had not noticed the closed
-        // sink it would still be pollable, and this would hang. The assertion is that it
-        // returns.
+        // Dropping the handle joins the thread; had the thread not noticed the closed sink this would
+        // hang. The assertion is that it returns.
         handle.stop();
     }
 }

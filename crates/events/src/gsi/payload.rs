@@ -1,20 +1,16 @@
-//! The Valve GSI POST body, as typed Rust (spec §7.2).
+//! The Valve GSI POST body, as typed Rust.
 //!
-//! One document type covers Counter-Strike 2 / CS:GO and Dota 2. They overlap in the
-//! `provider` and `map` blocks and differ everywhere else, and Valve's contract is that
-//! **every block is optional**: the `.cfg` the user installs decides what is sent, and a
-//! block that is not subscribed is simply absent. So every field here defaults, an unknown
-//! key is ignored, and a payload localplay does not recognise still parses — it just
-//! yields nothing.
+//! One document type covers Counter-Strike 2 / CS:GO and Dota 2. They overlap in `provider` and
+//! `map` and differ elsewhere, and Valve's contract is that every block is optional (the
+//! installed `.cfg` decides what is sent). So every field defaults, unknown keys are ignored,
+//! and an unrecognised payload still parses and yields nothing.
 //!
-//! Two shape differences are worth calling out, because they are what a hand-written
-//! parser gets wrong:
+//! Two shape differences a hand-written parser gets wrong:
 //!
-//! * Dota 2's `player` block is an object in a player's own client and an **array** in a
-//!   spectator's. [`PlayerBlock`] accepts both (the array's first element is used, and the
-//!   choice is documented in [`PlayerBlock::first`]).
-//! * A player's kills live in `player.match_stats` in Counter-Strike and directly on
-//!   `player` in Dota 2, under the same names. [`Player::kills`], [`Player::deaths`] and
+//! * Dota 2's `player` block is an object in a player's own client and an array in a
+//!   spectator's. [`PlayerBlock`] accepts both (see [`PlayerBlock::first`]).
+//! * A player's kills live in `player.match_stats` in Counter-Strike and directly on `player`
+//!   in Dota 2, under the same names. [`Player::kills`], [`Player::deaths`] and
 //!   [`Player::assists`] answer for both.
 
 use serde::{Deserialize, Serialize};
@@ -22,11 +18,10 @@ use std::collections::BTreeMap;
 
 /// Parse a GSI POST body.
 ///
-/// The body must be a JSON **object**. That is not pedantry: `serde`'s derive will happily
-/// read a struct out of a JSON *array* — an empty `[]` becomes a document with every field
-/// defaulted — because it supports formats that have no maps. Left alone, that would turn a
-/// nonsense body into "a document that says nothing", which the listener would accept and
-/// answer `200` to. So the shape is checked, once, at the edge.
+/// The body must be a JSON object. `serde`'s derive will read a struct out of a JSON array
+/// (an empty `[]` becomes a document with every field defaulted), which would turn a nonsense
+/// body into "a document that says nothing" that the listener answers `200`. The shape is
+/// therefore checked once, at the edge.
 pub fn parse(body: &[u8]) -> Result<GsiSnapshot, serde_json::Error> {
     let object: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(body)?;
@@ -37,8 +32,8 @@ pub fn parse(body: &[u8]) -> Result<GsiSnapshot, serde_json::Error> {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct GsiSnapshot {
-    /// Whatever the installed `.cfg` declared under `"auth"`, echoed back verbatim by the
-    /// game. This is where the token arrives — see [`crate::gsi::token_matches`].
+    /// Whatever the installed `.cfg` declared under `"auth"`, echoed back verbatim by the game.
+    /// The token arrives here (see [`crate::gsi::token_matches`]).
     pub auth: BTreeMap<String, String>,
     pub provider: Provider,
     pub map: Map,
@@ -100,7 +95,7 @@ pub struct Round {
     pub win_team: Option<String>,
 }
 
-/// `bomb` — the detailed bomb state, which the wiki documents as richer than `round.bomb`.
+/// `bomb`: the detailed bomb state, richer than `round.bomb`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Bomb {
@@ -124,10 +119,9 @@ pub enum PlayerBlock {
 impl PlayerBlock {
     /// The block's player, if it has one.
     ///
-    /// In spectator mode Dota 2 sends one entry per player slot and there is no way from
-    /// the payload alone to know which slot is being watched; the first is used, and the
-    /// kill/death derivation is guarded by `steamid` (see [`crate::gsi::derive`]), so a
-    /// wrong guess cannot produce a burst of events — it produces none.
+    /// A Dota 2 spectator payload has one entry per player slot with no way to tell which is
+    /// watched; the first is used. The kill/death derivation is guarded by `steamid` (see
+    /// [`crate::gsi::derive`]), so a wrong guess produces no events rather than a burst.
     pub fn first(&self) -> Option<&Player> {
         match self {
             PlayerBlock::Missing => None,
@@ -136,8 +130,7 @@ impl PlayerBlock {
         }
     }
 
-    /// The same player, mutably. Used by the derivation's tests, which edit one field of a
-    /// fixture rather than keeping a near-copy of the whole document for each case.
+    /// The same player, mutably, so derivation tests can edit one field of a fixture.
     pub fn first_mut(&mut self) -> Option<&mut Player> {
         match self {
             PlayerBlock::Missing => None,
@@ -165,9 +158,8 @@ pub struct Player {
 }
 
 impl Player {
-    /// Kills this player has, from whichever block the game puts them in. `None` when the
-    /// document does not say — which is different from zero, and the difference is what
-    /// keeps a missing block from looking like a score reset.
+    /// Kills this player has, from whichever block holds them. `None` when the document does not
+    /// say, which differs from zero: a missing block must not look like a score reset.
     pub fn kills(&self) -> Option<u32> {
         self.match_stats.kills.or(self.kills)
     }
@@ -278,8 +270,8 @@ mod tests {
         assert_eq!(minimal.map.name, "");
         assert_eq!(minimal.player, PlayerBlock::Missing);
 
-        // A wrong type is an error, not a silently zeroed field: a number where the
-        // document says the score is, and a block that is neither object nor array.
+        // A wrong type is an error, not a silently zeroed field: a number where the score should be,
+        // and a block that is neither object nor array.
         assert!(parse(br#"{"map":{"round":"five"}}"#).is_err());
         assert!(parse(br#"{"player":"nobody"}"#).is_err());
         assert!(parse(b"not json").is_err());
@@ -296,8 +288,8 @@ mod tests {
 
     #[test]
     fn a_kill_count_that_is_absent_is_not_zero() {
-        // The tri-state matters: a payload without `player_match_stats` must not look like
-        // a player whose score went back to zero.
+        // The tri-state matters: a payload without `player_match_stats` must not look like a score
+        // reset.
         let player = Player::default();
         assert_eq!(player.kills(), None);
         assert_eq!(player.deaths(), None);

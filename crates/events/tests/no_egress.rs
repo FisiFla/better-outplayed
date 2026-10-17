@@ -1,47 +1,39 @@
-//! Spec §7.3: enforce "zero egress" by inspecting the source tree.
+//! Zero egress, enforced by inspecting the source tree.
 //!
-//! These are static checks over the tree rather than runtime hopes, and they are the reason
-//! the two integrations can be trusted with the constraints the spec puts on them:
+//! Static checks rather than runtime hopes:
 //!
-//! * no HTTP client is constructed anywhere except the League module, which can only address
-//!   loopback ([`no_http_client_is_constructed_outside_the_loopback_module`]);
-//! * TLS certificate verification is relaxed in exactly one file, and that file is the same
-//!   one that pins the loopback address
-//!   ([`certificate_verification_is_relaxed_in_exactly_one_place`]);
-//! * every `TcpListener::bind` in the tree is pinned to loopback, and nothing in the tree
-//!   binds every interface ([`the_gsi_listener_binds_loopback_only`]).
+//! * no HTTP client is constructed outside the League module, which can only address loopback
+//!   ([`no_http_client_is_constructed_outside_the_loopback_module`]);
+//! * TLS certificate verification is relaxed in exactly one file, the one that pins the
+//!   loopback address ([`certificate_verification_is_relaxed_in_exactly_one_place`]);
+//! * every `TcpListener::bind` is pinned to loopback and nothing binds every interface
+//!   ([`the_gsi_listener_binds_loopback_only`]).
 //!
-//! A guard that passes for the wrong reason is worse than no guard, so each exemption below
-//! is by path and carries its reason — and every check reads **code**, with `//` comment
-//! lines removed first. Without that, this module's own subject matter ("the client that
-//! relaxes verification", "never bind `0.0.0.0`") would satisfy the checks it is asserting,
-//! which is precisely the failure mode these guards exist to avoid. (Only `//` line
-//! comments are stripped; the tree uses no block comments, and one would show up as an
-//! unexplained offender rather than as a silent pass.)
+//! Each exemption is by path and carries its reason. Every check reads code with `//` comment
+//! lines removed first, otherwise this module's own prose ("never bind `0.0.0.0`") would
+//! satisfy the checks it asserts. Block comments are not stripped; the tree uses none, so one
+//! would show up as an offender rather than a silent pass.
 
 use std::path::Path;
 
-/// The League module, which is the one place allowed to build its own client: it alone talks
-/// to `127.0.0.1:2999` with a self-signed certificate (spec §7.1). Exempted as a module
-/// rather than as a file, because it is split by layer — the client, the payload, the
-/// derivation, the poller — and every one of those files is part of the same exempt module.
+/// The League module, the one place allowed to build its own client: it alone talks to
+/// `127.0.0.1:2999` with a self-signed certificate. Exempted as a module because it is split
+/// by layer (client, payload, derivation, poller) and every file belongs to it.
 fn is_the_league_module(rel: &str) -> bool {
     rel == "crates/events/src/lol.rs" || rel.starts_with("crates/events/src/lol/")
 }
 
-/// The mock server the League tests drive, which builds a connector of its own **with
-/// verification left on** — that is the assertion that the generated CA is untrusted,
-/// so exempting it does not weaken anything: its connector cannot be relaxed by accident
-/// without the `danger_accept_invalid_certs` guard below failing first.
+/// The mock server the League tests drive. It builds a connector with verification left on,
+/// which asserts the generated CA is untrusted, so exempting it weakens nothing: it cannot be
+/// relaxed without the `danger_accept_invalid_certs` guard failing first.
 fn is_the_league_mock(rel: &str) -> bool {
     rel == "crates/events/tests/lol_mock.rs"
 }
 
 #[test]
 fn no_http_client_is_constructed_outside_the_loopback_module() {
-    // The literals a client is built from. `TlsConnector::builder` was added when the LoL
-    // client moved from a hypothetical `reqwest`/`ureq` to `native-tls`: the guard has to
-    // name whatever this tree actually uses, or it would pass by not looking.
+    // The literals a client is built from. The guard must name whatever this tree actually uses
+    // (`native-tls`), or it passes by not looking.
     let literals = ["reqwest::Client", "ureq::agent", "TlsConnector::builder"];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut offenders = Vec::new();
@@ -54,9 +46,7 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
         if is_the_league_module(&rel) || is_the_league_mock(&rel) {
             continue;
         }
-        // The guard must not scan itself: this file necessarily contains the very
-        // literals it searches for. Exempted by path, explicitly, rather than by
-        // splitting the literals.
+        // The guard must not scan itself: this file contains the literals it searches for.
         if rel.ends_with("no_egress.rs") {
             continue;
         }
@@ -75,10 +65,9 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
 
 #[test]
 fn certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed() {
-    // The binding security constraint of spec §7.1, as a static property. The League client
-    // trusts Riot's pinned root only, so *no* file may turn chain verification off, and the
-    // one remaining relaxation (the host-name match, which an IP literal cannot satisfy) lives
-    // in exactly one file: the one that pins the address.
+    // The League client trusts Riot's pinned root only, so no file may turn chain verification
+    // off, and the one remaining relaxation (the host-name match, which an IP literal cannot
+    // satisfy) lives in exactly one file: the one that pins the address.
     const THE_ONE_FILE: &str = "crates/events/src/lol/client.rs";
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut chain_offenders = Vec::new();
@@ -116,8 +105,8 @@ fn certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed() {
     assert!(client.contains("disable_built_in_roots(true)"), "platform roots must be disabled");
     assert!(client.contains("add_root_certificate"), "the pinned root must be added");
 
-    // And that one file must be the one that pins the address: the relaxation and the
-    // loopback endpoint are supposed to be the same object, not two decisions.
+    // That file must also pin the address: the relaxation and the loopback endpoint are one
+    // decision, not two.
     let client = code_of(&root.join(THE_ONE_FILE));
     assert!(
         client.contains("is_loopback"),
@@ -139,11 +128,9 @@ fn the_gsi_listener_binds_loopback_only() {
         }
         let text = code_of(&entry);
         if text.contains("TcpListener::bind") {
-            // Any of the three is the same pin, spelled the way the code that has it
-            // spells it: the literal address, `Ipv4Addr::LOCALHOST`, or a check of the
-            // address's own `is_loopback` (which is what `gsi::bind` does before binding
-            // anything). Comments are already stripped, so a mention in prose cannot
-            // satisfy this.
+            // Any of the three is the same pin, however the code spells it: the literal address,
+            // `Ipv4Addr::LOCALHOST`, or an `is_loopback` check (as `gsi::bind` does). Comments are
+            // stripped, so prose cannot satisfy this.
             let pinned = ["127.0.0.1", "LOCALHOST", "is_loopback"]
                 .iter()
                 .any(|pin| text.contains(pin));
@@ -153,9 +140,8 @@ fn the_gsi_listener_binds_loopback_only() {
                  Ipv4Addr::LOCALHOST, is_loopback)",
                 entry.display()
             );
-            // A wildcard *bind* is the mistake worth catching — line by line, so that a
-            // test asserting the refusal of `0.0.0.0` (which is what the listener's own
-            // tests do) is not mistaken for the mistake itself.
+            // A wildcard bind is the mistake to catch, line by line, so a test asserting the refusal of
+            // `0.0.0.0` is not mistaken for it.
             let wildcard: Vec<&str> = text
                 .lines()
                 .filter(|line| line.contains("TcpListener::bind") && line.contains("0.0.0.0"))
@@ -171,9 +157,8 @@ fn the_gsi_listener_binds_loopback_only() {
 
 #[test]
 fn only_the_loopback_modules_talk_to_a_socket_at_all() {
-    // The broader property the three checks above add up to: the tree's socket *clients* are
-    // the League module and the test mock. A new `TcpStream::connect` elsewhere is a new
-    // outbound path and belongs in this list deliberately, not by accident.
+    // The socket clients are the League module and the test mock. A new `TcpStream::connect`
+    // elsewhere is a new outbound path and belongs in this list deliberately.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut connecting: Vec<String> = Vec::new();
 
@@ -203,8 +188,8 @@ fn only_the_loopback_modules_talk_to_a_socket_at_all() {
     );
 }
 
-/// A file's Rust code, with `//` comment lines removed. Doc comments are comments: what
-/// these guards are about is what the code does, not what it says about itself.
+/// A file's Rust code with `//` comment lines removed (doc comments included): the guards are
+/// about what the code does, not what it says about itself.
 fn code_of(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -219,9 +204,8 @@ fn walk_rs(dir: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for e in entries.filter_map(|e| e.ok()) {
         let p = e.path();
-        // Prune build output and VCS metadata: `target/` holds the whole crates.io
-        // registry cache, whose vendored sources would otherwise be walked (and
-        // could trip the assertions) on every run.
+        // Prune build output and VCS metadata: `target/` holds the crates.io registry cache, whose
+        // vendored sources would otherwise be walked on every run.
         let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
         if p.is_dir() && (name == "target" || name == ".git") {
             continue;

@@ -1,31 +1,21 @@
 //! The game-presence API as a driver outside this crate sees it.
 //!
-//! `process.rs`'s own tests drive the logic directly; this file drives the **public
-//! surface**, which is what the tray and the CLI actually call. That is a different
-//! question, and it catches a different class of mistake: a type that is right but not
-//! exported, a constructor a caller cannot reach, an opt-in that is a flag on a watcher
-//! that runs anyway.
+//! `process.rs`'s own tests drive the logic directly; this file drives the public surface the
+//! tray and the CLI call, which catches a type that is right but not exported, a constructor a
+//! caller cannot reach, or an opt-in that is a flag on a watcher that runs anyway.
 //!
-//! # What this proves
+//! Proven here:
+//! * the shipped watch list is six titles, and League of Legends is the only one recognised by
+//!   Riot's Live Client Data API (Valorant has none and is watched by its game process);
+//! * with `auto_record = false` (the default) nothing is started: no watcher, poll, snapshot
+//!   or request;
+//! * with it on, the production path builds, runs and stops cleanly, and stopping releases the
+//!   channel;
+//! * a game already running at start is reported once by the first poll, and not again;
+//! * the process watcher either answers (Windows) or refuses with a clear reason, never panics.
 //!
-//! * the shipped watch list is the six titles, and League of Legends is the only one
-//!   recognised by Riot's Live Client Data API — Valorant is a Riot title without one, and
-//!   is watched by its game process instead;
-//! * with `auto_record = false` (the default) **nothing is started at all**: no watcher, no
-//!   poll, no snapshot, no request. The opt-in is real;
-//! * with it on, the production path builds, runs and stops cleanly, and stopping releases
-//!   the channel;
-//! * a game already running when the watcher starts is reported by the first poll, once,
-//!   and a game that goes on running is not reported again;
-//! * the process watcher either answers (Windows) or refuses with a clear reason and never
-//!   panics — the non-Windows half of the trait's contract.
-//!
-//! # What this does not prove
-//!
-//! The Windows enumeration itself, which needs a Windows machine to run: see the module
-//! docs in `process.rs`. Nothing here touches a socket except the Live Client Data API
-//! source, which addresses `127.0.0.1:2999` and nothing else (it is refused on a machine
-//! with no game running, which is every machine this test has run on).
+//! Not proven: the Windows enumeration itself (see `process.rs`). The only socket touched is
+//! the Live Client Data API source on `127.0.0.1:2999`, refused when no game runs.
 
 use localplay_events::process::{
     default_watch, GamePresence, GameWatcher, GamesSection, Presence,
@@ -36,10 +26,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A detector that answers the same thing every time, and counts how often it was asked.
-///
-/// Cheap on purpose: what is under test here is not detection but what the loop around a
-/// detector does with the answers.
+/// A detector that answers the same thing every time and counts how often it was asked, so the
+/// tests exercise the loop around a detector rather than detection.
 struct Always {
     games: Vec<WatchedGame>,
     running: Vec<String>,
@@ -79,9 +67,8 @@ fn the_shipped_watch_list_is_the_titles_the_project_names() {
         ]
     );
 
-    // The distinction that matters: the Live Client Data API is Riot's, and Riot publishes
-    // it for League. Valorant is a Riot title that publishes none, so the watch list says
-    // `process` for it — a lie would be worse than a mechanism.
+    // The Live Client Data API is Riot's, published for League only. Valorant has none, so the
+    // watch list says `process` for it.
     let by_api: Vec<&str> = watch
         .iter()
         .filter(|game| game.signal == Signal::LiveClientApi)
@@ -93,7 +80,7 @@ fn the_shipped_watch_list_is_the_titles_the_project_names() {
         .iter()
         .any(|game| game.exe == "VALORANT-Win64-Shipping.exe" && game.signal == Signal::Process));
 
-    // Every title is watched by a *game* process, not by a launcher's.
+    // Every title is watched by a game process, not a launcher's.
     for launcher in ["LeagueClient.exe", "VALORANT.exe", "steam.exe"] {
         assert!(
             watch.iter().all(|game| !game.exe.eq_ignore_ascii_case(launcher)),
@@ -112,8 +99,8 @@ fn auto_record_off_starts_nothing_and_therefore_polls_nothing() {
     );
     drop(started);
 
-    // Nothing was started, so the sink went with it: that is the whole safety property —
-    // with the feature off, not even a process list is enumerated.
+    // Nothing was started, so the sink went with it: with the feature off, not even a process
+    // list is enumerated.
     match changes.recv_timeout(Duration::from_secs(1)) {
         Err(RecvTimeoutError::Disconnected) => {}
         other => panic!("nothing should have been watching, but the channel said {other:?}"),
@@ -130,9 +117,8 @@ fn auto_record_on_starts_a_watcher_that_stops_cleanly() {
         .expect("a watcher builds")
         .expect("auto_record is on, so a watcher exists");
 
-    // Let it poll at least once. A build machine is not running any of these games, so
-    // there is normally nothing to receive — and if the machine *is* mid-match (a
-    // developer's own box), whatever arrives is drained rather than asserted about.
+    // Let it poll at least once. A build machine runs none of these games; if one is mid-match,
+    // whatever arrives is drained rather than asserted about.
     std::thread::sleep(Duration::from_millis(400));
     handle.stop();
 
@@ -200,8 +186,8 @@ fn the_watcher_thread_reports_a_start_and_releases_the_sink_when_stopped() {
 
 #[test]
 fn the_process_watcher_answers_on_windows_and_refuses_clearly_elsewhere() {
-    // The non-Windows half of the trait's contract: a clear error, never a panic and never
-    // a silent empty list that a driver would read as "every game has stopped".
+    // A clear error, never a panic and never a silent empty list a driver would read as "every
+    // game has stopped".
     let mut watcher = ProcessWatcher::new(default_watch()).expect("a validated watch list");
     let answer = watcher.poll();
 

@@ -1,84 +1,70 @@
-//! Snapshot → events, as a pure state machine.
+//! Snapshot to events, as a pure state machine.
 //!
-//! Nothing in this module has a socket, a clock or a log: it is
-//! `previous knowledge + one document → events`, so every rule below is a unit test.
-//! [`crate::lol::poller`] is what puts it on a network.
+//! No socket, clock or log: previous knowledge plus one document yields events, so every rule
+//! is a unit test. [`crate::lol::poller`] puts it on a network.
 //!
-//! # The attach policy, stated explicitly
-//!
-//! The Live Client serves the whole event log of the game so far, and a game is usually
-//! well under way before localplay is started. Replaying that history would be an event
-//! storm — dozens of clips at once, all of footage the user did not ask for. So:
+//! The Live Client serves the whole event log so far, and a game is usually well under way
+//! before localplay starts. Replaying that history would be a storm of clips of footage nobody
+//! asked for, hence the attach policy:
 //!
 //! | transition | what is emitted |
 //! |---|---|
-//! | no game → game | **`GameStart` only.** Every event already in the document is adopted as seen (`adopted_in_progress_events` in the payload says how many), and none of them is emitted. |
-//! | game → no game | **`GameEnd`**, once. Emitted from the *falling edge*, so a poll that finds no game, and every poll after it, is silent. |
-//! | game → game | only events whose id has not been seen. |
-//! | a fresh `GameStart` line appears mid-game | the client restarted without the endpoint going quiet: the tracker resets, adopts again and emits **`GameStart` only** — the same policy, because it is the same situation. |
+//! | no game to game | `GameStart` only. Every event already in the document is adopted as seen (`adopted_in_progress_events` in the payload counts them), none emitted. |
+//! | game to no game | `GameEnd`, once, on the falling edge; every later no-game poll is silent. |
+//! | game to game | only events whose id has not been seen. |
+//! | a fresh `GameStart` line appears mid-game | the client restarted without the endpoint going quiet: reset, adopt again, emit `GameStart` only. |
 //!
-//! # Idempotence
-//!
-//! Events are identified by `EventID` (a monotonic per-game counter) and only unseen ids
-//! are emitted, so polling the same document twice emits nothing the second time. A
-//! document whose events carry no id (the client has been seen to omit it) falls back to a
-//! synthetic key derived from the event's own content, which keeps idempotence without
-//! inventing an ordering.
-//!
-//! # The mapping (spec §7.1)
+//! Idempotence: events are identified by `EventID` (a monotonic per-game counter) and only
+//! unseen ids are emitted, so polling the same document twice emits nothing. A document whose
+//! events carry no id (the client has omitted it) falls back to a key derived from the event's
+//! content, which keeps idempotence without inventing an ordering.
 //!
 //! | `EventName` | kind |
 //! |---|---|
 //! | `ChampionKill` | `Kill` / `Death` / `Assist`, by comparing `KillerName` / `VictimName` / `Assisters` against the watched player's names |
 //! | `DragonKill`, `BaronKill`, `HeraldKill`, `TurretKilled` / `FirstBrick`, `InhibKilled` | `Dragon`, `Baron`, `Herald`, `Turret`, `Inhibitor` |
 //! | `EpicMonsterKill` (by `MonsterType`), `HordeKill`, `FirstBlood`, `Ace`, `Multikill` | the matching sub-kind, else `Objective` |
-//! | `GameStart`, `GameEnd` | handled by the state machine above, never by the table |
+//! | `GameStart`, `GameEnd` | the state machine above, never the table |
 //! | anything else (`MinionsSpawning`, a future name) | nothing |
 //!
-//! A `ChampionKill` that involves nobody the document names as the watched player is
-//! **not** emitted: a fight the user was not in is not a clip. When the document names no
-//! player at all — the loading screen, or a patch that moved the field — there is nothing
-//! to compare against, and the kill is emitted as `Kill` with the names in its payload
-//! rather than being thrown away.
+//! A `ChampionKill` involving nobody the document names as the watched player is not emitted
+//! (a fight the user was not in is not a clip). When the document names no player at all (the
+//! loading screen, or a patch that moved the field) there is nothing to compare, and the kill is
+//! emitted as `Kill` with the names in its payload rather than dropped.
 
 use crate::lol::payload::{GameSnapshot, StreamEvent};
 use crate::{EventKind, GameEvent, Source};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
-/// The state machine: what has been seen, and what is currently true.
-///
-/// Derives `Default` — "nothing seen, no game" — which is what a freshly started poller
-/// knows.
+/// The state machine: what has been seen, and what is currently true. `Default` is "nothing
+/// seen, no game", what a freshly started poller knows.
 #[derive(Debug, Default)]
 pub struct Tracker {
     in_game: bool,
-    /// Ids of the events this track has already accounted for. Cleared whenever the game
-    /// changes, because the client numbers ids per game.
+    /// Ids of the events already accounted for. Cleared when the game changes, since the client
+    /// numbers ids per game.
     seen: HashSet<EventKey>,
-    /// The game clock at the last document that described a game, for the `GameEnd`
-    /// payload's "how long did it run" line.
+    /// The game clock at the last document that described a game, for the `GameEnd` payload's
+    /// duration.
     last_game_time: f64,
-    /// The scoreboard of the last document that described a game: the falling edge has no
-    /// document of its own, so the end-of-game scoreboard is the last one seen alive.
+    /// The scoreboard of the last document that described a game: the falling edge has no document
+    /// of its own, so the end-of-game scoreboard is the last one seen alive.
     last_scoreboard: Value,
-    /// How many in-progress events the last attach adopted without emitting. Exposed for
-    /// the poller's log line, which is where a user finds out why the first clip is not
-    /// preceded by forty others.
+    /// How many in-progress events the last attach adopted without emitting; the poller logs it so
+    /// a user can see why the first clip is not preceded by forty others.
     adopted_on_attach: u64,
-    /// The map the last attach was for, for the poller's log line. Kept as a field rather
-    /// than read back out of the payload the derivation just rendered.
+    /// The map of the last attach, for the poller's log line, kept rather than read back out of the
+    /// rendered payload.
     attached_map: String,
 }
 
 impl Tracker {
     /// Observe one poll and return what it implies.
     ///
-    /// `observed` is `None` when the poll found no game — a 404, or a connection refusal.
-    /// A poll that *failed* (a malformed body, a TLS error) must not be passed in as
-    /// `None`: the caller keeps its state instead, which is why
-    /// [`crate::lol::poller::LolPoller::poll_once`] decides that and this function does not
-    /// see it.
+    /// `observed` is `None` when the poll found no game (a 404 or connection refusal). A poll that
+    /// failed (malformed body, TLS error) must not be passed as `None`: the caller keeps its state,
+    /// which [`crate::lol::poller::LolPoller::poll_once`] decides, not this function.
     pub fn observe(&mut self, observed: Option<&GameSnapshot>) -> Vec<GameEvent> {
         let Some(snapshot) = observed.filter(|snapshot| snapshot.game_present()) else {
             return self.end_game();
@@ -87,9 +73,9 @@ impl Tracker {
         if !self.in_game {
             return self.start_game(snapshot);
         }
-        // The player quit and requeued faster than the endpoint stopped answering: this
-        // document is a different game. Re-attach, exactly as if the endpoint had gone
-        // quiet first — otherwise the new game's early events arrive as a burst of clips.
+        // The player quit and requeued faster than the endpoint stopped answering, so this is a
+        // different game. Re-attach as if the endpoint had gone quiet, or the new game's early events
+        // arrive as a burst of clips.
         if self.started_again(snapshot) {
             return self.start_game(snapshot);
         }
@@ -103,17 +89,15 @@ impl Tracker {
                 continue;
             }
             match entry.event_name.as_str() {
-                // The game's own `GameStart` line, seen for the first time. That happens
-                // when the client begins including an event history it was not sending
-                // before — the loading screen serves an empty list — so this is the game
-                // already being watched, not a new one. Adopted in silence; a *different*
-                // game is recognised by its clock, below.
+                // The game's own `GameStart` line, seen for the first time. This happens when the client
+                // starts including an event history it was not sending before (the loading screen serves an
+                // empty list), so it is the game already watched, not a new one. Adopted silently; a
+                // different game is recognised by its clock, below.
                 "GameStart" => {
                     self.seen.insert(key);
                 }
-                // The document sometimes carries the end of the game as an event. Treated
-                // as the end of the game, so that the 404 which follows does not report it
-                // a second time.
+                // The document sometimes carries the end of the game as an event. Treat it as the end so the
+                // 404 that follows does not report it again.
                 "GameEnd" => {
                     self.in_game = false;
                     self.seen.clear();
@@ -132,14 +116,12 @@ impl Tracker {
         out
     }
 
-    /// Whether this document belongs to a *different* game than the one being tracked.
+    /// Whether this document belongs to a different game than the one tracked.
     ///
-    /// The Live Client's `gameTime` counts up from a negative value during the loading
-    /// screen, so a clock that has jumped backwards can only mean the client started
-    /// another game — the endpoint never went quiet, so there is no `GameEnd` to see. Event
-    /// ids restart with the game and cannot be used for this (`EventID` 0 is `GameStart` in
-    /// every game). A document that omits the clock is not evidence of anything and never
-    /// triggers this.
+    /// `gameTime` counts up from a negative value during the loading screen, so a clock that jumped
+    /// backwards means a new game started without the endpoint going quiet, leaving no `GameEnd` to
+    /// see. Event ids restart per game and cannot be used (`EventID` 0 is `GameStart` in every
+    /// game). A document omitting the clock is no evidence and never triggers this.
     fn started_again(&self, snapshot: &GameSnapshot) -> bool {
         /// Seconds of backwards movement that cannot be jitter within one game.
         const BACKWARDS_S: f64 = 5.0;
@@ -159,14 +141,12 @@ impl Tracker {
         self.adopted_on_attach
     }
 
-    /// The game mode and map of the last attach, for a driver's log line. Empty before the
-    /// first attach.
+    /// The game mode and map of the last attach, for a driver's log line; empty before the first.
     pub fn attached_map(&self) -> &str {
         &self.attached_map
     }
 
-    /// No game (or a new game): emit `GameStart` and take the document's history as already
-    /// seen.
+    /// No game (or a new game): emit `GameStart` and take the document's history as already seen.
     fn start_game(&mut self, snapshot: &GameSnapshot) -> Vec<GameEvent> {
         self.in_game = true;
         self.seen.clear();
@@ -195,8 +175,8 @@ impl Tracker {
     fn adopt(&mut self, snapshot: &GameSnapshot) -> u64 {
         let mut adopted = 0;
         for entry in snapshot.event_stream() {
-            // Deduplicate: an id-less document can legitimately repeat a line, and the
-            // count reported to the user should be the number of *events* adopted.
+            // Deduplicate: an id-less document can repeat a line, and the count reported should be the
+            // number of events adopted.
             if self.seen.insert(EventKey::of(entry)) {
                 adopted += 1;
             }
@@ -219,8 +199,8 @@ impl EventKey {
         if entry.event_id != 0 {
             return EventKey::Id(entry.event_id);
         }
-        // FNV-1a over the fields that describe the event. Not a security hash: it only has
-        // to be stable and collision-resistant enough for a few hundred events.
+        // FNV-1a over the fields describing the event. Not a security hash: it only needs to be stable
+        // and collision-resistant enough for a few hundred events.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed = |bytes: &[u8]| {
             for byte in bytes {
@@ -230,8 +210,8 @@ impl EventKey {
         };
         feed(entry.event_name.as_bytes());
         feed(b"\x1f");
-        // Time to a tenth of a second: the client's clock has more digits than a payload
-        // ever needs, and two events at the same tenth are the same event.
+        // Time to a tenth of a second: the client's clock has more digits than needed, and two events
+        // at the same tenth are the same event.
         feed(format!("{:.1}", entry.event_time).as_bytes());
         for name in [
             entry.killer_name.as_deref(),
@@ -259,8 +239,7 @@ fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind
         // A champion kill is about the watched player, when the document names one.
         "ChampionKill" => {
             if names.is_empty() {
-                // Nothing to compare against: the kill is real, so it is reported, with
-                // both names in the payload for whoever reads it later.
+                // Nothing to compare against: the kill is real, so report it with both names in the payload.
                 return Some(EventKind::Kill);
             }
             if entry.killer_name.as_deref().is_some_and(|k| names.contains(&k)) {
@@ -281,19 +260,19 @@ fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind
         "HeraldKill" => Some(EventKind::Herald),
         "TurretKilled" | "FirstBrick" => Some(EventKind::Turret),
         "InhibKilled" => Some(EventKind::Inhibitor),
-        // The client folds the epic monsters into one name on some patches; the monster type
-        // says which. An epic monster this build cannot name stays a plain objective.
+        // The client folds the epic monsters into one name on some patches; the monster type says
+        // which. An epic monster this build cannot name stays a plain objective.
         "EpicMonsterKill" => Some(epic_monster_kind(entry.monster_type.as_deref())),
         "HordeKill" | "FirstBlood" | "Ace" | "Multikill" => Some(EventKind::Objective),
-        // The lifecycle is the state machine's business; the pacing events are not
-        // clip-worthy, and an unknown name is a patch this build has not seen.
+        // The lifecycle is the state machine's business; pacing events are not clip-worthy, and an
+        // unknown name is a patch this build has not seen.
         _ => None,
     }
 }
 
 /// The sub-kind of an `EpicMonsterKill`, from the client's `MonsterType` (`"Dragon"`,
-/// `"Baron"`, `"Horde"`, ... — matched case-insensitively and by prefix, as the client has
-/// spelled these both `"BARON_NASHOR"` and `"Baron"`).
+/// `"Baron"`, `"Horde"`, ...), matched case-insensitively and by prefix, as the client has
+/// spelled these both `"BARON_NASHOR"` and `"Baron"`.
 fn epic_monster_kind(monster_type: Option<&str>) -> EventKind {
     let monster = monster_type.unwrap_or_default().to_ascii_lowercase();
     if monster.starts_with("dragon") {
@@ -307,11 +286,9 @@ fn epic_monster_kind(monster_type: Option<&str>) -> EventKind {
     }
 }
 
-/// A per-event payload: what happened, plus the fields the Live Client gave us for it.
-///
-/// A serde_json object built field by field so that a key the document omitted is absent
-/// from the payload rather than present and null — the `events.payload` column is read by
-/// a human and by the session UI, and `"killer": null` is noise.
+/// A per-event payload: what happened plus the fields the Live Client gave for it, built field
+/// by field so an omitted key is absent rather than null (`"killer": null` is noise in the
+/// column a human and the session UI read).
 fn event_payload(source: &str, name: &str, entry: &StreamEvent, game_time: f64) -> Value {
     let mut map = Map::new();
     map.insert("source".into(), json!(source));
@@ -369,12 +346,12 @@ fn start_event(snapshot: &GameSnapshot, adopted: u64) -> GameEvent {
     GameEvent::new(Source::Lol, EventKind::GameStart, Value::Object(map))
 }
 
-/// The `GameEnd` payload. The endpoint simply stops answering, so the reason is stated in
-/// the record rather than left to be inferred from an absence.
+/// The `GameEnd` payload. The endpoint just stops answering, so the reason is stated in the
+/// record rather than inferred from an absence.
 ///
-/// `scoreboard` (the last one seen) and `result` (`"Win"`/`"Lose"`, only when the document
-/// carried its own `GameEnd` line) ride along so the match keeps its end-of-game scoreboard;
-/// `result` is `null` rather than guessed when the endpoint just went quiet.
+/// `scoreboard` (the last seen) and `result` (`"Win"`/`"Lose"`, only when the document carried
+/// its own `GameEnd` line) ride along so the match keeps its end-of-game scoreboard; `result` is
+/// `null` rather than guessed when the endpoint merely went quiet.
 fn end_event(last_game_time: f64, scoreboard: Value, result: Option<String>) -> GameEvent {
     let scoreboard = if scoreboard.is_null() { json!([]) } else { scoreboard };
     GameEvent::new(
@@ -391,8 +368,8 @@ fn end_event(last_game_time: f64, scoreboard: Value, result: Option<String>) -> 
     )
 }
 
-/// Two decimal places is more than any of these values needs, and it keeps a payload
-/// readable and comparable in tests.
+/// Two decimal places is more than these values need and keeps payloads readable and
+/// comparable in tests.
 fn round_tenth(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
@@ -426,8 +403,8 @@ mod tests {
 
     #[test]
     fn attaching_to_a_game_already_in_progress_reports_the_attach_and_nothing_else() {
-        // The event storm this policy exists to prevent: the document already holds six
-        // events, two of which are the watched player's kill and death.
+        // The event storm this policy prevents: the document already holds six events, two of them the
+        // watched player's kill and death.
         let mut tracker = Tracker::default();
         let first = tracker.observe(snapshot(IN_PROGRESS).as_ref());
 
@@ -444,8 +421,8 @@ mod tests {
     fn the_same_document_twice_emits_nothing_the_second_time() {
         let mut tracker = Tracker::default();
         tracker.observe(snapshot(IN_PROGRESS).as_ref());
-        // The poller will serve the same document for several seconds while a game is
-        // quiet; every one of those polls must be a no-op.
+        // The poller serves the same document for several seconds while a game is quiet; each of those
+        // polls must be a no-op.
         for _ in 0..5 {
             assert!(tracker.observe(snapshot(IN_PROGRESS).as_ref()).is_empty());
         }
@@ -453,9 +430,8 @@ mod tests {
 
     #[test]
     fn every_event_of_a_full_history_is_derived_once_and_in_order() {
-        // No attach here: the tracker starts on an empty document (a game whose payload
-        // has arrived but which the tracker has not yet seen is the *attach* case above).
-        // Reached instead by attaching to an empty game and then seeing the history grow.
+        // No attach here: the tracker starts on an empty document. Reached by attaching to an empty
+        // game and then seeing the history grow.
         let mut tracker = Tracker::default();
 
         // 1. A game with no events yet: attach.
@@ -545,9 +521,8 @@ mod tests {
 
     #[test]
     fn a_new_game_starting_mid_game_resets_the_tracker_instead_of_replaying_it() {
-        // The abrupt re-attach: the player quit and requeued, and the endpoint never went
-        // quiet, so the first thing the tracker sees of the new game is a fresh GameStart
-        // line — with ids that restart at 0.
+        // The abrupt re-attach: the player quit and requeued and the endpoint never went quiet, so the
+        // first thing seen of the new game is a fresh GameStart line, with ids restarting at 0.
         let mut tracker = Tracker::default();
         tracker.observe(snapshot(IN_PROGRESS).as_ref());
         tracker.observe(snapshot(EVENTS_NEXT).as_ref());
@@ -564,9 +539,8 @@ mod tests {
 
     #[test]
     fn without_a_named_player_a_champion_kill_is_reported_as_a_kill() {
-        // The document names no player (the loading screen, or a patch that moved the
-        // field). There is nothing to compare against, so a real kill is reported rather
-        // than dropped — with both names in the payload.
+        // The document names no player (loading screen, or a patch that moved the field): a real kill
+        // is reported rather than dropped, with both names in the payload.
         let mut tracker = Tracker::default();
         // Attach on a game that has happened to report no events yet …
         tracker.observe(
@@ -586,8 +560,7 @@ mod tests {
 
     #[test]
     fn an_own_kill_is_a_kill_a_shared_kill_is_an_assist_and_an_own_death_is_a_death() {
-        // One document per case, so the classification is pinned to the rule rather than
-        // to the fixture's ordering.
+        // One document per case, so classification is pinned to the rule, not the fixture's ordering.
         let with_player = |event: &str| -> Vec<EventKind> {
             let body = format!(
                 r#"{{"gameData":{{"gameTime":100.0,"mapName":"Map11"}},
@@ -595,8 +568,8 @@ mod tests {
                      "events":{{"Events":[{event}]}}}}"#
             );
             let mut tracker = Tracker::default();
-            // Attach first, on a document with no events at all, so that the event under
-            // test is a new line rather than part of an adopted history.
+            // Attach first on a document with no events, so the event under test is a new line, not part
+            // of an adopted history.
             tracker.observe(
                 crate::lol::payload::parse(
                     br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"},
@@ -667,8 +640,8 @@ mod tests {
 
     #[test]
     fn an_id_less_document_still_emits_an_event_only_once() {
-        // The client has been seen to omit `EventID`. The fallback key is the event's own
-        // content, so polling the same document twice is still a no-op.
+        // The client has omitted `EventID`. The fallback key is the event's content, so polling the
+        // same document twice is still a no-op.
         let body = br#"{"gameData":{"gameTime":100.0,"mapName":"Map11"},
                        "activePlayer":{"summonerName":"TestPlayer#EUW"},
                        "events":{"Events":[{"EventName":"DragonKill","EventTime":99.3,"MonsterType":"DRAGON"}]}}"#;
@@ -686,8 +659,7 @@ mod tests {
         assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::Dragon]);
         assert!(tracker.observe(document.as_ref()).is_empty(), "the same line again");
 
-        // A *different* id-less event is emitted: the key is content, not "any id-less
-        // event".
+        // A different id-less event is emitted: the key is content, not "any id-less event".
         let other = crate::lol::payload::parse(
             br#"{"gameData":{"gameTime":110.0,"mapName":"Map11"},
                  "activePlayer":{"summonerName":"TestPlayer#EUW"},
@@ -700,8 +672,8 @@ mod tests {
 
     #[test]
     fn a_game_end_event_inside_the_document_is_not_reported_twice() {
-        // Some builds put the end of the game in the stream. It ends the game; the 404
-        // that follows must not end it again.
+        // Some builds put the end of the game in the stream. It ends the game; the 404 that follows
+        // must not end it again.
         let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
                        "activePlayer":{"summonerName":"TestPlayer#EUW"},
                        "events":{"Events":[{"EventID":40,"EventName":"GameEnd","EventTime":2400.0}]}}"#;

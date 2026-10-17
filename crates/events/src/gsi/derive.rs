@@ -1,46 +1,35 @@
-//! GSI document → events, as a pure state machine (spec §7.2).
+//! GSI document to events, as a pure state machine.
 //!
-//! Valve's GSI is a *snapshot* service, not an event stream: the game POSTs the current
-//! state whenever it changes (and on a heartbeat), and every conclusion about what
-//! happened has to be drawn from the difference between two snapshots. So this module is
-//! one function of `previous knowledge + document`, with no socket, no clock and no log —
-//! and every rule below is a unit test.
-//!
-//! # The mapping, stated explicitly
+//! GSI is a snapshot service, not an event stream: the game POSTs the current state on change
+//! and on a heartbeat, so what happened must be drawn from the difference between two
+//! snapshots. This is one function of previous knowledge plus document, with no socket, clock
+//! or log.
 //!
 //! | what changed | kind |
 //! |---|---|
 //! | nothing was in a game, now there is | `GameStart` |
 //! | a game was in progress, now there is not (`map.phase == "gameover"`, Dota 2's `POST_GAME`, or an empty map) | `GameEnd` |
-//! | `player.match_stats.kills` (Dota 2: `player.kills`) went **up** | `Kill` |
-//! | `…deaths` went up | `Death` |
-//! | `…assists` went up | `Assist` |
-//! | `map.round` went **up** | `RoundStart` |
+//! | `player.match_stats.kills` (Dota 2: `player.kills`) went up | `Kill` |
+//! | `deaths` went up | `Death` |
+//! | `assists` went up | `Assist` |
+//! | `map.round` went up | `RoundStart` |
 //! | `round.phase` became `"over"` | `RoundEnd` |
 //! | the bomb state became `"planted"` / `"defused"` | `BombPlanted` / `BombDefused` |
 //! | anything else | nothing |
 //!
-//! # Three rules that make it survive real payloads
+//! Three rules make it survive real payloads:
 //!
-//! * **A delta, not a count.** The scoreboards are totals, and a total only means something
-//!   relative to the previous one. So the tracker keeps a baseline, and it must be the
-//!   *same player's* baseline: the `steamid` is compared, and a payload that describes a
-//!   different player (a spectator switching point of view) re-baselines silently instead
-//!   of reporting somebody else's kills as a jump.
-//! * **A jump is one event, not N.** Two kills landing inside one POST window (GSI reports
-//!   at a few hertz at best) are one `Kill` event carrying `"delta": 2`. Clipping twice for
-//!   one payload would be inventing events that were never separately observed.
-//! * **Transitions, not values.** Round and bomb events fire on the *edge*, so the periodic
-//!   heartbeat POST — which repeats the current state verbatim — emits nothing. Without
-//!   this, a heartbeat would be a clip every ten seconds.
+//! * A delta, not a count. Scoreboards are totals, so the tracker keeps a baseline, and it
+//!   must be the same player's: `steamid` is compared, and a payload for a different player (a
+//!   spectator switching view) re-baselines silently instead of reporting their kills as a jump.
+//! * A jump is one event. Two kills inside one POST window are one `Kill` with `"delta": 2`;
+//!   two clips for one payload would invent events never separately observed.
+//! * Transitions, not values. Round and bomb events fire on the edge, so the heartbeat that
+//!   repeats the state emits nothing (else a clip every ten seconds).
 //!
-//! # The attach policy
-//!
-//! Identical to the League tracker's (see [`crate::lol::derive`]): the first document of a
-//! game reports `GameStart` and adopts the scoreboard, the round and the bomb state as the
-//! baseline. The kills that happened before localplay was watching are not reported — a
-//! payload that arrives mid-match must not produce a burst of clips for the whole match so
-//! far.
+//! Attach policy is the League tracker's (see [`crate::lol::derive`]): the first document of a
+//! game reports `GameStart` and adopts the scoreboard, round and bomb state as the baseline, so
+//! a payload arriving mid-match does not produce a burst of clips for the match so far.
 
 use crate::gsi::payload::{GsiSnapshot, Player};
 use crate::{EventKind, GameEvent, Source};
@@ -56,8 +45,8 @@ pub enum Game {
 }
 
 impl Game {
-    /// The game a document reports, from its app id — the one field Valve guarantees — and
-    /// falling back to the provider's name for a payload from a client that disagrees.
+    /// The game a document reports, from its app id (the one field Valve guarantees), falling back
+    /// to the provider's name for a client that disagrees.
     pub fn of(snapshot: &GsiSnapshot) -> Option<Game> {
         match snapshot.provider.appid {
             730 => Some(Game::Cs2),
@@ -83,8 +72,8 @@ impl Game {
     }
 }
 
-/// The scoreboard, round and bomb state a document describes — the "previous" side of the
-/// next diff.
+/// The scoreboard, round and bomb state a document describes: the "previous" side of the next
+/// diff.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Baseline {
     game: Option<Game>,
@@ -114,9 +103,9 @@ impl Baseline {
         }
     }
 
-    /// Whether `snapshot` describes the same player as this baseline, so that a scoreboard
-    /// delta is meaningful. A document that names no steam id cannot be compared, and is
-    /// treated as a different player rather than as a zero.
+    /// Whether `snapshot` describes the same player as this baseline, so a scoreboard delta is
+    /// meaningful. A document naming no steam id cannot be compared and is treated as a different
+    /// player, not as a zero.
     fn same_player(&self, snapshot: &GsiSnapshot) -> bool {
         match (self.steamid.as_deref(), snapshot.player.first().and_then(player_steamid)) {
             (Some(previous), Some(current)) => previous == current,
@@ -129,9 +118,8 @@ fn player_steamid(player: &Player) -> Option<String> {
     player.steamid.clone().filter(|id| !id.is_empty())
 }
 
-/// The bomb state, preferring the detailed root `bomb` block and falling back to
-/// `round.bomb` (the two are documented as describing the same thing at different
-/// resolutions).
+/// The bomb state, preferring the detailed root `bomb` block and falling back to `round.bomb`
+/// (the same thing at different resolutions).
 fn bomb_state(snapshot: &GsiSnapshot) -> String {
     if snapshot.bomb.state.is_empty() {
         snapshot.round.bomb.clone()
@@ -145,17 +133,17 @@ fn bomb_state(snapshot: &GsiSnapshot) -> String {
 pub struct Tracker {
     in_game: bool,
     baseline: Baseline,
-    /// How many documents have been folded in. Used only to make the tests explicit about
-    /// attach versus steady state; the derivation does not need it.
+    /// How many documents have been folded in; only makes tests explicit about attach versus
+    /// steady state.
     observed: u64,
 }
 
 impl Tracker {
     /// Observe one POST body and return what it implies.
     ///
-    /// A document localplay cannot attribute to a game (no provider block, an app id it
-    /// does not know) yields nothing and changes nothing: it is not evidence that a game
-    /// ended, and guessing would be worse than waiting.
+    /// A document that cannot be attributed to a game (no provider, an unknown app id) yields
+    /// nothing and changes nothing: it is not evidence a game ended, and guessing is worse than
+    /// waiting.
     pub fn observe(&mut self, snapshot: &GsiSnapshot) -> Vec<GameEvent> {
         let Some(game) = Game::of(snapshot) else {
             return Vec::new();
@@ -224,8 +212,8 @@ impl Tracker {
 /// Whether the document describes a game in progress, per game.
 fn in_game(snapshot: &GsiSnapshot, game: Game) -> bool {
     match game {
-        // Counter-Strike keeps the map name set for the whole session, so the phase is what
-        // separates a running match from the scoreboard after one.
+        // Counter-Strike keeps the map name set all session, so the phase separates a running match
+        // from the scoreboard after one.
         Game::Cs2 => {
             !snapshot.map.name.trim().is_empty() && snapshot.map.phase != "gameover"
         }
@@ -258,9 +246,8 @@ fn scoreboard_events(
         return Vec::new();
     };
     if !baseline.same_player(snapshot) {
-        // A different player's scoreboard (or a payload with no steam id). Nothing here can
-        // be attributed to the watched player, so nothing is reported; the baseline moves
-        // on with the next assignment in `observe`.
+        // A different player's scoreboard (or no steam id): nothing can be attributed to the watched
+        // player, so nothing is reported; the baseline moves on in `observe`.
         return Vec::new();
     }
 
@@ -322,9 +309,9 @@ fn round_events(baseline: &Baseline, snapshot: &GsiSnapshot) -> Vec<GameEvent> {
         ));
     }
 
-    // The bomb, on the edge only: the sequence is carried → planting → planted →
-    // (defusing) → defused/exploded, and each of those is a POST. Only the two moments
-    // worth a clip are reported; "exploded" is the round ending, which is `RoundEnd`.
+    // The bomb, on the edge only: carried, planting, planted, (defusing), defused/exploded, each
+    // a POST. Only the two moments worth a clip are reported; "exploded" is the round ending
+    // (`RoundEnd`).
     let bomb = bomb_state(snapshot);
     if bomb != baseline.bomb {
         match bomb.as_str() {
@@ -359,8 +346,7 @@ fn round_events(baseline: &Baseline, snapshot: &GsiSnapshot) -> Vec<GameEvent> {
     out
 }
 
-/// A small builder so the payloads read as what they are: a fixed envelope plus whatever
-/// this particular event knows.
+/// A small builder so payloads read as a fixed envelope plus whatever this event knows.
 struct Envelope(Value);
 
 impl Envelope {
@@ -411,8 +397,8 @@ mod tests {
         document(CS2_COMPETITIVE)
     }
 
-    /// The single player a Counter-Strike fixture describes, for editing one field at a
-    /// time instead of keeping a hundred near-copies of the same JSON on disk.
+    /// The single player a Counter-Strike fixture describes, for editing one field at a time
+    /// instead of a hundred near-copies of the JSON.
     fn player_of(snapshot: &mut GsiSnapshot) -> &mut Player {
         snapshot.player.first_mut().expect("the fixture names one player")
     }
@@ -444,8 +430,8 @@ mod tests {
 
     #[test]
     fn attaching_mid_match_reports_the_attach_and_adopts_the_scoreboard() {
-        // The counter-strike attach: 12 kills and 5 deaths are already on the board, and a
-        // round is in progress. None of that is a clip.
+        // Counter-Strike attach: 12 kills and 5 deaths are already on the board mid-round; none of it
+        // is a clip.
         let mut tracker = Tracker::default();
         let start = tracker.observe(&cs2());
 
@@ -462,8 +448,8 @@ mod tests {
 
     #[test]
     fn a_repeated_document_emits_nothing() {
-        // GSI repeats the state on a heartbeat. Every repeat must be a no-op, or a match
-        // would write a clip every ten seconds.
+        // GSI repeats the state on a heartbeat. Every repeat must be a no-op or a match would write a
+        // clip every ten seconds.
         let mut tracker = Tracker::default();
         tracker.observe(&cs2());
         for _ in 0..5 {
@@ -509,8 +495,8 @@ mod tests {
 
     #[test]
     fn a_scoreboard_that_belongs_to_another_player_is_not_a_burst_of_events() {
-        // Spectator mode switching point of view replaces one player's totals with
-        // another's. Reporting the difference would be reporting somebody else's kills.
+        // A spectator switching view replaces one player's totals with another's; reporting the
+        // difference would report somebody else's kills.
         let mut tracker = Tracker::default();
         tracker.observe(&cs2());
 
@@ -557,8 +543,8 @@ mod tests {
         assert_eq!(kinds(&ended), vec![EventKind::RoundEnd]);
         assert!(payload(&ended, EventKind::RoundEnd).contains("\"win_team\":\"CT\""));
 
-        // The same "over" state arriving again (the heartbeat during the end-of-round
-        // delay) is not a second round end.
+        // The same "over" state again (the heartbeat during the end-of-round delay) is not a second
+        // round end.
         assert!(tracker.observe(&over).is_empty());
 
         // Round 6 begins.
@@ -658,8 +644,8 @@ mod tests {
 
     #[test]
     fn a_payload_that_names_no_game_is_ignored_rather_than_read_as_an_end() {
-        // A document with no provider block (a client localplay cannot attribute) must not
-        // end a game that is running: the state is kept and the payload is dropped.
+        // A document with no provider block (an unattributable client) must not end a running game:
+        // the state is kept and the payload dropped.
         let mut tracker = Tracker::default();
         tracker.observe(&cs2());
 
@@ -716,9 +702,8 @@ mod tests {
 
     #[test]
     fn an_observer_payload_whose_player_block_is_an_array_is_accepted() {
-        // The first entry is used, and because the scoreboard is only compared across
-        // documents naming the same steam id, an observer payload cannot produce a burst of
-        // events for whoever happens to be first in the list.
+        // The first entry is used, and since the scoreboard is only compared across documents naming
+        // the same steam id, an observer payload cannot burst events for whoever is first in the list.
         let mut tracker = Tracker::default();
         assert_eq!(
             kinds(&tracker.observe(&document(DOTA_OBSERVER))),
@@ -734,8 +719,7 @@ mod tests {
     #[test]
     fn the_main_menu_is_not_a_game_and_never_ends_one_twice() {
         let mut tracker = Tracker::default();
-        // A client sitting in the main menu: no game, no event, no matter how many
-        // payloads arrive.
+        // A client in the main menu: no game, no event, however many payloads arrive.
         for _ in 0..3 {
             assert!(tracker.observe(&document(CS2_MENU)).is_empty());
             assert!(!tracker.in_game());

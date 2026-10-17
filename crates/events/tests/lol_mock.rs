@@ -1,25 +1,18 @@
-//! The League poller against a local HTTPS mock server — no game, no Riot, no network.
+//! The League poller against a local HTTPS mock server: no game, no Riot, no network.
 //!
-//! # What this proves
+//! The mock is a real TLS server on `127.0.0.1` with a self-signed certificate, the shape of
+//! Riot's Live Client Data API. The whole path runs for real: relaxed TLS handshake,
+//! hand-written request, response framing, payload parse, derivation, logging discipline and
+//! sink.
 //!
-//! The mock is a real TLS server on `127.0.0.1` presenting a **self-signed certificate**,
-//! which is the shape of Riot's Live Client Data API. So the whole path is exercised for
-//! real: the relaxed TLS handshake, the hand-written HTTP request, the response framing, the
-//! payload parse, the derivation, the logging discipline and the sink.
+//! It proves what cannot otherwise be proved without a real client: the relaxed client accepts
+//! a certificate nothing has signed, and a client with verification refuses the same
+//! certificate. Both halves are asserted, so the relaxation is demonstrated behaviour.
 //!
-//! In particular it proves the thing that cannot be proved any other way without touching a
-//! real client: that the relaxed client accepts a certificate nothing has signed, and that a
-//! client *with* verification refuses the very same certificate. Both halves are asserted
-//! below, so the relaxation is a demonstrable behaviour rather than a flag someone read.
+//! Not proven: that Riot's payloads look like the canned ones. They are shaped from the
+//! documented API, no League client was contacted, and that check is still outstanding.
 //!
-//! # What this does not prove
-//!
-//! That Riot's payloads look like the canned ones. They are shaped from the documented API;
-//! no League client was contacted, by requirement. A real client is the only thing that can
-//! confirm the shapes, and that check is still outstanding.
-//!
-//! Every socket here is on loopback, and the test never POSTs to anything: the mock is a
-//! plain TLS responder inside this process, and the poller only ever issues `GET`s to it.
+//! Every socket is loopback and the poller only issues `GET`s to an in-process responder.
 
 use localplay_events::lol::{Endpoint, LolConfig, LolPoller, Response};
 use localplay_events::{EventKind, GameEvent};
@@ -31,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// A throwaway CA plus a leaf it signed, generated fresh for every mock so that no private key
-/// is committed. P-256 keys come from pure-Rust `p256` (see the workspace `rcgen` note), and
-/// are handed to rcgen through its `SigningKey` trait.
+/// A throwaway CA plus a leaf it signed, generated per mock so no private key is committed.
+/// P-256 keys come from pure-Rust `p256` (see the workspace `rcgen` note) and are handed to
+/// rcgen through its `SigningKey` trait.
 mod tls {
     use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
     use rsa::pkcs1::EncodeRsaPublicKey;
@@ -142,8 +135,8 @@ mod tls {
 const IN_PROGRESS: &str = include_str!("fixtures/lol_in_progress.json");
 const EVENTS_NEXT: &str = include_str!("fixtures/lol_events_next.json");
 
-/// A game that is present but has reported no events yet — the loading screen, and the
-/// document an attach is tested against when the point is what happens *after* it.
+/// A game that is present but has reported no events yet (the loading screen), for tests about
+/// what happens after an attach.
 const LOADING: &str = r#"{"gameData":{"gameTime":-25.0,"mapName":"Map11"}}"#;
 
 /// What the mock answers with.
@@ -151,13 +144,13 @@ const LOADING: &str = r#"{"gameData":{"gameTime":-25.0,"mapName":"Map11"}}"#;
 enum Reply {
     /// `HTTP/1.1 200` and this body.
     Body(&'static str),
-    /// `HTTP/1.1 404` and no body — the Live Client between games.
+    /// `HTTP/1.1 200` and this body.
     NoGame,
 }
 
-/// A stand-in for the Live Client: a self-signed HTTPS server on loopback that answers each
+/// A stand-in for the Live Client: a self-signed HTTPS server on loopback answering each
 /// request with the next queued reply. The last reply repeats, so a test can poll more times
-/// than it queued answers without the server inventing anything.
+/// than it queued answers.
 struct MockGame {
     addr: SocketAddr,
     /// The CA a client must pin to trust this mock (fresh per mock).
@@ -216,8 +209,7 @@ impl MockGame {
         .expect("a client for the mock")
     }
 
-    /// The request lines the mock has seen, so a test can assert on the wire as well as on
-    /// the derived events.
+    /// The request lines the mock has seen, so a test can assert on the wire as well as the events.
     fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("the request log").clone()
     }
@@ -234,9 +226,8 @@ impl Drop for MockGame {
     }
 }
 
-/// Read one request and answer it, or do nothing at all if the client never finishes
-/// sending one (the strict-verification case below: the handshake is refused and the
-/// connection is dropped).
+/// Read one request and answer it, or do nothing if the client never finishes sending one (the
+/// strict-verification case: the handshake is refused and the connection dropped).
 fn serve_one(
     stream: TcpStream,
     acceptor: &TlsAcceptor,
@@ -264,8 +255,8 @@ fn serve_one(
 
     let reply = {
         let mut queue = queue.lock().expect("the reply queue");
-        // The last reply repeats: a test that polls five times against one queued answer is
-        // asking "and if it says the same thing again?"
+        // The last reply repeats: polling five times against one queued answer asks "and if it says
+        // the same thing again?"
         if queue.len() > 1 {
             queue.pop_front().unwrap_or(Reply::NoGame)
         } else {
@@ -301,9 +292,9 @@ fn payload_of(events: &[GameEvent], kind: EventKind) -> &str {
 
 #[test]
 fn the_client_trusts_only_its_pinned_root() {
-    // The security property the whole LoL arrangement rests on, tested from both sides. A
-    // server whose certificate chains to the pinned root is served; the same server, seen by
-    // a client pinned to a different root or by a stock client, is refused.
+    // The security property the LoL arrangement rests on, from both sides: a server whose
+    // certificate chains to the pinned root is served; the same server seen by a client pinned to
+    // a different root, or a stock client, is refused.
     let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS)]);
     let addr = mock.addr;
 
@@ -315,8 +306,8 @@ fn the_client_trusts_only_its_pinned_root() {
         "the generated CA must be untrusted by default, or this test proves nothing"
     );
 
-    // 2. localplay's client pinned to a *different* root (Riot's, as in production) refuses it
-    //    too: a squatter on port 2999 with some other certificate gets nothing.
+    // 2. localplay's client pinned to a different root (Riot's, as in production) refuses it too:
+    //    a squatter on port 2999 with some other certificate gets nothing.
     let err = localplay_events::lol::LoopbackClient::for_endpoint(mock.endpoint())
         .expect("pinned to Riot's root")
         .get()
@@ -329,8 +320,8 @@ fn the_client_trusts_only_its_pinned_root() {
         .expect_err("an unrelated root must be refused too");
     assert!(matches!(err, localplay_events::lol::FetchError::Tls(..)), "{err}");
 
-    // 3. Pinned to the CA that signed it, the client gets the game document (the host-name
-    //    mismatch on an IP literal is the only relaxation).
+    // 3. Pinned to the signing CA, the client gets the game document (the host-name mismatch on an
+    //    IP literal is the only relaxation).
     let mut poller = mock.poller();
     let events = poller.poll_once();
     assert_eq!(kinds(&events), vec![EventKind::GameStart], "the attach, through real TLS");
@@ -339,8 +330,8 @@ fn the_client_trusts_only_its_pinned_root() {
 
 #[test]
 fn attaching_to_a_game_already_in_progress_does_not_replay_its_history() {
-    // The event storm this exists to prevent: six events are already in the document, two of
-    // which are the watched player's kill and death.
+    // The event storm this prevents: six events are already in the document, two of them the
+    // watched player's kill and death.
     let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS)]);
     let mut poller = mock.poller();
 
@@ -358,7 +349,7 @@ fn attaching_to_a_game_already_in_progress_does_not_replay_its_history() {
         );
     }
 
-    // The request went to the path the spec names, over the endpoint the poller was given.
+    // The request went to the expected path, over the endpoint the poller was given.
     let requests = mock.requests();
     assert!(requests.len() >= 2, "the mock saw the polls: {requests:?}");
     assert_eq!(requests[0], "GET /liveclientdata/allgamedata HTTP/1.1");
@@ -366,9 +357,9 @@ fn attaching_to_a_game_already_in_progress_does_not_replay_its_history() {
 
 #[test]
 fn a_full_event_history_is_derived_in_order_and_each_event_is_emitted_once() {
-    // Two documents: the game with an empty history, then the game with the history. This is
-    // the shape a real start has — the loading screen serves almost nothing — and it is the
-    // one case where the history's events *are* new and must be reported.
+    // Two documents: the game with an empty history, then with the history. A real start looks
+    // like this (the loading screen serves almost nothing), and it is the one case where the
+    // history's events are new and must be reported.
     let mock = MockGame::start(vec![
         Reply::Body(LOADING),
         Reply::Body(IN_PROGRESS),
@@ -417,9 +408,8 @@ fn the_game_ending_emits_one_end_event_and_every_later_poll_is_silent() {
 
 #[test]
 fn a_connection_that_is_refused_is_the_no_game_case() {
-    // Nothing listening at all — the ordinary state of a machine with no League client
-    // running. The poll must be empty rather than an error, and it must not invent a
-    // GameEnd for a game that was never seen.
+    // Nothing listening: the ordinary state of a machine with no League client. The poll must be
+    // empty, not an error, and must not invent a GameEnd for a game never seen.
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
     let addr = listener.local_addr().unwrap();
     drop(listener); // the port is now closed
@@ -440,11 +430,11 @@ fn a_connection_that_is_refused_is_the_no_game_case() {
 #[test]
 fn a_malformed_body_is_neither_an_event_nor_the_end_of_the_game() {
     // 1. A game is being played.
-    // 2. The endpoint then answers something that is not JSON.
-    // 3. It recovers, with one new event.
+    // 2. The endpoint answers something that is not JSON.
+    // 3. It recovers with one new event.
     //
-    // The malformed answer must not end the game (the state is kept) and must not be
-    // reported as a stale event later: step 3 emits exactly the one new line.
+    // The malformed answer must not end the game (state is kept) nor be reported as a stale event
+    // later: step 3 emits exactly the one new line.
     let broken = r#"{"gameData": {"gameTime": "soon"}}"#;
     let mock = MockGame::start(vec![
         Reply::Body(LOADING),
