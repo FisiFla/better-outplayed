@@ -220,12 +220,8 @@ localplay/
 Start with [`docs/verification-status.md`](docs/verification-status.md) — the honest
 ledger of what is verified, what is only type-checked, and what is unverified — and
 [`docs/platform-traps.md`](docs/platform-traps.md) for the OS behaviours that have already
-caused two bugs here. The design spec is at
-[`docs/specs/2026-09-23-localplay-design.md`](docs/specs/2026-09-23-localplay-design.md),
-the Phase 1 task breakdown at
-[`docs/plans/2026-09-23-localplay-phase-1-poc.md`](docs/plans/2026-09-23-localplay-phase-1-poc.md)
-and the Phase 4 game-event integrations at
-[`docs/plans/2026-09-23-localplay-phase-4-integrations.md`](docs/plans/2026-09-23-localplay-phase-4-integrations.md).
+caused two bugs here. The architecture is described above; Phase 1 acceptance is in the runbooks under
+[`docs/runbooks/`](docs/runbooks/).
 
 ### Game event integrations (Phase 4)
 
@@ -307,7 +303,7 @@ resolution, A/V drift and audio level, next to the process's own CPU and memory 
 criterion 6's thresholds, the media-vs-wall-clock ratio, the scratch cap and eviction, and
 criterion 7's fail-loud encoder path. Everything lands in `target\verify\report.md`, raw
 output inline; checks it cannot perform are marked *not performed* with the reason, and it
-exits non-zero only when a check actually failed. Over SSH — where there is no desktop to
+exits non-zero only when a check actually failed. From a remote (non-interactive) shell — where there is no desktop to
 capture — use `scripts\verify-in-interactive-session.ps1`, which runs it in the logged-on
 user's session through a one-shot scheduled task and cleans the task up afterwards.
 
@@ -326,7 +322,7 @@ stays manual.
       **Ran on real Windows hardware** and produced correct clips, but two criteria
       miss: at 4K it sustains ~24 fps against 30 configured (~45% of frames dropped) and
       costs ~50.8% of a CPU core against a < 5% target (open as
-      [issue #1](https://github.com/FisiFla/better-outplayed/issues/1)). **Re-run on the box and
+      [issue #1](https://github.com/FisiFla/better-outplayed/issues/1)). **Re-run on the Windows test machine and
       still open**: a 2026-09-24 capture held 28fps against 30 at 4K and said so itself.
 - [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
       recording wiring exist, and so do the tray, the global clip hotkey and the
@@ -336,13 +332,13 @@ stays manual.
 - [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified,
       and the bundled-SQLite store now builds and its tests run on the Windows box too)*
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
-      tested against local mocks; **never run against a real game** — see the
-      [Phase 4 note](docs/plans/2026-09-23-localplay-phase-4-integrations.md))*
+      tested against local mocks; **never run against a real game** — see
+      [`docs/verification-status.md`](docs/verification-status.md))*
 - [ ] **Phase 5** — full-session recording, chapter marks, packaging/installer. The recording
       and the chapter marks are **done**: full-session mode with lossless finalise and crash
       recovery, an optional microphone on its own track, game-driven auto-record (off by
       default), the session IPC and a desktop session view that plots the markers and cuts a
-      clip out of a finished session. What keeps the box unticked is **packaging**: bundling
+      clip out of a finished session. What keeps this item unticked is **packaging**: bundling
       and the sidecar resource mapping are configured and a macOS `.app` was built and
       inspected, and the **Windows installer now builds, installs, uninstalls and reinstalls on
       real hardware** ([`docs/packaging.md`](docs/packaging.md) §3.5 — measured 2026-09-26, first
@@ -351,13 +347,13 @@ stays manual.
       as the intended mechanism, not missing from this one.
 
 > **Caveat on every `[x]` above.** The Windows-only surface has now run on Windows: on
-> 2026-09-24 the whole Rust workspace was built **and its test suite executed** on the box,
+> 2026-09-24 the whole Rust workspace was built **and its test suite executed** on the Windows test machine,
 > and a real desktop session produced a clip — WGC capture, WASAPI loopback, a microphone
 > track surviving the concat and `h264_nvenc` chosen by `vendor = "auto"`, all for the first
 > time. Three test defects were found and fixed by doing it, and one assertion still fails
 > there for a reason nobody has explained yet. What has *still* never run anywhere: the
 > either game integration against a real game, and any synthesised keypress. (The desktop GUI
-> did run on the box on 2026-09-26, and `cargo xtask verify` on 2026-10-15; the tray, the
+> did run on the Windows test machine on 2026-09-26, and `cargo xtask verify` on 2026-10-15; the tray, the
 > keypress and hide-on-close are still unobserved.) The per-item truth is in
 > [`docs/verification-status.md`](docs/verification-status.md) — §10 is that session, and its
 > headline paragraph is the short version.

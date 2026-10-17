@@ -1,8 +1,7 @@
 # better-outplayed — desktop shell (Phase 2)
 
 The session review window: clip list, player with a timeline scrubber, lossless trim, and a
-storage panel. Tauri v2 shell + Svelte 5 frontend, per [spec §3](../../docs/specs/2026-09-23-localplay-design.md)
-and [spec §9](../../docs/specs/2026-09-23-localplay-design.md).
+storage panel. Tauri v2 shell + Svelte 5 frontend, per the architecture section of the [top-level README](../../README.md).
 
 The window is **dark-mode only** and has **no network access**: it reads the same SQLite
 index the recorder writes, plays clips through Tauri's asset protocol, and shells out to

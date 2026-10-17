@@ -221,7 +221,7 @@ Both *were* read out of the NSIS template; §3.5 records what they actually did 
 
 ### 3.4 Checking an installer without installing it
 
-On the Windows box, the installer's contents can be listed without running either it or the
+On the Windows test machine, the installer's contents can be listed without running either it or the
 app (`7z l localplay_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
 first-pass check that `binaries\ffmpeg.exe` is inside. `npm run sidecars:check` already prints
 what was embedded at build time, and that *is* verified here (§4.2).
@@ -229,9 +229,9 @@ what was embedded at build time, and that *is* verified here (§4.2).
 
 ### 3.5 What building and installing actually did
 
-Run on the Windows box on 2026-09-26 — the first time any of §3.1–3.3 was observed rather than read
-out of a template. The working directory was `C:\Users\Flavio\localplay-ram`, and the machine
-belongs to the maintainer, so the install was real and left installed at the end.
+Run on the Windows test machine on 2026-09-26 — the first time any of §3.1–3.3 was observed rather than read
+out of a template. The working directory was a scratch directory, and the machine
+is a real, persistent one, so the install was real and left installed at the end.
 
 * **The build.** The machine had no node at all. It was fetched as a *portable zip* rather than
   installed — `node-v22.12.0-win-x64` extracted into the working directory, `PATH` and npm's cache
@@ -247,7 +247,7 @@ belongs to the maintainer, so the install was real and left installed at the end
   `mainBinaryName` keeps the executable's name, and the §2 resource mapping really does put the
   sidecars where discovery looks for them.
 * **The application.** Launched through `schtasks /it`, because it is a tray application and needs
-  a real session: pid 23320, 37.5 MB working set, still running at 30 seconds. Killed afterwards.
+  a real session: 37.5 MB working set, still running at 30 seconds. Killed afterwards.
 * **The uninstall.** Silent. The installation directory was gone afterwards, and the Start Menu
   shortcut (`better-outplayed.lnk`) with it.
 * **The user's data.** Untouched by all of it. `clips\`, `thumbnails\`, `scratch\`, `config.toml`
@@ -418,7 +418,7 @@ signing step. **The app was not launched to find out what Gatekeeper does with i
 | 5.3 | **No auto-update mechanism** — *deferred, not forgotten.* Decided 2026-09-26: it is not part of phase 5 and becomes its own later phase, with GitHub Releases as the intended mechanism rather than a hosted service. `bundle.createUpdaterArtifacts` is off and the plugin is not installed | every release is a manual download until then; a signed updater is also *not possible* before 5.1–5.2, since an unsigned update is exactly the attack the signature exists to prevent | `@tauri-apps/plugin-updater`, a signing keypair, and GitHub Releases |
 | 5.4 | ~~**The installer may need the network.**~~ *Decided and set 2026-09-26:* `bundle.windows.webviewInstallMode` is now `offlineInstaller`, so the installer embeds the WebView2 runtime and the install touches no network at all. Resolved, and deliberately at the cost of size — the installer carries ~127 MB more on top of the ~201 MiB of ffmpeg sidecars, which principle 1 is worth | — | — |
 | 5.5 | **The icon is a placeholder** (§6) | it is a teal play triangle on near-black, generated at scaffold time; shipping it would look unfinished | real artwork, then `npm run tauri -- icon` |
-| 5.6 | **No uninstaller verification on Windows** — *done 2026-09-26, see §3.5.* Installed, run, uninstalled and reinstalled silently on the box | the install lands where §3.3 said, both sidecars are inside it, the app launches and stays up, the uninstall removes the installation and the shortcut, and **the user's clips and index survive throughout** — the misleading checkbox errs in the safe direction, as §3.2 inferred | still open: an upgrade across *different* versions, and MSI |
+| 5.6 | **No uninstaller verification on Windows** — *done 2026-09-26, see §3.5.* Installed, run, uninstalled and reinstalled silently on the Windows test machine | the install lands where §3.3 said, both sidecars are inside it, the app launches and stays up, the uninstall removes the installation and the shortcut, and **the user's clips and index survive throughout** — the misleading checkbox errs in the safe direction, as §3.2 inferred | still open: an upgrade across *different* versions, and MSI |
 | 5.7 | **No CI packaging job** — *half done 2026-09-26.* A `package` job on `macos-latest` now fetches the sidecars, builds the frontend, runs `tauri build --bundles app` and asserts the bundle actually carries the ffmpeg sidecar | bundling is exercised on every push, and the bundle configuration — the identifier, `webviewInstallMode`, the resource mapping — is read by something rather than only by hand. The NSIS installer now has a `package-windows` job too (PRs and `workflow_dispatch` only, read-only token, nothing uploaded or published); it was written without a Windows runner to try it on, so its first run is the verification | — |
 | 5.8 | **The `.app` has never been launched** — *the installer half is done 2026-09-26*: built on Windows and run in a real session 1, where it stayed up for 30 seconds (§3.5) | the macOS half of this row remains a statement about the artifact as *files* | a login session on macOS, which is out of scope for a headless task (§7) |
 

@@ -2,7 +2,7 @@
 
 **Status: partly executed.** This document tells a human how to decide, honestly, whether
 Phase 1 works. Some Windows runs have happened — the capture→NVENC encode→clip-splice
-path ran on a 4K box and the WGC/WASAPI backends did execute (see the ledger
+path ran on a 4K machine and the WGC/WASAPI backends did execute (see the ledger
 `docs/verification-status.md`), so it is no longer true that nothing has run on Windows —
 but **large parts of it still have not**, and the eight criteria below have **not** been
 re-run end-to-end on the current build. A green `cargo test` on macOS exercises the
@@ -73,8 +73,7 @@ and it says so in its own report. The criteria below remain the source of truth 
 who wants to look with their own eyes — and the runbook text still applies, because the
 self-test trigger emits the **same log lines** a keypress does.
 
-**If you are driving the box over SSH**, a capture session needs a desktop, which an SSH
-session does not have. Use the wrapper, which runs the harness in your interactive session
+**If you are driving the Windows test machine from a remote shell**, a capture session needs a desktop, which a remote-shell session does not have. Use the wrapper, which runs the harness in the logged-on user's session
 through a one-shot scheduled task and cleans the task up afterwards:
 
 ```powershell
@@ -244,7 +243,7 @@ blocks), so these counters can never be traded for unbounded RAM.
 `skipped=` is the other half of `frames=`: the frames the capture backend offered that the
 pacer threw away **without reading their pixels back** (`CaptureBackend::discard_pending`).
 A display that delivers more frames per second than the rate the pipeline is running at is
-the normal case — measured on the reference box at 53-75fps delivered against a configured
+the normal case — measured on the reference machine at 53-75fps delivered against a configured
 30 — so `skipped=` is expected to be a substantial fraction of `frames=` there, close to
 `(source rate / fps - 1) × frames=`. On a high-refresh display, **`skipped= 0` means every
 surplus frame was read back before being dropped, which is the CPU cost that was measured
@@ -564,7 +563,7 @@ encoder init, first probes) are not the steady-state figure; sample later.
 Force `vendor` to an encoder this machine does **not** have, then run. Two cases belong to
 this criterion, and both must be checked:
 
-1. a vendor step 0.2 reported `not advertised` (e.g. `vendor = "nvenc"` on an AMD-only box);
+1. a vendor step 0.2 reported `not advertised` (e.g. `vendor = "nvenc"` on an AMD-only machine);
 2. a vendor step 0.2 reported **`advertised, FAILS: …`** — ffmpeg lists the encoder, but
    this machine cannot run it. This is the case that used to slip through, because the
    encoder list was the only check.
@@ -727,7 +726,7 @@ settings first, or there is nothing to check.
 **FAILURE looks like**
 
 - The app refuses to start with an `Initialize` error naming the requested 48000 Hz stereo
-  s16 format: on this box the engine would not convert, so the format could not be
+  s16 format: on this machine the engine would not convert, so the format could not be
   produced. Report it — with the `native_sample_rate` / `native_channels` /
   `native_sample_format` values — and **do not** set the device to 48 kHz and call the
   check passed; that is the cliff this change exists to remove.
@@ -746,7 +745,7 @@ not softened; do not read a pass elsewhere as coverage of them.
   early build of `crates/capture/src/wgc.rs` and `crates/capture/src/wasapi.rs` did run on
   Windows (a 4K capture session — frames were captured and audio came through WASAPI; see
   `docs/verification-status.md` §1). Since then a **2026-09-24 session** (§10 of the same
-  file) ran the whole workspace's test suite on the box and, in a real desktop session,
+  file) ran the whole workspace's test suite on the Windows test machine and, in a real desktop session,
   captured a clip with the shipping build. That run is the current evidence for the readback
   skip's *pacer* half (`dd921b3`) and for the WASAPI autoconversion (`0848fc7`); what it did
   **not** cover is the WGC `discard_pending` half — the CLI test that covers the readback path
@@ -757,7 +756,7 @@ not softened; do not read a pass elsewhere as coverage of them.
   initialises the loopback stream with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
   AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` and asks for 48 kHz stereo s16, so the audio
   engine converts an endpoint that is not natively that instead of refusing it. **Observed on
-  the box on 2026-09-24**: `WASAPI loopback capture started on the default render endpoint
+  the Windows test machine on 2026-09-24**: `WASAPI loopback capture started on the default render endpoint
   native_sample_rate=48000 native_channels=2 native_sample_format=F32
   requested_sample_format=s16 converting=true`, and the clip that came out had audio in it.
   That is the *conversion*; the *silence detector* on the same path is still unrun. If the
@@ -782,7 +781,7 @@ not softened; do not read a pass elsewhere as coverage of them.
   `advertised, FAILS: …`, `not advertised`). That proves the encoder **opens** on this
   machine. It does **not** prove the *live capture path* drives it at 4K, and the
   `advertised, FAILS` case has **not** yet been observed on real hardware in this change —
-  the box holder confirms it with `cargo xtask probe` there. What is verified on the
+  whoever has the Windows test machine confirms it with `cargo xtask probe` there. What is verified on the
   development host is the selection logic (against injected results) and the smoke test's
   own plumbing (a working encoder passes, an encoder that cannot open reports ffmpeg's
   reason, a hanging child is bounded by the timeout).
@@ -790,7 +789,7 @@ not softened; do not read a pass elsewhere as coverage of them.
   it can automate and marks the rest *not performed* with a reason. It has **never been run
   on Windows** — it was written and exercised on the development host against the synthetic
   backends (its self-test trigger, its parsers, its report writer and its criterion-7 path
-  all ran there). The first thing to check on the box is that the interactive session it
+  all ran there). The first thing to check on the Windows test machine is that the interactive session it
   runs in really gives the capture backend a desktop: if the report's `capture_started` row
   says the WGC line is missing, or the geometry says `1280x720`, the session has no
   desktop (or the stub ran) and nothing else in that report means anything. See its own

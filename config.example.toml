@@ -115,7 +115,7 @@ output_size = ""
 # Hand captured frames to the hardware encoder as GPU textures, so their pixels never
 # reach this process's memory. Default: false.
 #
-# What it removes, measured on this project's 4K box: the capture path copies 33.2 MB out
+# What it removes, measured on this project's 4K machine: the capture path copies 33.2 MB out
 # of VRAM for every frame, which is about 97% of what the pipeline does while recording
 # (`capture=` on the debug line). With this on, a hardware encoder MFT takes the captured
 # texture directly and ffmpeg is told to copy the H.264 that comes out - a few hundred
@@ -136,9 +136,9 @@ output_size = ""
 # Setting it changes that. `true` *requires* the hardware path and refuses to start
 # without it; `false` turns it off everywhere.
 #
-# Measured on the box it was built for: 4.0% of one core against 88.9% on the readback
+# Measured on the 4K Windows test machine it was built for: 4.0% of one core against 88.9% on the readback
 # path, 59.6 fps of 60 against 55.5, and no dropped frames against 8. See
-# docs/plans/2026-09-25-localplay-tier-2-zero-copy.md.
+# docs/verification-status.md (§15).
 #
 # zero_copy = true
 
