@@ -600,6 +600,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// One session's events with `at` in `[from_ms, to_ms)`, oldest first: the events a clip cut
+    /// from that stretch of footage shows, whichever clip (if any) each produced.
+    pub fn events_in_range(&self, session_id: i64, from_ms: u64, to_ms: u64) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, kind, at, payload, clip_id FROM events
+             WHERE session_id = ?1 AND at >= ?2 AND at < ?3 ORDER BY at, id",
+        )?;
+        let rows =
+            stmt.query_map(params![session_id, from_ms as i64, to_ms as i64], read_event)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Mark a clip as a favourite, or clear it. Favourites are exempt from both storage rules (the
     /// age rule and the total-bytes cap), so this is the user's only way to protect a clip.
     ///
@@ -1164,6 +1176,27 @@ mod tests {
         assert_eq!(for_clip.len(), 1, "the clip's own events");
         assert_eq!(for_clip[0].id, kill);
         assert!(s.events_for_clip(clip + 1).unwrap().is_empty(), "no such clip, no events");
+    }
+
+    #[test]
+    fn events_in_range_is_one_session_half_open_and_ordered() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let mine = s.start_session(None, SESSION_MODE_BUFFER, 1, "/scratch/a", 0).unwrap();
+        let other = s.start_session(None, SESSION_MODE_BUFFER, 2, "/scratch/b", 0).unwrap();
+        let at = |session: i64, kind: &str, at_ms: u64| NewEvent {
+            session_id: Some(session),
+            ..an_event(kind, at_ms, None)
+        };
+        s.insert_event(&at(mine, "death", 2_000)).unwrap();
+        s.insert_event(&at(mine, "kill", 1_000)).unwrap();
+        s.insert_event(&at(mine, "before", 999)).unwrap();
+        s.insert_event(&at(mine, "at_end", 3_000)).unwrap();
+        s.insert_event(&at(other, "elsewhere", 1_500)).unwrap();
+
+        let kinds: Vec<String> =
+            s.events_in_range(mine, 1_000, 3_000).unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, ["kill", "death"]);
     }
 
     #[test]

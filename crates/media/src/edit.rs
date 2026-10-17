@@ -141,6 +141,98 @@ pub fn remux_stream_lossless(
     Ok(())
 }
 
+/// One chapter mark: a named position in a clip, in ms from its first frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chapter {
+    pub start_ms: u64,
+    pub title: String,
+}
+
+/// The title of the chapter that covers a clip's lead-in when its first mark is later than 0.
+pub const LEAD_IN_TITLE: &str = "Start";
+
+/// Render `chapters` as an ffmetadata file. Each chapter runs to the next one's start and the last
+/// to `duration_ms`; one at or past `duration_ms` is dropped. `chapters` must be sorted.
+///
+/// A [`LEAD_IN_TITLE`] chapter is put in front of a first mark later than 0: the MP4 chapter track
+/// always starts at 0, so without it the first mark would be read back at 0 and seeking to it
+/// would land on the clip's start rather than the moment.
+pub fn ffmetadata(chapters: &[Chapter], duration_ms: u64) -> String {
+    let mut kept: Vec<(u64, &str)> = chapters
+        .iter()
+        .filter(|c| c.start_ms < duration_ms)
+        .map(|c| (c.start_ms, c.title.as_str()))
+        .collect();
+    if kept.first().is_some_and(|&(start, _)| start > 0) {
+        kept.insert(0, (0, LEAD_IN_TITLE));
+    }
+    let mut out = String::from(";FFMETADATA1\n");
+    for (i, &(start, title)) in kept.iter().enumerate() {
+        let end = kept.get(i + 1).map_or(duration_ms, |&(next, _)| next);
+        out.push_str(&format!(
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle={}\n",
+            escape_ffmetadata(title)
+        ));
+    }
+    out
+}
+
+/// ffmetadata reads `=`, `;`, `#`, `\` and newlines as syntax, so a title must escape them.
+fn escape_ffmetadata(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '=' | ';' | '#' | '\\' | '\n') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Rewrite the MP4 at `path` with `chapters` as chapter marks, which players such as VLC and mpv
+/// offer for seeking. A no-op when no chapter falls inside the clip.
+///
+/// The original is replaced only after the remux succeeded, so an error leaves it intact. The
+/// audio-track names are re-applied because `-c copy` drops them (see [`audio_titles`]). The MP4
+/// muxer writes the chapters both as a `chpl` atom and as a text track, so the file gains one
+/// `data` stream.
+pub fn add_chapters(
+    bin: &FfmpegBinaries,
+    path: &Path,
+    chapters: &[Chapter],
+    duration_ms: u64,
+) -> Result<()> {
+    if !chapters.iter().any(|c| c.start_ms < duration_ms) {
+        return Ok(());
+    }
+    let audio_streams = stream_layout(bin, path)?.audio_count();
+    let meta = path.with_extension("chapters.txt");
+    let tmp = path.with_extension("chapters.mp4");
+    std::fs::write(&meta, ffmetadata(chapters, duration_ms))
+        .with_context(|| format!("writing {}", meta.display()))?;
+
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
+    cmd.args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .arg("-i")
+        .arg(&meta)
+        .args(["-map", "0", "-map_chapters", "1", "-c", "copy"]);
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(&tmp);
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let remuxed = expect_success(cmd, "adding chapters", &tmp, copy_budget(bytes)).and_then(|()| {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("replacing {} with its chaptered copy", path.display()))
+    });
+    let _ = std::fs::remove_file(&meta);
+    if remuxed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    remuxed
+}
+
 /// The `title` the game-audio track is tagged with, the encoder's own string.
 pub const GAME_AUDIO_TITLE: &str = "Game Audio";
 
@@ -307,7 +399,10 @@ pub fn concat_list_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{concat_list_path, copy_budget, COPY_FLOOR, COPY_MIN_BYTES_PER_SEC};
+    use super::{
+        concat_list_path, copy_budget, ffmetadata, Chapter, COPY_FLOOR, COPY_MIN_BYTES_PER_SEC,
+        LEAD_IN_TITLE,
+    };
     use std::path::Path;
     use std::time::Duration;
 
@@ -374,5 +469,40 @@ mod tests {
             (Duration::from_secs(460)..=Duration::from_secs(500)).contains(&budget),
             "4GB should buy ~429s on top of the 60s floor, got {budget:?}"
         );
+    }
+
+    fn chapter(start_ms: u64, title: &str) -> Chapter {
+        Chapter { start_ms, title: title.to_string() }
+    }
+
+    #[test]
+    fn each_chapter_runs_to_the_next_and_the_last_to_the_clip_end() {
+        let meta = ffmetadata(&[chapter(0, "Kill"), chapter(1500, "Death")], 4000);
+        assert_eq!(
+            meta,
+            ";FFMETADATA1\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1500\ntitle=Kill\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=1500\nEND=4000\ntitle=Death\n"
+        );
+    }
+
+    #[test]
+    fn a_first_mark_after_zero_gets_a_lead_in_chapter() {
+        let meta = ffmetadata(&[chapter(1000, "Kill")], 4000);
+        assert!(meta.contains(&format!("START=0\nEND=1000\ntitle={LEAD_IN_TITLE}\n")), "{meta}");
+        assert!(meta.contains("START=1000\nEND=4000\ntitle=Kill\n"), "{meta}");
+    }
+
+    #[test]
+    fn a_chapter_past_the_clip_end_is_dropped_and_does_not_extend_the_last() {
+        let meta = ffmetadata(&[chapter(0, "Kill"), chapter(4000, "Late")], 4000);
+        assert!(meta.contains("START=0\nEND=4000\n"), "{meta}");
+        assert!(!meta.contains("Late"), "{meta}");
+    }
+
+    #[test]
+    fn ffmetadata_syntax_in_a_title_is_escaped() {
+        let meta = ffmetadata(&[chapter(0, "a=b;c#d\\e\nf")], 10);
+        assert!(meta.contains("title=a\\=b\\;c\\#d\\\\e\\\nf\n"), "{meta}");
     }
 }

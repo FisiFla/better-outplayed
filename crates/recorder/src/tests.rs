@@ -361,6 +361,40 @@ fn a_clip_records_why_it_was_taken() {
          pre-roll (the full window asked for {ready_ms}ms)",
         evented.metadata.duration_ms
     );
+
+    // The kill is a chapter at the trigger instant; the hotkey clip, whose only event is its
+    // bookmark, is left without chapters.
+    let bin = recorder_bin(&app_data_dir);
+    assert_eq!(
+        chapter_starts(&evented.metadata.path, &bin),
+        [(0, edit::LEAD_IN_TITLE.to_string()), (PRE_SECONDS * 1000, "Kill".to_string())]
+    );
+    assert!(chapter_starts(&manual.metadata.path, &bin).is_empty());
+    let row = clips.iter().find(|c| Some(c.id) == evented.id).expect("the event clip's row");
+    assert_eq!(
+        row.size_bytes,
+        std::fs::metadata(&evented.metadata.path).unwrap().len(),
+        "the index records the size after the chapters were added"
+    );
+}
+
+/// Each chapter's `(start ms, title)`, read back with ffprobe.
+fn chapter_starts(path: &Path, bin: &FfmpegBinaries) -> Vec<(u64, String)> {
+    let output = std::process::Command::new(&bin.ffprobe)
+        .args(["-v", "error", "-print_format", "json", "-show_chapters"])
+        .arg(path)
+        .output()
+        .expect("running ffprobe");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("ffprobe json");
+    json["chapters"]
+        .as_array()
+        .expect("a chapters array")
+        .iter()
+        .map(|c| {
+            let start: f64 = c["start_time"].as_str().unwrap().parse().unwrap();
+            ((start * 1000.0).round() as u64, c["tags"]["title"].as_str().unwrap().to_string())
+        })
+        .collect()
 }
 
 /// The ffmpeg binaries the recorder used, discovered the way the test configuration does.

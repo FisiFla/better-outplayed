@@ -178,6 +178,10 @@ impl MemoryRing {
         self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
     }
 
+    pub fn bin(&self) -> &FfmpegBinaries {
+        &self.bin
+    }
+
     /// [`MemoryRing::trigger`] with this clip's own pre- and post-roll, already clamped to what the ring can hold.
     pub fn trigger_window(
         &self,
