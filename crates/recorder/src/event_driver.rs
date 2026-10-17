@@ -527,27 +527,27 @@ mod tests {
 
     #[test]
     fn a_lone_event_ends_after_the_quiet_gap_and_not_the_max() {
+        // With a `max` an hour away, only the quiet gap can end the burst: returning at all is
+        // the proof, so no wall-clock bound is asserted (a loaded runner would flake on one).
+        let mut policy = quick();
+        policy.coalesce.max = Duration::from_secs(3_600);
         let (_tx, rx) = mpsc::channel::<GameEvent>();
-        let t = std::time::Instant::now();
-        assert_eq!(gather_burst(kill(), &rx, &quick()).len(), 1);
-        assert!(t.elapsed() < Duration::from_millis(300), "ended on the quiet gap");
+        assert_eq!(gather_burst(kill(), &rx, &policy).len(), 1);
     }
 
     #[test]
     fn a_continuous_stream_is_cut_at_the_max() {
+        // The stream never goes quiet and never ends until the receiver is dropped, so the
+        // only way `gather_burst` returns is the max cutting it. No elapsed-time bound: a
+        // run-to-the-end implementation hangs here, which fails the test without a clock.
         let (tx, rx) = mpsc::channel();
         let feeder = std::thread::spawn(move || {
-            for _ in 0..40 {
-                if tx.send(kill()).is_err() {
-                    return;
-                }
+            while tx.send(kill()).is_ok() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let t = std::time::Instant::now();
         let burst = gather_burst(kill(), &rx, &quick());
-        assert!(t.elapsed() < Duration::from_millis(700), "cut near max, not run to the end of the stream");
-        assert!(burst.len() > 3);
+        assert!(burst.len() > 3, "the burst gathered the stream until the cut");
         drop(rx);
         feeder.join().unwrap();
     }
