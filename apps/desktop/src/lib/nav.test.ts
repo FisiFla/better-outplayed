@@ -20,7 +20,7 @@ const healthy: Health = {
   recorder_error: null,
   encoder: null,
   ffmpeg_available: true,
-  disk: { free_bytes: 100 * 1024 ** 3, total_bytes: 500 * 1024 ** 3 },
+  disk: { path: '/c', free_bytes: 100 * 1024 ** 3, total_bytes: 500 * 1024 ** 3 },
   event_sources: [],
   recent_errors: [],
   log_path: '/log',
@@ -87,7 +87,7 @@ describe('health badge', () => {
   it('lights for a failed recorder, missing ffmpeg, low disk or a failed source', () => {
     expect(healthBadge({ ...healthy, recorder_state: 'failed' })).toBe(true);
     expect(healthBadge({ ...healthy, ffmpeg_available: false })).toBe(true);
-    expect(healthBadge({ ...healthy, disk: { free_bytes: 1024, total_bytes: 500 * 1024 ** 3 } })).toBe(true);
+    expect(healthBadge({ ...healthy, disk: { path: '/c', free_bytes: 1024, total_bytes: 500 * 1024 ** 3 } })).toBe(true);
     expect(
       healthBadge({
         ...healthy,

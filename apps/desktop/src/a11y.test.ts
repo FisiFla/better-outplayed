@@ -99,6 +99,46 @@ describe('accessibility (axe)', () => {
     expect(await violations(target)).toEqual([]);
   });
 
+  /** Mount the window, open one destination from the rail, and return its root. */
+  async function openView(label: string) {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(App, { target, props: { source: fakeSource() } });
+    await settle();
+    const item = [...target.querySelectorAll<HTMLButtonElement>('nav button')].find((b) =>
+      b.textContent?.includes(label),
+    );
+    expect(item, `rail item ${label}`).toBeDefined();
+    item!.click();
+    await settle();
+    expect(item!.getAttribute('aria-current')).toBe('page');
+    return target;
+  }
+
+  it.each([
+    ['Sessions', 'session-list'],
+    ['Storage', 'storage'],
+    ['Health', 'health'],
+    ['Settings', 'settings'],
+  ])('the %s view has no axe violations', async (label, region) => {
+    const target = await openView(label);
+    // Not vacuous: the region for this view really is on screen and has content.
+    const el = target.querySelector(`[data-region="${region}"]`);
+    expect(el?.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(await violations(target)).toEqual([]);
+  });
+
+  it('a clip page has no axe violations', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(App, { target, props: { source: fakeSource() } });
+    await settle();
+    target.querySelector<HTMLButtonElement>('[data-region="clip-grid"] button.row')?.click();
+    await settle();
+    expect(target.querySelector('[data-region="clip-page"]')).not.toBeNull();
+    expect(await violations(target)).toEqual([]);
+  });
+
   it('the harness does catch a violation', async () => {
     const target = document.createElement('div');
     target.innerHTML = '<img src="x.png"><button></button>';

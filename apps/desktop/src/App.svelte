@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
-   * The session review window (spec §9): the clip list, the player with its scrubber, the
-   * trim control, and the storage panel.
+   * The session review window (spec §9): a left rail of destinations (library, sessions,
+   * storage, health, settings), the recorder bar that stays above all of them, and the active
+   * view.
    *
    * Everything stateful lives here and every mutation goes through `ClipSource`, which is
    * a prop with the real Tauri IPC as its default. That is what lets the tests drive this
@@ -13,11 +14,14 @@
   import ClipFilterBar from './lib/components/ClipFilterBar.svelte';
   import ClipList from './lib/components/ClipList.svelte';
   import HealthPanel from './lib/components/HealthPanel.svelte';
-  import RecordingPanel from './lib/components/RecordingPanel.svelte';
+  import Icon from './lib/components/Icon.svelte';
+  import NavRail from './lib/components/NavRail.svelte';
+  import RecorderBar from './lib/components/RecorderBar.svelte';
   import SessionDetail from './lib/components/SessionDetail.svelte';
   import SessionList from './lib/components/SessionList.svelte';
   import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import StoragePanel from './lib/components/StoragePanel.svelte';
+  import Toasts from './lib/components/Toasts.svelte';
   import {
     describeDelete,
     describeTrim,
@@ -25,7 +29,6 @@
     gameOptions,
     isFiltering,
     NO_FILTER,
-    resolveSelection,
     tagOptions,
     thumbnailAtMs,
     toClipViews,
@@ -34,6 +37,17 @@
   import { errorCode, errorMessage, tauriIpc } from './lib/ipc';
   import type { ClipSource } from './lib/ipc';
   import { describeGsiInstall } from './lib/health';
+  import {
+    back,
+    healthBadge,
+    INITIAL_VIEW,
+    navigate,
+    openClip,
+    openSession,
+    railOf,
+    reconcile,
+  } from './lib/nav';
+  import type { RailView, View } from './lib/nav';
   import { describeRecordedClip } from './lib/recording';
   import { describeSettingsUpdate } from './lib/settings';
   import {
@@ -96,9 +110,8 @@
   let gsiTargets = $state<GsiTarget[]>([]);
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
-  let selectedId = $state<number | null>(null);
-  /** The selected session, if the main pane is showing one instead of a clip. */
-  let selectedSessionId = $state<number | null>(null);
+  /** Where the window is: a rail destination, or a clip / session opened from one. */
+  let view = $state<View>(INITIAL_VIEW);
   /** A command is in flight; the controls that mutate are held while it is. */
   let busy = $state(false);
   /** A recording command is in flight (a start handshake, a stop, or a clip trigger). */
@@ -111,6 +124,8 @@
   let filter = $state<ClipFilter>(NO_FILTER);
   const visibleClips = $derived(filterClips(clips, filter));
 
+  const selectedId = $derived(view.kind === 'clip' ? view.id : null);
+  const selectedSessionId = $derived(view.kind === 'session' ? view.id : null);
   const selected = $derived(clips.find((clip) => clip.id === selectedId) ?? null);
   const selectedSession = $derived(
     sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -126,11 +141,14 @@
       clips = toClipViews(rows, source.assetUrl);
       stats = storage;
       sessions = toSessionViews(sessionRows);
-      selectedId = resolveSelection(clips, selectedId);
-      // A selected session that is no longer in the list was deleted — here or by a retention
-      // pass — so the main pane stops showing a session that does not exist.
-      if (selectedSessionId !== null && !sessions.some((s) => s.id === selectedSessionId)) {
-        selectedSessionId = null;
+      // An open clip or session that is no longer listed was deleted — here or by a retention
+      // pass — so the window returns to its list instead of showing something that is gone.
+      view = reconcile(
+        view,
+        clips.map((clip) => clip.id),
+        sessions.map((session) => session.id),
+      );
+      if (view.kind !== 'session') {
         sessionEvents = [];
         sessionMatches = [];
       }
@@ -363,7 +381,7 @@
       notice = describeTrim(range, written);
       await refresh();
       // Show the clip that was just made, and fetch its thumbnail.
-      selectedId = written.id;
+      view = openClip(written.id);
       void loadThumbnails();
     } catch (err) {
       error = errorMessage(err);
@@ -398,11 +416,7 @@
   }
 
   /**
-   * Show a session's timeline in the main pane.
-   *
-   * The two selections are exclusive because there is one main pane, and a session's timeline
-   * is not a clip's: selecting a session clears the clip, which is what makes the pane's
-   * content unambiguous.
+   * Open a session in the sessions view's detail pane.
    *
    * The markers are read here rather than with the list, because they are per session and
    * nothing draws them until one is selected. An empty list is a real answer; a failure is
@@ -410,8 +424,7 @@
    * see for an untagged session.
    */
   async function selectSession(id: number) {
-    selectedId = null;
-    selectedSessionId = id;
+    view = openSession(id);
     sessionEvents = [];
     sessionMatches = [];
     try {
@@ -477,11 +490,6 @@
     try {
       const outcome = await source.deleteSession(id);
       notice = describeSessionDelete(outcome, title);
-      if (outcome.row_deleted && selectedSessionId === id) {
-        selectedSessionId = null;
-        sessionEvents = [];
-        sessionMatches = [];
-      }
       await refresh();
     } catch (err) {
       // A session that is still recording is refused by the Rust side; the message says so,
@@ -518,161 +526,170 @@
 </script>
 
 <div class="shell">
-  <aside class="sidebar">
-    <RecordingPanel
+  <NavRail
+    active={railOf(view)}
+    healthAttention={healthBadge(health)}
+    onNavigate={(rail: RailView) => (view = navigate(view, rail))}
+  />
+
+  <div class="content">
+    <RecorderBar
       status={recording}
       {app}
       busy={recordingBusy}
       onStart={startRecording}
       onStop={stopRecording}
       onClip={saveClip}
+      onOpenHealth={() => (view = navigate(view, 'health'))}
     />
-    <div class="pane-head">
-      <h2>Clips</h2>
-      <span class="muted">
-        {isFiltering(filter) ? `${visibleClips.length} of ${clips.length}` : clips.length} indexed
-      </span>
-    </div>
-    <ClipFilterBar
-      {filter}
-      games={gameOptions(clips)}
-      tags={tagOptions(clips)}
-      onChange={(next) => (filter = next)}
-    />
-    <ClipList
-      clips={visibleClips}
-      filtering={isFiltering(filter)}
-      {thumbnails}
-      {selectedId}
-      onSelect={(id) => {
-        selectedId = id;
-        // One main pane: selecting a clip takes it back from a session.
-        selectedSessionId = null;
-        sessionEvents = [];
-        sessionMatches = [];
-      }}
-      onFavourite={toggleFavourite}
-      onDelete={(id) => deleteClip(id, clipName(id))}
-      onCopy={(id) =>
-        osAction(() => source.copyClipToClipboard(id), 'Clip file copied to the clipboard.')}
-      onReveal={(id) => osAction(() => source.revealClip(id), null)}
-      onDragOut={(id) => osAction(() => source.dragClipOut(id), null)}
-    />
-    <div class="pane-head">
-      <h2>Sessions</h2>
-      <span class="muted">{sessions.length} indexed</span>
-    </div>
-    <SessionList
-      {sessions}
-      selectedId={selectedSessionId}
-      onSelect={selectSession}
-      onFavourite={toggleSessionFavourite}
-      onDelete={deleteSession}
-    />
-    {#if stats !== null}
-      <StoragePanel {stats} />
-    {/if}
-    {#if health !== null}
-      <HealthPanel {health} />
-    {/if}
-    {#if settings !== null}
-      <SettingsPanel
-        {gsiTargets}
-        onInstallGsi={installGsi}
-        {settings}
-        {recording}
-        {busy}
-        onApply={updateSettings}
-      />
-    {/if}
-  </aside>
 
-  <main class="main">
-    {#if error !== null}
-      <div class="banner error" role="alert">
-        <strong>Error.</strong>
-        {error}
-        <button type="button" onclick={() => (error = null)}>Dismiss</button>
-      </div>
-    {/if}
+    <main class="view">
+      {#if view.kind === 'library'}
+        <section class="library" data-region="library">
+          <div class="view-head">
+            <h2>Library</h2>
+            <span class="muted">
+              {isFiltering(filter) ? `${visibleClips.length} of ${clips.length}` : clips.length} indexed
+            </span>
+          </div>
+          <ClipFilterBar
+            {filter}
+            games={gameOptions(clips)}
+            tags={tagOptions(clips)}
+            onChange={(next) => (filter = next)}
+          />
+          <div class="grid" data-region="clip-grid">
+            <ClipList
+              clips={visibleClips}
+              filtering={isFiltering(filter)}
+              {thumbnails}
+              {selectedId}
+              onSelect={(id) => (view = openClip(id))}
+              onFavourite={toggleFavourite}
+              onDelete={(id) => deleteClip(id, clipName(id))}
+              onCopy={(id) =>
+                osAction(() => source.copyClipToClipboard(id), 'Clip file copied to the clipboard.')}
+              onReveal={(id) => osAction(() => source.revealClip(id), null)}
+              onDragOut={(id) => osAction(() => source.dragClipOut(id), null)}
+            />
+          </div>
+        </section>
+      {:else if view.kind === 'clip'}
+        <section class="page" data-region="clip-page">
+          <div class="crumbs">
+            <button type="button" class="ghost back" onclick={() => (view = back(view))}>
+              <Icon name="chevron-left" size={16} /> Library
+            </button>
+          </div>
+          {#if selected !== null}
+            {@const clip = selected}
+            {#key clip.id}
+              <ClipDetail
+                clip={clip}
+                {busy}
+                onTrim={(range) => trimClip(clip.id, range)}
+                onFavourite={(favourite) => toggleFavourite(clip.id, favourite)}
+                onRename={(title) => renameClip(clip.id, title)}
+                onTags={(tags) => setClipTags(clip.id, tags)}
+                onCopy={() =>
+                  osAction(() => source.copyClipToClipboard(clip.id), 'Clip file copied to the clipboard.')}
+                onReveal={() => osAction(() => source.revealClip(clip.id), null)}
+              />
+            {/key}
+          {/if}
+        </section>
+      {:else if view.kind === 'sessions' || view.kind === 'session'}
+        <section class="sessions" data-region="sessions">
+          <div class="master" data-region="session-list">
+            <div class="view-head">
+              <h2>Sessions</h2>
+              <span class="muted">{sessions.length} indexed</span>
+            </div>
+            <SessionList
+              {sessions}
+              selectedId={selectedSessionId}
+              onSelect={selectSession}
+              onFavourite={toggleSessionFavourite}
+              onDelete={deleteSession}
+            />
+          </div>
+          <div class="detail" data-region="session-page">
+            {#if selectedSession !== null}
+              {@const session = selectedSession}
+              {#key session.id}
+                <SessionDetail
+                  {session}
+                  events={sessionEvents}
+                  matches={sessionMatches}
+                  onExtractMatch={extractMatch}
+                  {busy}
+                  onExtract={extractClip}
+                  onFavourite={(favourite) => toggleSessionFavourite(session.id, favourite)}
+                  onDelete={() => deleteSession(session.id)}
+                />
+              {/key}
+            {:else if loaded}
+              <div class="empty-state">
+                <p>Select a session to see its markers and cut a clip out of it.</p>
+              </div>
+            {/if}
+          </div>
+        </section>
+      {:else if view.kind === 'storage'}
+        <section class="page" data-region="storage">
+          {#if stats !== null}
+            <StoragePanel {stats} />
+          {/if}
+        </section>
+      {:else if view.kind === 'health'}
+        <section class="page" data-region="health">
+          {#if health !== null}
+            <HealthPanel {health} />
+          {/if}
+        </section>
+      {:else if view.kind === 'settings'}
+        <section class="page" data-region="settings">
+          {#if settings !== null}
+            <SettingsPanel
+              {gsiTargets}
+              onInstallGsi={installGsi}
+              {settings}
+              {recording}
+              {busy}
+              onApply={updateSettings}
+            />
+          {/if}
+        </section>
+      {/if}
+    </main>
+  </div>
 
-    {#if notice !== null}
-      <div class="banner notice" role="status">
-        {notice}
-        <button type="button" onclick={() => (notice = null)}>Dismiss</button>
-      </div>
-    {/if}
-
-    {#if selectedSession !== null}
-      {@const session = selectedSession}
-      {#key session.id}
-        <SessionDetail
-          {session}
-          events={sessionEvents}
-          matches={sessionMatches}
-          onExtractMatch={extractMatch}
-          {busy}
-          onExtract={extractClip}
-          onFavourite={(favourite) => toggleSessionFavourite(session.id, favourite)}
-          onDelete={() => deleteSession(session.id)}
-        />
-      {/key}
-    {:else if selected !== null}
-      {@const clip = selected}
-      {#key clip.id}
-        <ClipDetail
-          clip={clip}
-          {busy}
-          onTrim={(range) => trimClip(clip.id, range)}
-          onFavourite={(favourite) => toggleFavourite(clip.id, favourite)}
-          onRename={(title) => renameClip(clip.id, title)}
-          onTags={(tags) => setClipTags(clip.id, tags)}
-          onCopy={() =>
-            osAction(() => source.copyClipToClipboard(clip.id), 'Clip file copied to the clipboard.')}
-          onReveal={() => osAction(() => source.revealClip(clip.id), null)}
-        />
-      {/key}
-    {:else if loaded}
-      <div class="empty-state">
-        <p>
-          Select a clip on the left to play it, scrub it and trim it — or a session, to see
-          its markers and cut a clip out of it.
-        </p>
-      </div>
-    {/if}
-  </main>
+  <Toasts
+    {error}
+    {notice}
+    onDismissError={() => (error = null)}
+    onDismissNotice={() => (notice = null)}
+  />
 </div>
 
 <style>
-  .banner {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-  }
-
-  .banner button {
-    margin-left: auto;
-    padding: 2px 8px;
-    font-size: 11px;
-  }
-
-  .main .banner:first-child {
-    margin-top: 14px;
-  }
-
-  .sidebar .pane-head {
-    border-top: 1px solid var(--line);
+  .back {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px 2px 2px;
+    color: var(--text-muted);
   }
 
   /*
-   * The window with nothing selected: one sentence in a pane as tall as the window. Pinned
-   * under the top edge it read as a stray line of text and left everything below it looking
-   * like a pane that had failed to draw; centred and bounded it reads as the pane's state.
+   * A view with nothing selected: one sentence in a pane as tall as the view. Centred and
+   * bounded it reads as the pane's state rather than a stray line of text.
    */
   .empty-state {
     display: grid;
     place-items: center;
     flex: 1;
+    height: 100%;
     padding: 24px 16px;
   }
 
