@@ -35,7 +35,7 @@ export default defineConfig({
 
   // Svelte's package exports a server build unless told otherwise, and its `mount` throws
   // there. Only the component tests (`a11y.test.ts`) mount anything.
-  resolve: { conditions: process.env.VITEST ? ['browser'] : [] },
+  resolve: { conditions: process.env.VITEST ? ['browser'] : undefined },
 
   test: {
     // Most of the suite covers pure logic — time formatting, trim-range maths, the

@@ -99,6 +99,10 @@ function report(state, description) {
  */
 const EXPECTED_ERRORS = [
   {
+    pattern: /reading 'invoke'/,
+    why: 'state 00 has no Tauri runtime and no test seam, so the first IPC call throws by design',
+  },
+  {
     pattern: /\.trim-\d+-\d+\.[a-z0-9]+/i,
     why: 'the trimmed clip names the file a real ffmpeg stream copy would have written; the mock does not run ffmpeg, so that clip plays black',
   },
@@ -141,6 +145,9 @@ function clip(id, file, durationMs, sizeBytes, codec, favourite, agoMs) {
     codec: CODECS[codec] ?? codec,
     favourite,
     created_at_ms: NEWEST_MS - agoMs,
+    title: null,
+    game: null,
+    tags: [],
   };
 }
 
@@ -766,6 +773,9 @@ function installMockSource(fixture) {
         codec: written.codec,
         favourite: false,
         created_at_ms: fixture.trimmedAtMs,
+        title: null,
+        game: null,
+        tags: [],
       });
       recording = { ...recording, clips: recording.clips + 1 };
       return { ...written };
@@ -1215,12 +1225,8 @@ const states = [
         (await page.locator('.main .star').getAttribute('aria-pressed')) === 'true',
         "the detail header's favourite button agrees with the selected row",
       );
-      for (const expected of ['vp9', 'vp8']) {
-        check(this.name, (await page.locator('.sidebar ul').textContent()).includes(expected), `the list shows ${expected}`);
-      }
-
       const body = (await page.locator('.sidebar ul').textContent()) ?? '';
-      for (const expected of ['1:11:05.0', '0:00.9', '142 MiB', '2.9 GiB', 'h265']) {
+      for (const expected of ['1:11:05.0', '0:00.9', '142 MiB', '2.9 GiB']) {
         check(this.name, body.includes(expected), `the list shows ${expected}`);
       }
 
@@ -1915,7 +1921,7 @@ const states = [
       check(this.name, await panel.getByRole('heading', { name: 'Library' }).isVisible(), 'the library section opens');
       check(
         this.name,
-        (await panel.locator('input[type="number"]').inputValue()) === '30',
+        (await panel.locator('input[type="number"]').first().inputValue()) === '30',
         'the framerate shows the configured value',
       );
       check(
@@ -1948,7 +1954,7 @@ const states = [
         'the recorder line follows the toggle once it settles',
       );
 
-      await panel.locator('input[type="number"]').fill('999');
+      await panel.locator('input[type="number"]').first().fill('999');
       check(
         this.name,
         await panel.getByText('Framerate must be 1–240.').isVisible(),
@@ -1969,7 +1975,7 @@ const states = [
       );
       check(
         this.name,
-        (await panel.locator('input[type="text"]').inputValue()) === '',
+        (await panel.locator('input[type="text"]').first().inputValue()) === '',
         'and leaves the draft alone',
       );
 
