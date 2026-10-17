@@ -1,18 +1,17 @@
 //! The health page's data, and the GSI installer behind the settings button.
 //!
-//! Everything here is a plain function over explicit paths and values, so the suite below
-//! drives it against temporary directories and hand-built statuses, with no window and no
-//! Tauri runtime (the same rule `commands.rs` follows).
+//! Everything here is a plain function over explicit paths and values, so tests drive it
+//! against temporary directories and hand-built statuses with no window or Tauri runtime.
 //!
-//! # The GSI installer and spec §7.2
+//! # The GSI installer
 //!
-//! The spec says the application "does not write into game installation directories on its
-//! own". The installer keeps that true: it runs only when the user presses the button, it
-//! writes exactly one file (`gamestate_integration_localplay.cfg`), and the destination is
-//! never taken from the webview. The command receives a *game* (`cs2` or `dota2`); the
-//! install directory is found here from Steam's own library list, and the final path is run
-//! through [`crate::paths::ensure_new_file_within`] against that install directory before a byte is written, so a
-//! symlink or a `..` cannot walk the write out of the game's folder.
+//! The application does not write into game installation directories on its own. The installer
+//! runs only when the user presses the button, writes exactly one file
+//! (`gamestate_integration_localplay.cfg`), and never takes the destination from the webview:
+//! the command receives a game (`cs2` or `dota2`), the install directory is found here from
+//! Steam's own library list, and the final path goes through
+//! [`crate::paths::ensure_new_file_within`] against that directory before a byte is written, so
+//! a symlink or `..` cannot walk the write out of the game's folder.
 
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::gsi;
@@ -169,8 +168,8 @@ pub struct GsiInstallOutcome {
 
 /// Write the cfg for `game` into `install` (the game's install folder).
 ///
-/// `port == 0` means the listener is switched off, so there is nothing for the game to
-/// talk to and installing would only mislead; that is refused with the setting's name.
+/// `port == 0` means the listener is off, so there is nothing for the game to talk to and
+/// installing would only mislead; that is refused with the setting's name.
 pub fn install_gsi_cfg(
     game: GsiGame,
     install: &Path,
@@ -184,8 +183,8 @@ pub fn install_gsi_cfg(
              nothing for the game to send to; set a port in config.toml first",
         ));
     }
-    // Only the cfg *directory* of a game that is really installed: a half-deleted CS2 with
-    // no `game/csgo` is not somewhere to start creating folders.
+    // Only the cfg directory of a game that is really installed: a half-deleted CS2 with no
+    // `game/csgo` is not somewhere to start creating folders.
     let target = cfg_path(game, install);
     let dest = crate::paths::ensure_new_file_within(install, &target).map_err(|why| {
         CommandError::new(ErrorCode::InvalidInput, format!("{}: {why}", target.display()))
@@ -282,8 +281,8 @@ pub fn event_source_dtos(reports: &[SourceReport]) -> Vec<EventSourceDto> {
         .collect()
 }
 
-/// Free and total bytes of the disk holding `dir` (its nearest existing ancestor, so a
-/// clips directory that does not exist yet still answers).
+/// Free and total bytes of the disk holding `dir` (its nearest existing ancestor, so a clips
+/// directory that does not exist yet still answers).
 pub fn disk_health(dir: &Path) -> Option<DiskHealth> {
     let probe = dir.ancestors().find(|p| p.exists())?;
     Some(DiskHealth {

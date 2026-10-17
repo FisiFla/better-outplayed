@@ -10,12 +10,11 @@ use super::*;
 // Settings
 // ---------------------------------------------------------------------------------------
 //
-// The settings the window shows and edits (`config.toml`, read at startup everywhere
-// else). Two commands: one reads the effective values, one writes edited keys and says
-// what the write means for a running recorder. Both are plain functions over explicit
-// paths — no `State`, no `AppHandle` — so the suite below drives them against temporary
-// directories. The one thing they cannot do headless is re-scope the asset protocol
-// after a clips-directory change; that three-line call lives in the `lib.rs` wrapper.
+// Two commands: one reads the effective values, one writes edited keys and says what the write
+// means for a running recorder. Both are plain functions over explicit paths (no `State`, no
+// `AppHandle`) so tests drive them against temporary directories. Only re-scoping the asset
+// protocol after a clips-directory change cannot run headless; that lives in the `lib.rs`
+// wrapper.
 
 /// The settings the window shows, as the frontend sees them.
 ///
@@ -43,11 +42,11 @@ pub struct SettingsDto {
     pub capture_monitor: usize,
     /// `[capture] window` — a window title to capture instead; empty captures the monitor.
     pub capture_window: String,
-    /// Display names from `[[games.watch]]`, or the default titles when the file names
-    /// none (which is what the engine watches then, too).
+    /// Display names from `[[games.watch]]`, or the default titles when the file names none (what
+    /// the engine watches then, too).
     pub watch_titles: Vec<String>,
-    /// Keys that fell back to the example because the file does not set them, e.g.
-    /// `"encode.fps"` — the panel says so rather than presenting defaults as configured.
+    /// Keys that fell back to the example because the file does not set them, e.g. `"encode.fps"`;
+    /// the panel says so rather than presenting defaults as configured.
     pub defaulted: Vec<String>,
     /// False when no file exists and every value is the example's.
     pub config_exists: bool,
@@ -55,8 +54,7 @@ pub struct SettingsDto {
     pub config_path: String,
 }
 
-/// A partial settings update from the window: every field optional, absent fields are
-/// left alone.
+/// A partial settings update from the window: every field optional, absent fields left alone.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SettingsUpdate {
     pub clips_dir: Option<String>,
@@ -72,27 +70,26 @@ pub struct SettingsUpdate {
 
 /// What writing settings did, and what it means for a running recorder.
 ///
-/// `settings` is read back after the write, so the window refreshes from this rather
-/// than issuing a second call against a file that may have changed under it.
+/// `settings` is read back after the write, so the window refreshes from this rather than
+/// issuing a second call against a file that may have changed under it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateSettingsOutcome {
     pub settings: SettingsDto,
     /// The keys that changed, e.g. `"encode.fps"`.
     pub applied: Vec<String>,
-    /// True only when a recording holds the slot and an engine key changed: fps,
-    /// output size, mic and auto-record are baked in per start, so they take effect on
-    /// the next one. Never an implicit restart (option A): the window offers Stop.
+    /// True only when a recording holds the slot and an engine key changed: fps, output size, mic
+    /// and auto-record are baked in per start, so they take effect on the next one. Never an
+    /// implicit restart; the window offers Stop.
     pub restart_required: bool,
     /// Names the changed engine keys when a restart is required, else null.
     pub restart_reason: Option<String>,
 }
 
-/// The engine options a start is built with: the file's `[mic]` and `[games]`, not
-/// defaults.
+/// The engine options a start is built with: the file's `[mic]` and `[games]`, not defaults.
 ///
-/// A start that ignored them would record without the microphone and without the
-/// watcher the user configured — silently, since both just look like an idle
-/// recorder. Mode stays the default (replay buffer); the window has no mode switch.
+/// A start that ignored them would silently record without the configured microphone and
+/// watcher, both of which just look like an idle recorder. Mode stays the default (replay
+/// buffer); the window has no mode switch.
 pub(super) fn recorder_options(engine: &EngineOptionsConfig) -> RecorderOptions {
     RecorderOptions {
         mode: Default::default(),
@@ -128,11 +125,11 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
 
 /// Validate and write edited keys, then report what the write means.
 ///
-/// A validation failure writes nothing. Engine keys (fps, output size, mic,
-/// auto-record) persist immediately but take effect on the next recorder start;
-/// `restart_required` says so exactly when a recording is running and one of them
-/// changed value. `storage.clips_dir` is applied by the caller (paths rebuild, asset
-/// scope) — this function reports it in `applied` but touches no state.
+/// A validation failure writes nothing. Engine keys (fps, output size, mic, auto-record) persist
+/// immediately but take effect on the next recorder start; `restart_required` says so when a
+/// recording is running and one of them changed value. `storage.clips_dir` is applied by the
+/// caller (paths rebuild, asset scope); this function reports it in `applied` but touches no
+/// state.
 pub fn update_settings_file(
     app_data_dir: &Path,
     config_path: &Path,
@@ -172,8 +169,8 @@ pub fn update_settings_file(
     }
     let after = read_settings(app_data_dir, config_path)?;
 
-    // Only a value that actually changed can demand a restart: re-applying the same
-    // fps the file already had is a no-op, not a reason to stop a recording.
+    // Only a value that actually changed can demand a restart: re-applying the same fps is a no-op,
+    // not a reason to stop a recording.
     let mut engine_changed = Vec::new();
     if update.fps.is_some() && after.fps != before.fps {
         engine_changed.push("encode.fps");
@@ -209,11 +206,11 @@ pub fn update_settings_file(
 
 /// Resolve the clips directory a configuration names, and create it on disk.
 ///
-/// Split out so that the ordering which matters can be tested without a window: this is
-/// the step that has to succeed **before** `[storage] clips_dir` is written. The next
-/// launch reads that value before it can open a window, and when the directory cannot be
-/// made, `AppState::open` logs and calls `std::process::exit(1)` — so a directory
-/// persisted before it is proved usable is an application with no UI left to repair it.
+/// Split out so the ordering that matters is testable without a window: this must succeed
+/// before `[storage] clips_dir` is written. The next launch reads that value before it can open
+/// a window, and when the directory cannot be made `AppState::open` logs and calls
+/// `std::process::exit(1)`, so a directory persisted before it is proved usable leaves an
+/// application with no UI left to repair it.
 pub fn prepare_clips_dir(app_data_dir: &Path, clips_dir: &str) -> Result<AppPaths, CommandError> {
     let paths = AppPaths::resolve(app_data_dir, clips_dir);
     std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
@@ -227,20 +224,18 @@ pub fn prepare_clips_dir(app_data_dir: &Path, clips_dir: &str) -> Result<AppPath
 
 /// [`update_settings_file`], plus the directory the shell has to move to.
 ///
-/// Returns the resolved (and already created) paths when the update carried a
-/// `clips_dir`, so the caller can commit them to the running shell and re-scope the asset
-/// protocol with them. The ordering is the reason this function exists at all:
-/// `prepare_clips_dir` runs **first**, so a directory that cannot be made never reaches
-/// the file, and the write never persists a value the next launch would die on.
+/// Returns the resolved (and already created) paths when the update carried a `clips_dir`, so
+/// the caller can commit them to the running shell and re-scope the asset protocol. The
+/// ordering is the reason this exists: `prepare_clips_dir` runs first, so a directory that
+/// cannot be made never reaches the file and the write never persists a value the next launch
+/// would die on.
 ///
-/// The reverse order is what shipped: the file was written, then the directory was
-/// created, so a failed create left `config.toml` naming a directory that does not exist
-/// while the running shell kept the old one. Nothing failed loudly at the time; the
-/// failure was deferred to the next launch, which exits before it can show a window.
+/// Writing the file first and creating the directory second would leave `config.toml` naming a
+/// missing directory while the running shell kept the old one, with the failure deferred to the
+/// next launch, which exits before it can show a window.
 ///
-/// Creating the directory even when the write is then rejected is harmless — an empty
-/// directory, at worst, and the alternative (checking without creating) is a race with
-/// nothing to win.
+/// Creating the directory even when the write is then rejected is harmless (an empty directory,
+/// at worst), and checking without creating would race.
 pub fn update_settings_and_prepare(
     app_data_dir: &Path,
     config_path: &Path,
@@ -270,8 +265,8 @@ mod tests {
 
     #[test]
     fn the_settings_dto_json_matches_the_typescript_interface() {
-        // Like the clip, storage and status DTOs: a rename on either side is discovered
-        // here, not by a settings panel that silently shows nothing.
+        // Like the clip, storage and status DTOs: a rename on either side is found here, not by a
+        // settings panel that silently shows nothing.
         let (dir, path) = settings_case();
         let dto = read_settings(dir.path(), &path).unwrap();
         let dto_value = serde_json::to_value(&dto).unwrap();
@@ -474,17 +469,16 @@ mod tests {
 
     #[test]
     fn a_clips_dir_that_cannot_be_created_is_never_written_to_the_config() {
-        // The blocker this guards. The file used to be written first and the directory
-        // created second, so `clips_dir = "Z:\\clips"` was persisted and the *next*
-        // launch failed in `AppState::open` — `std::process::exit(1)`, no window, no tray,
-        // nothing to click and no way back except hand-editing the file.
+        // The blocker this guards: writing the file first and creating the directory second would
+        // persist `clips_dir = "Z:\\clips"` and fail the next launch in `AppState::open`
+        // (`std::process::exit(1)`), leaving no window, no tray and no way back except hand-editing the
+        // file.
         let (dir, path) = settings_case();
         std::fs::write(&path, "[storage]\nclips_dir = \"\"\n").unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        // A regular file standing where a directory must go: `create_dir_all` cannot
-        // succeed here on any platform, as any user — which a permissions trick could not
-        // promise without running the tests as root.
+        // A regular file standing where a directory must go: `create_dir_all` cannot succeed here on
+        // any platform, as any user, which a permissions trick could not promise without root.
         let blocked = dir.path().join("a-file");
         std::fs::write(&blocked, "not a directory").unwrap();
         let wanted = blocked.join("clips").to_string_lossy().into_owned();
@@ -508,8 +502,8 @@ mod tests {
 
     #[test]
     fn a_settings_update_hands_back_the_directory_it_created() {
-        // The caller commits these paths to the running shell and re-scopes the asset
-        // protocol with them. What matters here is that the directory exists by then.
+        // The caller commits these paths to the running shell and re-scopes the asset protocol with
+        // them. What matters here is that the directory exists by then.
         let (dir, path) = settings_case();
         let wanted = dir.path().join("clips-here");
 
@@ -531,8 +525,8 @@ mod tests {
 
     #[test]
     fn an_update_without_a_clips_dir_prepares_nothing() {
-        // The shell's paths and the asset scope are only touched when the directory
-        // actually moved: editing fps must not re-create or re-scope anything.
+        // The shell's paths and the asset scope are touched only when the directory actually moved:
+        // editing fps must not re-create or re-scope anything.
         let (dir, path) = settings_case();
 
         let (outcome, prepared) = update_settings_and_prepare(
@@ -549,9 +543,9 @@ mod tests {
 
     #[test]
     fn an_empty_clips_dir_reset_prepares_the_default_directory_too() {
-        // "Empty resets to the default" is a clips_dir move like any other, so it goes
-        // through the same create: the default directory has to exist as well, or the reset
-        // would persist a path the next launch cannot open a window on.
+        // "Empty resets to the default" is a clips_dir move like any other, so it goes through the same
+        // create: the default directory must exist too, or the reset would persist a path the next
+        // launch cannot open a window on.
         let (dir, path) = settings_case();
 
         let (_, prepared) = update_settings_and_prepare(
@@ -569,8 +563,8 @@ mod tests {
 
     #[test]
     fn a_start_is_built_with_the_files_microphone_and_watcher() {
-        // The window's Start used to pass `RecorderOptions::default()` — no mic, nothing
-        // watched — whatever the file said. These are the options a start is built with.
+        // The options a start is built with come from the file, not `RecorderOptions::default()` (no
+        // mic, nothing watched).
         let engine = EngineOptionsConfig::from_toml(
             "[mic]\nenabled = true\n[games]\nauto_record = true\n",
         )
@@ -586,9 +580,9 @@ mod tests {
 
     #[test]
     fn the_asset_roots_are_the_clips_directory_and_the_thumbnail_cache() {
-        // What `lib.rs` hands to the runtime asset-protocol scope: playback is scoped to
-        // the clips directory, and the thumbnails directory is the cache served alongside
-        // it. Nothing else in the filesystem is reachable from the webview.
+        // What `lib.rs` hands to the runtime asset-protocol scope: playback is scoped to the clips
+        // directory, with the thumbnails cache served alongside. Nothing else in the filesystem is
+        // reachable from the webview.
         let dir = PathBuf::from("/app-data/localplay");
         let paths = AppPaths::resolve(&dir, "");
         assert_eq!(paths.asset_roots(), [Path::new("/app-data/localplay/clips"), Path::new("/app-data/localplay/thumbnails")]);

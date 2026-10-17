@@ -3,25 +3,21 @@
 //!
 //! # Why this file is mostly plain functions
 //!
-//! The same reason `commands.rs` is: **this project's test suite never opens a window**. A
-//! tray menu is a menu on a real desktop, a hotkey is a message on a real Windows message
-//! queue, and closing a window is something a person does with a mouse — none of which a
-//! headless run can do. So every decision lives here as a function over plain data
+//! The test suite never opens a window, and a tray menu, a hotkey message and a window close
+//! need a real desktop. So every decision lives here as a function over plain data
 //! ([`MenuAction::label`], [`TrayView::tray_state`], [`dispatch`], [`close_action`],
-//! [`sync_autostart`]), and `lib.rs` is left with a thin translation into Tauri calls whose
-//! only job is to be obviously correct.
+//! [`sync_autostart`]), and `lib.rs` is a thin translation into Tauri calls.
 //!
-//! What that buys, stated honestly: the *logic* is unit-tested and the wiring compiles for
-//! `x86_64-pc-windows-msvc`; that the tray appears, that the X hides the window, and that a
-//! real `Ctrl+F8` produces a clip on a real machine is **not** verified by any test in this
-//! repository. See `docs/verification-status.md`.
+//! The logic is unit-tested and the wiring compiles for `x86_64-pc-windows-msvc`; the tray
+//! appearing, the X hiding the window and a real `Ctrl+F8` producing a clip are not covered by
+//! any test.
 //!
 //! # The one hotkey implementation
 //!
-//! The chord is parsed and registered by `localplay_events::hotkey` — the same module the
-//! CLI installs from the same `config.toml` — through [`install_hotkey`]. There is no second
-//! hotkey path to drift, and a registration failure (the chord is somebody else's, which
-//! includes a second localplay) is returned as data the window and the tray can both show.
+//! The chord is parsed and registered by `localplay_events::hotkey`, the module the CLI installs
+//! from the same `config.toml`, through [`install_hotkey`]. A registration failure (the chord
+//! is somebody else's, including a second localplay) is returned as data the window and the
+//! tray can both show.
 
 use crate::commands::{CommandError, RecordedClipDto, RecordingStatusDto};
 use localplay_events::hotkey::{self, Hotkey};
@@ -40,9 +36,9 @@ use std::sync::mpsc::Receiver;
 /// `the_hotkey_status_json_matches_the_typescript_interface` below.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotkeyStatus {
-    /// The chord as `config.toml` asked for it, normalised by `Hotkey`'s `Display`
-    /// (`Ctrl+F8`). Present even when nothing is listening: it is what the user was told to
-    /// press, and a UI that hid it on failure would leave them with no idea what to try.
+    /// The chord as `config.toml` asked for it, normalised by `Hotkey`'s `Display` (`Ctrl+F8`).
+    /// Present even when nothing is listening: a UI that hid it on failure would leave the user
+    /// with no idea what to try.
     pub chord: String,
     /// True only when a listener is really installed in this process.
     pub installed: bool,
@@ -62,18 +58,17 @@ impl HotkeyStatus {
     }
 }
 
-/// Install the clip hotkey named by `[hotkeys] clip`, returning what the window should show
-/// and the channel a press arrives on (`None` when nothing was installed).
+/// Install the clip hotkey named by `[hotkeys] clip`, returning what the window should show and
+/// the channel a press arrives on (`None` when nothing was installed).
 ///
-/// Three outcomes, all of them *values* rather than a silent nothing:
+/// Three outcomes, all values rather than a silent nothing:
 ///
-/// * the chord does not parse — a typo in `config.toml`;
-/// * this build has no global hotkey at all ([`hotkey::supported`] is false off Windows),
-///   which is said out loud rather than showing a chord that cannot fire;
-/// * `RegisterHotKey` refused it — the chord is already held, by another application or by
-///   another localplay. The error names the chord and the likely owner
-///   (`crates/events/src/hotkey.rs` composes it), because this is the failure that would
-///   otherwise be invisible.
+/// * the chord does not parse (a typo in `config.toml`);
+/// * this build has no global hotkey ([`hotkey::supported`] is false off Windows), said out
+///   loud rather than showing a chord that cannot fire;
+/// * `RegisterHotKey` refused it: the chord is held by another application or another
+///   localplay. The error (composed in `crates/events/src/hotkey.rs`) names the chord and the
+///   likely owner.
 pub fn install_hotkey(
     config_value: &str,
     extras: &[(HotkeyAction, &str)],
@@ -94,8 +89,8 @@ pub fn install_hotkey(
         }
     };
 
-    // The optional chords parse before anything is registered, so a typo in one of them
-    // installs nothing rather than a half-working set.
+    // The optional chords parse before anything is registered, so a typo in one installs nothing
+    // rather than a half-working set.
     let mut actions = vec![HotkeyAction::Clip];
     let mut chords = vec![clip];
     for (action, text) in extras {
@@ -179,11 +174,12 @@ impl HotkeyAction {
     }
 }
 
-/// One hotkey press → **exactly one** clip, through the engine entry point the window's
-/// Save clip button and the CLI's driver loop call (`RecorderHost::clip_now`).///
-/// `take` is that call in the shipping wiring, and a counting stub in the tests. A
-/// `FnOnce` rather than a handle on purpose: one press can ask for one clip and no more, so
-/// there is no loop here to double-fire, and no retry to turn one keypress into two files.
+/// One hotkey press produces exactly one clip, through the engine entry point the window's Save
+/// clip button and the CLI's driver loop call (`RecorderHost::clip_now`).
+///
+/// `take` is that call in the shipping wiring and a counting stub in tests. A `FnOnce` on
+/// purpose: one press can ask for one clip and no more, with no loop to double-fire and no retry
+/// to turn one keypress into two files.
 pub fn on_hotkey_press(
     take: impl FnOnce() -> Result<RecordedClipDto, CommandError>,
 ) -> PressOutcome {
@@ -227,9 +223,9 @@ pub(crate) fn clip_file_name(path: &str) -> &str {
 
 /// Which of the three tray icons, and which tooltip.
 ///
-/// Two very different problems land on `Attention` — the recorder stopped for a failure, or
-/// the clip hotkey is not installed — because a 16x16 icon cannot deliver a sentence. The
-/// tooltip says which, and the window says why.
+/// `Attention` covers two problems, the recorder stopped for a failure or the clip hotkey not
+/// installed, because a 16x16 icon cannot deliver a sentence. The tooltip says which, and the
+/// window says why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
     Idle,
@@ -246,8 +242,8 @@ pub struct TrayView<'a> {
     pub window_visible: bool,
     /// Whether `config.toml` exists — the tray's "open config" item says which it opens.
     pub config_exists: bool,
-    /// One short line about the last hotkey press, when there has been one. This is how a
-    /// user who is in a game with this window hidden learns that the press did nothing.
+    /// One short line about the last hotkey press, when there has been one, so a user in a game
+    /// with this window hidden learns that the press did nothing.
     pub last_press: Option<&'a str>,
 }
 
@@ -262,8 +258,8 @@ impl TrayView<'_> {
         }
     }
 
-    /// The hover text. Read by a user who is alt-tabbed out of a game, so it says what is
-    /// happening and what the key does.
+    /// The hover text, read by a user who is alt-tabbed out of a game: what is happening and what
+    /// the key does.
     pub fn tooltip(&self) -> String {
         let mut text = match self.tray_state() {
             TrayState::Attention if !self.hotkey.installed => format!(
@@ -293,8 +289,8 @@ impl TrayView<'_> {
 
 /// The longest tooltip this shell will hand the OS.
 ///
-/// Windows' `NOTIFYICONDATA.szTip` is 128 characters including the terminator, and a tooltip
-/// cut off by the shell with no indication is worse than one this code cut with a marker.
+/// Windows' `NOTIFYICONDATA.szTip` is 128 characters including the terminator, and a tooltip cut
+/// off silently by the shell is worse than one cut here with a marker.
 pub const TOOLTIP_LIMIT: usize = 120;
 
 /// Cut `text` to `limit` characters on a character boundary, marking that it was cut.
@@ -309,9 +305,8 @@ fn truncate(text: &str, limit: usize) -> String {
 
 /// One item of the tray menu: what the user picks, in the words they read.
 ///
-/// The three with a dynamic label (the window toggle, the recording toggle, the config item)
-/// are the reason this is a function of [`TrayView`] rather than a constant list: a menu that
-/// says "Start recording" while a recording runs is a menu that lies.
+/// The window toggle, recording toggle and config item have dynamic labels, which is why this
+/// is a function of [`TrayView`]: a menu saying "Start recording" while a recording runs lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     /// Show the window, or hide it when it is already on screen.
@@ -336,8 +331,8 @@ impl MenuAction {
         MenuAction::Quit,
     ];
 
-    /// The stable id the menu is built with and the event handler dispatches on. These
-    /// strings cross a runtime boundary, so they are pinned by a test.
+    /// The stable id the menu is built with and the event handler dispatches on. They cross a
+    /// runtime boundary, so a test pins them.
     pub fn id(self) -> &'static str {
         match self {
             MenuAction::ShowHideWindow => "window",
@@ -348,8 +343,8 @@ impl MenuAction {
         }
     }
 
-    /// The action for a menu id, or `None` for an id this build did not create (a menu item
-    /// from a newer version, say — not an error, and not something to guess at).
+    /// The action for a menu id, or `None` for an id this build did not create (an item from a
+    /// newer version, say), which is not an error and not something to guess at.
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|action| action.id() == id)
     }
@@ -368,8 +363,8 @@ impl MenuAction {
         }
     }
 
-    /// Whether this item can do anything in this state. A disabled item is the honest way to
-    /// offer "save a clip" when there is no buffer to save one from.
+    /// Whether this item can do anything in this state. A disabled item is the honest way to offer
+    /// "save a clip" when there is no buffer to save one from.
     pub fn enabled(self, view: &TrayView<'_>) -> bool {
         match self {
             MenuAction::SaveClip => view.status.running,
@@ -389,9 +384,9 @@ impl MenuAction {
 
 /// What an action needs from the shell.
 ///
-/// Implemented for real in `lib.rs` (the window, the recorder, the platform file manager) and
-/// by a recording fake in the tests below, so that "the user picked this item" → "these calls
-/// happen, in this order" is pinned without a runtime and without a window.
+/// Implemented for real in `lib.rs` (window, recorder, platform file manager) and by a recording
+/// fake in tests, so "the user picked this item" -> "these calls happen, in this order" is
+/// pinned without a runtime.
 pub trait Shell {
     fn window_visible(&self) -> Result<bool, String>;
     fn show_window(&self) -> Result<(), String>;
@@ -400,14 +395,14 @@ pub trait Shell {
     fn start_recording(&self) -> Result<RecordingStatusDto, CommandError>;
     fn stop_recording(&self) -> Result<RecordingStatusDto, CommandError>;
     fn clip_now(&self) -> Result<RecordedClipDto, CommandError>;
-    /// Reveal `config.toml` in the platform's file manager — or the folder it belongs in,
-    /// when there is no file yet. Returns the path that was opened.
+    /// Reveal `config.toml` in the platform's file manager, or the folder it belongs in when there
+    /// is no file yet. Returns the path that was opened.
     fn open_config(&self) -> Result<PathBuf, String>;
     fn quit(&self) -> Result<(), String>;
 }
 
-/// What an action did. Every arm exists so a test can assert the *decision* rather than a
-/// log line, and so the tray handler has something to log.
+/// What an action did. Every arm exists so a test can assert the decision rather than a log
+/// line, and so the tray handler has something to log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     WindowShown,
@@ -417,8 +412,8 @@ pub enum Outcome {
     ClipSaved(String),
     ConfigOpened(PathBuf),
     Quitting,
-    /// The action could not do what its label says. Never swallowed: the reason is what the
-    /// tray handler logs and what the window shows.
+    /// The action could not do what its label says. Never swallowed: the reason is what the tray
+    /// handler logs and the window shows.
     Refused(String),
 }
 
@@ -475,9 +470,8 @@ pub fn dispatch(action: MenuAction, shell: &impl Shell) -> Outcome {
         },
 
         MenuAction::Quit => {
-            // Stop first, through the same `RecorderHost::stop` the window's Stop button
-            // calls: that is what flushes the encoder. A failure here is logged and does not
-            // veto the quit the user asked for — but it is never silent.
+            // Stop first, through the same `RecorderHost::stop` the window's Stop button calls, which
+            // flushes the encoder. A failure is logged and does not veto the quit the user asked for.
             if let Err(err) = shell.stop_recording() {
                 tracing::warn!(
                     "stopping the recorder before quitting failed: {} — quitting anyway",
@@ -507,17 +501,15 @@ pub enum CloseAction {
 
 /// **Hide. Always.**
 ///
-/// A game clipper that exits when its window closes is a clipper that ends the recording
-/// every time the user tidies their screen, so the X is a hide and quitting is an explicit
-/// act (the tray's Quit, or the OS ending the process). This function exists as a function
-/// so that the rule is executable — a later refactor has to delete a test to change it,
-/// rather than adding an arm to a `match` in the wiring.
+/// A game clipper that exits when its window closes ends the recording every time the user
+/// tidies their screen, so the X is a hide and quitting is explicit (the tray's Quit, or the OS
+/// ending the process). A function so the rule is executable: changing it means deleting a test.
 pub fn close_action() -> CloseAction {
     CloseAction::Hide
 }
 
-/// What the window tells its user *before* the first close, so that "the app disappeared" is
-/// not a mystery. Shown in the recorder panel.
+/// What the window tells its user before the first close, so "the app disappeared" is not a
+/// mystery. Shown in the recorder panel.
 pub const CLOSE_HINT: &str = "Closing this window hides localplay in the tray; recording keeps \
                               running. Quit from the tray menu when you are done.";
 
@@ -525,17 +517,15 @@ pub const CLOSE_HINT: &str = "Closing this window hides localplay in the tray; r
 // Autostart ([app] start_with_system)
 // ---------------------------------------------------------------------------------------
 //
-// Windows only, by design: the shipping target is Windows and no other platform has a
-// mechanism this project has any reason to own. The *decision* below is a plain function
-// with an injectable process boundary, so it is tested; the effect needs a Windows host (see
-// `docs/verification-status.md`).
+// Windows only: the shipping target is Windows. The decision below is a plain function with an
+// injectable process boundary, so it is tested; the effect needs a Windows host.
 
-/// The name of the value this application owns under the user's Run key. Nothing else in
-/// that key is ever touched, so a manual entry a user added by hand survives.
+/// The name of the value this application owns under the user's Run key. Nothing else in that
+/// key is touched, so an entry a user added by hand survives.
 pub const AUTOSTART_VALUE: &str = "localplay";
 
-/// The per-user Run key. Per-user on purpose: no elevation, no machine-wide change, and it is
-/// the first place a Windows user looks to see what starts with their session.
+/// The per-user Run key: no elevation, no machine-wide change, and the first place a Windows
+/// user looks to see what starts with their session.
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// One step of the sync, as a `reg.exe` invocation.
@@ -616,8 +606,7 @@ impl AutostartOutcome {
 ///
 /// `reg query` prints one line per value:
 /// `    localplay    REG_SZ    C:\path with spaces\localplay.exe`
-/// and exits non-zero with "The system was unable to find the specified registry key or
-/// value" when it is absent — in which case there is nothing to parse.
+/// and exits non-zero when the key or value is absent, in which case there is nothing to parse.
 fn registered_path(output: &str, value: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -630,10 +619,9 @@ fn registered_path(output: &str, value: &str) -> Option<String> {
 
 /// Bring the Windows autostart entry in line with `[app] start_with_system`.
 ///
-/// The config file is the only switch — this project has no settings UI — so this is a
-/// *sync*, not a one-way enable: `false` removes an entry this app wrote, and `true` writes
-/// one. `run` is the process boundary (real `reg.exe` in [`apply_autostart`], a fake in the
-/// tests), and it returns the command's stdout or a message describing how it failed.
+/// The config file is the only switch, so this is a sync, not a one-way enable: `false` removes
+/// an entry this app wrote, `true` writes one. `run` is the process boundary (real `reg.exe` in
+/// [`apply_autostart`], a fake in tests) and returns the command's stdout or a failure message.
 pub fn sync_autostart(
     enabled: bool,
     exe: &Path,
@@ -662,8 +650,8 @@ pub fn sync_autostart(
 
 /// Apply `[app] start_with_system` through `reg.exe`.
 ///
-/// A failure is returned, never fatal: the caller logs it and the app keeps running — an
-/// autostart entry that could not be written must not stop a recording session.
+/// A failure is returned, never fatal: an autostart entry that could not be written must not
+/// stop a recording session.
 #[cfg(windows)]
 pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, String> {
     let mut run = |argv: &[String]| -> Result<String, String> {
@@ -675,8 +663,8 @@ pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, St
         if output.status.success() {
             Ok(stdout)
         } else {
-            // A `query` for an absent value is the normal "it is not set" answer, and the
-            // caller reads the empty stdout as exactly that; anything else is reported.
+            // A `query` for an absent value is the normal "not set" answer, read by the caller from the
+            // empty stdout; anything else is reported.
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if argv.first().map(String::as_str) == Some("query") {
                 Ok(String::new())
@@ -688,8 +676,7 @@ pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, St
     sync_autostart(enabled, exe, &mut run)
 }
 
-/// Off Windows there is no entry to keep in sync, and the shell says so rather than
-/// pretending it did something.
+/// Off Windows there is no entry to keep in sync, and the shell says so rather than pretending.
 #[cfg(not(windows))]
 pub fn apply_autostart(_enabled: bool, _exe: &Path) -> Result<AutostartOutcome, String> {
     Ok(AutostartOutcome::NotApplicable(format!(
@@ -705,18 +692,17 @@ pub fn apply_autostart(_enabled: bool, _exe: &Path) -> Result<AutostartOutcome, 
 
 /// The shell's background half as the window asks for it once at startup.
 ///
-/// Two things a user cannot otherwise discover live here: *which chord to press and whether
-/// it is actually installed*, and *where the configuration it came from is on disk*. The
-/// `close_hint` is a field rather than a sentence hard-coded in the frontend so that the
-/// text explaining the X is the same text this module's tests pin ([`CLOSE_HINT`]).
+/// Two things a user cannot otherwise discover: which chord to press and whether it is
+/// installed, and where the configuration it came from is on disk. `close_hint` is a field so
+/// the text explaining the X is the text this module's tests pin ([`CLOSE_HINT`]).
 ///
-/// Mirrored in `src/lib/types.ts`; `the_app_status_json_matches_the_typescript_interface`
-/// pins the key set.
+/// Mirrored in `src/lib/types.ts`; `the_app_status_json_matches_the_typescript_interface` pins
+/// the key set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppStatus {
     pub hotkey: HotkeyStatus,
-    /// The `config.toml` this process read (`<app data>/config.toml`), so the window can
-    /// name the file a user has to edit rather than describing a dialog that does not exist.
+    /// The `config.toml` this process read (`<app data>/config.toml`), so the window can name the
+    /// file a user has to edit.
     pub config_path: String,
     /// False when that file does not exist and the example's values are in force.
     pub config_exists: bool,
@@ -724,12 +710,11 @@ pub struct AppStatus {
     pub close_hint: String,
 }
 
-/// The tray as it should look: the whole visible surface as **one comparable value**.
+/// The tray as it should look: the whole visible surface as one comparable value.
 ///
-/// The wiring compares two of these and only touches the OS when something really changed.
-/// That matters because it runs twice a second, and on Windows every `set_tooltip` and
-/// `set_icon` is a shell call — and because `==` on this struct is a claim a test can make:
-/// the same state must render identically, or the tray would rewrite itself forever.
+/// The wiring compares two and touches the OS only on a real change. It runs twice a second and
+/// on Windows every `set_tooltip` and `set_icon` is a shell call, and `==` here is a claim a
+/// test can make: the same state must render identically, or the tray rewrites itself forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayRendering {
     pub state: TrayState,
@@ -742,9 +727,8 @@ pub struct TrayRendering {
 }
 
 impl TrayView<'_> {
-    /// The menu and the icon as this state renders them. Every field comes from the same
-    /// [`MenuAction`] and [`TrayView`] functions the real menu is built from — there is no
-    /// second spelling of a label anywhere.
+    /// The menu and the icon as this state renders them, from the same [`MenuAction`] and
+    /// [`TrayView`] functions the real menu is built from, so no label has a second spelling.
     pub fn rendering(&self) -> TrayRendering {
         TrayRendering {
             state: self.tray_state(),
@@ -786,14 +770,11 @@ impl FileManager {
     }
 }
 
-/// The program and arguments that reveal `path`: the file itself, selected, when it exists —
-/// and its folder when it does not, because a user who has not created `config.toml` yet
-/// needs somewhere to create it.
+/// The program and arguments that reveal `path`: the file itself, selected, when it exists, and
+/// its folder when it does not, so a user without a `config.toml` has somewhere to create it.
 ///
-/// Pure, so a test pins the shape for **every** platform on any host, including the one this
-/// project cannot run. What that test cannot do is watch a window open; the alternative
-/// (`tauri-plugin-opener`) would add a dependency, a JavaScript package and a capability for
-/// the same two lines.
+/// Pure, so a test pins the shape for every platform on any host. `tauri-plugin-opener` would
+/// add a dependency, a JavaScript package and a capability for the same two lines.
 pub fn reveal_command(path: &Path, manager: FileManager) -> (String, Vec<String>) {
     let folder = || {
         path.parent()
@@ -852,8 +833,8 @@ mod tests {
 
     /// A `Shell` that records what it was asked to do, and can be told to fail.
     ///
-    /// The visibility it reports is fixed at construction: each test builds the state its
-    /// action is about, rather than driving a fake window through a sequence.
+    /// Its visibility is fixed at construction: each test builds the state its action is about
+    /// rather than driving a fake window through a sequence.
     struct FakeShell {
         calls: RefCell<Vec<&'static str>>,
         visible: bool,
@@ -986,10 +967,9 @@ mod tests {
 
     #[test]
     fn the_hotkey_status_is_honest_about_what_this_build_can_do() {
-        // On the development host there is no global hotkey to install, and the status says
-        // so — with the chord it *would* have used, and with something to do instead. This
-        // is also the only shape this test suite can produce: registering a real chord needs
-        // Windows, and the suite never takes one (see `docs/verification-status.md`).
+        // On the development host there is no global hotkey to install, and the status says so, with
+        // the chord it would have used and something to do instead. It is the only shape this suite
+        // can produce: registering a real chord needs Windows.
         let (hotkey, presses) = install_hotkey("ctrl+f8", &[]);
 
         assert_eq!(hotkey.chord, "Ctrl+F8", "the chord is normalised, as the CLI prints it");
@@ -1008,9 +988,8 @@ mod tests {
 
     #[test]
     fn the_status_json_matches_the_typescript_interfaces() {
-        // `src/lib/types.ts` mirrors this struct by hand, like every other DTO here. Without
-        // this test a rename on either side is discovered by a user staring at a panel that
-        // says nothing about the key they are pressing.
+        // `src/lib/types.ts` mirrors this struct by hand. Without this test a rename on either side is
+        // found by a user staring at a panel that says nothing about the key they press.
         let value = serde_json::to_value(HotkeyStatus::installed("Ctrl+F8")).unwrap();
         let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
@@ -1064,8 +1043,8 @@ mod tests {
 
     #[test]
     fn revealing_the_config_selects_it_or_opens_the_folder_that_should_hold_it() {
-        // Both halves of the second sentence: a user editing a file that exists wants it
-        // selected, and a user who has not created one yet needs the folder to create it in.
+        // Both halves: a user editing a file that exists wants it selected, and one without a file
+        // needs the folder to create it in.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.toml");
         std::fs::write(&file, "[app]\n").unwrap();
@@ -1091,8 +1070,8 @@ mod tests {
 
     #[test]
     fn a_press_takes_exactly_one_clip() {
-        // The property the whole feature rests on: one keypress is one `clip_now`, never two.
-        // (The engine's own trigger is what actually splices; this pins the call count.)
+        // The property the feature rests on: one keypress is one `clip_now`, never two. (The engine's
+        // own trigger does the splicing; this pins the call count.)
         let calls = RefCell::new(0);
         let outcome = on_hotkey_press(|| {
             *calls.borrow_mut() += 1;
@@ -1107,8 +1086,8 @@ mod tests {
 
     #[test]
     fn a_press_that_fails_reports_the_engines_reason_and_does_not_retry() {
-        // "Nothing is recording" is a press that did nothing; the user gets the engine's own
-        // sentence (the tray tooltip carries it) rather than a second attempt at a clip.
+        // "Nothing is recording" is a press that did nothing; the user gets the engine's own sentence
+        // (the tray tooltip carries it) rather than a second attempt.
         let calls = RefCell::new(0);
         let outcome = on_hotkey_press(|| {
             *calls.borrow_mut() += 1;
@@ -1127,8 +1106,8 @@ mod tests {
 
     #[test]
     fn every_menu_action_has_a_unique_stable_id_and_round_trips() {
-        // These strings are what the tray event carries; a duplicate or a rename would make
-        // one menu item dispatch another's action.
+        // These strings are what the tray event carries; a duplicate or rename would make one item
+        // dispatch another's action.
         let ids: Vec<&str> = MenuAction::ALL.iter().map(|a| a.id()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -1335,8 +1314,8 @@ mod tests {
 
     #[test]
     fn quitting_flushes_the_encoder_first() {
-        // A quit while recording must stop the recorder — that is the call that flushes
-        // ffmpeg and closes the capture session — *before* the process goes away.
+        // A quit while recording must stop the recorder (which flushes ffmpeg and closes the capture
+        // session) before the process goes away.
         let shell = FakeShell::recording();
         let outcome = dispatch(MenuAction::Quit, &shell);
 
@@ -1346,8 +1325,8 @@ mod tests {
 
     #[test]
     fn a_quit_still_quits_when_the_stop_fails() {
-        // The stop is best-effort: the user asked to quit, and a failure to flush must not
-        // leave a process running that they cannot see. It is logged, not swallowed.
+        // The stop is best-effort: a failure to flush must not leave a process running that the user
+        // cannot see. Logged, not swallowed.
         let shell =
             FakeShell { stop_fails: Some("the encoder refused to flush"), ..FakeShell::recording() };
 
@@ -1371,8 +1350,8 @@ mod tests {
 
     #[test]
     fn closing_the_window_hides_it_and_never_quits() {
-        // The rule this whole file exists for: a clipper that exits when its window closes
-        // ends the recording every time the user tidies their screen.
+        // The rule this file exists for: a clipper that exits on window close ends the recording every
+        // time the user tidies their screen.
         assert_eq!(close_action(), CloseAction::Hide);
         assert_eq!(close_action(), CloseAction::Hide, "and it is not conditional");
     }
@@ -1381,8 +1360,8 @@ mod tests {
 
     #[test]
     fn the_run_key_command_has_the_shape_windows_expects() {
-        // `reg.exe` on the per-user Run key, with the executable quoted because an install
-        // path may contain spaces. Idempotent by `/f`, so a moved install is repaired.
+        // `reg.exe` on the per-user Run key, the executable quoted because an install path may contain
+        // spaces. Idempotent by `/f`, so a moved install is repaired.
         let exe = Path::new(r"C:\Program Files\localplay\localplay.exe");
 
         assert_eq!(
@@ -1476,8 +1455,8 @@ mod tests {
 
     #[test]
     fn autostart_repairs_an_entry_that_points_somewhere_else() {
-        // The app moved, or an older install wrote it: `enabled = true` must end with the
-        // entry naming *this* executable.
+        // The app moved, or an older install wrote it: `enabled = true` must end with the entry naming
+        // this executable.
         let exe = Path::new(r"D:\games\localplay\localplay.exe");
         let reg = FakeReg::new(Some(r#""C:\old\localplay.exe""#));
         let mut run = reg.runner();
@@ -1500,8 +1479,8 @@ mod tests {
 
     #[test]
     fn autostart_never_touches_the_key_when_there_is_nothing_to_remove() {
-        // `false` on a machine that never had one: no delete, and therefore no chance of
-        // removing an entry this app did not write.
+        // `false` on a machine that never had one: no delete, so no chance of removing an entry this
+        // app did not write.
         let exe = Path::new(r"C:\localplay\localplay.exe");
         let reg = FakeReg::new(None);
         let mut run = reg.runner();
@@ -1512,8 +1491,8 @@ mod tests {
 
     #[test]
     fn a_registry_failure_is_reported_rather_than_treated_as_absent() {
-        // A `reg.exe` that cannot run at all must not be read as "there is no entry": that
-        // would make a failed *read* look like a successful "nothing to do".
+        // A `reg.exe` that cannot run at all must not be read as "there is no entry", which would make
+        // a failed read look like "nothing to do".
         let exe = Path::new(r"C:\localplay\localplay.exe");
         let mut run = |_: &[String]| Err("reg.exe could not be run: not found".to_string());
 
@@ -1524,14 +1503,12 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn off_windows_autostart_is_not_applicable_and_says_so() {
-        // No file, no plist, no launch agent: nothing outside this process is written on a
-        // host this feature does not target, and the caller gets a sentence to log.
+        // No file, no plist, no launch agent: nothing outside this process is written on a host this
+        // feature does not target, and the caller gets a sentence to log.
         //
-        // The Windows half of `apply_autostart` is deliberately NOT exercised by this suite
-        // on any host: `enabled = true` on Windows writes the real Run key of whoever ran the
-        // tests, which is not a test's business. It is compiled by the cross-check
-        // (`cargo check --target x86_64-pc-windows-msvc`) and belongs on the manual list in
-        // `docs/verification-status.md`.
+        // The Windows half of `apply_autostart` is deliberately not exercised: `enabled = true` writes
+        // the real Run key of whoever ran the tests. It is compiled by the Windows cross-check
+        // (`cargo check --target x86_64-pc-windows-msvc`).
         let outcome = apply_autostart(true, Path::new("/usr/local/bin/localplay")).unwrap();
 
         match outcome {

@@ -39,10 +39,9 @@ pub enum ErrorCode {
 
 /// A structured, serialisable command failure.
 ///
-/// Commands never panic and never return a bare string: the frontend gets a machine
-/// readable `code` and a message written for a person. Tauri's IPC boundary requires the
-/// error type to be `Serialize`, which is the only constraint this type carries — it is a
-/// plain value, so it is trivial to assert on in the tests below.
+/// Commands never panic and never return a bare string: the frontend gets a machine-readable
+/// `code` and a message written for a person. Tauri's IPC boundary requires `Serialize`, the
+/// only constraint this plain value carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandError {
     pub code: ErrorCode,

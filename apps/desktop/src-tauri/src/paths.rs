@@ -2,11 +2,10 @@
 //!
 //! The clip index is a user-writable SQLite file and `config.toml` is hand-edited, so a path
 //! read from either can name anything. Before the shell unlinks, removes a directory tree, or
-//! cuts from such a path, it asks this module. The rule is one function, [`ensure_within`]:
-//! the path's *real* parent (symlinks, junctions and `..` resolved) must sit under one of the
-//! given roots, and the path must be a proper child of it, never a root itself. The final
-//! component is deliberately not resolved, so a symlink *at* the path is unlinked as a link
-//! and never followed out of the root.
+//! cuts from such a path, it asks this module. The rule is [`ensure_within`]: the path's real
+//! parent (symlinks, junctions and `..` resolved) must sit under one of the given roots, and
+//! the path must be a proper child of it, never a root itself. The final component is not
+//! resolved, so a symlink at the path is unlinked as a link and never followed out of the root.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -55,14 +54,12 @@ pub fn ensure_within(path: &Path, roots: &[&Path]) -> Result<PathBuf, PathRefusa
 }
 
 /// `path` resolved all the way through, if it lies inside `root`; for a file about to be
-/// *written* (which, unlike an unlink, follows a symlink at the final component).
+/// written (which, unlike an unlink, follows a symlink at the final component).
 ///
-/// `path` need not exist yet: the deepest existing ancestor is canonicalised (resolving
-/// symlinks and junctions) and the missing tail re-appended, so the caller can create the
-/// missing directories afterwards. A `..` is refused outright rather than normalised.
-/// Returns the resolved path, which is the one to write to, so the check and the use cannot
-/// disagree. This is [`ensure_within`]'s counterpart for creation; the two differ only in
-/// that rule (a final-component link is followed here, left alone there).
+/// `path` need not exist yet: the deepest existing ancestor is canonicalised and the missing
+/// tail re-appended, so the caller can create the missing directories afterwards. A `..` is
+/// refused outright rather than normalised. The returned path is the one to write to, so the
+/// check and the use cannot disagree. [`ensure_within`]'s counterpart for creation.
 pub fn ensure_new_file_within(root: &Path, path: &Path) -> Result<PathBuf, PathRefusal> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(PathRefusal::NotAbsoluteAndClean);
@@ -88,10 +85,10 @@ pub fn ensure_new_file_within(root: &Path, path: &Path) -> Result<PathBuf, PathR
     }
 }
 
-/// Whether `name` is `session-<digits>` with an optional `-<digits>` suffix and, for a file,
-/// the `.mp4` extension: exactly what `localplay_recorder::session` names its directories and
-/// files. A configured `sessions_dir` may be anywhere, so this shape (not the location) is
-/// what identifies a session artifact outside the app data directory.
+/// Whether `name` is `session-<digits>` with an optional `-<digits>` suffix and, for a file, the
+/// `.mp4` extension: what `localplay_recorder::session` names its directories and files. A
+/// configured `sessions_dir` may be anywhere, so this shape (not the location) identifies a
+/// session artifact outside the app data directory.
 pub fn is_session_name(name: &str, file: bool) -> bool {
     let stem = if file {
         match name.strip_suffix(".mp4") {
@@ -111,10 +108,10 @@ pub fn is_session_name(name: &str, file: bool) -> bool {
     }
 }
 
-/// Whether `path` is acceptable as a session's scratch directory (`file == false`) or
-/// recorded file (`file == true`) to remove or cut from: either a proper child of one of
-/// `roots`, or shaped like a recorder-made session artifact — and in both cases never a
-/// protected location (one of `protected`, or an ancestor of one).
+/// Whether `path` is acceptable as a session's scratch directory (`file == false`) or recorded
+/// file (`file == true`) to remove or cut from: a proper child of one of `roots`, or shaped like
+/// a recorder-made session artifact, and in both cases never a protected location (one of
+/// `protected`, or an ancestor of one).
 pub fn ensure_session_artifact(
     path: &Path,
     file: bool,

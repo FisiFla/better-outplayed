@@ -20,37 +20,28 @@ struct LiveClips {
     missing: Vec<(i64, PathBuf)>,
 }
 
-/// **The index is a cache and the filesystem is the truth** — and this is the single place
-/// that says so.
+/// **The index is a cache and the filesystem is the truth**; this is the single place that says
+/// so.
 ///
-/// Every surface that speaks about clips goes through here: the listing and the storage
-/// panel. When the two read the index differently they contradict each other on screen,
-/// which is exactly what happened — the listing said "No clips are indexed yet" while the
-/// storage panel said "Indexed clips 12 (0 favourite)", "In use 1.2 GiB", for twelve rows
-/// whose files had been deleted. That `1.2 GiB in use` was the *recorded* size summed from
-/// rows with not one byte of it on disk.
+/// Every surface that speaks about clips (the listing and the storage panel) goes through here.
+/// When the two read the index differently they contradict each other on screen: one said "No
+/// clips are indexed yet" while the other said "Indexed clips 12", "In use 1.2 GiB", for twelve
+/// rows whose files had been deleted.
 ///
-/// It is not only a display bug. Handing a dead row to the window costs more than a wrong
-/// list: the UI asks the asset protocol for each one (which is where Tauri logs `File does
-/// not exist at path`), then asks for a thumbnail of each, and every thumbnail is an ffmpeg
-/// process. Measured on the first real install, where a cleanup had removed files without
-/// their rows: thirteen dead clips meant a burst of ffmpeg children, terminal windows
-/// appearing and vanishing, a machine that nearly fell over, and a window too busy to be
-/// dragged.
+/// Handing a dead row to the window also costs more than a wrong list: the UI asks the asset
+/// protocol for each one (Tauri logs `File does not exist at path`), then a thumbnail of each,
+/// and every thumbnail is an ffmpeg process. Thirteen dead clips on a real install meant a burst
+/// of ffmpeg children and a window too busy to be dragged.
 ///
-/// Skipped rather than deleted, deliberately: a file can be temporarily unavailable (a
-/// network directory, an antivirus quarantine), and silently rewriting a user's library is
-/// not a read's business. The rows stay, and `missing` says how many there are so a caller
-/// can tell the user instead of quietly showing less.
+/// Skipped rather than deleted: a file can be temporarily unavailable (a network directory, an
+/// antivirus quarantine), and silently rewriting a user's library is not a read's business. The
+/// rows stay, and `missing` says how many there are so a caller can tell the user.
 ///
-/// Ordered by `created_at_ms` (the wall clock the store stamps), **not** by
-/// `clips.started_at`, which is what `Store::list_clips` orders by. `started_at` is media
-/// time on the ring's own timeline: it restarts with the scratch directory, so two runs can
-/// produce the same value and a comparison across them is meaningless — the store's own
-/// docs say as much. `created_at` is the one comparable instant in the row, and it is also
-/// what the storage policy evicts by, so the list the user sees and the order the manager
-/// deletes in agree. Ties (a burst indexed in the same millisecond) are broken by id, so the
-/// order is total and stable.
+/// Ordered by `created_at_ms` (the wall clock the store stamps), not by `clips.started_at`,
+/// which is what `Store::list_clips` orders by. `started_at` is media time on the ring's own
+/// timeline and restarts with the scratch directory, so it is not comparable across runs.
+/// `created_at` is also what the storage policy evicts by, so the list the user sees and the
+/// order the manager deletes in agree. Ties are broken by id, so the order is total and stable.
 fn clips_on_disk(deps: &Deps<'_>) -> Result<LiveClips, CommandError> {
     let mut clips = deps.store.list_clips().map_err(|e| CommandError::store("listing clips", e))?;
     clips.sort_by_key(|clip| std::cmp::Reverse((clip.created_at_ms, clip.id)));
@@ -70,9 +61,8 @@ fn clips_on_disk(deps: &Deps<'_>) -> Result<LiveClips, CommandError> {
 pub fn list_clips(deps: &Deps<'_>) -> Result<Vec<ClipDto>, CommandError> {
     let LiveClips { clips, missing } = clips_on_disk(deps)?;
 
-    // Reported here rather than in `clips_on_disk`, so that a refresh that is not a listing
-    // cannot double the log. `debug!` because it repeats on every refresh and the level
-    // filter turns it on where it is wanted.
+    // Reported here rather than in `clips_on_disk`, so a refresh that is not a listing cannot double
+    // the log. `debug!` because it repeats on every refresh.
     for (id, path) in &missing {
         tracing::debug!("skipping clip #{id} from the listing: {} is gone", path.display());
     }
@@ -92,24 +82,18 @@ pub fn storage_stats(deps: &Deps<'_>) -> Result<StorageStats, CommandError> {
     storage_stats_at(deps, now_ms())
 }
 
-/// [`storage_stats`] against an explicit clock.
+/// [`storage_stats`] against an explicit clock, so a test can see the age rule fire without
+/// backdating rows through SQL (the store has no API for that) or sleeping for a day.
 ///
-/// The age rule is a function of the clock, so a test that wants to see it fire would
-/// otherwise have to backdate rows through SQL (the store deliberately has no API for
-/// that) or sleep for a day. Taking `now_ms` as a parameter keeps the command deterministic
-/// and the production wrapper a one-liner.
+/// Every figure is about the clips that are on disk (`clips_on_disk`), including the bytes and
+/// the eviction plan. `Store::total_bytes` sums what the rows recorded, so a library whose files
+/// had been deleted reported gigabytes in use with nothing on disk, and a row with no file has
+/// no bytes to reclaim: counting one in the cap arithmetic asks for an eviction that frees
+/// nothing.
 ///
-/// Every figure here is about the clips **that are on disk** (`clips_on_disk`), including
-/// the bytes and the eviction plan. `Store::total_bytes` sums what the *rows* recorded, so
-/// a library whose files had been deleted reported gigabytes in use with nothing on disk;
-/// and a row with no file has no bytes to reclaim, so counting one in the cap arithmetic
-/// asks for an eviction that frees nothing.
-///
-/// That last point is the reason this reads the filesystem where `plan_cleanup`'s other
-/// caller does not: the recorder's own retention pass still plans on rows, so a cap inflated
-/// by dead rows can currently make it evict a *live* clip. Same principle, different
-/// module — see `crates/store/src/cleanup.rs` and `crates/recorder/src/index.rs`, which are
-/// out of this file's scope.
+/// The recorder's own retention pass (`crates/store/src/cleanup.rs`,
+/// `crates/recorder/src/index.rs`) still plans on rows, so a cap inflated by dead rows can make
+/// it evict a live clip.
 pub fn storage_stats_at(deps: &Deps<'_>, now_ms: i64) -> Result<StorageStats, CommandError> {
     let LiveClips { clips, missing } = clips_on_disk(deps)?;
     let total_bytes: u64 = clips.iter().map(|clip| clip.size_bytes).sum();
@@ -139,15 +123,15 @@ pub fn storage_stats_at(deps: &Deps<'_>, now_ms: i64) -> Result<StorageStats, Co
     })
 }
 
-/// Mark a clip as a favourite, or clear it. Favourites are exempt from both storage rules
-/// (spec §8.1), so this is the user's only way to protect a clip from the manager.
+/// Mark a clip as a favourite, or clear it. Favourites are exempt from both storage rules, so
+/// this is the user's only way to protect a clip from the manager.
 pub fn set_favourite(deps: &Deps<'_>, id: i64, favourite: bool) -> Result<ClipDto, CommandError> {
     let updated = deps
         .store
         .set_favourite(id, favourite)
         .map_err(|e| CommandError::store("setting the favourite flag", e))?;
-    // The store reports whether a row was actually updated; `false` means the id does not
-    // exist, and the UI must be told rather than shown a clip that is not there.
+    // The store reports whether a row was updated; `false` means the id does not exist, and the UI
+    // must be told rather than shown a clip that is not there.
     if !updated {
         return Err(CommandError::clip_not_found(id));
     }
@@ -180,8 +164,8 @@ pub fn set_clip_tags(deps: &Deps<'_>, id: i64, tags: &[String]) -> Result<ClipDt
 }
 
 /// The on-disk file of clip `id`, for the actions that hand it to the OS (clipboard, reveal,
-/// drag-out). The path comes from the index, which is a user-writable SQLite file, so it must
-/// exist and sit inside the library — the same guard `delete_clip` applies before unlinking.
+/// drag-out). The path comes from the index, a user-writable SQLite file, so it must exist and
+/// sit inside the library, the guard `delete_clip` applies before unlinking.
 pub fn clip_file(deps: &Deps<'_>, id: i64) -> Result<PathBuf, CommandError> {
     let clip = find_clip(deps.store, id)?;
     if !clip.path.is_file() {
@@ -204,8 +188,8 @@ pub fn clip_file(deps: &Deps<'_>, id: i64) -> Result<PathBuf, CommandError> {
 }
 
 /// Give a freshly cut clip its parent's game and tags (a trim of a Valorant ace is still a
-/// Valorant ace). The title is not inherited: it names the parent. Best effort — the new file
-/// and row exist either way — and the returned DTO is the row as it ends up.
+/// Valorant ace). The title is not inherited: it names the parent. Best effort; the new file and
+/// row exist either way, and the returned DTO is the row as it ends up.
 pub(super) fn inherit_metadata(
     deps: &Deps<'_>,
     new: ClipDto,
@@ -225,16 +209,14 @@ pub(super) fn inherit_metadata(
     find_clip(deps.store, new.id).map(|c| ClipDto::from(&c)).unwrap_or(new)
 }
 
-/// Cut `[start_ms, end_ms)` out of clip `id` into a **new** file next to the original, and
-/// index the result.
+/// Cut `[start_ms, end_ms)` out of clip `id` into a new file next to the original, and index the
+/// result.
 ///
-/// The cut is [`localplay_media::edit::trim_lossless`] — `-c copy`, a stream copy. Nothing
-/// in this path re-encodes, and nothing may: re-encoding an export is the thing principle 5
-/// rules out. What a stream copy *can* cut, though, is bounded by the stream itself rather
-/// than by the requested millisecond (spec §6.3 treats that as the central trade-off of the
-/// whole design), so the returned clip reports the **probed** duration of the file that was
-/// actually written rather than echoing the span that was asked for. The UI shows the two
-/// side by side instead of pretending they always agree.
+/// The cut is [`localplay_media::edit::trim_lossless`], a stream copy; nothing here may
+/// re-encode an export. What a stream copy can cut is bounded by the stream itself (cuts snap to
+/// keyframes) rather than by the requested millisecond, so the returned clip reports the probed
+/// duration of the file actually written, not the requested span. The UI shows the two side by
+/// side.
 pub fn trim_clip(
     deps: &Deps<'_>,
     id: i64,
@@ -265,9 +247,9 @@ pub fn trim_clip(
     trim_lossless(bins, &clip.path, &dst, start_ms, end_ms)
         .map_err(|e| CommandError::media("trimming the clip", e))?;
 
-    // The file exists from here on. Everything below can fail, and if it does the file
-    // stays: it is what the user asked for, and deleting it to report a bookkeeping error
-    // would destroy the only copy of their edit.
+    // The file exists from here on. Everything below can fail, and if it does the file stays: it is
+    // what the user asked for, and deleting it to report a bookkeeping error would destroy the only
+    // copy of their edit.
     let new = index_new_clip(
         deps,
         &format!("clip #{}", clip.id),
@@ -282,11 +264,10 @@ pub fn trim_clip(
 
 /// Describe a newly written file and add it to the index.
 ///
-/// The parent is passed as what it *is* — a label for the log, the media position the new
-/// clip should be placed at, and a codec to name when the new file turns out to have no video
-/// stream — rather than as a `&Clip`. A session's extracted clip has no parent `Clip`: a
-/// session is not a clip, and inventing one to satisfy a parameter would put a fake row's id
-/// in a log line and a fake `started_at` on a real clip.
+/// The parent is passed as what it is (a label for the log, the media position the new clip
+/// should be placed at, and a codec to name when the new file has no video stream) rather than
+/// as a `&Clip`. A session's extracted clip has no parent `Clip`, and inventing one would put a
+/// fake row's id in a log line and a fake `started_at` on a real clip.
 pub(super) fn index_new_clip(
     deps: &Deps<'_>,
     parent: &str,
@@ -308,8 +289,8 @@ pub(super) fn index_new_clip(
         )
     })?;
 
-    // Sized from the file rather than from ffprobe's `format.size`, because the number the
-    // storage policy caps is a number of bytes on disk.
+    // Sized from the file rather than ffprobe's `format.size`, because the storage policy caps bytes
+    // on disk.
     let size_bytes = std::fs::metadata(dst)
         .map_err(|e| CommandError::io("sizing the trimmed clip", dst, e))?
         .len();
@@ -318,16 +299,14 @@ pub(super) fn index_new_clip(
         .video
         .as_ref()
         .map(|v| v.codec.clone())
-        // A file with no video stream is not a clip this app can show; falling back to the
-        // parent's codec would name a codec the file may not contain, so say what is known.
+        // A file with no video stream is not a clip this app can show; falling back to the parent's
+        // codec would name one the file may not contain, so say what is known.
         .unwrap_or_else(|| parent_codec.to_string());
 
-    // `started_at` is the trimmed clip's position on its **parent's** media timeline. The
-    // file's own timeline starts at zero, and nothing compares `started_at` across clips
-    // or runs, so this is the only reading of the column that carries information. It is an
-    // estimate rather than a measurement: a stream copy cannot place a cut at an arbitrary
-    // point in the stream, so the first frame of the file may sit slightly before the
-    // `start_ms` that was asked for (spec §6.3).
+    // `started_at` is the trimmed clip's position on its parent's media timeline. The file's own
+    // timeline starts at zero and nothing compares `started_at` across clips or runs, so this is
+    // the only reading that carries information. An estimate: a stream copy cannot cut at an
+    // arbitrary point, so the first frame may sit slightly before the requested `start_ms`.
     let new = NewClip {
         path: dst.to_path_buf(),
         started_at_ms: parent_started_at_ms.saturating_add(start_ms),
@@ -339,9 +318,8 @@ pub(super) fn index_new_clip(
     let new_id = deps.store.insert_clip(&new).map_err(|e| {
         CommandError::new(
             ErrorCode::Store,
-            // The file is on disk with no row naming it, so the storage policy will never
-            // collect it. Saying so is the difference between a user who can act and one
-            // with an invisible file filling their disk.
+            // The file is on disk with no row naming it, so the storage policy will never collect it.
+            // Saying so lets a user act instead of an invisible file filling their disk.
             format!(
                 "the trimmed clip was written to {} but could not be added to the index, \
                  so it will not appear in the library and the storage policy cannot manage \
@@ -364,16 +342,15 @@ pub(super) fn index_new_clip(
 
 /// A JPEG thumbnail of clip `id` at `at_ms`, made once and reused afterwards.
 ///
-/// The file lands in the thumbnails cache directory under a name derived from the clip and
-/// the timestamp, so a second request for the same frame is a `stat` rather than another
-/// ffmpeg process.
+/// The file lands in the thumbnails cache under a name derived from the clip and timestamp, so a
+/// repeat request is a `stat` rather than another ffmpeg process.
 ///
-/// A timestamp at or past `duration_ms` is rejected here rather than handed to ffmpeg. A
-/// timestamp *inside* the clip can still yield no frame — the last frame of a 2000ms stream
-/// does not start at 1999ms — and that surfaces as an [`ErrorCode::Media`] error naming the
-/// clip, the timestamp and the duration, because "ffmpeg had nothing to read" is otherwise
-/// indistinguishable from "the file is corrupt". The UI asks for a frame from the first
-/// second of a clip for exactly that reason (see `thumbnailAtMs` in `src/lib/clips.ts`).
+/// A timestamp at or past `duration_ms` is rejected here rather than handed to ffmpeg. One
+/// inside the clip can still yield no frame (the last frame of a 2000ms stream does not start at
+/// 1999ms) and surfaces as an [`ErrorCode::Media`] error naming the clip, timestamp and
+/// duration, since "ffmpeg had nothing to read" is otherwise indistinguishable from a corrupt
+/// file. The UI asks for a frame from the first second for that reason (see `thumbnailAtMs` in
+/// `src/lib/clips.ts`).
 pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, CommandError> {
     let clip = find_clip(deps.store, id)?;
     if clip.duration_ms == 0 {
@@ -395,9 +372,9 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
         ));
     }
 
-    // **Before anything is spawned.** A dead clip used to reach ffmpeg, which failed, which the UI
-    // retried — a process per attempt. The row is still here so the message can say which file is
-    // missing, but nothing is executed for it.
+    // **Before anything is spawned.** A dead clip reaching ffmpeg fails, the UI retries, and that is
+    // a process per attempt. The row is still here so the message can say which file is missing,
+    // but nothing is executed for it.
     if !clip.path.exists() {
         return Err(CommandError::new(
             ErrorCode::InvalidInput,
@@ -441,21 +418,19 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
     })
 }
 
-/// Delete a clip: the row first, then the file (spec §8.2).
+/// Delete a clip: the row first, then the file.
 ///
-/// The order is the safety property, not a detail: deleting the row first means the index
-/// never names a file that is gone, which is the failure a user cannot recover from,
-/// because the file is the only copy. The reverse failure — a file whose row is gone — is
-/// recoverable and is *reported* here in [`DeleteOutcome::orphaned_path`] rather than
-/// silently swallowed.
+/// The order is the safety property: deleting the row first means the index never names a file
+/// that is gone, the failure a user cannot recover from because the file is the only copy. The
+/// reverse failure, a file whose row is gone, is recoverable and is reported in
+/// [`DeleteOutcome::orphaned_path`] rather than swallowed.
 ///
-/// An id with no row is not an error: it is reported as `row_deleted: false`, and nothing
-/// is unlinked, because no committed row delete named the file. A UI acting on a list it
-/// fetched a moment ago can race a cleanup pass, and telling it "already gone" lets it
-/// refresh truthfully.
+/// An id with no row is not an error: it is reported as `row_deleted: false` and nothing is
+/// unlinked, because no committed row delete named the file. A UI acting on a list fetched a
+/// moment ago can race a cleanup pass, and "already gone" lets it refresh truthfully.
 pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandError> {
-    // Committed before the next line runs: the store's own contract, and the reason the
-    // path handed back here is a path a committed row delete removed.
+    // Committed before the next line runs (the store's own contract), which is why the path handed
+    // back here is one a committed row delete removed.
     let path = deps
         .store
         .delete_clip_returning_path(id)
@@ -481,13 +456,13 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
         orphaned_path: None,
         already_missing: false,
         bytes_reclaimed: 0,
-        // Best effort, and reported rather than fatal: a stale JPEG in the cache is a
-        // wasted kilobyte, not a reason to fail a delete whose row is already committed.
+        // Best effort, reported rather than fatal: a stale JPEG in the cache is a wasted kilobyte, not a
+        // reason to fail a delete whose row is already committed.
         thumbnails_removed: remove_cached_thumbnails(&deps.paths.thumbnails_dir, id),
     };
 
-    // The row is the only authority for the path, and the index is a user-writable SQLite
-    // file: a row pointing outside the library must cost the user a row, never a file.
+    // The row is the only authority for the path, and the index is a user-writable SQLite file: a
+    // row pointing outside the library must cost the user a row, never a file.
     if path.exists() && !is_inside_library(&path, deps.paths) {
         tracing::warn!(
             "clip #{id}: refusing to unlink {} because it is outside the clips and \
@@ -529,10 +504,9 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
 // Helpers
 // ---------------------------------------------------------------------------------------
 
-/// Whether `path`'s real parent directory is the clips directory or lives under the
-/// application data directory. Parents are canonicalised (so `..` segments, symlinks and
-/// junctions are resolved) but the file itself is not, so a symlink *at* the path is
-/// unlinked as a link and never followed.
+/// Whether `path`'s real parent directory is the clips directory or lives under the application
+/// data directory. Parents are canonicalised (resolving `..`, symlinks and junctions) but the
+/// file itself is not, so a symlink at the path is unlinked as a link, never followed.
 pub(super) fn is_inside_library(path: &Path, paths: &AppPaths) -> bool {
     crate::paths::ensure_within(path, &library_roots(paths)).is_ok()
 }
@@ -542,10 +516,10 @@ pub(super) fn library_roots(paths: &AppPaths) -> Vec<&Path> {
     [Some(paths.clips_dir.as_path()), paths.db_path.parent()].into_iter().flatten().collect()
 }
 
-/// Whether a session's recorded file (`file`) or scratch directory read from the index may
-/// be removed or cut from. Inside the library, or shaped like what the recorder names its
-/// session artifacts (a configured `sessions_dir` can live anywhere) — and never something
-/// that contains the clips, thumbnails or application data directories.
+/// Whether a session's recorded file or scratch directory read from the index may be removed or
+/// cut from: inside the library, or shaped like what the recorder names its session artifacts (a
+/// configured `sessions_dir` can live anywhere), and never something that contains the clips,
+/// thumbnails or application data directories.
 pub(super) fn session_artifact_ok(
     path: &Path,
     file: bool,
@@ -572,18 +546,15 @@ pub(super) fn find_clip(store: &Store, id: i64) -> Result<Clip, CommandError> {
 
 /// Reject a trim range before ffmpeg is spawned.
 ///
-/// The first branch is the one the UI must never hit, because it clamps before calling:
-/// `trim_lossless` would bail on it too, but with a message that names no clip. The second
-/// exists so that a range reaching past the end of the clip is an explicit, actionable
-/// error rather than an ffmpeg failure to decode.
+/// The first branch is one the UI never hits, because it clamps first; `trim_lossless` would
+/// bail too, but with a message naming no clip. The second makes a range past the clip's end an
+/// actionable error rather than an ffmpeg decode failure.
 fn validate_trim_range(clip: &Clip, start_ms: u64, end_ms: u64) -> Result<(), CommandError> {
     validate_range("clip", clip.id, clip.duration_ms, start_ms, end_ms)
 }
 
-/// The same rules for anything a range can be cut out of — a clip, or a session recording.
-///
-/// `subject` names which, so the message a user reads says "clip #7" or "session #3" instead
-/// of making them work out which one they asked for.
+/// The same rules for anything a range can be cut out of, a clip or a session recording.
+/// `subject` names which, so the message says "clip #7" or "session #3".
 pub(super) fn validate_range(
     subject: &str,
     id: i64,
@@ -618,12 +589,11 @@ pub(super) fn validate_range(
     Ok(())
 }
 
-/// Where a trim of `[start_ms, end_ms)` of `src` is written: beside the original, with the
-/// range in the name so the file explains itself in a directory listing.
+/// Where a trim of `[start_ms, end_ms)` of `src` is written: beside the original, with the range
+/// in the name so the file explains itself in a listing.
 ///
-/// The extension is preserved. Clips are `mp4` in this application, and `trim_lossless`
-/// muxes with `-movflags +faststart`, which only an ISO-BMFF muxer accepts — so the
-/// extension is carried over rather than assumed.
+/// The extension is carried over rather than assumed: `trim_lossless` muxes with
+/// `-movflags +faststart`, which only an ISO-BMFF muxer accepts.
 pub fn trim_output_path(src: &Path, start_ms: u64, end_ms: u64) -> PathBuf {
     let stem = src
         .file_stem()
@@ -638,9 +608,8 @@ pub fn trim_output_path(src: &Path, start_ms: u64, end_ms: u64) -> PathBuf {
 
 /// The first name derived from `candidate` that no file on disk already holds.
 ///
-/// Bounded, and a bound that is reached is an error rather than an overwrite: silently
-/// clobbering a previous trim would destroy a file the index may name, which is exactly
-/// the class of loss spec §8.2 is written to prevent.
+/// Bounded, and reaching the bound is an error rather than an overwrite: clobbering a previous
+/// trim would destroy a file the index may name.
 pub(super) fn free_output_path(candidate: PathBuf) -> Result<PathBuf, CommandError> {
     if !candidate.exists() {
         return Ok(candidate);
@@ -677,13 +646,12 @@ pub fn thumbnail_file_name(clip_id: i64, at_ms: u64) -> String {
 
 /// Remove every cached thumbnail belonging to `clip_id`. Returns how many went.
 ///
-/// The prefix match is exact about the id: `clip-1-` must not match `clip-12-0.jpg`, which
-/// is why the trailing dash is part of it.
+/// The prefix match is exact about the id: `clip-1-` must not match `clip-12-0.jpg`, hence the
+/// trailing dash.
 fn remove_cached_thumbnails(dir: &Path, clip_id: i64) -> usize {
     let prefix = format!("clip-{clip_id}-");
     let Ok(entries) = std::fs::read_dir(dir) else {
-        // No cache directory is the normal case for a library whose clips were never
-        // thumbnailed; it is not a failure.
+        // No cache directory is the normal case for a library whose clips were never thumbnailed.
         return 0;
     };
     let mut removed = 0;
@@ -704,10 +672,8 @@ fn remove_cached_thumbnails(dir: &Path, clip_id: i64) -> usize {
     removed
 }
 
-/// Milliseconds since the Unix epoch, saturating to 0 for a clock before it.
-///
-/// The store stamps `created_at` from its own copy of this. Nothing here is a measurement
-/// of elapsed time; it only has to be the same wall clock the store is on.
+/// Milliseconds since the Unix epoch, saturating to 0 for a clock before it. Nothing here
+/// measures elapsed time; it only has to be the wall clock the store is on.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -728,10 +694,9 @@ mod tests {
     #[test]
     fn lists_clips_newest_first_by_creation_time_not_by_media_time() {
         let f = Fixture::new();
-        // The older *row* carries the newer media timestamp. The store's own `list_clips`
-        // orders by `started_at` and would put it first; the command must not, because
-        // `started_at` restarts with the scratch directory and is not comparable across
-        // runs.
+        // The older row carries the newer media timestamp. The store's own `list_clips` orders by
+        // `started_at` and would put it first; the command must not, because `started_at` restarts with
+        // the scratch directory and is not comparable across runs.
         let older_row = f.add_row("older-row.mp4", 9_000, 1_000, 10);
         let newer_row = f.add_row("newer-row.mp4", 1_000, 1_000, 10);
 
@@ -749,10 +714,9 @@ mod tests {
 
     #[test]
     fn list_clips_leaves_out_rows_whose_files_are_gone_but_keeps_the_rows() {
-        // The state the first instrumented run found on a real install: a cleanup
-        // had removed files without their rows, and the listing handed every dead
-        // row to the window — one asset-protocol error and one ffmpeg thumbnail
-        // process per dead clip. The listing must not name a file that is gone.
+        // A cleanup removed files without their rows, and the listing handed every dead row to the
+        // window: one asset-protocol error and one ffmpeg thumbnail process per dead clip. The listing
+        // must not name a file that is gone.
         let f = Fixture::new();
         let live = f.add_row("here.mp4", 0, 1_000, 10);
         let gone = f.add_row("gone.mp4", 0, 1_000, 10);
@@ -776,15 +740,12 @@ mod tests {
 
     #[test]
     fn every_surface_counts_the_clips_that_are_actually_there() {
-        // What the Windows test machine showed: the listing filtered out rows whose files were gone and the
-        // storage panel did not, so one panel read "No clips are indexed yet" directly
-        // above "Indexed clips 12 (0 favourite), In use 1.2 GiB of 50 GiB" — twelve rows
-        // whose files had been deleted. That "1.2 GiB in use" was the library's *recorded*
-        // size, summed from rows, with not one byte of it on disk.
+        // The listing filtered out rows whose files were gone and the storage panel did not, so one
+        // panel read "No clips are indexed yet" above "Indexed clips 12, In use 1.2 GiB of 50 GiB":
+        // the recorded size summed from rows, with none of it on disk.
         //
-        // Both surfaces read one rule now, so they cannot drift apart again: the storage
-        // panel counts exactly what the listing shows, and (next test) names what it is
-        // not counting instead of quietly showing less.
+        // Both surfaces now read one rule: the storage panel counts exactly what the listing shows
+        // and (next test) names what it is not counting instead of quietly showing less.
         let f = Fixture::new();
         f.add_row("here.mp4", 0, 1_000, 4_000);
         f.add_row("also-here.mp4", 0, 1_000, 6_000);
@@ -969,19 +930,17 @@ mod tests {
 
     #[test]
     fn trim_is_a_stream_copy_not_a_re_encode() {
-        // The evidence: the trimmed file's video packets are byte-identical to the packets
-        // ffmpeg reads out of the same span of the parent. A re-encode cannot produce the
-        // same bytes for the same frames — which the negative control at the end proves, so
-        // that this assertion is known to be able to fail.
+        // The evidence: the trimmed file's video packets are byte-identical to the packets ffmpeg reads
+        // out of the same span of the parent. A re-encode cannot produce the same bytes, which the
+        // negative control at the end proves, so this assertion is known to be able to fail.
         let f = Fixture::new();
         let (id, src) = f.add_real_clip("copy.mp4", 4);
 
         let trimmed = trim_clip(&f.deps(), id, 1_500, 3_000).unwrap();
         let trimmed_path = PathBuf::from(&trimmed.path);
 
-        // Both sides cover the same span of stream, measured from the file that was
-        // written, so a stream copy that could not cut at exactly 3000ms still compares
-        // like for like.
+        // Both sides cover the same span, measured from the file written, so a stream copy that could
+        // not cut at exactly 3000ms still compares like for like.
         let from_written_file = stream_md5(&f.bins, &trimmed_path, 0, None);
         let from_parent = stream_md5(&f.bins, &src, 1_500, Some(trimmed.duration_ms));
         assert_eq!(
@@ -1007,8 +966,8 @@ mod tests {
 
     #[test]
     fn trim_can_cut_the_whole_clip() {
-        // The upper bound is inclusive on purpose: a scrubber dragged to the end of the
-        // clip asks for exactly `duration_ms`, and that is a legal range.
+        // The upper bound is inclusive: a scrubber dragged to the end asks for exactly `duration_ms`,
+        // a legal range.
         let f = Fixture::new();
         let (id, _src) = f.add_real_clip("whole.mp4", 2);
 
@@ -1069,8 +1028,8 @@ mod tests {
 
     #[test]
     fn storage_stats_says_when_the_favourites_alone_exceed_the_cap() {
-        // Spec §8.1: the manager stops rather than delete a favourite to satisfy a cap it
-        // cannot meet. The panel has to be able to say why nothing will ever be freed.
+        // The manager stops rather than delete a favourite to satisfy a cap it cannot meet. The panel
+        // has to be able to say why nothing will ever be freed.
         let f = Fixture::with_storage(StorageConfigView {
             max_total_bytes: 500,
             max_age_days: 3_650,
@@ -1175,11 +1134,10 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::OutOfRange);
         assert!(err.message.contains("2000ms"), "got: {}", err.message);
-        // A frame from inside the clip is served. The guarantee this command gives is
-        // "the timestamp names a position inside the clip", not "ffmpeg will find a frame
-        // there": the last frame of a stream starts a frame interval before its nominal
-        // duration ends, so a timestamp a few milliseconds short of the end can still fail
-        // — see the note on `thumbnail`. The UI asks for a frame in the first second.
+        // A frame from inside the clip is served. The guarantee is "the timestamp names a position
+        // inside the clip", not "ffmpeg will find a frame there": the last frame of a stream starts a
+        // frame interval before its nominal duration ends, so a timestamp a few milliseconds short of
+        // the end can still fail (see `thumbnail`). The UI asks for a frame in the first second.
         assert!(thumbnail(&f.deps(), id, 1_000).is_ok());
     }
 
@@ -1191,10 +1149,9 @@ mod tests {
 
     #[test]
     fn thumbnail_refuses_a_clip_whose_file_is_gone_before_anything_is_spawned() {
-        // A dead row must never reach ffmpeg: the UI asks per clip and retries, so
-        // one missing file used to mean a process per attempt. No-ffmpeg deps prove
-        // the guard runs before the binaries are even consulted — nothing can be
-        // spawned for a clip that cannot produce a frame.
+        // A dead row must never reach ffmpeg: the UI asks per clip and retries, so one missing file
+        // would mean a process per attempt. No-ffmpeg deps prove the guard runs before the binaries are
+        // even consulted.
         let f = Fixture::new();
         let id = f.add_row("vanished.mp4", 0, 2_000, 10);
         std::fs::remove_file(f.paths.clips_dir.join("vanished.mp4")).unwrap();
@@ -1216,9 +1173,9 @@ mod tests {
 
     #[test]
     fn a_thumbnail_ffmpeg_cannot_produce_names_the_clip_and_the_timestamp() {
-        // A row pointing at something that is not a video: ffmpeg fails, and the message has
-        // to say which clip and which frame — "ffmpeg had nothing to read" is otherwise
-        // indistinguishable from a corrupt library.
+        // A row pointing at something that is not a video: ffmpeg fails, and the message must say which
+        // clip and which frame, since "ffmpeg had nothing to read" otherwise looks like a corrupt
+        // library.
         let f = Fixture::new();
         let broken = f.paths.clips_dir.join("truncated.mp4");
         std::fs::write(&broken, b"not a video at all").unwrap();
@@ -1245,9 +1202,8 @@ mod tests {
 
     #[test]
     fn media_commands_fail_clearly_when_ffmpeg_is_missing() {
-        // The shell opens without ffmpeg — the list and the storage panel need none — so
-        // the two commands that do need it must fail with a code the UI can explain,
-        // rather than panicking or taking the window down.
+        // The shell opens without ffmpeg (the list and storage panel need none), so the two commands
+        // that do need it must fail with a code the UI can explain, not panic.
         let f = Fixture::new();
         let id = f.add_row("no-ffmpeg.mp4", 0, 1_000, 10);
         let deps = f.deps_without_ffmpeg();
@@ -1281,10 +1237,9 @@ mod tests {
 
     #[test]
     fn delete_reports_an_orphan_when_the_file_cannot_be_unlinked() {
-        // A directory where a clip file should be: `remove_file` refuses it on every
-        // platform, which is the only portable way to make an unlink fail on purpose.
-        // The state this leaves is the one spec §8.2 accepts as recoverable, and the one
-        // the UI must be able to name.
+        // A directory where a clip file should be: `remove_file` refuses it on every platform, the only
+        // portable way to make an unlink fail on purpose. The state left is the recoverable one the UI
+        // must be able to name.
         let f = Fixture::new();
         let not_a_file = f.paths.clips_dir.join("not-a-file.mp4");
         std::fs::create_dir(&not_a_file).unwrap();
@@ -1317,9 +1272,8 @@ mod tests {
     fn delete_reports_a_row_whose_file_was_already_gone() {
         let f = Fixture::new();
         let id = f.add_row("missing.mp4", 0, 1_000, 10);
-        // The state under test: the file was removed without its row — a cleanup
-        // that deleted files but left the index alone did exactly this on a real
-        // install, which is what the missing-file guards elsewhere are for.
+        // The state under test: the file was removed without its row (a cleanup that deleted files but
+        // left the index alone), which is what the missing-file guards elsewhere are for.
         std::fs::remove_file(f.paths.clips_dir.join("missing.mp4")).unwrap();
 
         let outcome = delete_clip(&f.deps(), id).unwrap();
@@ -1395,8 +1349,8 @@ mod tests {
 
     #[test]
     fn delete_of_an_unknown_id_unlinks_nothing() {
-        // Spec §8.2: no file is deleted unless a committed database row names it. So an id
-        // with no row must leave any file of that name exactly where it is.
+        // No file is deleted unless a committed database row names it, so an id with no row must leave
+        // any file of that name where it is.
         let f = Fixture::new();
         let stray = f.paths.clips_dir.join("stray.mp4");
         std::fs::write(&stray, b"not indexed, and therefore not this command's to delete").unwrap();
@@ -1435,8 +1389,8 @@ mod tests {
             trim_output_path(Path::new("/clips/game.mp4"), 1_500, 3_000),
             PathBuf::from("/clips/game.trim-1500-3000.mp4")
         );
-        // The extension is preserved (the muxer flags `trim_lossless` passes are only
-        // accepted by an ISO-BMFF muxer, so the extension is carried, never assumed).
+        // The extension is carried over, never assumed (the muxer flags `trim_lossless` passes are only
+        // accepted by an ISO-BMFF muxer).
         assert_eq!(
             trim_output_path(Path::new("clip.mkv"), 0, 10),
             PathBuf::from("clip.trim-0-10.mkv")

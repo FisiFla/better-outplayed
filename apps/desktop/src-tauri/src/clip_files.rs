@@ -1,20 +1,19 @@
 //! Handing a clip's file to the operating system: the clipboard and drag-out.
 //!
-//! (Reveal-in-folder reuses [`crate::background::reveal_command`], which the tray's "open
-//! config" item already runs.) Everything here acts on a path [`crate::commands::clip_file`]
-//! has already vetted — it exists and sits inside the library.
+//! (Reveal-in-folder reuses [`crate::background::reveal_command`].) Everything here acts on a
+//! path [`crate::commands::clip_file`] has already vetted: it exists and sits inside the library.
 //!
-//! The builders are pure so a test pins the exact command for **every** platform on any host;
-//! what no test here can do is watch a paste land in Explorer or a drop land in Discord.
+//! The builders are pure so a test pins the exact command for every platform on any host; no
+//! test can watch a paste land in Explorer or a drop land in Discord.
 
 use crate::background::FileManager;
 use std::path::Path;
 
 /// A process to run, plus the environment it needs.
 ///
-/// The path travels in an environment variable, never spliced into script text: a clip path
-/// is user-influenced (the title is not part of it, but the directory and file name are), and
-/// quoting rules for PowerShell and AppleScript are exactly where injection hides.
+/// The path travels in an environment variable, never spliced into script text: the directory
+/// and file name are user-influenced, and PowerShell and AppleScript quoting rules are where
+/// injection hides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {
     pub program: String,
@@ -25,9 +24,9 @@ pub struct ClipboardCommand {
 /// The environment variable that carries the path to the clipboard script.
 pub const CLIP_PATH_ENV: &str = "LOCALPLAY_CLIP_PATH";
 
-/// The command that puts `path` on the clipboard **as a file** (so Explorer, Finder, Discord
-/// and mail clients paste the video itself, not its path as text). `None` where this build
-/// has no mechanism (generic Linux: clipboards differ per desktop and the target is Windows).
+/// The command that puts `path` on the clipboard as a file (so Explorer, Finder, Discord and
+/// mail clients paste the video itself, not its path as text). `None` where this build has no
+/// mechanism (generic Linux: clipboards differ per desktop and the target is Windows).
 pub fn clipboard_command(path: &Path, manager: FileManager) -> Option<ClipboardCommand> {
     let env = vec![(CLIP_PATH_ENV.to_string(), path.display().to_string())];
     match manager {
