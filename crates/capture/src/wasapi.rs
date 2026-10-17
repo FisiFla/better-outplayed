@@ -27,9 +27,16 @@
 //! Each packet is placed by its device QPC timestamp, not by how many bytes came before it (see
 //! [`AudioTimeline`]): loopback sends nothing while nothing plays, so a byte count alone would
 //! play every later sample early against the video.
+//!
+//! # Device changes
+//!
+//! An invalidated endpoint (headset unplugged) or a new default output reopens the stream on the
+//! current default endpoint without resetting the timeline ([`RecoveringSource`]), so the outage
+//! is silence in the clip rather than an error or a track that ends early.
 
 #![cfg(windows)]
 
+use crate::audio_recovery::{RecoveringSource, SourceGone, SourceOpener};
 use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
 use crate::platform::init_com;
 use crate::{
@@ -44,8 +51,9 @@ use windows::Win32::Foundation::{
     CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_E_DEVICE_INVALIDATED,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
@@ -74,16 +82,13 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_PCM: u16 = 0x0001;
 
-/// Packets drained per `next_buffer` call, so a wedged or chatty endpoint cannot spin the drain
-/// loop forever. Sixteen is 160ms of audio; the next call picks up the rest.
-const MAX_PACKETS_PER_CALL: usize = 16;
-
 /// WASAPI loopback capture of the default render endpoint, opened as 48kHz stereo s16le with the
 /// engine converting (see the module docs).
 pub struct WasapiLoopback {
-    client: Option<Client>,
-    /// Places packets by device time and slices the result into 10ms blocks.
-    timeline: AudioTimeline,
+    /// The open stream and the timeline it feeds, reopened across device changes.
+    source: Option<RecoveringSource<EndpointOpener>>,
+    /// The stream generation `silence_watch` was armed for.
+    watched_generation: u64,
     /// Whether this thread's COM apartment was taken by us and must be given back.
     com_owned: bool,
     /// Diagnostic for the reported `AUTOCONVERTPCM`-delivers-silence failure (see
@@ -136,8 +141,8 @@ impl Drop for Client {
 impl WasapiLoopback {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            client: None,
-            timeline: AudioTimeline::new(TARGET, Duration::ZERO),
+            source: None,
+            watched_generation: 0,
             com_owned: false,
             // Disarmed until `start` learns whether the endpoint needed conversion.
             silence_watch: ConvertedSilenceWatch::new(false),
@@ -155,18 +160,19 @@ impl WasapiLoopback {
 
 impl AudioBackend for WasapiLoopback {
     fn start(&mut self) -> Result<()> {
-        if self.client.is_some() {
+        if self.source.is_some() {
             bail!("WASAPI loopback capture is already started");
         }
         self.com_owned = init_com()?;
-        match open_client() {
-            Ok(client) => {
-                // Frame 0 is the moment capture began, so a session that opens on silence still
-                // starts its audio alongside the video.
-                self.timeline.reset(client.anchor);
-                // A fresh session gets a fresh watch, armed only if the endpoint needed the engine's converter.
-                self.silence_watch = ConvertedSilenceWatch::new(client.converting);
-                self.client = Some(client);
+        // Frame 0 is the moment capture began, so a session that opens on silence still starts its
+        // audio alongside the video.
+        let now = clock_base().elapsed();
+        let opened = EndpointOpener::new()
+            .and_then(|opener| RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now));
+        match opened {
+            Ok(source) => {
+                self.source = Some(source);
+                self.watched_generation = 0;
                 Ok(())
             }
             Err(e) => {
@@ -180,17 +186,22 @@ impl AudioBackend for WasapiLoopback {
     /// Returns the next whole 10ms block, or `Ok(None)` when nothing is due within `timeout`. A zero
     /// timeout is a non-blocking "is anything due?" check, how the CLI drains audio without starving video.
     fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-        let Self { client, timeline, silence_watch, .. } = self;
-        let client = client.as_mut().context("WASAPI loopback capture is not started")?;
+        let Self { source, silence_watch, watched_generation, .. } = self;
+        let source = source.as_mut().context("WASAPI loopback capture is not started")?;
         let deadline = Instant::now() + timeout;
 
         loop {
             // Take everything the engine has already handed us, then pad any stretch it sent nothing for.
-            if timeline.drain(client, MAX_PACKETS_PER_CALL)? {
-                timeline.fill_to(clock_base().elapsed());
+            source.poll(clock_base().elapsed())?;
+            if let Some(client) = source.stream() {
+                if source.generation() != *watched_generation {
+                    // Each endpoint gets its own watch, armed only if it needs the engine's converter.
+                    *watched_generation = source.generation();
+                    *silence_watch = ConvertedSilenceWatch::new(client.converting);
+                }
             }
 
-            if let Some(block) = timeline.next_block() {
+            if let Some(block) = source.next_block() {
                 let buffer = block.buffer;
                 let block_duration =
                     Duration::from_micros(buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate));
@@ -222,6 +233,11 @@ impl AudioBackend for WasapiLoopback {
                 // A partial block stays buffered until it is complete.
                 return Ok(None);
             }
+            let Some(client) = source.stream() else {
+                // No stream to wait on while the device is being reopened; silence is padded meanwhile.
+                std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+                continue;
+            };
             // The engine signals this event once per device period, so waiting on it beats sleeping a fixed slice.
             let wait_ms = (deadline - now).as_millis().clamp(1, 200) as u32;
             // SAFETY: `client.event` is a live auto-reset event owned by `self`.
@@ -234,8 +250,7 @@ impl AudioBackend for WasapiLoopback {
 
     fn stop(&mut self) -> Result<()> {
         // Dropping the client stops the stream and closes the event handle.
-        self.client = None;
-        self.timeline.reset(Duration::ZERO);
+        self.source = None;
         self.release_com();
         Ok(())
     }
@@ -244,22 +259,82 @@ impl AudioBackend for WasapiLoopback {
 impl Drop for WasapiLoopback {
     fn drop(&mut self) {
         // A backend dropped without `stop` must still release the endpoint and the COM apartment it took.
-        self.client = None;
+        self.source = None;
         self.release_com();
     }
 }
 
-/// Open the default render endpoint in loopback mode and start it, asking the engine for the
-/// canonical 48kHz stereo s16le format whatever the endpoint's own mix format is.
-fn open_client() -> Result<Client> {
-    // SAFETY: the CLSID is the documented one; `None` means no aggregation.
-    let enumerator: IMMDeviceEnumerator = unsafe {
-        CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
-            .context("CoCreateInstance(MMDeviceEnumerator)")?
-    };
-    // SAFETY: the enumerator is alive; eRender/eConsole is the default output.
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-        .context("IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)")?;
+/// Opens loopback on whatever the default render endpoint is at the time.
+struct EndpointOpener {
+    enumerator: IMMDeviceEnumerator,
+}
+
+// SAFETY: as for `Client`: only the capture thread uses it, and the enumerator is free-threaded.
+unsafe impl Send for EndpointOpener {}
+
+impl EndpointOpener {
+    fn new() -> Result<Self> {
+        // SAFETY: the CLSID is the documented one; `None` means no aggregation.
+        let enumerator: IMMDeviceEnumerator = unsafe {
+            CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
+                .context("CoCreateInstance(MMDeviceEnumerator)")?
+        };
+        Ok(Self { enumerator })
+    }
+
+    fn default_device(&self) -> Result<IMMDevice> {
+        // SAFETY: the enumerator is alive; eRender/eConsole is the default output.
+        unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+            .context("IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)")
+    }
+}
+
+impl SourceOpener for EndpointOpener {
+    type Stream = Client;
+
+    fn open(&mut self) -> Result<(Client, String)> {
+        let device = self.default_device()?;
+        let id = device_id(&device)?;
+        Ok((open_client(&device)?, id))
+    }
+
+    fn wanted(&mut self) -> Result<String> {
+        device_id(&self.default_device()?)
+    }
+}
+
+/// The endpoint's id string, which tells one device from another across reopens.
+fn device_id(device: &IMMDevice) -> Result<String> {
+    // SAFETY: the device is alive; the returned string is CoTaskMemAlloc'd and freed right after
+    // it is copied out.
+    unsafe {
+        let id = device.GetId().context("IMMDevice::GetId")?;
+        let text = id.to_string();
+        CoTaskMemFree(Some(id.0 as *const core::ffi::c_void));
+        text.context("IMMDevice::GetId returned a string that is not UTF-16")
+    }
+}
+
+/// Whether an HRESULT means the endpoint behind the stream is gone, so a reopen can recover.
+fn is_endpoint_gone(e: &windows::core::Error) -> bool {
+    [AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING]
+        .contains(&e.code())
+}
+
+/// Context for a capture call, marking a lost endpoint as [`SourceGone`] so it is reopened.
+fn capture_call(what: &'static str) -> impl FnOnce(windows::core::Error) -> anyhow::Error {
+    move |e| {
+        if is_endpoint_gone(&e) {
+            SourceGone(format!("{what}: HRESULT {:#010x}", e.code().0)).into()
+        } else {
+            anyhow::Error::new(e).context(what)
+        }
+    }
+}
+
+/// Open `device` in loopback mode and start it, asking the engine for the canonical 48kHz stereo
+/// s16le format whatever the endpoint's own mix format is.
+fn open_client(device: &IMMDevice) -> Result<Client> {
     // SAFETY: IAudioClient is the render endpoint's documented client interface.
     let audio: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .context("IMMDevice::Activate(IAudioClient)")?;
@@ -473,7 +548,7 @@ impl PacketSource for Client {
     fn pull(&mut self, out: &mut Vec<u8>) -> Result<Option<PacketInfo>> {
         // SAFETY: the capture client is alive for as long as `self` is.
         let available = unsafe { self.capture.GetNextPacketSize() }
-            .context("IAudioCaptureClient::GetNextPacketSize")?;
+            .map_err(capture_call("IAudioCaptureClient::GetNextPacketSize"))?;
         if available == 0 {
             return Ok(None);
         }
@@ -487,7 +562,7 @@ impl PacketSource for Client {
         unsafe {
             self.capture
                 .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc_position))
-                .context("IAudioCaptureClient::GetBuffer")?
+                .map_err(capture_call("IAudioCaptureClient::GetBuffer"))?
         };
 
         // The buffer must be released however the copy below turns out.
@@ -495,7 +570,7 @@ impl PacketSource for Client {
         // SAFETY: `frames` is exactly the count `GetBuffer` just reported.
         let released = unsafe { self.capture.ReleaseBuffer(frames) };
         copied?;
-        released.context("IAudioCaptureClient::ReleaseBuffer")?;
+        released.map_err(capture_call("IAudioCaptureClient::ReleaseBuffer"))?;
 
         let timestamp_ok = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc_position != 0;
         Ok(Some(PacketInfo {

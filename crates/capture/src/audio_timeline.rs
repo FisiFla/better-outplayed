@@ -172,11 +172,6 @@ impl AudioTimeline {
             filler,
         })
     }
-
-    /// Drop whatever is buffered and restart the timeline at `origin`.
-    pub fn reset(&mut self, origin: Duration) {
-        *self = Self::new(self.format, origin);
-    }
 }
 
 /// A device QPC position (100ns units) on the shared clock, given one instant read on both:
