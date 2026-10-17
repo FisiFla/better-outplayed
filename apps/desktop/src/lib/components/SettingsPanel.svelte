@@ -105,22 +105,72 @@
   function applyAutomatic() {
     onApply({ auto_record: autoRecord });
   }
+
+  /** The sections the sub-nav jumps between; the ids are local to this panel. */
+  const SECTIONS = [
+    { id: 'settings-library', label: 'Library' },
+    { id: 'settings-capture', label: 'Capture' },
+    { id: 'settings-automatic', label: 'Automatic recording' },
+    { id: 'settings-games', label: 'Game integrations' },
+  ];
+  let activeSection = $state('settings-library');
+
+  function jumpTo(id: string) {
+    activeSection = id;
+    document.getElementById(id)?.scrollIntoView({ block: 'start' });
+  }
+
+  /** Highlight the section nearest the top of the view as it scrolls (no-op without the API). */
+  $effect(() => {
+    if (settings === null || typeof IntersectionObserver === 'undefined') return;
+    const seen = new Set<string>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) seen.add(entry.target.id);
+          else seen.delete(entry.target.id);
+        }
+        const first = SECTIONS.find((section) => seen.has(section.id));
+        if (first) activeSection = first.id;
+      },
+      { rootMargin: '0px 0px -60% 0px' },
+    );
+    for (const section of SECTIONS) {
+      const el = document.getElementById(section.id);
+      if (el) observer.observe(el);
+    }
+    return () => observer.disconnect();
+  });
 </script>
 
 <section class="panel settings">
-  <h2>Settings</h2>
+  <header class="head">
+    <h2>Settings</h2>
+  </header>
 
   {#if settings !== null}
-    <details class="body">
-      <summary>Library, capture, automatic recording</summary>
+    <div class="layout">
+    <nav class="subnav" aria-label="Settings sections">
+      {#each SECTIONS as section (section.id)}
+        <button
+          type="button"
+          class="ghost"
+          aria-current={activeSection === section.id ? 'true' : undefined}
+          onclick={() => jumpTo(section.id)}
+        >
+          {section.label}
+        </button>
+      {/each}
+    </nav>
 
+    <div class="sections">
     {#if !settings.config_exists}
       <p class="muted footnote">
         No config.toml yet — showing the example values. Saving writes the file.
       </p>
     {/if}
 
-    <div class="group">
+    <div class="group" id="settings-library">
       <h3>Library</h3>
       <label class="field">
         <span>Clips directory {#if isDefault('storage.clips_dir')}<span class="muted">(default)</span>{/if}</span>
@@ -139,7 +189,7 @@
       <button type="button" onclick={applyLibrary} disabled={busy}>Apply library</button>
     </div>
 
-    <div class="group">
+    <div class="group" id="settings-capture">
       <h3>Capture</h3>
       <div class="row">
         <label class="field">
@@ -231,7 +281,7 @@
       </button>
     </div>
 
-    <div class="group">
+    <div class="group" id="settings-automatic">
       <h3>Automatic recording</h3>
       <label class="check">
         <input
@@ -249,7 +299,7 @@
       <button type="button" onclick={applyAutomatic} disabled={busy}>Apply automatic</button>
     </div>
 
-    <div class="group">
+    <div class="group" id="settings-games">
       <h3>Game integrations</h3>
       <p class="muted footnote">
         Counter-Strike 2 and Dota 2 send round and kill events to this app through a small
@@ -269,7 +319,8 @@
         </div>
       {/each}
     </div>
-    </details>
+    </div>
+    </div>
   {/if}
 </section>
 
@@ -281,45 +332,78 @@
     gap: 8px;
   }
 
-  .body summary {
-    cursor: pointer;
-    color: var(--muted);
-    font-size: 11px;
-    padding: 2px 0;
+  .settings {
+    flex: none;
+    gap: var(--s-4);
+    padding: var(--s-5);
+    border-top: 0;
   }
 
-  .body summary:hover {
+  .head h2 {
+    font: var(--t-display);
     color: var(--text);
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 170px minmax(0, 1fr);
+    gap: var(--s-5);
+    align-items: start;
+  }
+
+  /* The sub-nav stays in view while the sections scroll past it. */
+  .subnav {
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+  }
+
+  .subnav button {
+    text-align: left;
+    border-color: transparent;
+    color: var(--text-muted);
+  }
+
+  .subnav button[aria-current='true'] {
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+
+  .sections {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-4);
+    min-width: 0;
   }
 
   .group {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding-top: 4px;
-  }
-
-  .group + .group {
-    border-top: 1px solid var(--line);
-    padding-top: 12px;
+    gap: var(--s-2);
+    padding: var(--s-4);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    scroll-margin-top: var(--s-2);
   }
 
   h3 {
     margin: 0;
-    font-size: 12px;
-    font-weight: 600;
+    font: var(--t-heading);
+    color: var(--text);
   }
 
   .field {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font: var(--t-small);
   }
 
   .field span {
     color: var(--muted);
-    font-size: 11px;
   }
 
   .row {
@@ -343,10 +427,10 @@
   select {
     font: inherit;
     color: inherit;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 5px 8px;
+    background: var(--surface-1);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    padding: 6px 10px;
     min-width: 0;
   }
 
@@ -359,7 +443,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font: var(--t-small);
     cursor: pointer;
   }
 
@@ -373,11 +457,23 @@
 
   .invalid {
     color: var(--warn);
-    font-size: 11px;
+    font: var(--t-small);
   }
 
   .footnote {
-    font-size: 11px;
+    font: var(--t-small);
+  }
+
+  @media (max-width: 1000px) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .subnav {
+      flex-direction: row;
+      flex-wrap: wrap;
+      position: static;
+    }
   }
 
   .group button {
