@@ -26,30 +26,24 @@ impl StubCapture {
         Self { cfg, frame_index: 0, started_at: None, read_back: 0, discarded: 0 }
     }
 
-    /// How many frames this source has **materialised** — pixel buffers actually built by
-    /// [`Self::render_next`], which is the readback a real backend pays a GPU copy and a
-    /// 33MB-per-frame CPU copy for.
-    ///
-    /// The regression test for the pacer's discard path (`apps/localplay-cli/tests/`)
-    /// asserts on this: a source offering frames faster than the pacer's target must
-    /// materialise only about the target rate, however many frames it offers.
+    /// How many frames this source has materialised: pixel buffers built by [`Self::render_next`],
+    /// the readback a real backend pays a GPU copy and a 33MB CPU copy for. The pacer's discard-path
+    /// regression test asserts on it: a source offering frames faster than the target rate must
+    /// materialise only about the target rate.
     pub fn frames_read_back(&self) -> u64 {
         self.read_back
     }
 
-    /// How many frames were consumed by [`CaptureBackend::discard_pending`] — offered by
-    /// the source, skipped by the pacer, and never rendered. Deliberately separate from
-    /// [`Self::frames_read_back`], because the whole point of the discard path is that
-    /// these frames cost nothing.
+    /// How many frames [`CaptureBackend::discard_pending`] consumed: offered, skipped by the pacer
+    /// and never rendered. Kept apart from [`Self::frames_read_back`] because these frames cost nothing.
     pub fn frames_discarded(&self) -> u64 {
         self.discarded
     }
 
     /// When the frame at `frame_index` is due, measured from `start`.
     ///
-    /// One formula for the whole source: `next_frame` and `discard_pending` must agree
-    /// about which frame is due, or a discard would consume a frame the pump is about to
-    /// ask for.
+    /// One formula for the whole source: `next_frame` and `discard_pending` must agree on which frame
+    /// is due, or a discard would consume a frame the pump is about to ask for.
     fn due_after(&self) -> Duration {
         Duration::from_micros(self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64)
     }
@@ -92,9 +86,7 @@ impl CaptureBackend for StubCapture {
     fn start(&mut self) -> anyhow::Result<()> {
         self.frame_index = 0;
         self.started_at = Some(std::time::Instant::now());
-        // A restart is a new run: the frame counter and both telemetry counters start
-        // from zero together, so a caller can never compare one run's frames against
-        // another's discarded ones.
+        // A restart is a new run: the frame counter and both telemetry counters restart together.
         self.read_back = 0;
         self.discarded = 0;
         Ok(())
@@ -102,10 +94,8 @@ impl CaptureBackend for StubCapture {
 
     /// Real-time paced, so the CLI's buffer runs at 1x like a real capture source.
     ///
-    /// Returns `None` when the next frame is not due within `timeout`. That is what
-    /// lets a single-threaded caller drive video and audio together without either
-    /// stream starving (see the CLI loop in Task 13).
-    /// `drain_for` deliberately bypasses pacing to keep tests fast.
+    /// Returns `None` when the next frame is not due within `timeout`, which lets a single-threaded
+    /// caller drive video and audio together without either starving. `drain_for` bypasses pacing.
     fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>> {
         let started = self
             .started_at
@@ -120,15 +110,12 @@ impl CaptureBackend for StubCapture {
         Ok(Some(self.render_next()))
     }
 
-    /// Consume the frame that is due right now, if any, **without rendering it**.
+    /// Consume the frame that is due right now, if any, without rendering it.
     ///
-    /// The stub holds no frame pool: `next_frame` builds a frame on demand from a
-    /// schedule, so "pending" is exactly "the next frame's due time has passed" and there
-    /// is never more than one. Consuming it is advancing `frame_index`, which is the whole
-    /// state a stub frame carries — the pixels are a deterministic function of it and the
-    /// caller has already decided to throw them away. Nothing is allocated and no pixel is
-    /// touched, which is the property under test: this is the cheap path the pacer uses for
-    /// the frames it will not keep, so it must never appear in [`Self::frames_read_back`].
+    /// The stub holds no frame pool: "pending" is exactly "the next frame's due time has passed", so
+    /// there is never more than one, and consuming it just advances `frame_index` (the pixels are a
+    /// deterministic function of it). Nothing is allocated and no pixel touched, so this path must
+    /// never appear in [`Self::frames_read_back`].
     fn discard_pending(&mut self) -> anyhow::Result<usize> {
         let started = self
             .started_at
@@ -187,9 +174,8 @@ impl AudioBackend for StubAudio {
         Ok(())
     }
 
-    /// Real-time paced like `StubCapture::next_frame`. Returns `None` when the next
-    /// 10ms block is not due within `timeout`; a `Duration::ZERO` timeout makes this
-    /// a non-blocking "is anything due?" check for the CLI's drain loop.
+    /// Real-time paced like `StubCapture::next_frame`. Returns `None` when the next 10ms block is
+    /// not due within `timeout`; a zero timeout is a non-blocking "is anything due?" check.
     fn next_buffer(&mut self, timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
         let started = self
             .started_at
@@ -249,8 +235,7 @@ mod tests {
 
     #[test]
     fn next_frame_with_zero_timeout_returns_none_when_not_due() {
-        // 10 fps => frames are 100ms apart, a comfortable margin over the handful of
-        // microseconds that elapse between the two calls below.
+        // 10 fps => frames 100ms apart, a comfortable margin over the microseconds between the calls below.
         let cfg = StubConfig { width: 8, height: 8, fps: 10 };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
@@ -273,8 +258,7 @@ mod tests {
         let cfg = StubConfig { width: 8, height: 8, fps: 10 };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
-        // Consume the immediately-due frame, then ask for the next one, which is due
-        // 100ms out, with a timeout long enough to wait for it.
+        // Consume the immediately-due frame, then wait for the next one (100ms out).
         assert!(cap.next_frame(Duration::ZERO).unwrap().is_some());
         assert!(
             cap.next_frame(Duration::from_secs(1)).unwrap().is_some(),
@@ -284,9 +268,8 @@ mod tests {
 
     #[test]
     fn discarding_the_pending_frame_does_not_read_it_back() {
-        // 10fps: frames are 100ms apart, and the frame at pts 0 is due immediately — so
-        // the calls below are deterministic without sleeping. (Everything here happens
-        // within microseconds of `start`.)
+        // 10fps: frames are 100ms apart and the frame at pts 0 is due immediately, so the calls below
+        // are deterministic without sleeping.
         let cfg = StubConfig { width: 8, height: 8, fps: 10 };
         let mut cap = StubCapture::new(cfg);
         cap.start().expect("start the stub");
@@ -304,8 +287,7 @@ mod tests {
         );
         assert_eq!(cap.frames_discarded(), 1);
 
-        // The schedule moved with it: frame 1 is 100ms out, so nothing is pending now and
-        // nothing is invented.
+        // The schedule moved with it: frame 1 is 100ms out, so nothing is pending and nothing is invented.
         assert_eq!(
             cap.discard_pending().expect("discard anything due"),
             0,
@@ -314,8 +296,7 @@ mod tests {
         assert!(cap.next_frame(Duration::ZERO).expect("poll").is_none());
         assert_eq!(cap.frames_read_back(), 0);
 
-        // And a frame the pump *does* take is counted as read back, so the split between
-        // the two counters is what the caller reads it as.
+        // A frame the pump does take is counted as read back.
         assert!(cap.next_frame(Duration::from_secs(1)).expect("wait for the frame").is_some());
         assert_eq!(cap.frames_read_back(), 1);
         assert_eq!(cap.frames_discarded(), 1);
