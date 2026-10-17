@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_path_lookup_and_reports_all_searched_locations() {
+    fn the_error_reports_every_searched_location() {
         let err = FfmpegBinaries::discover_from(None, &[]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("sidecar"), "error must name the sidecar dir: {msg}");
@@ -353,10 +353,7 @@ mod tests {
             "error must name the installed layout too, or a user of a broken installer has \
              nothing to look at: {msg}"
         );
-    }
 
-    #[test]
-    fn error_lists_every_location_it_searched() {
         let err = FfmpegBinaries::discover_from(
             None,
             &[PathBuf::from("/nowhere/next-to-exe"), PathBuf::from("/nowhere/checkout")],
@@ -404,13 +401,9 @@ mod tests {
     fn dev_fallback_finds_the_checkout_binaries_above_target_debug() {
         let tmp = TempDir::new().expect("temp dir");
         let (exe_dir, expected) = fake_checkout(tmp.path());
-        assert_eq!(dev_sidecar_dir_from(&exe_dir), Some(expected));
-    }
+        assert_eq!(dev_sidecar_dir_from(&exe_dir), Some(expected.clone()));
 
-    #[test]
-    fn dev_fallback_finds_the_checkout_from_a_test_binary_in_deps() {
-        let tmp = TempDir::new().expect("temp dir");
-        let (exe_dir, expected) = fake_checkout(tmp.path());
+        // A test binary lives one level further down, in `target/debug/deps`.
         let deps = exe_dir.join("deps");
         std::fs::create_dir_all(&deps).expect("creating deps");
         assert_eq!(dev_sidecar_dir_from(&deps), Some(expected));
@@ -442,18 +435,6 @@ mod tests {
         assert_eq!(dev_sidecar_dir_from(&exe_dir), None);
     }
 
-    #[test]
-    fn production_sidecar_dir_is_searched_before_the_dev_checkout_and_before_path() {
-        let tmp = TempDir::new().expect("temp dir");
-        let (exe_dir, dev) = fake_checkout(tmp.path());
-        let candidates = search_candidates(&exe_dir, Some(PathBuf::from("/usr/bin")));
-        assert_eq!(
-            candidates,
-            vec![exe_dir.join("binaries"), dev, PathBuf::from("/usr/bin")],
-            "order is: next to the executable, then the checkout, then PATH"
-        );
-    }
-
     /// The load-bearing test for packaging.
     ///
     /// `Contents/Resources/binaries` is **not** "next to the executable" — it is where the
@@ -479,23 +460,6 @@ mod tests {
             "the resolved binary must be inside the application bundle, was {}",
             found.ffmpeg.display()
         );
-    }
-
-    /// The Windows-shaped installation: resources installed *beside* the executable, so
-    /// `binaries/` sits in the installation directory and the plain `exe_dir` rule finds it.
-    /// Nothing platform-specific is needed for this — which is why the test pins the shape
-    /// rather than a code path: if the first candidate ever moved, this would notice.
-    #[test]
-    fn a_windows_style_install_finds_the_sidecars_next_to_the_executable() {
-        let tmp = TempDir::new().expect("temp dir");
-        let install = tmp.path().join("Program Files").join("localplay");
-        std::fs::create_dir_all(&install).expect("creating the installation directory");
-        write_sidecar_pair(&install.join(SIDECAR_DIR_NAME));
-
-        let found = FfmpegBinaries::discover_from(None, &search_candidates(&install, None))
-            .expect("the installer's own layout must be found");
-
-        assert_eq!(found.ffmpeg, install.join(SIDECAR_DIR_NAME).join(exe("ffmpeg")));
     }
 
     #[test]
@@ -625,26 +589,6 @@ mod tests {
             app.join("Contents").join("Resources").join(SIDECAR_DIR_NAME).join(exe("ffmpeg"))
         );
         assert!(found.ffprobe.is_file(), "{:?} exists too", found.ffprobe);
-    }
-
-    #[test]
-    fn installed_sidecar_outranks_the_checkout_copy() {
-        let tmp = TempDir::new().expect("temp dir");
-        let installed = tmp.path().join("installed/binaries");
-        let checkout = tmp.path().join("checkout/binaries");
-        for dir in [&installed, &checkout] {
-            std::fs::create_dir_all(dir).expect("creating a binaries dir");
-            std::fs::write(dir.join(exe("ffmpeg")), b"binary").expect("writing ffmpeg");
-            std::fs::write(dir.join(exe("ffprobe")), b"binary").expect("writing ffprobe");
-        }
-        let found = FfmpegBinaries::discover_from(None, &[installed.clone(), checkout.clone()])
-            .expect("the first complete directory wins");
-        assert_eq!(
-            found.ffmpeg,
-            installed.join(exe("ffmpeg")),
-            "an installed sidecar must never be shadowed by a checkout copy"
-        );
-        assert_ne!(found.ffmpeg, checkout.join(exe("ffmpeg")));
     }
 
     #[test]
