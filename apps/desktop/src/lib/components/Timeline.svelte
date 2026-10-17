@@ -223,17 +223,16 @@
   .timeline {
     display: flex;
     flex-direction: column;
-    gap: 7px;
-    padding: 12px 16px 14px;
-    border-top: 1px solid var(--line);
-    background: var(--panel);
+    gap: var(--s-2);
+    padding: var(--s-4) var(--s-4) var(--s-3);
+    background: var(--surface-1);
   }
 
   .legend {
     display: flex;
     align-items: baseline;
-    gap: 12px;
-    font-size: 12px;
+    gap: var(--s-3);
+    font: var(--t-small);
   }
 
   .playhead-readout {
@@ -243,10 +242,11 @@
 
   .track {
     position: relative;
-    height: 46px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: linear-gradient(var(--panel-2), var(--panel-2));
+    height: 48px;
+    margin: 0 7px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
     cursor: crosshair;
     touch-action: none;
   }
@@ -255,21 +255,32 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    background: rgba(139, 123, 255, 0.16);
-    border-left: 1px solid rgba(139, 123, 255, 0.5);
-    border-right: 1px solid rgba(139, 123, 255, 0.5);
+    background: var(--accent-soft);
+    border-top: 2px solid var(--accent);
+    border-bottom: 2px solid var(--accent);
     pointer-events: none;
   }
 
   .playhead {
     position: absolute;
-    top: -2px;
-    bottom: -2px;
+    top: -3px;
+    bottom: -3px;
     width: 2px;
     margin-left: -1px;
-    background: var(--accent);
-    box-shadow: 0 0 6px rgba(139, 123, 255, 0.6);
+    background: var(--text);
+    box-shadow: 0 0 6px rgb(255 255 255 / 0.35);
     pointer-events: none;
+  }
+
+  .playhead::before {
+    content: '';
+    position: absolute;
+    top: -2px;
+    left: -3px;
+    width: 8px;
+    height: 8px;
+    border-radius: var(--r-full);
+    background: var(--text);
   }
 
   /*
@@ -298,12 +309,12 @@
     width: 3px;
     height: 13px;
     border-radius: 1px;
-    background: var(--marker, #94a3b8);
+    background: var(--marker, var(--text-muted));
   }
 
   .marker:hover::before,
   .marker:focus-visible::before {
-    box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.35);
+    box-shadow: 0 0 0 3px rgb(163 170 187 / 0.35);
   }
 
   .marker:focus-visible {
@@ -312,8 +323,8 @@
 
   .handle {
     position: absolute;
-    top: -4px;
-    bottom: -4px;
+    top: -5px;
+    bottom: -5px;
     width: 14px;
     margin-left: -7px;
     padding: 0;
@@ -332,11 +343,12 @@
     width: 4px;
     border-radius: 2px;
     background: var(--accent);
+    transition: box-shadow var(--d-fast) var(--ease);
   }
 
   .handle:hover::before,
   .handle:focus-visible::before {
-    box-shadow: 0 0 0 3px rgba(139, 123, 255, 0.35);
+    box-shadow: 0 0 0 3px var(--accent-soft), 0 0 0 4px var(--accent);
   }
 
   .handle:focus-visible {
@@ -344,6 +356,7 @@
   }
 
   .hint {
-    font-size: 11px;
+    font: var(--t-small);
+    color: var(--text-muted);
   }
 </style>
