@@ -2257,7 +2257,7 @@ fn build_encode_config(
     // record no video.
     #[cfg(windows)]
     let openable = vendor.is_some()
-        && localplay_encoder::mft::can_encode_with_textures(codec, native_size, cfg.encode.bitrate_kbps);
+        && localplay_encoder::mft::can_encode_with_textures(codec, native_size, cfg.encode.bitrate_kbps, cfg.encode.fps);
     #[cfg(not(windows))]
     let openable = false;
 
