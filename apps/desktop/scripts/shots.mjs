@@ -1292,6 +1292,22 @@ const states = [
       );
       await backToLibrary(page);
       check(this.name, (await page.locator('[data-region=clip-grid] .name').count()) === 6, 'Back returns to the full list');
+      const columns = () =>
+        page.locator('[data-region=clip-grid] ul').evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length);
+      check(this.name, (await columns()) === 5, `the grid has five columns at 1280 (${await columns()})`);
+      // Keyboard path: the card's menu opens from the keyboard, Escape closes it and returns focus.
+      const more = page.locator('[data-region=clip-grid] .more').first();
+      await more.focus();
+      await page.keyboard.press('Enter');
+      check(this.name, (await page.getByRole('menuitem', { name: 'Show in folder' }).count()) === 1, 'the card menu opens from the keyboard');
+      await page.keyboard.press('Escape');
+      check(this.name, (await page.locator('[role=menu]').count()) === 0, 'Escape closes the card menu');
+      check(this.name, await more.evaluate((el) => el === document.activeElement), 'and focus returns to the menu button');
+      await page.setViewportSize({ width: 940, height: 600 });
+      await page.waitForTimeout(150);
+      check(this.name, (await columns()) === 3, `the grid has three columns at 940 (${await columns()})`);
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await page.waitForTimeout(150);
       // The library at rest is where the heading, count, name and metadata labels live.
       await auditContrast(page, this.name);
     },
