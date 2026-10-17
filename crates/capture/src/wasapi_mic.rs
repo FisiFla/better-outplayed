@@ -262,18 +262,20 @@ impl AudioBackend for StubMicrophone {
 mod wasapi_impl {
     use crate::platform::init_com;
     use crate::{
-        clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
+        clock_base, is_silent_block, AudioBackend, AudioBuffer, ConvertedSilenceWatch,
     };
     // Shared with the loopback backend rather than copied: the same three questions asked of a
     // different endpoint, which keeps the log lines comparable and the published format identical.
-    use crate::wasapi::{native_format, requested_format, MixFormatGuard, TARGET};
+    use crate::wasapi::{native_format, qpc_anchor, requested_format, MixFormatGuard, TARGET};
+    use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
     use anyhow::{bail, Context, Result};
     use std::time::{Duration, Instant};
     use windows::core::IUnknown;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::Media::Audio::{
         eCapture, eCommunications, IAudioCaptureClient, IAudioClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
+        AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
         AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE,
@@ -321,22 +323,14 @@ mod wasapi_impl {
     /// WASAPI shared-mode microphone capture, opened as 48kHz stereo s16le with the engine
     /// converting (see the module docs).
     pub struct WasapiMicrophone {
-        /// Published format; always [`TARGET`], which is what the engine was asked to deliver.
-        format: AudioFormat,
         client: Option<Client>,
-        /// Samples that do not yet add up to a whole 10ms block.
-        pending: Vec<u8>,
-        /// pts of the next block to be published, stamped when its first sample arrived.
-        pending_pts: Duration,
-        last_pts: Duration,
+        /// Places packets by device time, like the game-audio track, and slices 10ms blocks.
+        timeline: AudioTimeline,
         /// Whether this thread's COM apartment was taken by us and must be given back.
         com_owned: bool,
         /// Diagnostic for a microphone delivering only silence (see [`ConvertedSilenceWatch`]). Armed
         /// when the endpoint needed engine conversion; it only logs.
         silence_watch: ConvertedSilenceWatch,
-        /// When a packet last came out of the engine. Persisted across `next_buffer` calls because the
-        /// caller polls in short slices, so a per-call timestamp could never reach [`DEVICE_STALL`].
-        last_packet_at: Instant,
         /// When the endpoint's state was last checked, so a stalled stream asks Windows at most once per [`DEVICE_STALL`].
         last_state_check: Instant,
     }
@@ -350,6 +344,12 @@ mod wasapi_impl {
         /// Whether the endpoint's native format needed the engine's converter (was not already 48kHz
         /// stereo s16), so the capture loop can decide whether silence is worth blaming on conversion.
         converting: bool,
+        /// One instant read on both the QPC and the shared clock, to move packet timestamps across.
+        anchor_hns: u64,
+        anchor: Duration,
+        /// When a packet last came out of the engine. Persisted across `next_buffer` calls because the
+        /// caller polls in short slices, so a per-call timestamp could never reach [`DEVICE_STALL`].
+        last_packet_at: Instant,
     }
 
     // SAFETY: the backend is used from one thread at a time: the one that called `start`, which is
@@ -390,15 +390,11 @@ mod wasapi_impl {
         /// surface from `start`, with the rest of the recording's startup errors.
         pub fn new() -> Result<Self> {
             Ok(Self {
-                format: TARGET,
                 client: None,
-                pending: Vec::new(),
-                pending_pts: Duration::ZERO,
-                last_pts: Duration::ZERO,
+                timeline: AudioTimeline::new(TARGET, Duration::ZERO),
                 com_owned: false,
                 // Disarmed until `start` learns whether the endpoint needed conversion.
                 silence_watch: ConvertedSilenceWatch::new(false),
-                last_packet_at: Instant::now(),
                 last_state_check: Instant::now(),
             })
         }
@@ -420,12 +416,9 @@ mod wasapi_impl {
             self.com_owned = init_com()?;
             match open_client() {
                 Ok(client) => {
-                    self.pending.clear();
-                    self.pending_pts = Duration::ZERO;
-                    self.last_pts = Duration::ZERO;
+                    self.timeline = AudioTimeline::new(TARGET, client.anchor);
                     // A fresh session gets a fresh watch, armed only if the endpoint needed the engine's converter.
                     self.silence_watch = ConvertedSilenceWatch::new(client.converting);
-                    self.last_packet_at = Instant::now();
                     self.last_state_check = Instant::now();
                     self.client = Some(client);
                     Ok(())
@@ -442,55 +435,30 @@ mod wasapi_impl {
         /// timeout is a non-blocking "is anything due?" check, how the recorder drains the microphone
         /// without starving the video.
         fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-            let Self {
-                client,
-                format,
-                pending,
-                pending_pts,
-                last_pts,
-                silence_watch,
-                last_packet_at,
-                last_state_check,
-                ..
-            } = self;
+            let Self { client, timeline, silence_watch, last_state_check, .. } = self;
             let client = client
-                .as_ref()
+                .as_mut()
                 .context("WASAPI microphone capture is not started")?;
-            let block_bytes = format.bytes_per_10ms();
-            let block_frames = format.sample_rate as usize / 100;
-            let block_duration =
-                Duration::from_micros(block_frames as u64 * 1_000_000 / format.sample_rate as u64);
             let deadline = Instant::now() + timeout;
 
             loop {
-                // Take everything the engine has already handed us.
-                for _ in 0..MAX_PACKETS_PER_CALL {
-                    let starting_empty = pending.is_empty();
-                    if !pull_packet(client, pending)? {
-                        break;
-                    }
-                    *last_packet_at = Instant::now();
-                    if starting_empty {
-                        // Stamp the block's first sample on the shared clock now, and let further blocks in the same
-                        // burst follow by exactly one block of samples each. This is when the packet was retrieved: the
-                        // engine hands a capture buffer over about one device period late, so this track's timestamps can
-                        // carry up to ~10ms of offset against video. Sample-accurate QPC stamps are deferred, as on the
-                        // loopback side.
-                        *pending_pts = clock_base().elapsed().max(*last_pts);
-                    }
+                // Take everything the engine has already handed us, placed by its device timestamps so a
+                // glitch that loses samples leaves silence rather than pulling the rest of the track early.
+                if timeline.drain(client, MAX_PACKETS_PER_CALL)? {
+                    timeline.fill_to(clock_base().elapsed());
                 }
 
-                if pending.len() >= block_bytes {
-                    let data: Vec<u8> = pending.drain(..block_bytes).collect();
-                    let pts = (*pending_pts).max(*last_pts);
-                    *last_pts = pts;
-                    *pending_pts = pts + block_duration;
-                    let buffer = AudioBuffer { data, frames: block_frames, pts, format: *format };
+                if let Some(block) = timeline.next_block() {
+                    let buffer = block.buffer;
+                    let block_duration = Duration::from_micros(
+                        buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate),
+                    );
 
                     // Diagnostic only: silence with the converter in the path is either a muted microphone or the
                     // reported AUTOCONVERTPCM-delivers-silence failure, and a user whose clip has no voice track
                     // should hear about it. It latches (one warning per session) and never errors or stops capture.
-                    if silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
+                    // Padding is skipped: it says nothing about what the microphone hears.
+                    if !block.filler && silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
                         tracing::warn!(
                             silent_run_secs = silence_watch.silent_run().as_secs_f64(),
                             capture_secs = silence_watch.elapsed().as_secs_f64(),
@@ -520,7 +488,7 @@ mod wasapi_impl {
                 // backend with a zero timeout (`pump_once_counted`), which returns before reaching the wait, so a
                 // check placed there would never run in the real capture loop. Throttled to one `GetState` per
                 // [`DEVICE_STALL`], so checking on every poll costs nothing.
-                let since_packet = last_packet_at.elapsed();
+                let since_packet = client.last_packet_at.elapsed();
                 if since_packet >= DEVICE_STALL && last_state_check.elapsed() >= DEVICE_STALL {
                     *last_state_check = Instant::now();
                     check_endpoint_alive(client, since_packet)?;
@@ -547,7 +515,7 @@ mod wasapi_impl {
         fn stop(&mut self) -> Result<()> {
             // Dropping the client stops the stream and closes the event handle.
             self.client = None;
-            self.pending.clear();
+            self.timeline = AudioTimeline::new(TARGET, Duration::ZERO);
             self.release_com();
             Ok(())
         }
@@ -641,6 +609,7 @@ mod wasapi_impl {
             .map_err(wasapi_call("IAudioClient::GetService(IAudioCaptureClient)"))?;
         // SAFETY: the stream is fully configured at this point.
         unsafe { audio.Start() }.map_err(wasapi_call("IAudioClient::Start"))?;
+        let (anchor_hns, anchor) = qpc_anchor()?;
 
         // Which microphone was opened and whether the engine is converting for it: `converting = true`
         // plus audible 48kHz stereo audio in the microphone track is checkable without a debugger, and
@@ -658,7 +627,16 @@ mod wasapi_impl {
             engine_upmixes_mono_to_stereo = native.channels == 1,
             "WASAPI microphone capture started on the default communications capture endpoint"
         );
-        Ok(Client { audio, capture, device, event, converting: native.needs_conversion() })
+        Ok(Client {
+            audio,
+            capture,
+            device,
+            event,
+            converting: native.needs_conversion(),
+            anchor_hns,
+            anchor,
+            last_packet_at: Instant::now(),
+        })
     }
 
     /// Fail cleanly if the endpoint behind a stalled stream has gone away.
@@ -709,38 +687,48 @@ mod wasapi_impl {
         }
     }
 
-    /// Pull one packet from the capture client and append it to `out`.
-    ///
-    /// Returns whether a packet was consumed. Callers must not assume `out` grew: a packet can be
-    /// empty, or flagged silent (its buffer contents are then undefined; only the frame count matters).
-    fn pull_packet(client: &Client, out: &mut Vec<u8>) -> Result<bool> {
-        // SAFETY: the capture client is alive for as long as `client` is.
-        let available = unsafe { client.capture.GetNextPacketSize() }
-            .map_err(wasapi_call("IAudioCaptureClient::GetNextPacketSize"))?;
-        if available == 0 {
-            return Ok(false);
+    impl PacketSource for Client {
+        /// Pull one packet from the capture client and append it to `out`. A packet can be empty, or
+        /// flagged silent (its buffer contents are then undefined; only the frame count matters).
+        fn pull(&mut self, out: &mut Vec<u8>) -> Result<Option<PacketInfo>> {
+            // SAFETY: the capture client is alive for as long as `self` is.
+            let available = unsafe { self.capture.GetNextPacketSize() }
+                .map_err(wasapi_call("IAudioCaptureClient::GetNextPacketSize"))?;
+            if available == 0 {
+                return Ok(None);
+            }
+
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut frames: u32 = 0;
+            let mut flags: u32 = 0;
+            let mut qpc_position: u64 = 0;
+            // SAFETY: all four are valid out-parameters; the device position is not needed because the
+            // QPC position already says when the first frame was recorded.
+            unsafe {
+                self.capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc_position))
+                    .map_err(wasapi_call("IAudioCaptureClient::GetBuffer"))?
+            };
+
+            // The buffer must be released however the copy below turns out.
+            let copied = append_packet(data, frames, flags, out);
+            // SAFETY: `frames` is exactly the count `GetBuffer` just reported.
+            let released = unsafe { self.capture.ReleaseBuffer(frames) }
+                .map_err(wasapi_call("IAudioCaptureClient::ReleaseBuffer"));
+            copied?;
+            released?;
+            self.last_packet_at = Instant::now();
+
+            let timestamp_ok =
+                flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc_position != 0;
+            Ok(Some(PacketInfo {
+                frames: frames as usize,
+                time: timestamp_ok
+                    .then(|| qpc_to_shared(qpc_position, self.anchor_hns, self.anchor))
+                    .flatten(),
+                discontinuity: flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+            }))
         }
-
-        let mut data: *mut u8 = std::ptr::null_mut();
-        let mut frames: u32 = 0;
-        let mut flags: u32 = 0;
-        // SAFETY: all three are valid out-parameters; the device and QPC positions are not needed
-        // because pts comes from the shared Instant base.
-        unsafe {
-            client
-                .capture
-                .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-                .map_err(wasapi_call("IAudioCaptureClient::GetBuffer"))?
-        };
-
-        // The buffer must be released however the copy below turns out.
-        let copied = append_packet(data, frames, flags, out);
-        // SAFETY: `frames` is exactly the count `GetBuffer` just reported.
-        let released = unsafe { client.capture.ReleaseBuffer(frames) }
-            .map_err(wasapi_call("IAudioCaptureClient::ReleaseBuffer"));
-        copied?;
-        released?;
-        Ok(true)
     }
 
     /// Append one packet's samples to `out`.
