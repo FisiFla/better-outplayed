@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
-   * The clip list: newest first, with a thumbnail, the three facts that identify a clip,
-   * a favourite toggle and a confirmed delete.
+   * The clip library: a grid of thumbnail cards, newest first. A card opens the clip,
+   * and carries a favourite toggle and a menu (copy, show in folder, confirmed delete).
    *
    * The list does not sort. `list_clips` returns the clips newest first, ordered by the
    * wall-clock instant the row was written, and that decision belongs to the Rust side
@@ -10,6 +10,9 @@
    */
   import { shouldStartDrag } from '../clips';
   import type { ClipView } from '../clips';
+  import { gridIndex } from '../nav';
+  import type { NavKey } from '../nav';
+  import Icon from './Icon.svelte';
 
   interface Props {
     clips: ClipView[];
@@ -52,27 +55,83 @@
     }
   }
 
-  /** The clip whose delete button is armed, if any. */
-  let confirming = $state<number | null>(null);
+  /** The clip whose menu is open, and whether its delete is armed. */
+  let menuFor = $state<number | null>(null);
+  let confirming = $state(false);
+  let list = $state<HTMLUListElement>();
+
+  function closeMenu(refocus = false) {
+    const id = menuFor;
+    menuFor = null;
+    confirming = false;
+    if (refocus && id !== null) list?.querySelector<HTMLElement>(`[data-menu-for="${id}"]`)?.focus();
+  }
+
+  function toggleMenu(id: number) {
+    if (menuFor === id) return closeMenu();
+    menuFor = id;
+    confirming = false;
+  }
+
+  /** Focus the first item of a menu as it opens, so the keyboard path continues inside it. */
+  function focusFirst(node: HTMLElement) {
+    node.querySelector<HTMLElement>('button')?.focus();
+  }
+
+  function menuKey(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      closeMenu(true);
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const items = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button')];
+      const at = items.indexOf(document.activeElement as HTMLElement);
+      const next = event.key === 'ArrowDown' ? at + 1 : at - 1;
+      items[(next + items.length) % items.length]?.focus();
+    }
+  }
+
+  function outside(event: PointerEvent) {
+    if (menuFor !== null && !(event.target as Element).closest('.menu-wrap')) closeMenu();
+  }
+
+  /** Arrow keys move between cards; the column count is read off the laid-out grid. */
+  function cardKey(event: KeyboardEvent, index: number) {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    const columns = getComputedStyle(list!).gridTemplateColumns.split(' ').length;
+    const target = gridIndex(index, event.key as NavKey, clips.length, columns);
+    if (target < 0) return;
+    event.preventDefault();
+    list?.querySelectorAll<HTMLElement>('button.row')[target]?.focus();
+  }
 </script>
 
+<svelte:window onpointerdown={outside} />
+
 {#if clips.length === 0 && filtering}
-  <p class="empty">No clips match the current search and filters.</p>
+  <div class="empty">
+    <Icon name="search" size={32} />
+    <p>No clips match the current search and filters.</p>
+  </div>
 {:else if clips.length === 0}
-  <p class="empty">
-    No clips are indexed yet. Start recording above, then take one with
-    <strong>Save clip</strong> — or with the clip hotkey.
-  </p>
+  <div class="empty">
+    <Icon name="clapperboard" size={40} />
+    <p>
+      No clips are indexed yet. Start recording above, then take one with
+      <strong>Save clip</strong> — or with the clip hotkey.
+    </p>
+  </div>
 {:else}
-  <ul>
-    {#each clips as clip (clip.id)}
+  <ul bind:this={list}>
+    {#each clips as clip, index (clip.id)}
       {@const thumbnail = thumbnails[clip.id]}
-      <li class:selected={clip.id === selectedId}>
+      <li class:selected={clip.id === selectedId} class:menu-open={menuFor === clip.id}>
         <button
           class="row"
           type="button"
           aria-current={clip.id === selectedId}
           onclick={() => onSelect(clip.id)}
+          onkeydown={(e) => cardKey(e, index)}
           onpointerdown={(e) => {
             if (e.button === 0) press = { id: clip.id, x: e.clientX, y: e.clientY };
           }}
@@ -81,15 +140,18 @@
           onpointerleave={pointerMove}
           title="Drag to copy this clip's file into another app"
         >
-          {#if thumbnail}
-            <img class="thumb" src={thumbnail} alt="" loading="lazy" draggable="false" />
-          {:else}
-            <span class="thumb placeholder" aria-hidden="true"></span>
-          {/if}
+          <span class="frame">
+            {#if thumbnail}
+              <img class="thumb" src={thumbnail} alt="" loading="lazy" decoding="async" draggable="false" />
+            {:else}
+              <span class="thumb placeholder" aria-hidden="true"><Icon name="video" size={28} /></span>
+            {/if}
+            <span class="duration">{clip.durationLabel}</span>
+          </span>
           <span class="meta">
             <span class="name">{clip.displayName}</span>
             <span class="sub muted">
-              {#if clip.game}{clip.game} · {/if}{clip.durationLabel} · {clip.sizeLabel} · {clip.createdAtLabel}
+              {#if clip.game}{clip.game} · {/if}{clip.sizeLabel} · {clip.createdAtLabel}
             </span>
             {#if clip.tags.length > 0}
               <span class="tags">
@@ -101,56 +163,82 @@
 
         <div class="actions">
           <button
-            class="star"
+            class="icon star"
             type="button"
             aria-pressed={clip.favourite}
             aria-label={clip.favourite ? 'Remove from favourites' : 'Add to favourites'}
             title="Favourites are exempt from the storage policy's cap and age rules"
             onclick={() => onFavourite(clip.id, !clip.favourite)}
           >
-            {clip.favourite ? '★' : '☆'}
+            <Icon name="star" size={16} />
           </button>
 
-          <button
-            type="button"
-            title="Copy the clip file to the clipboard"
-            aria-label="Copy clip file"
-            onclick={() => onCopy(clip.id)}
-          >
-            Copy
-          </button>
-          <button
-            type="button"
-            title="Show the clip file in the file manager"
-            aria-label="Show in folder"
-            onclick={() => onReveal(clip.id)}
-          >
-            Folder
-          </button>
-
-          {#if confirming === clip.id}
+          <div class="menu-wrap">
             <button
-              class="danger"
+              class="icon more"
               type="button"
-              title="The index row is deleted first, then the file"
-              onclick={() => {
-                onDelete(clip.id);
-                confirming = null;
-              }}
+              aria-label="More actions"
+              aria-haspopup="true"
+              aria-expanded={menuFor === clip.id}
+              data-menu-for={clip.id}
+              onclick={() => toggleMenu(clip.id)}
             >
-              Delete
+              <Icon name="ellipsis" size={16} />
             </button>
-            <button type="button" onclick={() => (confirming = null)}>Cancel</button>
-          {:else}
-            <button
-              class="danger"
-              type="button"
-              title="Delete this clip"
-              onclick={() => (confirming = clip.id)}
-            >
-              Delete
-            </button>
-          {/if}
+            {#if menuFor === clip.id}
+              <div class="menu" role="menu" tabindex="-1" aria-label="Clip actions" use:focusFirst onkeydown={menuKey}>
+                {#if confirming}
+                  <button
+                    role="menuitem"
+                    class="danger"
+                    type="button"
+                    title="The index row is deleted first, then the file"
+                    onclick={() => {
+                      onDelete(clip.id);
+                      closeMenu();
+                    }}
+                  >
+                    <Icon name="trash-2" size={15} /> Delete clip
+                  </button>
+                  <button role="menuitem" type="button" onclick={() => (confirming = false)}>Cancel</button>
+                {:else}
+                  <button
+                    role="menuitem"
+                    type="button"
+                    title="Copy the clip file to the clipboard"
+                    aria-label="Copy clip file"
+                    onclick={() => {
+                      onCopy(clip.id);
+                      closeMenu(true);
+                    }}
+                  >
+                    <Icon name="copy" size={15} /> Copy file
+                  </button>
+                  <button
+                    role="menuitem"
+                    type="button"
+                    title="Show the clip file in the file manager"
+                    aria-label="Show in folder"
+                    onclick={() => {
+                      onReveal(clip.id);
+                      closeMenu(true);
+                    }}
+                  >
+                    <Icon name="folder-open" size={15} /> Show in folder
+                  </button>
+                  <button
+                    role="menuitem"
+                    class="danger"
+                    type="button"
+                    title="Delete this clip"
+                    onclick={() => (confirming = true)}
+                  >
+                    <Icon name="trash-2" size={15} /> Delete
+                  </button>
+                {/if}
+              </div>
+            {/if}
+          </div>
         </div>
       </li>
     {/each}
@@ -159,68 +247,117 @@
 
 <style>
   ul {
-    /*
-     * The primary list: basis `auto` (not 0) so it shares surplus and deficit fairly
-     * with the session list below instead of collapsing to nothing the moment the
-     * fixed chrome fills the sidebar — with thirty clips the content basis is the big
-     * one, so it keeps the lion's share and scrolls the rest.
-     */
+    /* The grid scrolls inside the view: it takes what is left and no more. */
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     margin: 0;
-    padding: 0 8px 8px;
+    padding: var(--s-2) var(--s-5) var(--s-5);
     list-style: none;
+    display: grid;
+    /* 3 columns at the 940px minimum window, 5 at the 1280px default. */
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-auto-rows: max-content;
+    gap: var(--s-5) var(--s-4);
   }
 
   li {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: center;
-    gap: 4px;
-    border-radius: 6px;
-    border: 1px solid transparent;
+    position: relative;
+    min-width: 0;
+    border-radius: var(--r-md);
   }
 
-  li.selected {
-    background: var(--panel-2);
-    border-color: var(--accent-dim);
+  li.menu-open {
+    z-index: 2;
   }
 
   .row {
-    display: grid;
-    grid-template-columns: 64px 1fr;
-    align-items: center;
-    gap: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
     width: 100%;
-    padding: 8px;
+    padding: 0;
     background: transparent;
     border: 0;
-    border-radius: 6px;
+    border-radius: var(--r-md);
     text-align: left;
   }
 
+  .row:hover:not(:disabled),
+  .row:active:not(:disabled) {
+    background: transparent;
+    border-color: transparent;
+  }
+
+  .row:focus-visible {
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+
+  .frame {
+    position: relative;
+    display: block;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border-radius: var(--r-md);
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    transition: border-color var(--d-fast) var(--ease);
+  }
+
+  li:hover .frame {
+    border-color: var(--border-strong);
+  }
+
+  li.selected .frame {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
   .thumb {
-    width: 64px;
-    height: 36px;
+    width: 100%;
+    height: 100%;
     object-fit: cover;
-    border-radius: 3px;
-    border: 1px solid var(--line);
+    display: block;
     background: #000;
   }
 
   .thumb.placeholder {
-    display: block;
-    background: #16181f;
+    display: grid;
+    place-items: center;
+    background: var(--surface-2);
+    color: var(--text-faint);
+  }
+
+  .duration {
+    position: absolute;
+    right: var(--s-2);
+    bottom: var(--s-2);
+    padding: 1px 6px;
+    border-radius: var(--r-sm);
+    background: rgb(0 0 0 / 0.78);
+    color: #fff;
+    font: var(--t-micro);
+    font-feature-settings: 'tnum';
   }
 
   .meta {
     display: flex;
     flex-direction: column;
+    gap: 2px;
     min-width: 0;
+    padding: 0 2px;
   }
 
   .name {
+    font: var(--t-body);
+    font-weight: 550;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sub {
+    font: var(--t-small);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -234,73 +371,135 @@
   }
 
   .tag {
-    font-size: 10px;
-    color: var(--muted);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    font: var(--t-micro);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: var(--r-full);
     padding: 0 6px;
     white-space: nowrap;
   }
 
-  .sub {
-    font-size: 11px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   /*
-   * The star and the delete live behind the row until they are needed: a list where every
-   * row shows two buttons is mostly buttons. They appear for the row under the pointer,
-   * the selected row, and — always — for keyboard and touch users, whose focus lands on
-   * them: `:focus-within` keeps the focused control painted, and hiding is by opacity so
-   * nothing leaves the tab order or the accessibility tree.
+   * The favourite and the menu float over the thumbnail. They show for the card under the
+   * pointer, with focus inside it, and always for a favourited clip's star; hiding is by
+   * opacity so nothing leaves the tab order or the accessibility tree, and touch devices
+   * (no hover) always see them.
    */
   .actions {
+    position: absolute;
+    top: var(--s-2);
+    left: var(--s-2);
+    right: var(--s-2);
     display: flex;
-    align-items: center;
-    gap: 2px;
-    padding-right: 6px;
-    opacity: 0;
-    transition: opacity 150ms ease-out;
-  }
-
-  li:hover .actions {
-    opacity: 1;
-  }
-
-  li:focus-within .actions {
-    opacity: 1;
-  }
-
-  li.selected .actions {
-    opacity: 1;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .actions {
-      transition: none;
-    }
-  }
-
-  @media (hover: none) {
-    .actions {
-      opacity: 1;
-    }
+    justify-content: space-between;
+    pointer-events: none;
   }
 
   .actions button {
-    padding: 3px 6px;
-    font-size: 11px;
+    pointer-events: auto;
+    width: 30px;
+    height: 30px;
+    background: rgb(12 13 18 / 0.8);
+    border-color: transparent;
+    backdrop-filter: blur(6px);
+    opacity: 0;
+    transition:
+      opacity var(--d-fast) var(--ease),
+      background var(--d-fast) var(--ease);
+  }
+
+  li:hover .actions button,
+  li:focus-within .actions button,
+  li.menu-open .actions button,
+  .actions .star[aria-pressed='true'] {
+    opacity: 1;
+  }
+
+  .actions button:hover:not(:disabled) {
+    background: rgb(12 13 18 / 0.95);
+    border-color: var(--border-strong);
   }
 
   .star {
-    font-size: 13px;
-    color: var(--muted);
+    color: var(--text);
   }
 
   .star[aria-pressed='true'] {
     color: var(--star);
-    border-color: var(--star);
+  }
+
+  .star[aria-pressed='true'] :global(svg) {
+    fill: currentColor;
+  }
+
+  @media (hover: none) {
+    .actions button {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .frame,
+    .actions button {
+      transition: none;
+    }
+  }
+
+  .menu-wrap {
+    position: relative;
+    pointer-events: auto;
+  }
+
+  .menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 160px;
+    padding: var(--s-1);
+    background: var(--surface-3);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-pop);
+  }
+
+  .menu button {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    width: auto;
+    height: auto;
+    padding: 6px 10px;
+    text-align: left;
+    background: transparent;
+    border-color: transparent;
+    backdrop-filter: none;
+    opacity: 1;
+    font: var(--t-small);
+  }
+
+  .menu button:hover:not(:disabled) {
+    background: var(--surface-2);
+  }
+
+  .empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s-3);
+    padding: var(--s-7) var(--s-5);
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .empty p {
+    max-width: 44ch;
+  }
+
+  .empty :global(svg) {
+    color: var(--text-faint);
   }
 </style>
