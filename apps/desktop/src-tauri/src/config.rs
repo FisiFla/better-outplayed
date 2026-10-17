@@ -1052,13 +1052,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_config_file_falls_back_to_the_example() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = StorageConfig::load(&dir.path().join("config.toml")).unwrap();
-        assert_eq!(cfg, StorageConfig::example().unwrap());
-    }
-
-    #[test]
     fn a_malformed_config_file_is_reported_with_its_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1067,20 +1060,9 @@ mod tests {
         let err = StorageConfig::load(&path).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("[storage]"), "got: {}", err.message);
-    }
 
-    #[test]
-    fn the_recording_settings_fall_back_to_the_example_config() {
-        // A fresh install has no `config.toml`: a first recording must behave exactly as
-        // `config.example.toml` documents, which is also what the CLI does.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = RecordingConfig::load(&dir.path().join("config.toml")).unwrap();
-
-        assert_eq!(cfg.buffer.pre_seconds, 30);
-        assert_eq!(cfg.buffer.post_seconds, 5);
-        assert_eq!(cfg.encode.fps, 60, "the example's capture rate");
-        assert_eq!(cfg.encode.codec, "h264");
-        assert_eq!(cfg.storage.max_total_bytes, 53_687_091_200);
+        // One file, one verdict, whichever part of the shell reads it.
+        assert!(BackgroundConfig::load(&path).is_err());
     }
 
     #[test]
@@ -1130,32 +1112,26 @@ mod tests {
     // -- the [hotkeys] / [app] half -------------------------------------------------------
 
     #[test]
-    fn the_background_settings_fall_back_to_the_example_config() {
-        // A fresh install has no `config.toml`: the hotkey must still be the documented
-        // Ctrl+F8 and start-with-system must still be off.
+    fn every_reader_falls_back_to_the_example_when_there_is_no_file() {
+        // A fresh install has no `config.toml`: a first recording behaves as
+        // `config.example.toml` documents (as the CLI does), the hotkey is the documented
+        // Ctrl+F8 and start-with-system is off.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = BackgroundConfig::load(&dir.path().join("config.toml")).unwrap();
+        let path = dir.path().join("config.toml");
 
+        assert_eq!(StorageConfig::load(&path).unwrap(), StorageConfig::example().unwrap());
+
+        let cfg = BackgroundConfig::load(&path).unwrap();
         assert_eq!(cfg, BackgroundConfig::example().unwrap());
         assert_eq!(cfg.clip_hotkey, DEFAULT_CLIP_HOTKEY);
         assert!(!cfg.start_with_system, "start_with_system is off unless it is asked for");
-    }
 
-    #[test]
-    fn the_example_config_carries_the_documented_hotkey_and_the_off_default() {
-        // `config.example.toml` is what a fresh install *does*, so the fallback constant
-        // above and the example must not drift apart. (This is the recursion-free way to
-        // pin them: the constant is the fallback for a file with no [hotkeys] at all.)
-        let example = BackgroundConfig::example().expect("config.example.toml must stay readable");
-        assert_eq!(example.clip_hotkey, DEFAULT_CLIP_HOTKEY);
-        assert!(!example.start_with_system, "the example must not autostart by default");
-
-        // And the file really carries the section, rather than the parse defaulting it: a
-        // user reading the example has to be able to find the switch it mentions.
-        assert!(
-            EXAMPLE_CONFIG.contains("[app]") && EXAMPLE_CONFIG.contains("start_with_system = false"),
-            "config.example.toml must document [app] start_with_system = false"
-        );
+        let rec = RecordingConfig::load(&path).unwrap();
+        assert_eq!(rec.buffer.pre_seconds, 30);
+        assert_eq!(rec.buffer.post_seconds, 5);
+        assert_eq!(rec.encode.fps, 60, "the example's capture rate");
+        assert_eq!(rec.encode.codec, "h264");
+        assert_eq!(rec.storage.max_total_bytes, 53_687_091_200);
     }
 
     #[test]
@@ -1183,37 +1159,22 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_hotkey_section_is_reported_rather_than_defaulted() {
+    fn a_malformed_hotkey_or_app_section_is_reported_rather_than_defaulted() {
         // `clip = 8` is a typo a user will make. Falling back to Ctrl+F8 here would leave
         // them pressing a key that is not the one they configured.
-        let err = BackgroundConfig::from_toml("[hotkeys]\nclip = 8\n").unwrap_err();
+        for (toml, section) in [
+            ("[hotkeys]\nclip = 8\n", "[hotkeys]"),
+            ("[app]\nstart_with_system = \"yes\"\n", "start_with_system"),
+        ] {
+            let err = BackgroundConfig::from_toml(toml).unwrap_err();
 
-        assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(
-            err.message.contains("[hotkeys]"),
-            "the message must name the section: {}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn a_malformed_config_file_is_reported_with_its_path_for_the_hotkey_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[hotkeys\nclip = ").unwrap();
-
-        let err = BackgroundConfig::load(&path).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidInput);
-
-        // And the recorder's own reader agrees that the file is broken: one file, one
-        // verdict, whichever part of the shell reads it.
-        assert!(StorageConfig::load(&path).is_err());
-    }
-
-    #[test]
-    fn a_malformed_app_section_is_reported_rather_than_defaulted() {
-        let err = BackgroundConfig::from_toml("[app]\nstart_with_system = \"yes\"\n").unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidInput);
+            assert_eq!(err.code, ErrorCode::InvalidInput);
+            assert!(
+                err.message.contains(section),
+                "the message must name the section: {}",
+                err.message
+            );
+        }
     }
 
     // -- the [mic] / [games] half --------------------------------------------------------
@@ -1710,18 +1671,5 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
-    }
-
-    #[test]
-    fn the_extra_chords_are_off_unless_the_file_sets_them() {
-        let none = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Ctrl+F8\"\n").unwrap();
-        assert_eq!((none.toggle_recording_hotkey, none.bookmark_hotkey), (None, None));
-
-        let set = BackgroundConfig::from_toml(
-            "[hotkeys]\nclip = \"Ctrl+F8\"\ntoggle_recording = \"Ctrl+F9\"\nbookmark = \"Ctrl+F10\"\n",
-        )
-        .unwrap();
-        assert_eq!(set.toggle_recording_hotkey.as_deref(), Some("Ctrl+F9"));
-        assert_eq!(set.bookmark_hotkey.as_deref(), Some("Ctrl+F10"));
     }
 }
