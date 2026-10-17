@@ -1,4 +1,4 @@
-//! Proves the spec's principle 5: export never re-encodes.
+//! Export never re-encodes: lossless edits preserve the streams they copy.
 use localplay_media::{edit, probe::MediaInfo, FfmpegBinaries};
 use std::process::Command;
 
@@ -17,9 +17,8 @@ fn fixture(dir: &std::path::Path) -> std::path::PathBuf {
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
             "-t", "3",
             "-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
-            // `-ac 2` matters: `sine` defaults to mono, but the real pipeline
-            // captures 48kHz stereo, so a mono fixture would not exercise the
-            // same muxing path (criterion 8).
+            // `-ac 2` matters: `sine` defaults to mono, but the real pipeline captures 48kHz stereo, so a
+            // mono fixture would not exercise the same muxing path.
             "-c:a", "aac", "-ac", "2", "-shortest",
         ])
         .arg(&out)
@@ -66,12 +65,12 @@ fn trim_keeps_both_streams_and_shortens() {
     );
 }
 
-/// 2s of video and **two** audio tracks, tagged exactly as the encoder tags a recording that
-/// has a microphone: `-map 0:v -map 1:a -map 2:a` plus the two titles.
+/// 2s of video and two audio tracks, tagged as the encoder tags a recording with a microphone:
+/// `-map 0:v -map 1:a -map 2:a` plus the two titles.
 ///
-/// The titles come from [`edit::audio_titles`] rather than being written out again, so this
-/// fixture cannot drift from the pipeline it stands in for — which is the whole point, since a
-/// drifted literal is how the defect below stayed invisible.
+/// The titles come from [`edit::audio_titles`] rather than being rewritten, so this fixture
+/// cannot drift from the pipeline it stands in for (a drifted literal is how the defect below
+/// stayed invisible).
 fn two_track_fixture(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
     let out = dir.join(format!("two-track-{tag}.mp4"));
     let bin = ffmpeg();
@@ -94,10 +93,9 @@ fn two_track_fixture(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
     out
 }
 
-/// The `name` tag of each audio stream, in order; `None` for a track with no name.
-///
-/// `name`, not `title`: ffmpeg's MP4 muxer stores `-metadata:s:a:N title=…` in the track's
-/// **`name`** atom, and ffprobe reports it as `tags.name`.
+/// The `name` tag of each audio stream, in order; `None` for an unnamed track. `name`, not
+/// `title`: ffmpeg's MP4 muxer stores `-metadata:s:a:N title=...` in the track's `name` atom,
+/// which ffprobe reports as `tags.name`.
 fn audio_names(bin: &FfmpegBinaries, path: &std::path::Path) -> Vec<Option<String>> {
     let out = Command::new(&bin.ffprobe)
         .args(["-v", "error", "-print_format", "json", "-show_streams"])
@@ -114,18 +112,13 @@ fn audio_names(bin: &FfmpegBinaries, path: &std::path::Path) -> Vec<Option<Strin
         .collect()
 }
 
-/// The concatenation keeps the audio tracks **named**.
+/// The concatenation keeps the audio tracks named.
 ///
-/// **A `-c copy` through the concat demuxer does not carry per-stream metadata.** Measured: the
-/// encoder's own segments are tagged — `tags: { "name": "Game Audio" }`, because ffmpeg's MP4
-/// muxer stores `title=` in the `name` atom — and after `-map 0 -c copy` neither name survives,
-/// with or without `-map_metadata 0`. So every clip and every session file made from segments
-/// came out with **anonymous** audio tracks: a player showed two tracks both called "Audio",
-/// with nothing to say which was the game and which the microphone.
-///
-/// Found by probing a real clip a Windows capture produced (`docs/verification-status.md`
-/// §10.2), where three streams came back as `video, audio, audio` and `stream_tags=name` was
-/// empty. This is the regression test for the fix: the concat re-applies the names.
+/// A `-c copy` through the concat demuxer does not carry per-stream metadata. The encoder's own
+/// segments are tagged (`tags: { "name": "Game Audio" }`), but after `-map 0 -c copy` neither
+/// name survives, with or without `-map_metadata 0`. Every clip and session file made from
+/// segments therefore had anonymous audio tracks, with nothing saying which was the game and
+/// which the microphone. This is the regression test for the concat re-applying the names.
 #[test]
 fn concat_keeps_the_audio_track_names_the_encoder_wrote() {
     let dir = tempfile::tempdir().unwrap();
@@ -153,8 +146,8 @@ fn concat_keeps_the_audio_track_names_the_encoder_wrote() {
         expected,
         "the clip's audio tracks must be named, not two anonymous 'Audio' streams"
     );
-    // The naming must not have cost a track: the sample counts above only prove the tags, and
-    // the defect this guards was a *missing* stream before it was a missing name.
+    // The naming must not have cost a track: the counts above only prove the tags, and the
+    // original defect was a missing stream before it was a missing name.
     assert_eq!(audio_names(&bin, &dst).len(), 2, "both audio tracks are still there");
     assert!(
         MediaInfo::probe(&bin, &dst).unwrap().video.is_some(),
