@@ -373,6 +373,10 @@ Dual-licensed under either of
 at your option. This is the Rust ecosystem convention and is compatible with
 shipping an LGPL-licensed `ffmpeg` sidecar.
 
+The desktop window also bundles the Inter and JetBrains Mono typefaces (SIL OFL 1.1) and a
+subset of the Lucide icons (ISC); their licence texts are in
+[apps/desktop/THIRD_PARTY_NOTICES.md](apps/desktop/THIRD_PARTY_NOTICES.md).
+
 ### A note on the `ffmpeg` build
 
 better-outplayed only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
