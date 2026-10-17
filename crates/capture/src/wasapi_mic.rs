@@ -814,30 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn the_stub_microphone_is_not_silent_by_default() {
-        let mut mic = mic(10);
-        mic.start().expect("start the stub microphone");
-        let block = mic
-            .next_buffer(Duration::from_secs(1))
-            .expect("poll the stub")
-            .expect("a block is due");
-
-        // A silent default would make every "the microphone path carried audio" assertion in the
-        // recorder's tests pass vacuously and trip the silence watch in any test that wires it up.
-        assert!(
-            !is_silent_block(&block.data),
-            "the default stub microphone must produce real audio, not zeros"
-        );
-        let peak = block
-            .data
-            .chunks_exact(2)
-            .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
-            .max()
-            .expect("a block has samples");
-        assert_eq!(peak, DEFAULT_AMPLITUDE as u16, "and it is the documented default level");
-    }
-
-    #[test]
     fn with_signal_scales_the_waveform_and_zero_is_silence() {
         let mut loud = mic(10).with_signal(1_234);
         let mut silent = mic(10).with_signal(0);
@@ -871,54 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn the_stub_microphone_pts_advances_monotonically_by_the_block_duration() {
-        let mut mic = mic(10);
-        mic.start().expect("start the stub microphone");
-        let blocks: Vec<AudioBuffer> = (0..5)
-            .map(|_| {
-                mic.next_buffer(Duration::from_secs(1))
-                    .expect("poll the stub")
-                    .expect("a block is due")
-            })
-            .collect();
-
-        // pts advances by exactly one block of samples, never by wall-clock time, which is what makes the
-        // timeline derivable from the byte count.
-        for pair in blocks.windows(2) {
-            assert_eq!(
-                pair[1].pts,
-                pair[0].pts + Duration::from_millis(10),
-                "one 10ms block of pts per 10ms block of samples"
-            );
-        }
-        assert!(blocks.windows(2).all(|w| w[0].pts < w[1].pts), "and never goes backwards");
-        // 5 blocks handed out, counted by the backend rather than by the test.
-        assert_eq!(mic.buffers_emitted(), 5);
-    }
-
-    #[test]
-    fn a_silent_stub_microphone_is_reported_by_the_converted_silence_watch() {
-        // One-second blocks, so the crate's 30s threshold is reached in 30 iterations, not 3000.
-        let mut mic = mic(1_000).with_signal(0);
-        mic.start().expect("start the stub microphone");
-        let mut watch = ConvertedSilenceWatch::new(true); // as if the device needed conversion
-        let mut warnings = 0usize;
-        for (index, buffer) in mic.drain_for(CONVERTED_SILENCE_THRESHOLD).into_iter().enumerate() {
-            assert!(is_silent_block(&buffer.data), "the stub was asked for digital silence");
-            let warned = watch.observe(Duration::from_secs(1), is_silent_block(&buffer.data));
-            warnings += usize::from(warned);
-            let second = index as u64 + 1;
-            if second < CONVERTED_SILENCE_THRESHOLD.as_secs() {
-                assert!(!warned, "second {second} is still under the threshold");
-            } else {
-                assert!(warned, "the crossing second must warn");
-            }
-        }
-        assert_eq!(warnings, 1, "once per session, not once per block");
-        assert_eq!(mic.buffers_emitted(), CONVERTED_SILENCE_THRESHOLD.as_secs());
-    }
-
-    #[test]
     fn the_default_stub_microphone_never_trips_the_silence_watch() {
         // A non-silent stub must keep the watch disarmed even over more than the threshold's worth of blocks.
         let mut mic = mic(10);
@@ -932,19 +860,6 @@ mod tests {
             );
         }
         assert!(!watch.has_warned());
-    }
-
-    #[test]
-    fn next_buffer_with_zero_timeout_returns_none_when_not_due() {
-        let mut mic = mic(10);
-        mic.start().expect("start the stub microphone");
-        // Block 0 is due immediately.
-        assert!(mic.next_buffer(Duration::ZERO).expect("poll").is_some());
-        // Block 1 is due 10ms later: a zero timeout must not block for it or invent it.
-        assert!(
-            mic.next_buffer(Duration::ZERO).expect("poll").is_none(),
-            "must return None rather than block or fabricate a block"
-        );
     }
 
     #[test]

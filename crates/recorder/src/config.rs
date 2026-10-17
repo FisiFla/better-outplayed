@@ -281,15 +281,10 @@ output_size = \"\"
         );
     }
 
-    /// A `config.toml` without `adapt_fps` gets adaptation, not silence.
-    #[test]
-    fn a_config_that_does_not_mention_the_key_enables_adaptation() {
-        assert!(encode_section(MINIMAL).adapt_fps);
-    }
-
     /// The opt-out is honoured; it is the only way to declare a rate the machine may not hold.
     #[test]
     fn the_key_can_turn_adaptation_off() {
+        assert!(encode_section(MINIMAL).adapt_fps, "absent means on");
         let text = MINIMAL.replace("fps = 30", "fps = 30\nadapt_fps = false");
         assert!(!encode_section(&text).adapt_fps);
     }

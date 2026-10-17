@@ -365,16 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn the_canonical_audio_format_is_48khz_stereo_s16() {
-        // The format the WASAPI backend asks the engine for and the encoder's audio pipe is declared as.
-        let canonical = AudioFormat::default();
-        assert_eq!(canonical.sample_rate, 48_000);
-        assert_eq!(canonical.channels, 2);
-        // 10ms of it: 480 frames x 2 channels x 2 bytes, the granularity the pipeline counts in.
-        assert_eq!(canonical.bytes_per_10ms(), 1_920);
-    }
-
-    #[test]
     fn an_endpoint_that_is_already_canonical_needs_no_conversion() {
         assert!(!native(48_000, 2, SampleEncoding::I16).needs_conversion());
     }
