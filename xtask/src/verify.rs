@@ -1,47 +1,33 @@
-//! `xtask verify` — one command that runs the Phase 1 acceptance checks and writes a
-//! Markdown report a human can read and attach to an issue.
+//! `xtask verify`: runs the acceptance checks against the CLI and writes a Markdown report a
+//! human can read and attach to an issue.
 //!
-//! # What this is for
-//!
-//! The ledger (`docs/verification-status.md`) tracks which claims about localplay are
-//! *verified* and which are only *type-checked*, and the runbook
-//! (`docs/runbooks/phase-1-verification.md`) tells a human how to check each criterion by
-//! hand. That procedure is expensive: every criterion is a separate command, and the clip
-//! criteria used to require pressing `Ctrl+F8` — which, from a script, means synthesising
-//! input. On a machine whose anti-cheat treats synthetic input as hostile, that is not a
-//! safe thing to do, so the clip path could not be verified there at all.
-//!
-//! This harness removes both costs. It starts the buffer with a bounded, documented
-//! configuration, drives the clip path through the CLI's own verification-only trigger
-//! (`buffer --self-test-clip-after`, an in-process call to the same `Recorder::clip_now`
-//! the hotkey calls), measures the process, probes the clip and writes everything down.
+//! It starts the buffer with a bounded configuration, drives the clip path through the CLI's
+//! verification-only trigger (`buffer --self-test-clip-after`, an in-process call to the same
+//! `Recorder::clip_now` the hotkey calls), measures the process, probes the clip and writes
+//! everything down. Pressing the hotkey from a script would mean synthesising input, which is
+//! unsafe on a machine whose anti-cheat treats it as hostile.
 //!
 //! # It does not synthesise input
 //!
-//! **Nothing in this file sends, simulates or injects a keyboard or mouse event, and
-//! nothing enumerates windows.** There is no `keybd_event`, no `SendInput`, no
-//! `SendKeys`, no `mouse_event`, and no enumeration call anywhere in this crate. The
-//! self-test flag is the whole mechanism, and it is a function call inside the process
-//! under test. That property is the reason the harness exists.
+//! **Nothing in this file sends, simulates or injects a keyboard or mouse event, and nothing
+//! enumerates windows.** The self-test flag is the whole mechanism, and it is a function call
+//! inside the process under test. That property is the reason the harness exists.
 //!
 //! # What it cannot do, and says so
 //!
-//! Every check it cannot perform is listed in the report as *not performed* with the
-//! reason — never silently omitted. It cannot verify:
+//! Every check it cannot perform is listed in the report as *not performed* with the reason,
+//! never silently omitted. It cannot verify:
 //!
-//! * the **desktop GUI** (no window is opened) or its recording wiring;
-//! * a **real keypress** (the hotkey listener is installed but not driven);
-//! * anything needing a **real game** (the event sources are switched off in the harness
-//!   config, and nothing is contacted);
-//! * the **live-source clock divergence** between the WGC video clock and the WASAPI
-//!   audio clock (not instrumented in this build at all);
-//! * whatever the machine's own state makes impossible on the day — a box whose every
-//!   encoder works has no unusable vendor to point criterion 7 at, and an endpoint that is
-//!   natively 48 kHz never exercises the engine-side conversion.
+//! * the desktop GUI (no window is opened);
+//! * a real keypress (the hotkey listener is installed but not driven);
+//! * anything needing a real game (the event sources are off and nothing is contacted);
+//! * the live-source clock divergence between the WGC video clock and the WASAPI audio clock;
+//! * whatever the machine's own state makes impossible: a machine whose every encoder works has
+//!   no unusable vendor to test, and a natively 48 kHz endpoint never exercises the
+//!   engine-side conversion.
 //!
-//! It also cannot tell you *whether the pixels were the desktop*, only that frames flowed:
-//! the frame-content check decodes one frame and refuses a single-colour one (the
-//! black-frame defect class), but a black screen would look black to it too.
+//! It also cannot tell whether the pixels were the desktop, only that frames flowed: the
+//! frame-content check refuses a single-colour frame, but a black screen would pass as one.
 
 use crate::probe::{self, ProbeReport};
 use anyhow::{bail, Context, Result};
@@ -64,11 +50,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The bounded configuration the harness starts the buffer with.
 ///
-/// **Stated in the report verbatim**, because a measurement without the configuration it
-/// was taken under is not evidence. These are *not* the shipping defaults
-/// (`config.example.toml`: 30 s pre, 5 s post, 60 fps, 2 GiB scratch cap, 20 Mbps): they
-/// are chosen so that one bounded run exercises the clip path, the scratch cap and
-/// eviction, and a steady-state window, in under two minutes.
+/// Stated in the report verbatim, because a measurement without its configuration is not
+/// evidence. Not the shipping defaults (`config.example.toml`): chosen so that one run under
+/// two minutes exercises the clip path, the scratch cap, eviction and a steady-state window.
 struct RunConfig {
     pre_seconds: u64,
     post_seconds: u64,
@@ -79,10 +63,9 @@ struct RunConfig {
     audio_bitrate_kbps: u32,
 }
 
-/// The one configuration this harness runs with. `segment_time = 1` matches the runbook's
-/// criterion-4 quantisation (cuts snap to the segment grid, ±0.5 s tolerance); the 16 MiB
-/// cap is small enough that a ~45 s run of ~1.0 MB/s must evict, and large enough to hold
-/// several times the 8 s window.
+/// The one configuration this harness runs with. `segment_time = 1` makes cuts snap to a 1 s
+/// grid (+-0.5 s tolerance); the 16 MiB cap is small enough that a ~45 s run of ~1.0 MB/s must
+/// evict, and large enough to hold several times the 8 s window.
 const RUN_CONFIG: RunConfig = RunConfig {
     pre_seconds: 5,
     post_seconds: 3,
@@ -96,10 +79,8 @@ const RUN_CONFIG: RunConfig = RunConfig {
 impl RunConfig {
     /// The whole config file, as the CLI parses it.
     ///
-    /// `vendor` is `auto` for the buffer run (the machine picks its own hardware encoder;
-    /// criterion 7 gets a `vendor`-forced copy). The event sources are off: this run must
-    /// touch nothing but its own capture, and a League poll or a bound GSI port is not part
-    /// of what it verifies.
+    /// `vendor` is `auto` for the buffer run; the unusable-vendor check gets a `vendor`-forced
+    /// copy. The event sources are off: this run must touch nothing but its own capture.
     fn to_toml(&self, vendor: &str) -> String {
         format!(
             "# Written by `cargo xtask verify`. A bounded verification configuration, not a\n\
@@ -268,10 +249,9 @@ struct Session {
 
 impl Session {
     fn new(opts: Options, repo: PathBuf) -> Self {
-        // On Windows the harness runs the shipping path (WGC + WASAPI + a hardware
-        // encoder) unless it was explicitly told to use the software encoder; off Windows
-        // it always runs the synthetic stubs, which prove nothing about capture. Checks
-        // that depend on the real path are reported, not judged, in the latter cases.
+        // On Windows the harness runs the shipping path (WGC + WASAPI + a hardware encoder) unless told
+        // to use the software encoder; elsewhere it runs the synthetic stubs, which prove nothing about
+        // capture. Checks that depend on the real path are reported, not judged, in the latter cases.
         let hardware_path = cfg!(windows) && !opts.dev_software;
         Session {
             opts,
@@ -324,10 +304,9 @@ impl Session {
 
     /// A check that needs the real capture path and a hardware encoder.
     ///
-    /// On a stub/software run the numbers are reported but not judged: a `--dev-software`
-    /// run says nothing about criterion 6, and a synthetic source says nothing about the
-    /// capture rate. The rule is printed in the report so a reader is never left guessing
-    /// why a row is unjudged.
+    /// On a stub/software run the numbers are reported but not judged: a `--dev-software` run says
+    /// nothing about hardware encoding, and a synthetic source nothing about the capture rate. The
+    /// rule is printed in the report so a reader knows why a row is unjudged.
     #[allow(clippy::too_many_arguments)]
     fn hardware_check(
         &mut self,
@@ -474,12 +453,10 @@ impl Session {
 
     /// Empty the sandbox before the run, so the eviction evidence means something.
     ///
-    /// The engine *adopts* an existing scratch directory and continues its segment numbering
-    /// (`segment numbering continues at <n>`), which is right for a user's machine and wrong
-    /// for a measurement: a second run against a previous run's directory would report
-    /// "the lowest segment number is not 0" without a single eviction having happened. So
-    /// the sandbox is removed here, and a failure to remove it is a failed check rather than
-    /// a silently weakened one.
+    /// The engine adopts an existing scratch directory and continues its segment numbering, which
+    /// is right for a user's machine and wrong for a measurement: a second run against a previous
+    /// directory would report a non-zero lowest segment without any eviction. A failure to remove
+    /// the sandbox is a failed check rather than a silently weakened one.
     fn reset_sandbox(&mut self) {
         let dir = self.opts.work_dir.clone();
         match std::fs::remove_dir_all(&dir) {
@@ -920,16 +897,13 @@ impl Session {
                 );
             }
 
-            // Achieved frame rate against the rate the pipeline declared. The denominator is
-            // the *effective* rate (the status line's `fps=` field, which is what the pacer
-            // and the encoder child were both given); `configured=` carries what `encode.fps`
-            // asked for, and is checked on its own below. Keeping the two apart is what
-            // stops this check from becoming trivially true once adaptation exists.
+            // Achieved frame rate against the rate the pipeline declared. The denominator is the
+            // *effective* rate (the status line's `fps=`, given to both the pacer and the encoder child);
+            // `configured=` carries what `encode.fps` asked for and is checked on its own below.
             let declared_fps = last.declared as f64;
             let floor = declared_fps * 0.9;
-            // Steady state = after the first segment landed (the encoder is spawned and
-            // warm). The final sample is taken while the process shuts down and reads ~0, so
-            // the verdict is the median of the steady samples, not the last one.
+            // Steady state = after the first segment landed (encoder spawned and warm). The final sample is
+            // taken during shutdown and reads ~0, so the verdict is the median of the steady samples.
             let steady: Vec<&Status> = parsed.iter().map(|(_, s)| s).filter(|s| s.segments >= 1).collect();
             let steady_fps = {
                 let mut v: Vec<f64> = steady.iter().map(|s| s.fps).collect();
@@ -970,10 +944,9 @@ impl Session {
                 },
             );
 
-            // Was the configured rate achievable at all? This is criterion 1 as written, and
-            // adaptation must not be able to hide a shortfall: a machine that cannot hold
-            // `encode.fps` at this resolution is reported as failing it, with both numbers,
-            // even though the pipeline is now running honestly at the lower rate.
+            // Was the configured rate achievable at all? Adaptation must not hide a shortfall: a machine
+            // that cannot hold `encode.fps` at this resolution fails this check, with both numbers, even
+            // though the pipeline then runs honestly at the lower rate.
             {
                 let reached = last.declared == last.configured;
                 let measured = format!(
@@ -1001,9 +974,8 @@ impl Session {
                 );
             }
 
-            // Dropped frames: the encoder's own count of payloads it had to discard. Frames
-            // lost while the encoder child is still starting (before segment 1) are reported
-            // but not held against the steady state.
+            // Dropped frames: the encoder's own count of discarded payloads. Frames lost before segment 1
+            // (encoder still starting) are reported but not held against the steady state.
             let startup_dropped = steady.first().map(|s| s.dropped).unwrap_or(last.dropped);
             self.hardware_check(
                 "dropped",
@@ -1025,10 +997,9 @@ impl Session {
                 },
             );
 
-            // The readback skip: only observable when the source offers more frames than
-            // the pacer keeps. On a 60 Hz+ display against 30 fps it must be non-zero; on a
-            // source paced at the declared rate there is nothing to skip, and demanding
-            // a non-zero count would be wrong.
+            // The readback skip is only observable when the source offers more frames than the pacer keeps:
+            // on a 60 Hz+ display against 30 fps it must be non-zero; on a source paced at the declared
+            // rate there is nothing to skip, and demanding a non-zero count would be wrong.
             if let (Some((t0, first)), Some((t1, _))) = (parsed.first(), parsed.last()) {
                 let offered_delta =
                     (last.frames + last.skipped).saturating_sub(first.frames + first.skipped);
@@ -1062,16 +1033,13 @@ impl Session {
                 );
             }
 
-            // Media time against the wall clock, measured the way the ledger says: from
-            // `span=` between two timestamped status lines. Not from file mtimes.
+            // Media time against the wall clock, from `span=` between two timestamped status lines, not
+            // file mtimes.
             //
-            // This is the check for the timeline fix itself, and it is deliberately a
-            // *hardware* check: the property must hold when the machine cannot keep up, and
-            // only a real soak can show that. The frame-rate conversion is off
-            // (`-fps_mode passthrough`), so frames carry their arrival timestamps and this
-            // ratio is ~1.0 by construction whatever the delivered rate is — which is why
-            // it no longer depends on whether the startup probe adapted the rate (the
-            // `frame_rate`/`configured_rate_reached` checks above cover that separately).
+            // Deliberately a hardware check: the property must hold when the machine cannot keep up, which
+            // only a real soak shows. Frame-rate conversion is off (`-fps_mode passthrough`), so frames
+            // carry arrival timestamps and the ratio is ~1.0 by construction whatever the delivered rate
+            // (the `frame_rate`/`configured_rate_reached` checks cover that separately).
             if let (Some((Some(t0), first)), Some((Some(t1), last))) = (parsed.first(), parsed.last()) {
                 let wall_ms = t1.saturating_sub(*t0) as f64;
                 let span_ms = last.span_ms.saturating_sub(first.span_ms) as f64;
@@ -1150,8 +1118,8 @@ impl Session {
                 );
             }
 
-            // The engine's own directories hang off `<base>/localplay` (the CLI's
-            // `app_data_dir()`); `app_data` here is the *base* the harness redirected.
+            // The engine's directories hang off `<base>/localplay` (the CLI's `app_data_dir()`); `app_data`
+            // here is the base the harness redirected.
             let scratch = app_data.join("localplay").join("scratch");
             match segments_on_disk(&scratch) {
                 Ok(numbers) if !numbers.is_empty() => {
@@ -1184,9 +1152,8 @@ impl Session {
                              seg-000000 is still on disk: nothing was evicted",
                         );
                     } else {
-                        // The run was too small to fill the ring — the harness's own
-                        // configuration, not a defect. Saying so is the honest answer; a
-                        // PASS here would be a claim about code that never ran.
+                        // The run was too small to fill the ring: the harness's own configuration, not a defect. A PASS
+                        // here would be a claim about code that never ran.
                         self.not_performed(
                             "eviction",
                             "the cap evicted oldest-first (the lowest surviving segment is not 0)",
@@ -1337,9 +1304,8 @@ impl Session {
     /// CPU as a percentage of one core and RSS in MB, over a steady-state window.
     fn cpu_and_rss(&mut self, run: &RunOutput) {
         let note = |_s: &Session| -> String {
-            // Samples relative to the trigger, so "steady state" is explicit rather than
-            // assumed: the window ends when the clip was triggered, because the trigger's
-            // post-roll wait is a different workload.
+            // Samples relative to the trigger, so "steady state" is explicit: the window ends at the
+            // trigger, whose post-roll wait is a different workload.
             let mut text = String::from(
                 "| t (s) | CPU time (s) | RSS (MB) |\n|---|---|---|\n",
             );
@@ -1461,9 +1427,8 @@ impl Session {
     /// Probe the clip the run produced: duration, streams, codec, drift, audio level.
     fn clip_checks(&mut self) -> Result<()> {
         let bin = self.bin.clone().context("no ffmpeg")?;
-        // Taken *out* of `self` rather than borrowed from it, so the checks below can be
-        // recorded while the run's own data is still being read. Nothing after this step
-        // needs either value.
+        // Taken out of `self` rather than borrowed, so checks can be recorded while the run's data is
+        // still being read. Nothing after this step needs either value.
         let run = self.run.take().context("no buffer run")?;
         let app_data = self.app_data.take().context("no application data directory")?;
         let clips_dir = app_data.join("localplay").join("clips");
@@ -1480,8 +1445,8 @@ impl Session {
             return Ok(());
         };
 
-        // The trigger line and the `wrote` line, as the runbook reads them. Owned values
-        // (not references into `run`) so the checks can be recorded while reading them.
+        // The trigger line and the `wrote` line. Owned values, not references into `run`, so checks can
+        // be recorded while reading them.
         let trigger: Option<(u64, Trigger)> = run
             .stdout
             .iter()
@@ -1656,10 +1621,9 @@ impl Session {
         let expected_family = if video_codec.starts_with("hevc") { "hevc" } else { "h264" };
         match &wrote {
             Some((at_ms, wrote)) => {
-                // The encoder's *family*, not its name: `h264_nvenc` and `libx264` are
-                // both H.264, and ffprobe reports the codec, never the implementation —
-                // the runbook's criterion 5 rule. Matching on the name would fail for
-                // every software-encoder run and for the `-c copy` splice being right.
+                // The encoder's *family*, not its name: `h264_nvenc` and `libx264` are both H.264, and ffprobe
+                // reports the codec, never the implementation. Matching on the name would fail every
+                // software-encoder run and a correct `-c copy` splice.
                 let encoder_family = encoder_family(&wrote.encoder);
                 let splice_ms = at_ms.zip(trigger_at_ms).map(|(w, t)| w.saturating_sub(t));
                 let measured = format!(
@@ -1714,7 +1678,7 @@ impl Session {
             ),
         }
 
-        // The hardware-encoder half of criterion 5 (shipping path only).
+        // The hardware-encoder half of the codec check (shipping path only).
         if let Some((_, wrote)) = &wrote {
             let is_hardware = ["nvenc", "qsv", "amf"].iter().any(|v| wrote.encoder.ends_with(v));
             self.hardware_check(
@@ -1972,8 +1936,8 @@ impl Session {
         cmd.args(args)
             .current_dir(&self.opts.work_dir)
             .env("RUST_LOG", "debug")
-            // The application data directory (config, scratch, clips, index) is redirected
-            // into the sandbox, so this run cannot touch the machine's real one.
+            // The application data directory is redirected into the sandbox, so this run cannot touch the
+            // machine's real one.
             .env(data_dir_env(), app_data_base)
             .env("NO_COLOR", "1")
             .stdout(Stdio::piped())
@@ -2199,11 +2163,9 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// The engine's periodic status line.
 ///
-/// `declared` is the status line's `fps=` denominator: the rate the pipeline is running at,
-/// i.e. the pacer's rate and the encoder child's `-framerate`. `configured` is the
-/// `configured=` field — what `encode.fps` asked for — and falls back to `declared` for a
-/// line written before that field existed (and for the fabricated lines in this file's own
-/// tests, where the two are the same thing).
+/// `declared` is the `fps=` denominator: the rate the pipeline runs at (the pacer's rate and
+/// the encoder child's `-framerate`). `configured` is the `configured=` field, what
+/// `encode.fps` asked for, falling back to `declared` when absent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Status {
     frames: u64,
@@ -2279,8 +2241,7 @@ fn parse_wrote(line: &str) -> Option<Wrote> {
 
 /// The splice's drift line: `clip clip-1234: video 3007ms audio 3008ms drift -1ms`.
 ///
-/// Note the format: these three are space-separated words, not `key=value` fields (it is a
-/// human-readable line, not a structured one), so [`field`] does not apply.
+/// These are space-separated words, not `key=value` fields, so [`field`] does not apply.
 fn parse_drift_line(line: &str) -> Option<(u64, u64, i64)> {
     if !line.contains("clip ") || !line.contains("drift ") {
         return None;
@@ -2484,10 +2445,8 @@ fn segments_on_disk(dir: &Path) -> Result<Vec<u64>> {
 
 /// The codec family an encoder id belongs to, as ffprobe would report it.
 ///
-/// ffprobe never prints `h264_nvenc` or `libx264`; it prints `h264`. The runbook's
-/// criterion 5 therefore compares *families*, and this is the mapping that comparison
-/// needs — including the software encoders the development path uses, whose names
-/// (`libx264`, `libx265`) look nothing like the hardware ids.
+/// ffprobe prints `h264`, never `h264_nvenc` or `libx264`, so the codec check compares
+/// families; this maps hardware and software ids alike.
 fn encoder_family(encoder: &str) -> &str {
     if encoder.contains("264") {
         "h264"
@@ -2548,9 +2507,8 @@ fn drain_pipes(child: &mut Child) -> Receiver<(Stream, String)> {
 
 /// The process's cumulative CPU time and working set.
 ///
-/// Windows: `GetProcessTimes` + `GetProcessMemoryInfo` on the child's own handle — the same
-/// numbers the runbook's PowerShell recipe reads. Everywhere else (the development host):
-/// `ps -o time=,rss=`, because the harness still has to run somewhere.
+/// Windows: `GetProcessTimes` + `GetProcessMemoryInfo` on the child's handle. Everywhere else
+/// (the development host): `proc_pid_rusage` on macOS, `ps -o time=,rss=` otherwise.
 #[cfg(windows)]
 fn sample_process(child: &Child) -> Option<(f64, u64)> {
     use std::os::windows::io::AsRawHandle;
@@ -2588,10 +2546,9 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
 
 #[cfg(target_os = "macos")]
 fn sample_process(child: &Child) -> Option<(f64, u64)> {
-    // `proc_pid_rusage` rather than `ps`: no subprocess (a sandboxed shell denies `ps`,
-    // which is how this path was found) and exactly the two numbers this harness wants.
-    // `ri_user_time` + `ri_system_time` are nanoseconds of CPU; `ri_resident_size` is the
-    // resident set in bytes — macOS's analogue of the Windows working set.
+    // `proc_pid_rusage` rather than `ps`: no subprocess (a sandboxed shell denies `ps`) and exactly
+    // the two numbers wanted. `ri_user_time` + `ri_system_time` are nanoseconds of CPU;
+    // `ri_resident_size` is the resident set in bytes, macOS's analogue of the working set.
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
     // SAFETY: `info` is a live, fully owned `rusage_info_v2`; `proc_pid_rusage` fills it
     // in for a pid that is our own live child. The cast is the signature libc declares
@@ -2607,11 +2564,10 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
             return None;
         }
         let info = info.assume_init();
-        // A live process with any address space has a non-zero resident set, so a zero
-        // here means the call did not actually fill the buffer. It happens: in a sandboxed
-        // shell, `proc_pid_rusage` answers `rc = 0` and leaves the struct as it was. An
-        // honest `None` ("could not measure") is the only correct answer — reporting
-        // `0.0 MB / 0.00% of a core` would be a fabricated criterion-6 measurement.
+        // A live process has a non-zero resident set, so zero here means the call did not fill the
+        // buffer: in a sandboxed shell `proc_pid_rusage` answers `rc = 0` and leaves the struct as it
+        // was. An honest `None` ("could not measure") is the only correct answer; reporting
+        // `0.0 MB / 0.00% of a core` would be a fabricated measurement.
         if info.ri_resident_size == 0 {
             return None;
         }
@@ -2638,8 +2594,7 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
 
 /// `ps`'s `time=` column: `[[dd-]hh:]mm:ss[.ss]`.
 ///
-/// Compiled on every platform on purpose: only the non-Windows, non-macOS sampler calls
-/// it, but its unit test should run wherever the harness is developed.
+/// Compiled on every platform so its unit test runs wherever the harness is developed.
 #[allow(dead_code)]
 fn parse_ps_time(text: &str) -> Option<f64> {
     let (days, rest) = match text.split_once('-') {
@@ -2795,8 +2750,7 @@ mod tests {
                 configured: 30,
             }
         );
-        // A line written before `configured=` existed still parses: the declared rate is the
-        // fallback, which is the honest reading of a line whose two rates were always equal.
+        // A line without `configured=` still parses: the declared rate is the fallback.
         let older = parse_status("frames=1 segments=2 bytes=3 span=4ms dropped=0 \
                                   dropped_audio=0 skipped=0 fps=29.9/30")
             .expect("an older status line still parses");
@@ -2883,8 +2837,8 @@ mod tests {
 
     #[test]
     fn ansi_escapes_do_not_survive_a_piped_log() {
-        // tracing's fmt layer colours the level even when stdout is a pipe; every parser
-        // above would then miss its field. Measured: a `head`-piped run emits these.
+        // tracing's fmt layer colours the level even when stdout is a pipe, which would make every
+        // parser miss its field.
         let coloured = "\u{1b}[2m2026-09-23T19:20:27.157909Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
                         \u{1b}[2mxtask\u{1b}[0m\u{1b}[2m:\u{1b}[0m frames=10 span=1000ms";
         let clean = strip_ansi(coloured);
@@ -2896,14 +2850,11 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn the_macos_sampler_never_reports_a_zero_working_set() {
-        // The sampler the harness uses on its development host, checked against a child
-        // that is definitely alive and definitely has memory.
+        // The macOS sampler, checked against a child that is definitely alive and has memory.
         //
-        // The invariant that matters is `None` or a real number — never a plausible zero:
-        // in a sandboxed shell `proc_pid_rusage` answers `rc = 0` and leaves the buffer
-        // untouched, and reporting that as "0.0 MB, 0.00% of a core" would be a fabricated
-        // measurement of exactly the two quantities criterion 6 is about. (Measured here:
-        // the stub is real, so the harness marks the check not-performed instead.)
+        // The invariant is `None` or a real number, never a plausible zero: in a sandboxed shell
+        // `proc_pid_rusage` answers `rc = 0` and leaves the buffer untouched, and reporting that as
+        // "0.0 MB" would be a fabricated measurement, so the harness marks the check not-performed.
         let mut child = Command::new("sleep").arg("5").spawn().expect("spawning sleep");
         if let Some((cpu_s, rss_bytes)) = sample_process(&child) {
             assert!(
@@ -2960,8 +2911,7 @@ mod tests {
 
     #[test]
     fn the_summary_counts_the_failed_checks_and_not_the_rest() {
-        // The exit code must follow the FAIL count only: a not-performed check is honesty,
-        // not a failure. (The host has no Windows, so plenty of checks land there.)
+        // The exit code follows the FAIL count only: a not-performed check is honesty, not a failure.
         let mut session = Session::new(
             Options {
                 report: PathBuf::from("/tmp/report.md"),

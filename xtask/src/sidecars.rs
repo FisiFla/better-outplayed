@@ -1,22 +1,19 @@
 //! Sidecar acquisition: `xtask sidecars record` and `xtask sidecars fetch`.
 //!
-//! localplay ships no ffmpeg in the repository (README, design spec §3/§4): the binaries
-//! are *sidecars*, downloaded at build time and pinned by SHA-256 in `xtask/sidecars.toml`.
-//! The two halves of that pin are deliberately separate commands:
+//! localplay ships no ffmpeg in the repository: the binaries are sidecars, downloaded at build
+//! time and pinned by SHA-256 in `xtask/sidecars.toml`. The two halves of the pin are separate
+//! commands:
 //!
-//! * `record` downloads each archive, hashes it and rewrites `sidecars.toml` in place. The
-//!   hash it writes is **trust on first use**: it attests nothing about who served the
-//!   bytes, only that the bytes are the ones fetched at that moment. What it buys is that
-//!   every *later* fetch must match those bytes or fail loudly. A human reviews the URL and
-//!   the hash in the diff and commits them; that review is the only trust anchor there is.
-//! * `fetch` downloads, verifies the hash against the recorded one, and only then extracts
-//!   the paths named in the entry's `binaries` allowlist into `<repo>/binaries/`.
+//! * `record` downloads each archive, hashes it and rewrites `sidecars.toml` in place. The hash
+//!   is trust on first use: it attests nothing about who served the bytes, only that later
+//!   fetches must match them or fail loudly. A human reviews the URL and hash in the diff; that
+//!   review is the only trust anchor.
+//! * `fetch` downloads, verifies the hash against the recorded one, and only then extracts the
+//!   paths in the entry's `binaries` allowlist into `<repo>/binaries/`.
 //!
-//! Everything security-relevant happens in *this* module rather than in an external
-//! `unzip`/`tar` process: the traversal rules ([`validate_entry_path`]), the destination
-//! rule ([`entry_destination`]) and the allowlist matching ([`scan`]) are all ordinary Rust
-//! functions with tests, and `zip` is only used as a decoder. Windows ships no `unzip.exe`
-//! either, which is the second reason not to shell out.
+//! Everything security-relevant happens here rather than in an external `unzip`/`tar`: the
+//! traversal rules ([`validate_entry_path`]), destination rule ([`entry_destination`]) and
+//! allowlist matching ([`scan`]) are ordinary tested Rust, with `zip` only as a decoder.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -30,10 +27,9 @@ use std::time::Duration;
 /// The placeholder `record` replaces. `fetch` refuses while it is still there.
 pub const UNRECORDED: &str = "RECORD_ME";
 
-/// Ceiling on one extracted file. A recorded hash pins an archive, but not how much that
-/// archive expands to, and the allowlist can only name files — a decompression bomb inside
-/// an allowlisted entry would otherwise fill the disk unchecked. 2 GiB leaves an order of
-/// magnitude of headroom over a current ffmpeg build (~120 MB per binary).
+/// Ceiling on one extracted file. A recorded hash pins an archive, not what it expands to, so a
+/// decompression bomb inside an allowlisted entry would otherwise fill the disk. 2 GiB is an
+/// order of magnitude over a current ffmpeg binary (~120 MB).
 const MAX_EXTRACTED_FILE_BYTES: u64 = 2 << 30;
 
 /// One `[[platform]]` entry of `xtask/sidecars.toml`.
@@ -58,9 +54,8 @@ pub struct Manifest {
 // Target selection
 // ---------------------------------------------------------------------------------------
 
-/// The platform triple this xtask binary was built for, in the spelling `sidecars.toml`
-/// uses. `None` means "a host this file has no name for" — the caller then has to pass
-/// `--target`, which is the documented way to fetch a Windows sidecar from macOS or Linux.
+/// The platform triple this xtask binary was built for, in the spelling `sidecars.toml` uses.
+/// `None` means a host with no name there; the caller must pass `--target`.
 pub fn host_target() -> Option<String> {
     triple_for(std::env::consts::ARCH, std::env::consts::OS).map(str::to_string)
 }
@@ -129,14 +124,12 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
     parse_manifest(&text)
 }
 
-/// Rewrite the `sha256` value of each named target in a manifest's text, leaving every
-/// other byte alone.
+/// Rewrite the `sha256` value of each named target in a manifest's text, leaving every other
+/// byte alone.
 ///
-/// Line-based on purpose. `sidecars.toml` is commented and reviewed by hand, and a
-/// round-trip through a TOML serialiser would drop those comments; this keeps the diff a
-/// one-line-per-platform change a reviewer can actually check. An update whose target is
-/// nowhere in the text is an error rather than a silent no-op: `record` must never look
-/// like it recorded something it did not.
+/// Line-based on purpose: `sidecars.toml` is hand-commented, and a TOML serialiser round-trip
+/// would drop the comments. An update whose target is nowhere in the text is an error, so
+/// `record` never looks like it recorded something it did not.
 pub fn rewrite_sha256(text: &str, updates: &[(String, String)]) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut current: Option<String> = None;
@@ -190,11 +183,10 @@ fn toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// Download `url` to `dest` with `curl`.
 ///
-/// `curl` rather than an HTTP crate: this is a development helper, and an HTTP client with
-/// TLS would add a whole certificate stack (and, for the usual choice, a C or assembly
-/// build dependency) to the workspace tree to fetch one file. `curl` ships with Windows 10
-/// 1803+, macOS and every Linux distribution. Nothing is trusted on the strength of the
-/// transport anyway — the recorded hash is the pin, and it is checked immediately after.
+/// `curl` rather than an HTTP crate: an HTTP client with TLS would add a certificate stack and
+/// a C build dependency to fetch one file, and `curl` ships with Windows 10 1803+, macOS and
+/// Linux. The recorded hash is the pin, checked immediately after, so the transport is not
+/// trusted.
 pub fn download(url: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -258,11 +250,9 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Check a file against an expected lowercase-hex SHA-256.
-///
-/// Returns the actual digest on success so callers can print it. Nothing downstream may
-/// run before this succeeds: in `fetch` the archive is fully verified before a single
-/// entry is written.
+/// Check a file against an expected lowercase-hex SHA-256, returning the actual digest.
+/// Nothing downstream may run before this succeeds: `fetch` verifies the whole archive before
+/// writing a single entry.
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<String> {
     let expected = expected_hex.trim();
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -291,11 +281,10 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<String> {
 
 /// Refuse an archive entry name that could escape the destination directory.
 ///
-/// Zip entries name themselves, so the name is attacker-controlled input. The rules are
-/// refusals, never rewrites: an archive carrying `../escape.txt`, `/etc/passwd` or
-/// `..\..\x` is a hostile archive, and silently sanitising it into something harmless would
-/// hide exactly the event worth knowing about. A trailing `/` is the zip spelling of "this
-/// is a directory" and is allowed; an empty component anywhere else is not.
+/// Zip entry names are attacker-controlled. The rules are refusals, never rewrites: an archive
+/// carrying `../escape.txt`, `/etc/passwd` or `..\..\x` is hostile, and silently sanitising it
+/// would hide the event worth knowing about. A trailing `/` (zip's spelling of a directory) is
+/// allowed; an empty component anywhere else is not.
 pub fn validate_entry_path(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("archive entry has an empty name");
@@ -334,11 +323,9 @@ pub fn validate_entry_path(name: &str) -> Result<()> {
 
 /// Decide the destination path for an archive entry, or refuse it.
 ///
-/// Only the entry's *file name* is kept, so `bin/ffmpeg.exe` (in its archive, often
-/// `ffmpeg-<version>-essentials_build/bin/ffmpeg.exe`) lands at `<root>/ffmpeg.exe`. That rule is
-/// itself the strongest traversal defence — one component cannot climb anywhere — but the
-/// name is still validated first, so a hostile name is reported instead of quietly reduced
-/// to its last component.
+/// Only the entry's file name is kept, so `ffmpeg-<version>-essentials_build/bin/ffmpeg.exe`
+/// lands at `<root>/ffmpeg.exe`. Keeping one component is itself a strong traversal defence,
+/// but the name is validated first so a hostile name is reported, not quietly reduced.
 pub fn entry_destination(root: &Path, name: &str) -> Result<PathBuf> {
     validate_entry_path(name)?;
     if name.ends_with('/') {
@@ -348,8 +335,8 @@ pub fn entry_destination(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(root.join(file_name))
 }
 
-/// A Windows path such as `C:ffmpeg.exe` is drive-*relative*, and `C:/x` absolute: neither
-/// may be treated as a name that is safe to join.
+/// A Windows path such as `C:ffmpeg.exe` is drive-relative, and `C:/x` absolute: neither is
+/// safe to join.
 fn has_drive_prefix(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -420,12 +407,10 @@ fn open_archive(path: &Path) -> Result<zip::ZipArchive<BufReader<File>>> {
 
 /// Do an allowlist path and an archive entry name refer to the same file?
 ///
-/// The archives are built by upstream packagers and wrap their contents in a versioned
-/// top-level directory (`ffmpeg-<version>-essentials_build/bin/ffmpeg.exe`), whose name changes
-/// with every release. So an allowlist entry matches either the whole entry name or its
-/// final path components: `bin/ffmpeg.exe` matches both `bin/ffmpeg.exe` and
-/// `ffmpeg-anything/bin/ffmpeg.exe`. Two entries matching one allowlist path is an error,
-/// not a coin toss.
+/// Upstream archives wrap their contents in a versioned top-level directory
+/// (`ffmpeg-<version>-essentials_build/...`), so an allowlist entry matches either the whole
+/// entry name or its final path components: `bin/ffmpeg.exe` matches `bin/ffmpeg.exe` and
+/// `ffmpeg-anything/bin/ffmpeg.exe`. Two entries matching one allowlist path is an error.
 fn path_matches(entry_name: &str, allowlist_path: &str) -> bool {
     if entry_name == allowlist_path {
         return true;
@@ -468,9 +453,8 @@ pub fn scan<R: Read + Seek>(
                 entry.size(),
             )
         };
-        // Every entry, allowlisted or not. An archive that smuggles `../escape.txt` or an
-        // absolute path anywhere is not the archive the recorded hash was reviewed for, and
-        // "we would not have extracted that one" is not a good enough reason to carry on.
+        // Every entry, allowlisted or not. An archive that smuggles `../escape.txt` or an absolute path
+        // anywhere is not the archive the recorded hash was reviewed for.
         validate_entry_path(&name)
             .with_context(|| format!("zip entry #{index} ({name:?})"))?;
         if is_symlink {
@@ -547,10 +531,8 @@ pub fn scan<R: Read + Seek>(
     })
 }
 
-/// Extract exactly the allowlisted entries from `archive` into `root`.
-///
-/// The archive must already have been verified against its recorded hash — this function
-/// looks at nothing but the bytes it is given.
+/// Extract exactly the allowlisted entries from `archive` into `root`. The archive must already
+/// have been verified against its recorded hash.
 pub fn extract_allowlisted(
     archive_path: &Path,
     root: &Path,
@@ -565,8 +547,8 @@ pub fn extract_allowlisted(
     for m in &scan.matches {
         let dest = entry_destination(root, &m.archive_name)
             .with_context(|| format!("choosing a destination for {:?}", m.archive_name))?;
-        // The suffix match above guarantees this; asserting it here means a future change to
-        // either rule fails the run instead of quietly writing a differently-named binary.
+        // Guaranteed by the suffix match above; asserted so a change to either rule fails the run
+        // instead of writing a differently-named binary.
         if dest.file_name().map(|f| f.to_string_lossy().to_string()).as_deref()
             != Some(m.file_name.as_str())
         {
@@ -596,9 +578,8 @@ pub fn extract_allowlisted(
     })
 }
 
-/// Stream one entry to `dest`, via a `.part` sibling that is renamed into place only when
-/// the whole entry is on disk. A truncated `ffmpeg.exe` left where the app looks for it
-/// would be worse than no file at all.
+/// Stream one entry to `dest` via a `.part` sibling renamed into place only when the whole entry
+/// is on disk: a truncated `ffmpeg.exe` where the app looks for it is worse than none.
 fn write_entry_to_disk<R: Read>(entry: &mut R, dest: &Path) -> Result<u64> {
     let file_name = dest
         .file_name()
@@ -707,9 +688,9 @@ fn work_archive(work_dir: &Path, target: &str) -> PathBuf {
 
 /// `cargo xtask sidecars record [--target <triple>]`
 ///
-/// Downloads every selected archive, hashes it, and rewrites `sidecars.toml`. Downloads all
-/// entries before writing anything, so a failure half-way leaves the manifest untouched.
-/// `binaries_dir` is only read to validate the allowlist paths (nothing is extracted here).
+/// Downloads every selected archive, hashes it, and rewrites `sidecars.toml`. All downloads
+/// finish before anything is written, so a mid-way failure leaves the manifest untouched.
+/// `binaries_dir` is only read, to validate the allowlist paths.
 pub fn record(
     manifest_path: &Path,
     binaries_dir: &Path,
@@ -751,8 +732,8 @@ pub fn record(
         println!("bytes   {bytes}");
         println!("sha256  {hash}");
 
-        // Hashing an archive that does not even hold the allowlisted files would record a
-        // pin that `fetch` must then fail on. Say so here instead, while a human is looking.
+        // Hashing an archive that lacks the allowlisted files would record a pin `fetch` must then
+        // fail on. Say so here, while a human is looking.
         let mut archive_reader = open_archive(&archive)?;
         let scan = scan(&mut archive_reader, binaries_dir, &entry.binaries)?;
         println!("archive holds {} entries; the allowlist resolves to:", scan.entry_count);
@@ -851,8 +832,8 @@ pub fn fetch(
         entry.binaries.join(", ")
     );
 
-    // Prove the binaries run *only* where they can: a Windows .exe cannot be executed on
-    // this host, and pretending to have verified it would be the worst outcome here.
+    // Prove the binaries run only where they can: a Windows .exe cannot run on this host, and
+    // pretending to have verified it would be the worst outcome.
     if host == Some(entry.target.as_str()) {
         for f in &outcome.extracted {
             let name = f.path.file_name().map(|n| n.to_string_lossy().to_string());
@@ -874,17 +855,14 @@ pub fn fetch(
     Ok(())
 }
 
-/// Both sidecar binaries answer `-version`, and nothing else in the allowlist is expected to,
-/// so a future allowlist entry that is not an executable gets left alone rather than being
+/// Both sidecar binaries answer `-version`; other allowlist entries are left alone rather than
 /// reported as a failed check.
 fn is_ffmpeg_family(file_name: &str) -> bool {
     ["ffmpeg", "ffmpeg.exe", "ffprobe", "ffprobe.exe"].contains(&file_name)
 }
 
-/// Run `<bin> -version` and return its first non-empty output line.
-///
-/// Uses the media crate's bounded runner so a wedged binary (a missing DLL, say) cannot
-/// park the build forever.
+/// Run `<bin> -version` and return its first non-empty output line, through the media crate's
+/// bounded runner so a wedged binary (a missing DLL, say) cannot park the build.
 fn first_line_of_version(bin: &Path) -> Result<String> {
     let mut cmd = Command::new(bin);
     cmd.arg("-version");
@@ -908,9 +886,8 @@ mod tests {
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------------------
-    // A tiny zip *writer*, so fixtures can express things the `zip` crate's safe writer
-    // refuses to create (a symlink entry, `../` names, absolute paths). Entries are stored
-    // uncompressed, which keeps the writer to the three headers in the spec.
+    // A tiny zip *writer*, so fixtures can express what the `zip` crate's safe writer refuses to
+    // create (a symlink entry, `../` names, absolute paths). Entries are stored uncompressed.
     // -----------------------------------------------------------------------------------
 
     struct FixtureEntry<'a> {
@@ -1656,10 +1633,8 @@ binaries = [\"bin/ffmpeg\"]
 
     #[test]
     fn first_line_of_version_reports_a_real_binarys_version() {
-        // This is the reporting `fetch` does when the archive matches the host platform, run
-        // against whatever ffmpeg the *host* has on PATH (not a sidecar: a sidecar for
-        // another platform cannot be executed, which is the whole reason `fetch` says so).
-        // Like `crates/media/tests/lossless.rs`, this needs a real ffmpeg and says so.
+        // The reporting `fetch` does when the archive matches the host platform, run against whatever
+        // ffmpeg the host has on PATH. Needs a real ffmpeg, like `crates/media/tests/lossless.rs`.
         let Some(ffmpeg) = find_on_path("ffmpeg") else {
             eprintln!("skipping: no ffmpeg on PATH");
             return;
@@ -1744,9 +1719,8 @@ binaries = [\"bin/ffmpeg\"]
     /// Run with `cargo test -p xtask -- --ignored --nocapture`.
     ///
     /// Downloads the real Windows archive twice (record, then fetch), records its hash in
-    /// `xtask/sidecars.toml` and extracts the two binaries into `<repo>/binaries/`, which is
-    /// gitignored. There is no way to check in a test that a Windows `.exe` runs on this
-    /// host: `fetch` says out loud that it did not check.
+    /// `xtask/sidecars.toml` and extracts the two binaries into the gitignored `<repo>/binaries/`.
+    /// A test cannot check that a Windows `.exe` runs on this host; `fetch` says it did not check.
     #[test]
     #[ignore = "downloads ~120 MB from gyan.dev and writes <repo>/binaries; run deliberately"]
     fn real_windows_sidecar_records_then_fetches() {
