@@ -1,20 +1,14 @@
 //! What this machine's hardware video encoders are, and whether they will take a GPU texture.
 //!
-//! Tier 2 rests on one assumption nothing in this tree can check from a development host: that a
-//! hardware encoder MFT exists here **and** will accept the D3D11 device the capture backend
-//! already owns. That is what makes handing it a [`localplay_capture::Frame`]'s texture possible
-//! instead of reading 33.2 MB back into system memory per frame — which is ~97% of what the 4K
-//! pipeline does (§14 of `docs/verification-status.md`).
+//! The hybrid path rests on one assumption a development host cannot check: that a hardware
+//! encoder MFT exists here and accepts the D3D11 device the capture backend already owns, which
+//! avoids reading 33.2 MB back into system memory per frame (~97% of the 4K pipeline's work).
 //!
-//! So this asks the machine rather than the documentation, deliberately in the shape of
-//! `xtask probe`: it starts Media Foundation, enumerates the hardware encoder MFTs for H.264, and
-//! runs the actual handshake the encoder will have to run — `MFT_MESSAGE_SET_D3D_MANAGER` with a
-//! real device manager over a real D3D11 device of the same kind the capture path creates. **No
-//! window is opened, nothing is captured and no input is synthesised**, which matters because the
-//! machine this runs on is the one running an anti-cheat.
-//!
-//! A refusal in that handshake is not a detail: it is the answer to whether this design is
-//! viable, and it is far cheaper to learn here than after the encoder is written.
+//! So this asks the machine, in the shape of `xtask probe`: it starts Media Foundation,
+//! enumerates the hardware encoder MFTs, and runs the handshake the encoder will run
+//! (`MFT_MESSAGE_SET_D3D_MANAGER` with a real device manager over a real D3D11 device of the
+//! capture path's kind). No window is opened, nothing is captured and no input is synthesised,
+//! which matters because the machine runs an anti-cheat.
 
 use crate::ffmpeg::MFT_TIMEOUT;
 use crate::VideoCodec;
@@ -63,7 +57,7 @@ use windows::Win32::Media::MediaFoundation::{
 enum Asked {
     /// `METransformNeedInput`: it will take a frame now.
     Input,
-    /// Nothing queued — which is what a poll looks like when there is no work.
+    /// Nothing queued: what a poll looks like when there is no work.
     Quiet,
 }
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -73,46 +67,39 @@ use windows::Win32::System::Com::CoTaskMemFree;
 pub struct HardwareEncoder {
     /// The MFT's own name for itself (`MFT_FRIENDLY_NAME_Attribute`).
     pub name: String,
-    /// `MFT_ENUM_HARDWARE_URL_Attribute`, the marker that distinguishes a real hardware MFT from
-    /// a software one that happens to be enumerable under the hardware flag.
+    /// `MFT_ENUM_HARDWARE_URL_Attribute`, which distinguishes a real hardware MFT from a software
+    /// one enumerable under the hardware flag.
     pub hardware_url: Option<String>,
-    /// `MF_TRANSFORM_ASYNC`. An asynchronous MFT refuses to be configured until it is *unlocked*
-    /// — measured on the box: NVIDIA's MFT answers an unlocked handshake with
-    /// `MF_E_TRANSFORM_ASYNC_LOCKED` (`0xC00D6D77`). [`ask_one`] therefore unlocks before asking,
-    /// so `accepts_d3d11` is about D3D11 and not about the async contract.
+    /// `MF_TRANSFORM_ASYNC`. An asynchronous MFT refuses to be configured until unlocked: NVIDIA's
+    /// answers a locked handshake with `MF_E_TRANSFORM_ASYNC_LOCKED` (`0xC00D6D77`). [`ask_one`]
+    /// unlocks first, so `accepts_d3d11` is about D3D11 and not the async contract.
     pub asynchronous: bool,
-    /// **The question this module exists for**: did `MFT_MESSAGE_SET_D3D_MANAGER` succeed?
+    /// The question this module exists for: did `MFT_MESSAGE_SET_D3D_MANAGER` succeed?
     pub accepts_d3d11: bool,
     /// The input subtypes this MFT will accept, named where this build knows the name.
     ///
-    /// This decides the *shape* of the chain rather than whether it exists. Windows Graphics
-    /// Capture delivers **BGRA8**; if the encoder will only take **NV12**, then something has to
-    /// convert between them, and the honest place for that is a Video Processor MFT on the GPU
-    /// rather than a CPU loop in this process — which is precisely the cost this whole plan exists
-    /// to remove. If it accepts BGRA directly, the texture can go straight in.
-    /// Empty when the MFT could not be asked — it would not activate, or it would not unlock —
-    /// which is what the `refusal` beside it explains.
+    /// This decides the shape of the chain. WGC delivers BGRA8; if the encoder takes only NV12,
+    /// something must convert, and the place for that is a GPU Video Processor MFT, not a CPU loop.
+    /// If it accepts BGRA directly, the texture goes straight in. Empty when the MFT could not be
+    /// asked (see `refusal`).
     pub input_subtypes: Vec<String>,
-    /// Which of the formats this pipeline might feed it the MFT actually **took**, by being asked
-    /// to accept one.
+    /// Which of the formats this pipeline might feed it the MFT actually took, by being asked to
+    /// accept one.
     ///
-    /// This is the answer, where `input_subtypes` above is only the enumeration attempt: a
-    /// hardware encoder refuses to enumerate its types (`GetInputAvailableType` came back empty on
-    /// the box even after the D3D11 handshake), but it will not refuse a `SetInputType` it likes —
-    /// and that is the same call the encoder makes, so agreement here is agreement about the real
-    /// thing. Names come from [`CANDIDATE_INPUTS`].
+    /// This is the answer; `input_subtypes` is only the enumeration attempt. A hardware encoder
+    /// refuses to enumerate its types (`GetInputAvailableType` came back empty even after the D3D11
+    /// handshake) but accepts a `SetInputType` it likes, the same call the encoder makes. Names come
+    /// from [`CANDIDATE_INPUTS`].
     pub accepts: Vec<String>,
-    /// Why no full answer could be had, when that happened — a driver's own words are worth more
-    /// than a summary of them. Covers the handshake, an activation that failed, an unlock that was
-    /// refused, and a type negotiation that would not start.
+    /// Why no full answer could be had: a failed handshake, activation, unlock or type negotiation,
+    /// in the driver's own words.
     pub refusal: Option<String>,
 }
 
-/// Every hardware H.264 encoder on this machine, asked whether it takes a D3D11 device manager.
+/// Every hardware encoder for `codec` on this machine, asked whether it takes a D3D11 device manager.
 ///
-/// Returns an error only when the question could not be *asked* (Media Foundation would not start,
-/// the enumeration itself failed). A machine that offers no hardware encoder returns an empty list,
-/// because "there are none" is an answer rather than a failure.
+/// Errors only when the question could not be asked (Media Foundation would not start, the
+/// enumeration failed). No hardware encoder is an empty list, an answer rather than a failure.
 pub fn probe_hardware_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
     // SAFETY: `MFStartup` is the documented first call before any other MF entry point, and it is
     // paired with `MFShutdown` on every path out of this function.
@@ -127,27 +114,16 @@ pub fn probe_hardware_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>
 }
 
 fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
-    // **No type filter, deliberately.**
-    //
-    // This used to ask for encoders that declare a given output subtype, and that question has two
-    // ways to be wrong. It can hide an encoder whose registration does not match its name, and
-    // `MFT_ENUM_FLAG_SORTANDFILTER` additionally filters against a *preference* list, which says
-    // nothing useful without a type to prefer for. Measured on the box: asking for HEVC returned the
-    // two H.264 encoders and one Quick Sync encoder, while the unfiltered list had held
-    // "NVIDIA HEVC Encoder MFT" and "Intel® Hardware H265 Encoder MFT" the whole time. The MFT was
-    // never missing; the question was.
-    //
-    // The negotiation below is what actually decides, and always was — that is why the input side has
-    // always been asked with `SetInputType` rather than read from a filter. So the enumeration's job
-    // is to be *complete* and the asking to be precise: hand it every hardware encoder on the machine
-    // and let each one say for itself what it will do. It costs a few more activations and removes a
-    // whole class of bug where a filter silently answers for the hardware.
+    // No type filter, deliberately. Filtering by output subtype can hide an encoder whose
+    // registration does not match its name, and `MFT_ENUM_FLAG_SORTANDFILTER` filters against a
+    // preference list that means nothing without a type to prefer for. Asking for HEVC returned the
+    // two H.264 encoders and one Quick Sync encoder, while the unfiltered list held "NVIDIA HEVC
+    // Encoder MFT" and "Intel(R) Hardware H265 Encoder MFT". The negotiation below is what decides, so
+    // the enumeration is complete and each encoder says for itself what it will do.
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
 
-    // The type to match is what the encoder must be able to produce: which hardware encoders can
-    // make this codec out of video.
-    // SAFETY: `activates`/`count` are the out-parameters this call fills, and `input` outlives it.
+    // The type to match is what the encoder must produce: which hardware encoders can make this codec.
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -161,8 +137,8 @@ fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
     .context("MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE)")?;
 
     if activates.is_null() || count == 0 {
-        // The array is COM-allocated whether or not it holds anything, so a non-null empty one
-        // still has to be freed — but "no hardware encoder" is an answer, not an error.
+        // The array is COM-allocated even when empty, so a non-null empty one still has to be freed;
+        // "no hardware encoder" is an answer, not an error.
         if !activates.is_null() {
             // SAFETY: `activates` came from `MFTEnumEx`, which allocates with the COM task
             // allocator, and this is the matching free.
@@ -171,8 +147,8 @@ fn probe_started_encoders(codec: VideoCodec) -> Result<Vec<HardwareEncoder>> {
         return Ok(Vec::new());
     }
 
-    // One device and one manager, shared by every candidate: that is exactly what the encoder will
-    // do, and a device created per candidate would answer a different question.
+    // One device and one manager shared by every candidate, as the encoder will do; a device per
+    // candidate would answer a different question.
     let device = create_capture_kind_device()?;
     let manager = create_device_manager(&device)?;
 
@@ -223,11 +199,9 @@ fn ask_one(
     };
 
     // An asynchronous MFT will not be configured until the caller says it understands the async
-    // contract, and every hardware encoder on this box is asynchronous. Without this the
-    // handshake comes back `MF_E_TRANSFORM_ASYNC_LOCKED` — *"the caller does not appear to support
-    // this transform's asynchronous capabilities"* — which reads like a refusal of D3D11 and is
-    // not one. That distinction is the whole point of asking: without the unlock the probe would
-    // have reported "no hardware encoder takes a GPU texture" on a machine that has one.
+    // contract, and every hardware encoder on the test machine is asynchronous. Without this the
+    // handshake comes back `MF_E_TRANSFORM_ASYNC_LOCKED`, which reads like a refusal of D3D11 and is
+    // not one: the probe would report "no hardware encoder takes a GPU texture" on a machine that has one.
     if asynchronous {
         // SAFETY: `GetAttributes` is this transform's own method, and the handle it returns
         // borrows the transform, which is alive here.
@@ -252,28 +226,23 @@ fn ask_one(
         }
     }
 
-    // The handshake itself. `MFT_MESSAGE_SET_D3D_MANAGER` carries the manager as its *ulParam*,
-    // which is why the raw pointer crosses as a `usize` — that is the documented protocol, not a
-    // shortcut.
+    // The handshake itself. `MFT_MESSAGE_SET_D3D_MANAGER` carries the manager as its `ulParam`, so
+    // the raw pointer crosses as a `usize`; that is the documented protocol.
     // SAFETY: `manager` outlives the call, and the parameter is the manager's own interface
     // pointer, which is what the message requires.
     let handshake =
         unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) };
-    // Detach the manager before letting the transform go: Media Foundation's contract is that the
-    // MFT is told when it no longer holds one (`ulParam = 0`). The transform itself needs no
-    // shutdown — it is this function's own activation and its reference drops here — but the
-    // device manager outlives it, so leaving the association dangling would be a leak of the
-    // association rather than of the object.
+    // Detach the manager before letting the transform go: the contract is that the MFT is told when
+    // it no longer holds one (`ulParam = 0`). The device manager outlives the transform, so leaving
+    // the association dangling would leak the association.
     // SAFETY: the transform is live and the parameter is the documented detach value.
     unsafe {
         let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
 
     let input_subtypes = input_subtypes(&transform);
-    // Asked at a modest size: the answer is about the *format*, and a 640x480 type is as much a
-    // statement about that as a 3840x2160 one, without depending on this machine's display.
-    // A negotiation failure is a finding rather than a panic: it means the machine will not tell us
-    // what it eats, which is exactly what `refusal` is for.
+    // Asked at a modest size: the answer is about the format, and 640x480 says as much as 3840x2160
+    // without depending on the display. A negotiation failure is a finding (`refusal`), not a panic.
     let (accepts, negotiation) = match accepted_subtypes(&transform, (640, 480), codec) {
         Ok(accepts) => (accepts, None),
         Err(err) => (Vec::new(), Some(format!("{err:#}"))),
@@ -305,39 +274,32 @@ fn ask_one(
     }
 }
 
-/// The frame rate this probe negotiates, in **both** directions.
+/// The frame rate this probe negotiates, in both directions.
 ///
-/// One constant and not two, because two of them is what the first version of this had and the two
-/// disagreed — an output type at 30 fps and an input type at 60 — which Media Foundation refused
-/// with `MF_E_INVALIDMEDIATYPE`, whose own text says *"invalid, inconsistent, or not supported"*.
-/// The word doing the work there was "inconsistent": nothing was wrong with either rate on its own.
-/// 30 rather than 60 because 4K at 60 needs H.264 level 5.2 while 4K at 30 fits 5.1, and this
-/// negotiates 5.1 (`eAVEncH264VLevel5_1`) — asking for a rate the declared level cannot carry is
-/// the other way to be refused by a type that is perfectly well formed.
+/// One constant: an output type at 30fps and an input type at 60 were refused with
+/// `MF_E_INVALIDMEDIATYPE` ("invalid, inconsistent, or not supported"); neither rate was wrong
+/// alone. 30 rather than 60 because 4K at 60 needs H.264 level 5.2 while 4K at 30 fits the 5.1
+/// negotiated (`eAVEncH264VLevel5_1`), and a rate the declared level cannot carry is refused too.
 const FRAME_RATE: (u32, u32) = (30, 1);
 
 /// The formats worth asking about, in the order worth asking.
 ///
-/// `RGB32` and `ARGB32` first because Windows Graphics Capture delivers BGRA8 and either of those
-/// names means the texture can go straight in, with no conversion anywhere. `NV12` last because it
-/// is the format a hardware encoder most often *wants* and the one this pipeline cannot produce
-/// without help — if only it is accepted, the chain needs a Video Processor MFT on the GPU.
-/// The input subtype to offer an encoder **first**, given the texture it will be handed.
+/// `RGB32` and `ARGB32` first because WGC delivers BGRA8 and either name means the texture goes
+/// straight in. `NV12` last: the format a hardware encoder most often wants and the one this
+/// pipeline cannot produce without a GPU Video Processor MFT.
+/// The input subtype to offer an encoder first, given the texture it will be handed.
 ///
-/// **The order is not a preference, it is a correctness requirement.** `accepts_subtype` asks the MFT
-/// whether it will *take* a media type, and an MFT answers that about the type rather than about the
-/// texture that arrives later — so a D3D texture whose real format is NV12 can be offered "RGB32",
-/// accepted, and refused only at `ProcessInput`, with nothing in between left to say why. Measured on
-/// the box: the HEVC encoder refuses an ARGB32 texture outright (`0xC00D6D76`), where the H.264 one
-/// accepts it, so which format capture hands over is the difference between those two encoders
-/// working.
+/// The order is a correctness requirement. `accepts_subtype` asks whether the MFT will take a
+/// media type, not the texture that arrives later, so an NV12 texture can be offered "RGB32",
+/// accepted, and refused only at `ProcessInput` with nothing to say why. The HEVC encoder refuses
+/// an ARGB32 texture outright (`0xC00D6D76`) where the H.264 one accepts it, so which format
+/// capture hands over decides whether those encoders work.
 ///
-/// The texture's own format is the only honest answer to what to offer first. The rest of the list
-/// stays as fallbacks.
+/// The texture's own format is the honest answer to what to offer first; the rest are fallbacks.
 fn preferred_input(format: DXGI_FORMAT) -> Option<&'static windows::core::GUID> {
     match format {
-        // WGC hands over BGRA, which Media Foundation calls RGB32 — same byte order, different name,
-        // and the distinction is why both are in the candidate list at all.
+        // WGC hands over BGRA, which Media Foundation calls RGB32: same byte order, different name,
+        // which is why both are candidates.
         DXGI_FORMAT_B8G8R8A8_UNORM => Some(&MFVideoFormat_RGB32),
         DXGI_FORMAT_NV12 => Some(&MFVideoFormat_NV12),
         _ => None,
@@ -367,15 +329,13 @@ const CANDIDATE_INPUTS: [(&windows::core::GUID, &str); 3] = [
 /// Which candidate input formats this transform will actually take.
 ///
 /// Asked with `SetInputType` rather than read from an enumeration, because an asynchronous
-/// hardware MFT will not enumerate (measured on the box) and because *accepting a type* is the fact
-/// that matters: it is the call the encoder will make, with a media type built the same way.
+/// hardware MFT will not enumerate and accepting a type is the call the encoder will make, with
+/// a media type built the same way.
 fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32), codec: VideoCodec) -> Result<Vec<String>> {
-    // **The output type first, and this is not a detail.** An encoder will not accept an *input*
-    // type until it knows what it is producing: Media Foundation negotiates the output side first,
-    // and an input attempt made before that is refused for the ordering rather than for the format.
-    // Measured the hard way — the first version of this probe asked for the input alone and
-    // reported "takes no candidate input format" on an encoder that has one, which is the same
-    // shape of false negative as the async lock was, and would have been believed just as easily.
+    // The output type first: an encoder will not accept an input type until it knows what it
+    // produces (Media Foundation negotiates the output side first), and an input attempt before that
+    // is refused for the ordering rather than the format. Asking for the input alone reported "takes
+    // no candidate input format" on an encoder that has one.
     set_output_type(transform, size, codec, PROBE_BITRATE_KBPS)
         .context("setting the output type, which must come before the input")?;
 
@@ -388,21 +348,18 @@ fn accepted_subtypes(transform: &IMFTransform, size: (u32, u32), codec: VideoCod
         }
     }
     if accepted.is_empty() {
-        // Every candidate refused, which is worth saying in full: the driver's own words for each
-        // are the only thing that can distinguish "wrong format" from "wrong ordering" from
-        // "wrong size".
+        // Every candidate refused: the driver's own words for each distinguish "wrong format" from
+        // "wrong ordering" from "wrong size".
         bail!("set an output type but no candidate input type was accepted: {}", refusals.join("; "));
     }
     Ok(accepted)
 }
 
-/// The media subtype an encoder must be able to *produce* for this codec.
+/// The media subtype an encoder must be able to produce for this codec.
 ///
-/// Used twice, and the second use is the one that cost an afternoon: [`MFTEnumEx`]'s fourth argument
-/// is the type an encoder produces, not the one it consumes, and it was pinned to `MFVideoFormat_H264`
-/// — so enumerating "the hardware encoders" could never return an HEVC one, and the probe reported
-/// that this machine had none while `ffmpeg -encoders` listed `hevc_nvenc` and `hevc_mf`, and a 4K60
-/// `hevc_nvenc` encode ran clean. The MFT was there the whole time; the question was wrong.
+/// [`MFTEnumEx`]'s fourth argument is the type an encoder produces, not consumes. Pinned to
+/// `MFVideoFormat_H264` it could never return an HEVC encoder, and the probe reported none while
+/// `ffmpeg -encoders` listed `hevc_nvenc` and a 4K60 `hevc_nvenc` encode ran clean.
 fn output_subtype(codec: VideoCodec) -> windows::core::GUID {
     match codec {
         VideoCodec::H264 => MFVideoFormat_H264,
@@ -412,33 +369,30 @@ fn output_subtype(codec: VideoCodec) -> windows::core::GUID {
 
 /// The bitrate the probes negotiate with, in kbit/s.
 ///
-/// The probes ask what *formats and sizes* an encoder will take; the rate is not what they are
-/// measuring, so they use this rather than taking a parameter through four public functions. It is
-/// the example config's own number, so a probe's verdict describes the configuration somebody gets
-/// by default — while the recording path passes the configured value, which is the number that
-/// decides a clip's size. Two numbers, two purposes, each named.
+/// The probes ask what formats and sizes an encoder takes, not the rate, so this avoids a
+/// parameter through four public functions. It is the example config's number, so a verdict
+/// describes the default configuration; the recording path passes the configured value, which
+/// decides a clip's size.
 const PROBE_BITRATE_KBPS: u32 = 20_000;
 
-/// A size small enough that this encoder will accept it as a first configuration.
-///
-/// See [`set_output_type`] — a workaround for a measured behaviour, not a preference.
+/// A size small enough that this encoder will accept it as a first configuration (see
+/// [`set_output_type`]; a workaround for measured behaviour).
 const WARM_UP_SIZE: (u32, u32) = (640, 480);
 
 /// Configure the encoder's output, warming an HEVC encoder at a small size first.
 ///
-/// **That warming is measured, not defensive.** This encoder refuses the pipeline's own output type at
-/// 3840x2160 as the *first* thing it is ever asked for — `0xC00D6D76`, `MF_E_UNSUPPORTED_D3D_TYPE` —
-/// and accepts it once it has accepted a smaller one:
+/// The warming is measured. This encoder refuses the pipeline's output type at 3840x2160 as the
+/// first thing it is asked (`0xC00D6D76`, `MF_E_UNSUPPORTED_D3D_TYPE`) and accepts it once it
+/// has accepted a smaller one:
 ///
 /// ```text
 /// 640x480 -> ACCEPTED   720p -> ACCEPTED   1080p -> ACCEPTED
 /// 1440p   -> ACCEPTED   1800p -> ACCEPTED   4K -> ACCEPTED, twice
 /// ```
 ///
-/// while asking for 4K first, in the same process, is refused. The refusal is *sticky*, too: an encoder
-/// that has just refused 4K goes on to refuse 640x480, which is why a retry after the refusal does not
-/// help and being configured small first does. `probe_size_ceiling` found this and remains the way to
-/// re-check it. The H.264 encoder needs none of it and is not given it.
+/// Asking for 4K first in the same process is refused, and the refusal is sticky: an encoder that
+/// just refused 4K goes on to refuse 640x480, so a retry does not help and being configured small
+/// first does. `probe_size_ceiling` re-checks this. The H.264 encoder needs none of it.
 fn set_output_type(
     transform: &IMFTransform,
     size: (u32, u32),
@@ -446,16 +400,14 @@ fn set_output_type(
     bitrate_kbps: u32,
 ) -> Result<()> {
     if codec == VideoCodec::Hevc && size != WARM_UP_SIZE {
-        // Best effort: the type that matters is the one below, and an encoder that does not need
-        // warming simply accepts both.
+        // Best effort: the type that matters is the one below; an encoder that needs no warming accepts both.
         let _ = set_output_type_once(transform, WARM_UP_SIZE, codec, bitrate_kbps);
     }
     set_output_type_once(transform, size, codec, bitrate_kbps)
 }
 
-/// One attempt at configuring the output, with no warming.
-/// Configure the encoder's output, which is what makes it willing to talk about its input at all.
-///
+/// One attempt at configuring the output, with no warming. This is what makes the encoder
+/// willing to talk about its input at all.
 fn set_output_type_once(
     transform: &IMFTransform,
     size: (u32, u32),
@@ -465,13 +417,11 @@ fn set_output_type_once(
     // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
     let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
     let pair = |first: u32, second: u32| ((first as u64) << 32) | second as u64;
-    // **The one place the codec matters.** The profile and the level are load-bearing at 4K — see the
-    // long note below — and they are per codec rather than per encoder: an H.265 profile number handed
-    // to an H.264 encoder is not a format it can refuse, it is a value it does not know.
+    // The one place the codec matters. Profile and level are load-bearing at 4K (see the note below)
+    // and per codec: an H.265 profile number handed to an H.264 encoder is a value it does not know.
     //
-    // `Main_420_8` because that is what this pipeline's input converts to: WGC hands over 8-bit RGB,
-    // not 10-bit, so Main10 would describe a stream nothing here produces. The level is the rung 4K
-    // needs, which is the same one H.264 asked for.
+    // `Main_420_8` because WGC hands over 8-bit RGB, so Main10 would describe a stream nothing here
+    // produces. The level is the rung 4K needs, the same one H.264 asked for.
     let (subtype, profile, level) = match codec {
         VideoCodec::H264 => (
             output_subtype(VideoCodec::H264),
@@ -493,44 +443,34 @@ fn set_output_type_once(
         media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        // A bitrate is not optional for a rate-controlled encoder, and this one is the configured
-        // `encode.bitrate_kbps` rather than a token value: measured, a token 2 Mbit/s at 4K is not
-        // enough for the encoder to accept the size at all, so the size of this number is
-        // load-bearing at the open. It is also **the rate the clip is really made at on this path**
-        // — nothing downstream sets one, because ffmpeg only copies what comes out of here — which
-        // is why it is a parameter: this was a hardcoded 20 Mbit/s that `bitrate_kbps` never reached,
-        // so a clip's actual size had nothing to do with the setting that describes it.
+        // A bitrate is required for a rate-controlled encoder, and it is the configured
+        // `encode.bitrate_kbps`: a token 2 Mbit/s at 4K is not enough for the encoder to accept the
+        // size at all. It is also the rate the clip is really made at on this path, since ffmpeg only
+        // copies what comes out of here.
         media_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps.saturating_mul(1_000))?;
-        // **The profile and the level are the load-bearing attributes at 4K.** Without them this MFT
-        // refuses *every* input format at 3840x2160 — including NV12, which it encodes for ffmpeg
-        // every day — because the level it would have to claim to carry 4K@60 is not one it can
-        // assume on the caller's behalf. Measured: 0xC00D36B4 for ARGB32 and NV12, 0xC00D36BD for
-        // RGB32, all three before these two lines existed.
+        // The profile and level are the load-bearing attributes at 4K. Without them this MFT refuses
+        // every input format at 3840x2160, including NV12 which it encodes for ffmpeg every day, because
+        // it cannot assume the level needed to carry 4K@60. Measured without them: 0xC00D36B4 for ARGB32
+        // and NV12, 0xC00D36BD for RGB32.
         media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
         media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level)?;
-        // **The GOP is the MFT's to set, and this is where it is set.**
-        //
-        // The plan named this as the risk that lives in this half of the change: `-force_key_frames`
-        // cannot apply to a stream ffmpeg is only copying, so nothing downstream can impose the
-        // segment boundaries the replay path depends on. It has to come from the encoder, and a
-        // keyframe a second — the segment length — is what makes one fragment per segment, which is
-        // what `MemoryRingBuffer` parses and what the lossless clip path cuts on.
+        // The GOP is the MFT's to set, here. `-force_key_frames` cannot apply to a stream ffmpeg only
+        // copies, so nothing downstream can impose the segment boundaries the replay path depends on.
+        // A keyframe a second (the segment length) gives one fragment per segment, which is what
+        // `MemoryRingBuffer` parses and the lossless clip path cuts on.
         media_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FRAME_RATE.0)?;
     }
     // SAFETY: setting the output type on a transform that was just unlocked and given its device
     // manager, with a media type that outlives the call.
-    // The bitrate is in the message because it is part of the question: a rate the encoder refuses
-    // is refused here, and a reader has to be able to tell that from a refusal of the size.
+    // The bitrate is in the message so a rate refusal can be told from a size refusal.
     unsafe { transform.SetOutputType(0, &media_type, 0) }
         .with_context(|| format!("SetOutputType({codec:?}, {bitrate_kbps} kbps)"))
 }
 
-/// Set one `ICodecAPI` value and report it — set, or refused in the encoder's own words.
+/// Set one `ICodecAPI` value and report it: set, or refused in the encoder's own words.
 ///
-/// The reporting is the point rather than a courtesy: a rate this pipeline asks for and an
-/// encoder that declines to be told are indistinguishable from the outside, and the difference
-/// is exactly what a clip whose size does not follow `encode.bitrate_kbps` would otherwise leave
-/// a reader to guess at.
+/// Reporting matters because a rate this pipeline asks for and an encoder that declines to be
+/// told look identical from outside, except as a clip whose size ignores `encode.bitrate_kbps`.
 fn set_codec_api_value(api: &ICodecAPI, key: &windows::core::GUID, value: u32, what: &str) {
     // SAFETY: `SetValue` is the interface's own method on a transform this process owns; the
     // `VT_UI4` variant is created here and outlives the call.
@@ -557,20 +497,17 @@ fn set_codec_api_value(api: &ICodecAPI, key: &windows::core::GUID, value: u32, w
     }
 }
 
-/// Pin the rate through the encoder's own control surface — `ICodecAPI` — instead of only asking
-/// for it on the output type.
+/// Pin the rate through the encoder's `ICodecAPI` instead of only asking on the output type.
 ///
-/// `MF_MT_AVG_BITRATE` is what the stream is *described* as, and every MFT measured here accepts
-/// it and then treats it as a target: §18's paired runs asked for 20,000 kbps and wrote
-/// 39,564,433 bit/s with the H.264 MFT and 35,747,208 with the HEVC one — 1.98x and 1.79x.
-/// `CODECAPI_AVEncCommonMeanBitRate` is the number those encoders rate-control from, and
-/// `CODECAPI_AVEncCommonRateControlMode` is what "mean" means to them: an average to aim near
-/// (the default, roughly VBR) or a rate to hold (CBR). This sets the mode first and then the
-/// rate, because that is the order an encoder expects to be configured in.
+/// `MF_MT_AVG_BITRATE` is what the stream is described as, and every MFT measured treats it as a
+/// target: asking for 20,000 kbps wrote 39,564,433 bit/s with the H.264 MFT and 35,747,208 with
+/// the HEVC one (1.98x and 1.79x). `CODECAPI_AVEncCommonMeanBitRate` is the number those encoders
+/// rate-control from, and `CODECAPI_AVEncCommonRateControlMode` is what "mean" means to them (an
+/// average to aim near, roughly VBR, or a rate to hold). The mode is set first, then the rate,
+/// the order an encoder expects.
 ///
-/// An MFT with no `ICodecAPI` is not a failure — the recording is still made, at the encoder's
-/// own default, which is what this pipeline did before this function existed — but it is said out
-/// loud rather than left to be inferred from a file's size.
+/// An MFT with no `ICodecAPI` is not a failure (the recording is made at the encoder's default)
+/// but it is said out loud rather than inferred from a file's size.
 fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
     let api: ICodecAPI = match transform.cast() {
         Ok(api) => api,
@@ -594,11 +531,10 @@ fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
         bitrate_kbps.saturating_mul(1_000),
         "mean bitrate (bit/s)",
     );
-    // §19 left the mode and the mean accepted-and-ignored on the NVENC MFT, and a maximum added
-    // alone moved the file by half a percent. The two things §19 listed as untried and that
-    // define a CBR *window* are the buffer (one second of the rate) and low-latency mode, which
-    // the hardware MFTs tie their strict rate control to. Set together with the ceiling so the
-    // encoder is told the whole contract; whether this one obeys is a measurement still owed.
+    // On the NVENC MFT the mode and mean were accepted and ignored, and a maximum added alone moved
+    // the file by half a percent. What defines a CBR window and was untried is the buffer (one second
+    // of the rate) and low-latency mode, which the hardware MFTs tie strict rate control to. Set
+    // with the ceiling so the encoder is told the whole contract; whether it obeys is still unmeasured.
     let bits = bitrate_kbps.saturating_mul(1_000);
     set_codec_api_value(&api, &CODECAPI_AVEncCommonMaxBitRate, bits, "maximum bitrate (bit/s)");
     set_codec_api_value(&api, &CODECAPI_AVEncCommonBufferSize, bits, "buffer size (bits)");
@@ -607,10 +543,10 @@ fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
 
 /// Try to set `subtype` as the transform's input type at `size`.
 ///
-/// The media type carries the four attributes every video encoder insists on seeing — major type,
-/// subtype, frame size, frame rate, interlace mode and pixel aspect ratio — packed the way Media
-/// Foundation packs them (two 32-bit halves in a `u64`), because a type missing any of them is
-/// rejected for the missing attribute rather than for the format under test.
+/// The media type carries the attributes every video encoder insists on (major type, subtype,
+/// frame size, frame rate, interlace mode, pixel aspect ratio), packed as Media Foundation packs
+/// them (two 32-bit halves in a `u64`), because a type missing one is rejected for that rather
+/// than for the format under test.
 fn accepts_subtype(
     transform: &IMFTransform,
     subtype: &windows::core::GUID,
@@ -624,8 +560,7 @@ fn accepts_subtype(
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pair(size.0, size.1))?;
-        // The same rate as the output type, from the same constant: a probe that guessed a
-        // different one here would be measuring its own inconsistency.
+        // The same rate as the output type, from the same constant, or the probe would measure its own inconsistency.
         media_type.SetUINT64(&MF_MT_FRAME_RATE, pair(FRAME_RATE.0, FRAME_RATE.1))?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
@@ -638,9 +573,8 @@ fn accepts_subtype(
 
 /// The input subtypes an MFT offers, by enumerating until it stops answering.
 ///
-/// Bounded rather than unbounded: an MFT that answered forever would hang the probe, and no
-/// encoder has ever offered more than a handful. The documented signal for "no more types" is an
-/// error, which is the break.
+/// Bounded, since an MFT that answered forever would hang the probe and no encoder offers more
+/// than a handful. An error is the documented "no more types" signal, which is the break.
 fn input_subtypes(transform: &IMFTransform) -> Vec<String> {
     const ENOUGH: u32 = 32;
     let mut found = Vec::new();
@@ -659,9 +593,8 @@ fn input_subtypes(transform: &IMFTransform) -> Vec<String> {
 
 /// A video subtype's name, for the ones this build knows, and its GUID otherwise.
 ///
-/// `RGB32` is included deliberately: Media Foundation's name for it is BGRX/RGB32 in memory, which
-/// is the *same byte order* Windows Graphics Capture delivers as BGRA8, so an encoder that lists it
-/// can take a captured texture without a colour conversion — which is not obvious from the name.
+/// `RGB32` is included deliberately: it is BGRX in memory, the same byte order WGC delivers as
+/// BGRA8, so an encoder that lists it takes a captured texture without a colour conversion.
 fn describe_subtype(guid: &windows::core::GUID) -> String {
     let known: [(&windows::core::GUID, &str); 8] = [
         (&MFVideoFormat_NV12, "NV12"),
@@ -681,11 +614,10 @@ fn describe_subtype(guid: &windows::core::GUID) -> String {
     format!("{guid:?}")
 }
 
-/// Whether this machine offers a hardware-accelerated **Video Processor** MFT.
+/// Whether this machine offers a hardware-accelerated Video Processor MFT.
 ///
-/// Only needed if the encoder refuses BGRA: a processor is where a BGRA→NV12 conversion belongs if
-/// one is required, because it runs on the GPU. Reported either way, since "there is one" is worth
-/// knowing before the design depends on it.
+/// Only needed if the encoder refuses BGRA: a BGRA to NV12 conversion belongs on the GPU there.
+/// Reported either way.
 pub fn probe_video_processors() -> Result<Vec<String>> {
     enumerate_names(MFT_CATEGORY_VIDEO_PROCESSOR)
 }
@@ -727,17 +659,12 @@ fn enumerate_names(category: windows::core::GUID) -> Result<Vec<String>> {
 
 /// A D3D11 device of the kind the capture backend creates.
 ///
-/// **`BGRA_SUPPORT | VIDEO_SUPPORT`, and the second one is not optional for HEVC.** BGRA is what
-/// Windows Graphics Capture requires; VIDEO_SUPPORT is what a Media Foundation encoder asks for when
-/// it is handed a D3D11 texture it has to convert, and the HEVC encoder answers
-/// `0xC00D6D76` — "the input type is not supported for D3D device" — without it, at any size, while
-/// the H.264 encoder is content either way. An earlier version of this comment said BGRA was the flag
-/// that matters; it was right about capture and wrong about what comes after it.
-/// it, so a device without it could not receive a captured texture and the handshake would be
-/// answering a question nobody is asking.
-/// A D3D11 device of the kind the capture backend creates.
+/// `BGRA_SUPPORT | VIDEO_SUPPORT`, and the second is not optional for HEVC. BGRA is what WGC
+/// requires; VIDEO_SUPPORT is what a Media Foundation encoder asks for when handed a D3D11
+/// texture it has to convert. Without it the HEVC encoder answers `0xC00D6D76` ("the input type
+/// is not supported for D3D device") at any size, while the H.264 encoder is content either way.
 ///
-/// Public because the probe needs one: in the real pipeline the device is capture's, and that is why
+/// Public because the probe needs one; in the real pipeline the device is capture's, which is why
 /// [`MftEncoder::open`] takes one instead of making its own.
 pub fn create_capture_kind_device() -> Result<ID3D11Device> {
     let mut device: Option<ID3D11Device> = None;
@@ -802,36 +729,31 @@ fn attribute_u32(activate: &IMFActivate, key: &windows::core::GUID) -> Option<u3
 
 /// A hardware encoder MFT, configured for a size and fed one GPU texture at a time.
 ///
-/// This is the Tier 2 encoder core, and its whole point is that [`MftEncoder::push_texture`] moves
-/// **no pixels through the CPU**: the captured texture goes to the encoder as a DXGI surface buffer
-/// on the GPU it already lives on. Measured context: the readback this replaces is ~97% of what the
-/// 4K pipeline does (§14 of `docs/verification-status.md`).
+/// [`MftEncoder::push_texture`] moves no pixels through the CPU: the captured texture goes to the
+/// encoder as a DXGI surface buffer on the GPU it lives on.
 ///
-/// Three things about opening it are measured rather than assumed, each of which reported a
-/// confident false negative when done the obvious way — see the module note and the plan:
+/// Three things about opening it were each a confident false negative when done the obvious way:
 ///
-/// * an asynchronous MFT must be **unlocked** before it can be configured;
-/// * the **output type must be set before the input**, because an encoder will not negotiate an
+/// * an asynchronous MFT must be unlocked before it can be configured;
+/// * the output type must be set before the input, because an encoder will not negotiate an
 ///   input until it knows what it is producing;
-/// * the encoder must be **chosen**, not assumed: the hardware flag enumerates MFTs that cannot be
-///   instantiated on this machine at all.
+/// * the encoder must be chosen, not assumed: the hardware flag enumerates MFTs that cannot be
+///   instantiated on this machine.
 pub struct MftEncoder {
     transform: IMFTransform,
-    /// The same transform seen as an event generator, which is how an asynchronous MFT says it
-    /// wants input and has output. Cast once at open rather than per frame.
+    /// The same transform as an event generator, which is how an asynchronous MFT says it wants
+    /// input and has output. Cast once at open rather than per frame.
     events: IMFMediaEventGenerator,
     /// Held because the manager only borrows it: releasing the device while an MFT holds a manager
-    /// over it is exactly the dangling-association case Media Foundation warns about.
+    /// over it is the dangling-association case Media Foundation warns about.
     device: ID3D11Device,
     size: (u32, u32),
-    /// Which MFT was selected, for the log and for the record.
+    /// Which MFT was selected, for the log.
     pub encoder_name: String,
     /// Which input format it actually took, at this size.
     ///
-    /// Reported because it decides whether the chain needs anything else in it: `ARGB32` is what
-    /// Windows Graphics Capture delivers, so taking it means the captured texture goes straight in,
-    /// while taking only `NV12` means something has to convert — and that something has to be on the
-    /// GPU or this whole exercise has moved the copy rather than removed it.
+    /// `ARGB32` is what WGC delivers, so taking it means the texture goes straight in; taking only
+    /// `NV12` means something must convert, and it has to be on the GPU or the copy is moved, not removed.
     pub input_format: String,
 }
 
@@ -842,14 +764,13 @@ pub struct MftEncoder {
 unsafe impl Send for MftEncoder {}
 
 impl MftEncoder {
-    /// Open a hardware H.264 encoder on `device` for frames of `size`, taking `ARGB32` input.
+    /// Open a hardware encoder for `codec` on `device` for frames of `size`.
     ///
-    /// `device` is the **capture path's** device, deliberately: an MFT given a manager over a
-    /// different device cannot be handed the captured texture at all, so the two have to be the
-    /// same one. That is why this takes a device rather than creating its own.
+    /// `device` is the capture path's, deliberately: an MFT given a manager over a different device
+    /// cannot be handed the captured texture at all.
     ///
-    /// `bitrate_kbps` is the rate the stream is made at — on this path nothing else sets one, since
-    /// ffmpeg copies it rather than encoding it.
+    /// `bitrate_kbps` is the rate the stream is made at; nothing else sets one, since ffmpeg copies
+    /// the stream.
     pub fn open(device: &ID3D11Device, size: (u32, u32), codec: VideoCodec, preferred: Option<DXGI_FORMAT>, bitrate_kbps: u32) -> Result<Self> {
         // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
         // in one process is a supported sequence.
@@ -870,11 +791,8 @@ impl MftEncoder {
         let manager = create_device_manager(device)?;
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
-        // **Unfiltered, for the reason written out at `probe_started_encoders`.** This asked for
-        // encoders declaring an H.264 output subtype, which is how the HEVC encoder on this machine
-        // stayed invisible to the code that actually records — the probe and the recorder share this
-        // mistake, and fixing only the probe would have left the recorder unable to find an encoder
-        // the machine demonstrably has. The negotiation below is the fact that decides.
+        // Unfiltered, for the reason at `probe_hardware_encoders`: filtering by an H.264 output subtype
+        // hid the HEVC encoder from the recorder as well as the probe. The negotiation below decides.
         //
         // SAFETY: `activates`/`count` are the out-parameters this call fills.
         unsafe {
@@ -908,8 +826,7 @@ impl MftEncoder {
                     chosen = Some((transform, name, input_format));
                     break;
                 }
-                // Not fatal: the hardware flag enumerates encoders this machine cannot instantiate,
-                // which is a fact about the machine rather than a failure of the search.
+                // Not fatal: the hardware flag enumerates encoders this machine cannot instantiate.
                 Err(err) => refusals.push(format!("{name}: {err:#}")),
             }
         }
@@ -938,16 +855,11 @@ impl MftEncoder {
 
     /// Open an encoder for frames shaped like `texture`, taking its device from the texture itself.
     ///
-    /// **The device is the texture's by construction, and that is stronger than a promise.** An MFT
-    /// can only be handed a texture that lives on the device its manager was built over, so a design
-    /// that had the caller pass a device separately would be trusting two components to agree about
-    /// which one capture chose — and the failure mode of that disagreement is a texture the encoder
-    /// silently cannot see. Asking the texture removes the question: whatever produced this frame is
-    /// what the encoder is opened on.
-    ///
-    /// The geometry comes from the texture for the same reason. It is the size that will actually
-    /// arrive rather than the size somebody configured, and for this mode they are required to be the
-    /// same anyway — `VideoInput::EncodedBitstream` refuses a scaled output at spawn.
+    /// An MFT can only be handed a texture that lives on the device its manager was built over, so
+    /// passing a device separately would trust two components to agree which one capture chose, and
+    /// disagreement leaves a texture the encoder silently cannot see. The geometry also comes from the
+    /// texture: it is the size that will arrive, and `VideoInput::EncodedBitstream` refuses a scaled
+    /// output at spawn.
     pub fn open_for_texture(texture: &ID3D11Texture2D, codec: VideoCodec, bitrate_kbps: u32) -> Result<Self> {
         // SAFETY: `texture` is a live D3D11 texture and `GetDevice` is the documented way to ask
         // which device it belongs to. The device it returns is a new reference, held by the encoder.
@@ -963,17 +875,14 @@ impl MftEncoder {
         self.size
     }
 
-    /// The device this encoder was opened on, which is the capture path's.
-    ///
-    /// Exposed because it is the device a texture handed to [`MftEncoder::push_texture`] has to
-    /// belong to — one the encoder is not managing cannot be wrapped as a media buffer for it. The
-    /// probe uses it to build a synthetic frame; the recorder will have got it from capture.
+    /// The device this encoder was opened on, the capture path's. A texture handed to
+    /// [`MftEncoder::push_texture`] must belong to it; the probe uses it to build a synthetic frame.
     pub fn device(&self) -> &ID3D11Device {
         &self.device
     }
 
-    /// Start the stream. Media Foundation's asynchronous contract begins here, not with the first
-    /// frame: an async MFT will not accept input until it has been told streaming has begun.
+    /// Start the stream. Media Foundation's asynchronous contract begins here: an async MFT will not
+    /// accept input until told streaming has begun.
     pub fn start(&mut self) -> Result<()> {
         // SAFETY: both are messages to the encoder's own transform, with no parameter.
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) }
@@ -985,14 +894,11 @@ impl MftEncoder {
 
     /// Hand the encoder one captured texture once it asks for one, and return what it produced.
     ///
-    /// The async contract is the whole reason this is not just "push the frame": an async MFT takes
-    /// input only when it has said it wants some (`METransformNeedInput`), and it says so through
-    /// the event generator rather than by accepting whatever arrives. `ProcessInput` called at any
-    /// other moment answers `MF_E_NOTACCEPTING` — measured, on the first attempt to feed this
-    /// encoder — which is why the wait is here rather than at the call site.
+    /// An async MFT takes input only after `METransformNeedInput`, delivered through the event
+    /// generator. `ProcessInput` at any other moment answers `MF_E_NOTACCEPTING`, which is why the
+    /// wait is here rather than at the call site.
     ///
-    /// `deadline` bounds the wait for that request: an encoder that never asks is a fault to report,
-    /// not a hang to sit in.
+    /// `deadline` bounds the wait: an encoder that never asks is a fault to report, not a hang.
     pub fn encode_texture(
         &mut self,
         texture: &ID3D11Texture2D,
@@ -1014,16 +920,13 @@ impl MftEncoder {
         }
 
         self.push_texture(texture, pts_ms)?;
-        // Collect without waiting further: what this frame produced, if anything, is already queued
-        // by the time it was accepted.
+        // Collect without waiting further: what this frame produced is already queued once it was accepted.
         let _ = self.pump_events(&mut produced);
         Ok(produced)
     }
 
-    /// Tell the encoder no more input is coming, and take everything it still has.
-    ///
-    /// A drain is what makes the tail of a stream real: without it the last few frames sit inside
-    /// the encoder and never reach the container.
+    /// Tell the encoder no more input is coming, and take everything it still has. Without a drain
+    /// the last few frames sit inside the encoder and never reach the container.
     pub fn finish(&mut self, deadline: Duration) -> Result<Vec<u8>> {
         // SAFETY: a message to the encoder's own transform, with no parameter.
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
@@ -1042,7 +945,7 @@ impl MftEncoder {
         Ok(produced)
     }
 
-    /// Drain whatever the encoder has to say, collecting its H.264 as it goes.
+    /// Drain whatever the encoder has to say, collecting its output as it goes.
     fn pump_events(&mut self, produced: &mut Vec<u8>) -> Result<Asked> {
         loop {
             // SAFETY: the event generator on this encoder's own transform. `NO_WAIT` makes an empty
@@ -1060,15 +963,14 @@ impl MftEncoder {
             if kind == METransformHaveOutput.0 as u32 {
                 self.take_output(produced)?;
             }
-            // Anything else — a drain completing, an error event — is not this exchange's business;
-            // the loop simply continues until the queue is empty.
+            // Anything else (a drain completing, an error event) is not this exchange's business.
         }
     }
 
     /// Take one finished sample's bytes out of the encoder.
     fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<()> {
-        // `ManuallyDrop` because that is how this struct is generated: the sample inside is owned by
-        // the caller once taken, and leaving the field un-taken must not release it twice.
+        // `ManuallyDrop` because that is how the struct is generated: the sample is the caller's once
+        // taken, and leaving the field un-taken must not release it twice.
         let mut buffer = MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: 0,
             pSample: std::mem::ManuallyDrop::new(None),
@@ -1076,14 +978,14 @@ impl MftEncoder {
             pEvents: std::mem::ManuallyDrop::new(None),
         };
         let mut status = 0u32;
-        // SAFETY: one output stream, and the sample is the MFT's to allocate — an encoder that
-        // provides samples is the case here, which is why `dwFlags` is zero and the buffer carries
-        // no sample of ours. The slice is exactly one element, which is what this stream has, and
-        // `status` is the documented out-parameter for the per-stream flags.
+        // SAFETY: one output stream, and the sample is the MFT's to allocate (an encoder that provides
+        // samples is the case here, so `dwFlags` is zero and the buffer carries no sample of ours). The
+        // slice is exactly one element, which is what this stream has, and `status` is the documented
+        // out-parameter for the per-stream flags.
         let taken =
             unsafe { self.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
-        // The MFT hands back a sample only when it has one; being asked before that is the
-        // documented `MF_E_TRANSFORM_NEED_MORE_INPUT`, which is not an error to propagate.
+        // The MFT hands back a sample only when it has one; asking earlier is the documented
+        // `MF_E_TRANSFORM_NEED_MORE_INPUT`, not an error to propagate.
         match taken {
             Ok(()) => {}
             Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
@@ -1114,11 +1016,10 @@ impl MftEncoder {
 
     /// Hand one captured texture to the encoder, with no copy of its pixels.
     ///
-    /// `pts_ms` is media time, in the same milliseconds the rest of the pipeline uses; the encoder
-    /// wants 100-nanosecond units, so the conversion happens here rather than at every call site.
+    /// `pts_ms` is media time in the pipeline's milliseconds; the encoder wants 100-nanosecond units.
     pub fn push_texture(&mut self, texture: &ID3D11Texture2D, pts_ms: i64) -> Result<()> {
-        // The documented way to wrap a DXGI surface as a media buffer. `fbottomupwhenlinear` is
-        // false because a captured texture is top-down, which is what the encoder expects.
+        // The documented way to wrap a DXGI surface as a media buffer. `fbottomupwhenlinear` is false
+        // because a captured texture is top-down.
         // SAFETY: `texture` is a live D3D11 texture on this encoder's device, and the IID names the
         // interface it is being wrapped as.
         let buffer = unsafe {
@@ -1141,8 +1042,8 @@ impl MftEncoder {
 
 impl Drop for MftEncoder {
     fn drop(&mut self) {
-        // Detach the device manager before the transform goes, as Media Foundation's contract
-        // requires; the transform's own reference then drops with this struct.
+        // Detach the device manager before the transform goes, as Media Foundation requires; the
+        // transform's own reference then drops with this struct.
         // SAFETY: the transform is live, and the parameter is the documented detach value.
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
@@ -1156,10 +1057,9 @@ impl Drop for MftEncoder {
 
 /// Configure one candidate: unlock it, give it the device, set its output type, then its input.
 ///
-/// The order is the whole of this function's value. Every step below was learned from a refusal:
-/// an async MFT that is not unlocked will not be configured at all, and an encoder asked for an
-/// input type before an output type refuses — which reads as "this format is unsupported" and is
-/// not that.
+/// The order matters; each step was learned from a refusal. An async MFT that is not unlocked
+/// will not be configured, and an input type asked for before an output type is refused in a way
+/// that reads as "this format is unsupported".
 fn configure_encoder(
     activate: &IMFActivate,
     manager: &IMFDXGIDeviceManager,
@@ -1174,20 +1074,18 @@ fn configure_encoder(
 
     prepare_transform(activate, &transform, manager)?;
     set_output_type(&transform, size, codec, bitrate_kbps)?;
-    // **The number is set here, not only described.** See `pin_bitrate`: the output type above
-    // carries `MF_MT_AVG_BITRATE`, which these encoders accept as a target rather than a limit.
+    // The number is set here, not only described: the output type carries `MF_MT_AVG_BITRATE`, which
+    // these encoders treat as a target rather than a limit (see `pin_bitrate`).
     pin_bitrate(&transform, bitrate_kbps);
 
-    // **Negotiated, not assumed.** Measured: this MFT takes `ARGB32` at 640x480 and refuses it at
-    // 3840x2160 with `MF_E_INVALIDMEDIATYPE`, so what it will eat is a function of the size as well
-    // as the format. Trying the candidates in order — the *direct* one first, because taking
-    // `ARGB32` means the captured texture goes straight in — is what makes this work at whatever
-    // size it is asked for rather than at the size someone happened to test.
+    // Negotiated, not assumed: this MFT takes `ARGB32` at 640x480 and refuses it at 3840x2160 with
+    // `MF_E_INVALIDMEDIATYPE`, so what it eats depends on size as well as format. Candidates are
+    // tried in order, the direct one first (`ARGB32` means the texture goes straight in).
     let mut refusals = Vec::new();
     for (subtype, name) in candidate_inputs(preferred) {
         let input = video_type(subtype, size)?;
         // SAFETY: setting the input type on a configured transform, with a media type that outlives
-        // the call. A refusal here is expected for some formats at some sizes, not a failure.
+        // the call. A refusal here is expected for some formats at some sizes.
         match unsafe { transform.SetInputType(0, &input, 0) } {
             Ok(()) => return Ok((transform, name.to_string())),
             Err(err) => refusals.push(format!("{name}: {err}")),
@@ -1199,11 +1097,9 @@ fn configure_encoder(
     )
 }
 
-/// A video media type for one subtype and size, with the attributes every encoder insists on.
-///
-/// The frame size, frame rate, pixel aspect ratio and interlace mode are packed the way Media
-/// Foundation packs them — two 32-bit halves in a `u64` — and a type missing any of them is
-/// rejected for the missing attribute rather than for the format under test.
+/// A video media type for one subtype and size, with the attributes every encoder insists on,
+/// packed as Media Foundation packs them (two 32-bit halves in a `u64`); a type missing one is
+/// rejected for that rather than for the format under test.
 fn video_type(subtype: &windows::core::GUID, size: (u32, u32)) -> Result<IMFMediaType> {
     // SAFETY: `MFCreateMediaType` returns an empty type this function owns.
     let media_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType")?;
@@ -1224,13 +1120,11 @@ fn video_type(subtype: &windows::core::GUID, size: (u32, u32)) -> Result<IMFMedi
 mod tests {
     use super::*;
 
-    /// What this machine offers, and whether it will take the capture path's own D3D11 device.
+    /// What this machine offers, and whether it takes the capture path's own D3D11 device.
     ///
-    /// Deliberately a test that **reports** and asserts only what is a fact about the platform
-    /// rather than about one GPU: the enumeration must work, and every MFT the hardware flag
-    /// returned must either have accepted the handshake or said why not. Requiring an encoder to
-    /// *exist* would fail on a machine that legitimately has none, which is not what this is for —
-    /// the numbers are the output, and they are printed for the record.
+    /// Reports, and asserts only platform facts: the enumeration must work and every MFT returned must
+    /// have accepted the handshake or said why not. Requiring an encoder to exist would fail on a
+    /// machine that legitimately has none.
     #[test]
     fn the_hardware_encoders_are_enumerable_and_answer_the_d3d11_handshake() {
         let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
@@ -1261,55 +1155,47 @@ mod tests {
 
 /// How many textures may be waiting for the hardware encoder.
 ///
-/// **Two, and it is derived rather than chosen.** Capture hands out each of its three handover
-/// textures in turn, so the texture given to frame *n* is blitted into again at frame *n + 3*. A
-/// queue of two means the encoder is never more than two frames behind what it was handed, so by
-/// the time capture wants that texture back, the encoder is done with it.
+/// Two, derived rather than chosen. Capture hands out three handover textures in turn, so the
+/// texture given to frame *n* is blitted into again at frame *n + 3*. With a queue of two the
+/// encoder is done with a texture by the time capture wants it back.
 ///
-/// Deepening it would not buy throughput, because the encoder is slower than 60 Hz: the queue fills
-/// and frames are dropped either way. What it would buy is tearing — a texture blitted into while
-/// the encoder is still reading it, which is a corruption that would show up as a torn picture
-/// rather than as an error. Half the ring is what keeps the guarantee true instead of likely.
+/// Deeper would not buy throughput (the encoder is slower than 60 Hz, so frames drop either way)
+/// but would risk a texture blitted into while the encoder is still reading it, a torn picture
+/// rather than an error. Half the ring keeps the guarantee true instead of likely.
 const QUEUE_DEPTH: usize = 2;
 
 /// How long one encoded frame waits for room in the video queue before it is dropped instead.
 ///
-/// The queue it waits on is drained by the thread that writes to ffmpeg, and that thread stops
-/// making progress whenever ffmpeg stops reading: a child that has gone quiet fills its own pipe,
-/// the pipe fills the queue, and the queue fills this thread. Waiting there without a deadline is
-/// how the recorder stopped closing — [`MftFeed::shutdown`] joins this thread, and the step that
-/// could break the reader loose (killing ffmpeg) sits *below* that join, so a handover that never
-/// returns is an app that never exits. Measured on the box, 2026-10-15, four runs of the shipped
-/// hardware path: two of four were inside this send when the join was reached and had to be killed,
-/// while both runs that got through it closed in ~21 s.
+/// The queue is drained by the thread that writes to ffmpeg, which stops making progress whenever
+/// ffmpeg stops reading: a quiet child fills its pipe, the pipe fills the queue, and the queue
+/// fills this thread. Waiting without a deadline is how the recorder stopped closing:
+/// [`MftFeed::shutdown`] joins this thread, and the step that could unstick the reader (killing
+/// ffmpeg) sits below that join. On the Windows test machine two of four runs of the hardware
+/// path were inside this send at the join and had to be killed.
 ///
-/// It is [`MFT_TIMEOUT`], the budget the encoder calls in this same thread already use, because it
-/// answers the same question — how long to wait on the other side of the transform before giving up.
+/// It is [`MFT_TIMEOUT`], the budget the encoder calls on this thread already use, since it
+/// answers the same question: how long to wait on the other side of the transform.
 const HANDOVER_BUDGET: Duration = MFT_TIMEOUT;
 
 /// The hardware encoder on its own thread, fed through a queue that never blocks.
 ///
-/// `submit` is called from the capture pump, and the encoder is a Media Foundation transform whose
-/// synchronous calls take ~30 ms at 4K. Running it inline — which is what this did first — makes the
-/// pump wait for it, and the pump is what paces capture: measured, that turned a 56.9 fps recording
-/// into 35.0 and dropped 2288 frames of 5700, while the copy it removed was worth 70% of the loop.
-/// So the encoder gets a thread of its own and the pump only hands over textures.
-///
-/// What crosses the boundary is a texture we own, not a frame of pixels: no copy happens here, and
-/// nothing is read back.
+/// `submit` is called from the capture pump, and the transform's synchronous calls take ~30 ms
+/// at 4K. Running it inline made the pump wait, and the pump paces capture: a 56.9fps recording
+/// came out at 35.0 with 2288 of 5700 frames dropped. So the encoder has its own thread and the
+/// pump only hands over textures (owned, nothing copied or read back).
 pub struct MftFeed {
-    /// `None` once shut down. Dropping it is the shutdown signal — see [`MftFeed::shutdown`].
+    /// `None` once shut down. Dropping it is the shutdown signal (see [`MftFeed::shutdown`]).
     tx: Option<std::sync::mpsc::SyncSender<GpuTexture>>,
     handle: Option<std::thread::JoinHandle<()>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Set by [`MftFeed::shutdown`] before it joins the thread, so a handover that is waiting for
-    /// room stops waiting: from that point nothing below the join can make room.
+    /// Set by [`MftFeed::shutdown`] before it joins the thread, so a handover waiting for room stops
+    /// waiting: from then on nothing below the join can make room.
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MftFeed {
-    /// Start the encoder's thread, whose output goes into `out` — the same video queue the pump
-    /// used to write to, so the depth accounting stays in one place.
+    /// Start the encoder's thread, whose output goes into `out`, the video queue the pump writes to,
+    /// so depth accounting stays in one place.
     pub fn spawn(codec: VideoCodec, bitrate_kbps: u32, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1328,9 +1214,8 @@ impl MftFeed {
         }
     }
 
-    /// Hand a frame to the encoder. Never blocks, and never queues deeper than [`QUEUE_DEPTH`]: a
-    /// full queue drops the frame and counts it, which is the same bargain the video queue strikes
-    /// when it cannot keep up with ffmpeg.
+    /// Hand a frame to the encoder. Never blocks and never queues deeper than [`QUEUE_DEPTH`]: a
+    /// full queue drops and counts the frame, as the video queue does when ffmpeg is behind.
     pub fn submit(&self, texture: GpuTexture) {
         let Some(tx) = self.tx.as_ref() else { return };
         match tx.try_send(texture) {
@@ -1351,15 +1236,13 @@ impl MftFeed {
 
     /// Close the queue and wait for the thread to encode what is already in it, then drain.
     ///
-    /// **Dropping the sender is the shutdown signal, rather than a message sent down the queue**,
-    /// because a message can be refused by a full queue and a shutdown that can be refused is a
-    /// hang. Closing the sender ends the `recv` loop after the frames already queued have been
-    /// taken, so nothing in flight is lost.
+    /// Dropping the sender is the shutdown signal rather than a message down the queue, because a
+    /// full queue can refuse a message and a shutdown that can be refused is a hang. Closing the
+    /// sender ends the `recv` loop after the queued frames are taken, so nothing in flight is lost.
     pub fn shutdown(&mut self) {
-        // The flag before the sender, and both before the join: this thread cannot finish a
-        // handover that is waiting for a queue whose reader has stopped draining, and the join
-        // cannot return until the thread ends. Telling it to stop waiting is what keeps the join
-        // bounded — see [`hand_over`].
+        // The flag before the sender, and both before the join: this thread cannot finish a handover
+        // waiting on a queue whose reader has stopped draining, and the join cannot return until it
+        // ends. Telling it to stop waiting keeps the join bounded (see [`hand_over`]).
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.tx.take();
@@ -1384,11 +1267,10 @@ enum Handover {
 /// Hand one encoded frame to the video queue, waiting for room but not for ever.
 ///
 /// A `send` here is what stopped the recorder closing: the queue is drained by the thread that
-/// writes to ffmpeg, that thread stops when ffmpeg stops reading, and the join in
-/// [`MftFeed::shutdown`] — the only thing that could unstick it — cannot run until this returns. So
-/// the wait is bounded, and a frame that cannot be queued in time is dropped and counted, which is
-/// the same bargain the encoder's own input queue strikes one step up: the timeline is wall-clock,
-/// and a gap is better than a recording that will not stop.
+/// writes to ffmpeg, which stops when ffmpeg stops reading, and the join in
+/// [`MftFeed::shutdown`] (the only thing that could unstick it) cannot run until this returns.
+/// So the wait is bounded and a frame that cannot be queued in time is dropped and counted: the
+/// timeline is wall-clock, and a gap beats a recording that will not stop.
 fn hand_over(
     out: &std::sync::mpsc::SyncSender<Vec<u8>>,
     units: Vec<u8>,
@@ -1404,8 +1286,7 @@ fn hand_over(
                 if stopping.load(std::sync::atomic::Ordering::SeqCst) || Instant::now() >= deadline {
                     return Handover::Dropped;
                 }
-                // A millisecond: short enough that a shutdown is not felt, long enough that a
-                // stalled queue is not a spin.
+                // A millisecond: short enough that a shutdown is not felt, long enough that a stalled queue is not a spin.
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Handover::Closed,
@@ -1422,13 +1303,11 @@ fn encode_loop(
     bitrate_kbps: u32,
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Opened on the first texture rather than up front, because both the device and the size come
-    // from that texture — and opening it here rather than on the pump takes the open off the
-    // capture path as well.
+    // Opened on the first texture, because the device and size come from it; opening here also keeps
+    // the open off the capture path.
     let mut encoder: Option<MftEncoder> = None;
     let mut pts_ms: i64 = 0;
-    // Frames this thread encoded and then could not queue. Counted rather than logged one by one:
-    // a stalled queue drops every frame behind it, and the total is the whole story.
+    // Frames encoded and then not queued, counted rather than logged one by one: a stalled queue drops every frame behind it.
     let mut unqueued: u64 = 0;
 
     while let Ok(texture) = rx.recv() {
@@ -1449,8 +1328,7 @@ fn encode_loop(
                     encoder = Some(opened);
                 }
                 Err(err) => {
-                    // Counted as a drop so the reporting stays honest about frames that reached this
-                    // stage and did not become video.
+                    // Counted as a drop so reporting stays honest about frames that reached this stage and did not become video.
                     tracing::error!("could not open the hardware encoder: {err:#}");
                     dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
@@ -1458,11 +1336,9 @@ fn encode_loop(
             }
         }
         let mft = encoder.as_mut().expect("just opened");
-        // Media time is counted per frame handed over rather than taken from the caller's clock:
-        // what the encoder is being asked to produce is a stream at the configured frame rate, and
-        // the timestamps have to march at that rate whether or not frames were dropped on the way
-        // here. `MftEncoder::push_texture` converts to the 100-nanosecond units Media Foundation
-        // wants.
+        // Media time is counted per frame handed over, not taken from the caller's clock: the stream is
+        // at the configured frame rate and its timestamps must march at that rate whether or not frames
+        // were dropped on the way here. `MftEncoder::push_texture` converts to 100ns units.
         pts_ms += (1000 / FRAME_RATE.0 as i64).max(1);
         match mft.encode_texture(texture.as_raw(), pts_ms, MFT_TIMEOUT) {
             Ok(units) if units.is_empty() => {}
@@ -1485,8 +1361,7 @@ fn encode_loop(
         );
     }
 
-    // The tail. An asynchronous MFT produces output when it decides to, so the last frames of a
-    // stream only become real when it is drained.
+    // The tail: an asynchronous MFT produces output when it decides to, so the last frames only become real when drained.
     if let Some(mut mft) = encoder {
         match mft.finish(MFT_TIMEOUT) {
             Ok(tail) if !tail.is_empty() => {
@@ -1502,11 +1377,9 @@ fn encode_loop(
 
 /// The adapter a device is running on, by name.
 ///
-/// **"A hardware encoder" is not an answer when the machine has two GPUs.** A device created with a
-/// null adapter gets whichever adapter DXGI calls the default, and on a machine with an integrated
-/// GPU beside a discrete one that is not something to assume — so this is reported at runtime rather
-/// than left to whoever reads the `D3D11CreateDevice` call. The encoder takes its device *from the
-/// captured texture*, so the name printed for it is the adapter the capture is really running on.
+/// With two GPUs, "a hardware encoder" is not an answer: a null-adapter device gets whichever
+/// adapter DXGI calls the default. The encoder takes its device from the captured texture, so
+/// this names the adapter the capture is really running on.
 pub fn adapter_description(device: &ID3D11Device) -> String {
     let Ok(dxgi) = device.cast::<IDXGIDevice>() else {
         return "<not a DXGI device>".to_string();
@@ -1529,10 +1402,8 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
     String::from_utf16_lossy(&description.Description[..end])
 }
 
-/// The output-type variants the HEVC matrix tries, in order.
-///
-/// Each is the type this pipeline builds with exactly one thing changed, so that a refusal can be
-/// attributed to something rather than to everything.
+/// The output-type variants the HEVC matrix tries, in order. Each is the pipeline's type with
+/// exactly one thing changed, so a refusal can be attributed.
 const OUTPUT_TYPE_VARIANTS: [&str; 8] = [
     "exactly what the pipeline builds",
     "no profile and no level",
@@ -1544,8 +1415,7 @@ const OUTPUT_TYPE_VARIANTS: [&str; 8] = [
     "Main_420_10 instead of Main_420_8",
 ];
 
-/// Build the output media type the pipeline builds, with variant `index` of [`OUTPUT_TYPE_VARIANTS`]
-/// applied.
+/// Build the output media type the pipeline builds, with variant `index` of [`OUTPUT_TYPE_VARIANTS`] applied.
 ///
 /// SAFETY: the returned type is a COM object owned by the caller.
 unsafe fn build_output_type(
@@ -1590,15 +1460,11 @@ unsafe fn build_output_type(
 
 /// Unlock an asynchronous transform and hand it the device manager, in that order.
 ///
-/// **The sequence is the thing, and it is easy to lose half of it.** An asynchronous MFT refuses the
-/// device manager with `0xC00D6D77` — "the caller does not appear to support this transform's
-/// asynchronous capabilities" — until `MF_TRANSFORM_ASYNC_UNLOCK` is set on its attributes, and it
-/// will not accept any type before it has the manager.
-///
-/// That is the error the first version of the encoder hit, and then the error the output-type matrix
-/// hit again when it re-typed this and left the unlock out: every candidate refused, the matrix
-/// reported nothing, and the machine's ten encoders looked like none. Two copies of an ordered
-/// sequence is one copy too many, so there is one.
+/// An async MFT refuses the device manager with `0xC00D6D77` ("the caller does not appear to
+/// support this transform's asynchronous capabilities") until `MF_TRANSFORM_ASYNC_UNLOCK` is set
+/// on its attributes, and accepts no type before it has the manager. A second copy of this
+/// sequence once left out the unlock: every candidate refused and ten encoders looked like none.
+/// So there is one copy.
 fn prepare_transform(
     activate: &IMFActivate,
     transform: &IMFTransform,
@@ -1645,18 +1511,15 @@ fn describe_media_type(media_type: &IMFMediaType) -> String {
 
 /// What an encoder says its own output and input types are.
 ///
-/// **The direct question, and the one to ask before guessing at attributes.** `0xC00D6D76` is
-/// `MF_E_UNSUPPORTED_D3D_TYPE` — Media Foundation's "the type you asked for is not one this GPU device
-/// supports" — and it is the same error, at the same `SetOutputType` call, that OBS users hit with
-/// NVENC. The documented way to find out what it accepts is to ask it: `GetOutputAvailableType`
-/// returns the types the transform offers, *with the attributes it wants on them*, rather than a
-/// caller's idea of what a 4K HEVC type looks like.
+/// The direct question, to ask before guessing at attributes. `0xC00D6D76` is
+/// `MF_E_UNSUPPORTED_D3D_TYPE` (the type is not one this GPU device supports), the same error NVENC
+/// users hit at `SetOutputType`. `GetOutputAvailableType` returns the types the transform offers,
+/// with the attributes it wants.
 ///
-/// An asynchronous MFT refuses to enumerate *input* types — which is why the input negotiation
-/// elsewhere is done by trying `SetInputType` — so an input failure here is expected and is reported
-/// as such rather than treated as a finding. An encoder that refuses this codec's output type is
-/// **not** skipped: the refusal is a row of its own, and its available output types are still
-/// enumerated, because those are what say which type it would have taken instead.
+/// An async MFT refuses to enumerate input types (hence `SetInputType` elsewhere), so an input
+/// failure here is expected and reported as such. An encoder that refuses this codec's output type
+/// is not skipped: the refusal is a row, and its available output types are still enumerated,
+/// since they say which type it would have taken.
 pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
     // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
@@ -1704,13 +1567,10 @@ pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<
                     continue;
                 }
             };
-            // **A refusal is a row, not a skip.** This used to `continue`, and that dropped the one
-            // case the function exists for: `GetOutputAvailableType` is what says *which* type the
-            // encoder would take, and an MFT answers that whether or not it took the caller's type.
-            // The matrix above does say that this encoder refuses this codec — but not why, and the
-            // encoder that refuses is the one a reader came here to interrogate. So the error is
-            // reported with its code, at the call that produced it, like every other failure here,
-            // and the enumeration below still runs.
+            // A refusal is a row, not a skip: `GetOutputAvailableType` says which type the encoder would
+            // take whether or not it took the caller's, and the refusing encoder is the one a reader wants
+            // to interrogate. The error is reported with its code at the call that produced it and the
+            // enumeration below still runs.
             //
             // SAFETY: the transform is live and the type outlives the call.
             let refused = match unsafe { transform.SetOutputType(0, &media_type, 0) } {
@@ -1727,10 +1587,8 @@ pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<
                 ));
             }
             for output in [true, false] {
-                // The input side needs an output type to have been *accepted* — an asynchronous MFT
-                // will not talk about its inputs until it knows what it is producing — so when the
-                // type was refused there is nothing to ask there, and the output side is exactly the
-                // side that answers the question.
+                // The input side needs an accepted output type (an async MFT will not discuss its inputs until
+                // it knows what it produces), so when the type was refused only the output side can answer.
                 if !output && refused.is_some() {
                     continue;
                 }
@@ -1767,13 +1625,12 @@ pub fn probe_available_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<
     rows
 }
 
-/// Whether an encoder wants its **input** type declared before its **output** type.
+/// Whether an encoder wants its input type declared before its output type.
 ///
-/// The rule this project followed — output first, because an encoder will not negotiate an input type
-/// until it knows what it is producing — was measured on the H.264 encoder. But the error being chased
-/// names the *input* type, and one NVENC report of the same `0xC00D6D76` describes fixing it by
-/// configuring the source, then the transform, then the codec. So the order is a variable, not an
-/// assumption: this tries all four combinations of order and device manager and reports each.
+/// "Output first" was measured on the H.264 encoder, but the error being chased names the input
+/// type, and an NVENC report of the same `0xC00D6D76` describes configuring the source, then the
+/// transform, then the codec. So the order is a variable: this tries all four combinations of
+/// order and device manager and reports each.
 pub fn probe_ordering(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
     // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
@@ -1821,8 +1678,7 @@ pub fn probe_ordering(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String
                         continue;
                     }
                 } else {
-                    // An asynchronous transform must be unlocked whether or not it is given a device,
-                    // and setting the attribute on a synchronous one is harmless.
+                    // An asynchronous transform must be unlocked whether or not it is given a device; setting the attribute on a synchronous one is harmless.
                     if let Ok(attributes) = unsafe { transform.GetAttributes() } {
                         let _ = unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) };
                     }
@@ -1862,26 +1718,21 @@ pub fn probe_ordering(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String
 
 /// The largest size a codec's hardware encoder will accept a D3D texture input for.
 ///
-/// **The last question left, and a size-shaped one.** Everything else about the refusal is invariant:
-/// `prepare_transform`'s order, the attributes of the output type, the input format, and the device
-/// flags all make no difference, while the *same* output type is accepted at 640x480 and refused at
-/// 3840x2160. That leaves the frame size itself, so this walks a ladder of sizes and reports where the
-/// answer changes. A "yes at 1080p, no at 1440p" is a fact about the encoder's D3D path; a "yes
-/// everywhere but 4K" is a fact about 4K.
+/// Everything else about the refusal is invariant (`prepare_transform`'s order, the output type's
+/// attributes, the input format, the device flags) while the same output type is accepted at
+/// 640x480 and refused at 3840x2160. So this walks a ladder of sizes and reports where the answer
+/// changes: "yes at 1080p, no at 1440p" is a fact about the encoder's D3D path, "yes everywhere
+/// but 4K" a fact about 4K.
 pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
     // SAFETY: refcounted, and the matching `MFShutdown` runs on the way out.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
     let rows = (|| -> Result<Vec<(String, String)>> {
-        // **4K twice, and 1080p twice, on purpose.** The ladder is what proved that this encoder does
-        // accept the type the pipeline builds at 4K — after `probe_output_types` had just been refused
-        // the same type at the same size. If the distinguishing factor is the transform's history, then
-        // a repeat either changes the answer or it does not, and either result is worth more than the
-        // ladder alone: a first attempt that fails and a second that succeeds is a state problem with
-        // a retry as its fix, while two identical answers points somewhere else entirely.
-        // **Rising, with 4K at the end *and* twice.** The order is the variable: a ladder that began
-        // at 3840x2160 refused every size, while the same ladder rising from 640x480 accepted all of
-        // them — including 4K, twice in one run and once in another. If a small size accepted first
-        // is what makes a larger one work, the last two rows here say so; if 4K is refused again on
+        // 4K twice and 1080p twice, on purpose. If the distinguishing factor is the transform's history,
+        // a repeat either changes the answer (a state problem with a retry as fix) or it does not
+        // (the cause is elsewhere).
+        // The ladder rises, with 4K at the end: one that began at 3840x2160 refused every size, while
+        // the same ladder rising from 640x480 accepted all of them, 4K twice in one run. If a small size
+        // accepted first is what makes a larger one work, the last rows say so; if 4K is refused again on
         // the second attempt, warm-up is not the mechanism.
         let sizes = [
             (640u32, 480u32),
@@ -1918,8 +1769,7 @@ pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
             for (width, height) in sizes {
-                // A fresh transform per size: an MFT that has refused a type is not required to be
-                // in a state where the next one means anything.
+                // A fresh transform per size: an MFT that has refused a type need not be in a state where the next answer means anything.
                 let Ok(transform) = (unsafe { candidate.ActivateObject::<IMFTransform>() }) else {
                     break;
                 };
@@ -1948,14 +1798,12 @@ pub fn probe_size_ceiling(codec: VideoCodec) -> Result<Vec<(String, String)>> {
 
 /// Which output-media-type attribute an encoder is objecting to, asked one at a time.
 ///
-/// **A diagnostic, and deliberately one.** The HEVC encoder on the development box accepts the type
-/// this pipeline builds at 640x480 and refuses it at 3840x2160 with `0xC00D6D76` — "the input type is
-/// not supported for D3D device" — which names the device rather than the attribute at fault. Three
-/// guesses have been tried and none moved it: an NV12 input, a video-capable device, and a different
-/// wrapper entirely (ffmpeg's own `hevc_mf`, which cannot open an HEVC encoder at any size here).
-/// Rather than guess a fourth time, ask: build the same type with one thing changed at a time and
-/// report which ones it takes. The device manager is set first, because that is the context the
-/// refusal is about.
+/// A diagnostic. The HEVC encoder on the Windows test machine accepts the pipeline's type at
+/// 640x480 and refuses it at 3840x2160 with `0xC00D6D76` ("the input type is not supported for
+/// D3D device"), which names the device rather than the attribute. An NV12 input, a video-capable
+/// device and ffmpeg's own `hevc_mf` (which cannot open an HEVC encoder at any size there) did
+/// not move it. So this builds the same type with one thing changed at a time and reports which
+/// the encoder takes. The device manager is set first, because that is the context of the refusal.
 ///
 /// Nothing in the pipeline calls this. Returns `(what was tried, what happened)` per candidate.
 pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(String, String)>> {
@@ -1991,13 +1839,10 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            // **A skip is reported, not swallowed, and the preparation is shared.**
-            //
-            // The first version of this returned an empty matrix on a machine with ten encoders and
-            // said nothing about why — because it had re-typed the preparation sequence and left out
-            // the async unlock, so every candidate refused its device manager with `0xC00D6D77` and
-            // the diagnostic blamed the encoders. A sequence that must be in one order belongs in one
-            // place; that is `prepare_transform`, and it is used here and by the encoder proper.
+            // A skip is reported, not swallowed, and the preparation is shared. An earlier version returned
+            // an empty matrix on a machine with ten encoders because it re-typed the preparation and left
+            // out the async unlock, so every candidate refused its device manager with `0xC00D6D77`.
+            // `prepare_transform` is the one place that sequence lives.
             let transform = match unsafe { candidate.ActivateObject::<IMFTransform>() } {
                 Ok(transform) => transform,
                 Err(err) => {
@@ -2030,19 +1875,17 @@ pub fn probe_output_types(codec: VideoCodec, size: (u32, u32)) -> Result<Vec<(St
     rows
 }
 
-/// Whether a hardware encoder for `codec` will actually **open** at `size`.
+/// Whether a hardware encoder for `codec` will actually open at `size`.
 ///
-/// **For deciding whether to choose the hardware path, as opposed to insisting on it.** `auto` is the
-/// default for `encode.zero_copy` and it means "use the hardware when the hardware can" — which an
-/// enumeration cannot answer. An encoder MFT that exists, activates, and then refuses this codec at
-/// this size is exactly the case that matters, and this machine has one: its HEVC encoder is
-/// enumerated, activates, and rejects the output type with `0xC00D6D76` at 4K while accepting the same
-/// type at 640x480. Deciding from `MFTEnumEx` would produce a recording with no video in it and a
-/// warning in a log, which is the failure this whole design exists to avoid.
+/// For deciding whether to choose the hardware path rather than insisting on it. `auto` is the
+/// default for `encode.zero_copy` ("use the hardware when it can"), which an enumeration cannot
+/// answer: the Windows test machine's HEVC encoder enumerates, activates, and rejects the output
+/// type with `0xC00D6D76` at 4K while accepting it at 640x480. Deciding from `MFTEnumEx` would
+/// produce a recording with no video in it.
 ///
-/// The device is the kind capture creates, because the encoder takes its device *from the captured
-/// texture* and this is asking the same question the recording will ask. It costs one device and one
-/// negotiation, and only while the key is left unset.
+/// The device is the kind capture creates, because the encoder takes its device from the captured
+/// texture and this asks the question the recording will ask. It costs one device and one
+/// negotiation, and only while the key is unset.
 pub fn can_encode_with_textures(codec: VideoCodec, size: (u32, u32), bitrate_kbps: u32) -> bool {
     let Ok(device) = create_capture_kind_device() else {
         return false;
@@ -2050,24 +1893,20 @@ pub fn can_encode_with_textures(codec: VideoCodec, size: (u32, u32), bitrate_kbp
     MftEncoder::open(&device, size, codec, None, bitrate_kbps).is_ok()
 }
 
-/// Every hardware video encoder MFT this machine will admit to, with no type filter at all.
-///
-/// The probe's last resort, and the one that answers a question the filtered enumeration kept
-/// answering ambiguously: whether an encoder for a given codec exists here at all, independent of
-/// what it is willing to consume or produce.
+/// Every hardware video encoder MFT this machine admits to, with no type filter at all: whether
+/// an encoder for a codec exists here independent of what it will consume or produce.
 pub fn list_hardware_video_encoders() -> Result<Vec<String>> {
     enumerate_names(MFT_CATEGORY_VIDEO_ENCODER)
 }
 
-/// Every adapter DXGI lists, in the order it lists them — the first being what a null-adapter device
-/// gets. Printed by the probe so that "which GPU is this using" is a list rather than a guess.
+/// Every adapter DXGI lists, in order (the first is what a null-adapter device gets), so "which GPU" is a list, not a guess.
 pub fn describe_adapters() -> Vec<String> {
     let mut names = Vec::new();
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return names;
     };
     let mut index = 0u32;
-    // `EnumAdapters` fails — rather than returning null — once the index runs off the end.
+    // `EnumAdapters` fails rather than returning null once the index runs off the end.
     while let Ok(adapter) = unsafe { factory.EnumAdapters(index) } {
         names.push(adapter_name(&adapter));
         index += 1;

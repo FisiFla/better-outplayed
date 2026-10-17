@@ -10,18 +10,14 @@ const AUTO_ORDER: [Vendor; 3] = [Vendor::Nvenc, Vendor::Qsv, Vendor::Amf];
 
 /// Pick a hardware encoder, or explain precisely why none is usable.
 ///
-/// There is no software fallback (spec §3.2). A CPU encode would silently destroy
-/// in-game performance, so failing loudly is the correct behaviour.
+/// There is no software fallback: a CPU encode would silently destroy in-game performance.
 ///
-/// A vendor is accepted only once it has **encoded a frame** ([`smoke_test_cached`]).
-/// Being listed by `ffmpeg -encoders` is not evidence that anything can use it: that list
-/// is what ffmpeg was compiled with, and it names `h264_amf` on a machine with no AMD
-/// driver at all (measured: an RTX 3090 + Intel iGPU box, where the process then died
-/// mid-capture with "video writer thread has stopped"). Asking ffmpeg to encode one frame
-/// is what turns that into a startup failure that names the encoder and the reason.
+/// A vendor is accepted only once it has encoded a frame ([`smoke_test_cached`]). `ffmpeg
+/// -encoders` is what ffmpeg was compiled with and names `h264_amf` on a machine with no AMD
+/// driver (an RTX 3090 + Intel iGPU machine then died mid-capture with "video writer thread has
+/// stopped"). Encoding one frame turns that into a startup failure naming the encoder and reason.
 pub fn select_vendor(bin: &FfmpegBinaries, requested: &str, codec: VideoCodec) -> Result<Vendor> {
-    // Resolve the request before touching ffmpeg, so a bad config value fails
-    // immediately and does not depend on the machine's hardware.
+    // Resolve the request before touching ffmpeg, so a bad config value fails immediately and independent of hardware.
     let candidates = candidates_for(requested)?;
 
     let advertised = advertised_encoders(bin)?;
@@ -43,16 +39,12 @@ fn candidates_for(requested: &str) -> Result<Vec<Vendor>> {
 
 /// The selection loop, with "can this machine actually run it?" injected.
 ///
-/// `usable` is a parameter rather than a direct call into ffmpeg so that the ordering and
-/// the reporting rules below are testable on a host with no hardware encoder at all: every
-/// GPU encoder is absent from the development host's ffmpeg, so a hard-coded call could
-/// only ever be exercised on the Windows box itself. The real probe is
-/// [`smoke_test_encoder`], passed in by [`select_vendor`].
+/// `usable` is a parameter so the ordering and reporting rules are testable on a host with no
+/// hardware encoder. The real probe is [`smoke_test_encoder`], passed in by [`select_vendor`].
 ///
-/// A candidate that is not advertised is never probed — there is nothing to probe — and a
-/// candidate that *is* advertised still has to encode a frame before it is chosen. The
-/// first candidate that passes wins; if none does, the error names every candidate tried
-/// and what happened to each one.
+/// A candidate that is not advertised is never probed, and an advertised one must still encode a
+/// frame before it is chosen. The first that passes wins; if none does, the error names every
+/// candidate tried and what happened to each.
 fn select_usable(
     candidates: &[Vendor],
     codec: VideoCodec,
@@ -68,8 +60,7 @@ fn select_usable(
         }
         match usable(encoder) {
             Ok(()) => {
-                // A breadcrumb for "why did startup spend a moment here": the vendor that
-                // was chosen is the one that encoded a frame, not the first one listed.
+                // Breadcrumb: the vendor chosen is the one that encoded a frame, not the first one listed.
                 tracing::debug!("{encoder} passed its smoke test");
                 return Ok(*vendor);
             }
@@ -108,23 +99,21 @@ fn advertised_encoders(bin: &FfmpegBinaries) -> Result<Vec<String>> {
 /// What a smoke test said: whether the encoder encoded a frame, or ffmpeg's reason why not.
 type SmokeResult = Result<(), String>;
 
-/// Encoder name → smoke-test result. A `Mutex` rather than a lock-free map because a
-/// probe runs once per encoder per process, not in a hot loop.
+/// Encoder name to smoke-test result. A `Mutex`, not a lock-free map: a probe runs once per
+/// encoder per process.
 type SmokeCache = Mutex<Vec<(&'static str, SmokeResult)>>;
 
 /// Smoke-test results for this process, keyed by encoder name.
 ///
-/// Startup must not pay for the same ffmpeg child twice. Whether this machine can
-/// initialise a given encoder cannot change while the process runs, so the answers are
-/// memoised for the life of the process. The key is the encoder name alone: one process
-/// resolves one ffmpeg binary, and `FfmpegBinaries` is fixed for the length of a run.
+/// Whether this machine can initialise an encoder cannot change while the process runs, so
+/// startup does not pay for the same ffmpeg child twice. One process resolves one ffmpeg binary,
+/// so the encoder name alone is the key.
 static SMOKE_RESULTS: OnceLock<SmokeCache> = OnceLock::new();
 
 /// [`smoke_test_encoder`], memoised for the process lifetime.
 ///
-/// The lock is never held across the child: a probe can take seconds, and nothing else
-/// should wait on it. A poisoned lock is recovered rather than panicking on the failure
-/// path — the worst case is that one probe is run twice.
+/// The lock is never held across the child (a probe can take seconds). A poisoned lock is
+/// recovered rather than panicking on the failure path; the worst case is one probe run twice.
 fn smoke_test_cached(bin: &FfmpegBinaries, encoder: &'static str) -> Result<(), String> {
     let results = SMOKE_RESULTS.get_or_init(|| Mutex::new(Vec::new()));
 
@@ -169,8 +158,8 @@ mod tests {
         assert_eq!(candidates_for("auto").unwrap(), AUTO_ORDER.to_vec());
     }
 
-    /// The bug this module's smoke test exists for: ffmpeg advertises an encoder the
-    /// machine cannot initialise. Selection must reject it and use the next candidate.
+    /// The bug the smoke test exists for: ffmpeg advertises an encoder the machine cannot
+    /// initialise. Selection must reject it and use the next candidate.
     #[test]
     fn an_advertised_but_unusable_encoder_is_rejected_in_favour_of_the_next_candidate() {
         let advertised = advertised_all_h264();
@@ -183,8 +172,7 @@ mod tests {
             |encoder| {
                 probed.push(encoder);
                 match encoder {
-                    // The measured Windows shape: the encoder is there to be listed, and
-                    // cannot start because its vendor runtime is not installed.
+                    // The measured Windows shape: the encoder is listed but cannot start because its vendor runtime is not installed.
                     "h264_nvenc" => Err("Cannot load nvcuda.dll".to_string()),
                     _ => Ok(()),
                 }
@@ -253,9 +241,8 @@ mod tests {
         );
     }
 
-    /// An encoder that is not advertised is not probed at all — the list is still the
-    /// cheap first filter, and probing an encoder ffmpeg does not know would report
-    /// "unknown encoder" instead of the real story.
+    /// An encoder that is not advertised is not probed at all: the list is the cheap first filter,
+    /// and probing an unknown encoder would report "unknown encoder" instead of the real story.
     #[test]
     fn a_candidate_that_is_not_advertised_is_never_probed() {
         let mut probed: Vec<&str> = Vec::new();
@@ -274,8 +261,8 @@ mod tests {
         assert!(err.to_string().contains("h264_nvenc"), "got: {err}");
     }
 
-    /// The whole point of the smoke test: `h264_amf` is in ffmpeg's list on a box with no
-    /// AMD driver, so *advertising is not acceptance*.
+    /// The point of the smoke test: `h264_amf` is in ffmpeg's list on a machine with no AMD driver,
+    /// so advertising is not acceptance.
     #[test]
     fn advertising_alone_does_not_make_a_vendor_usable() {
         let advertised = vec!["h264_amf".to_string()];

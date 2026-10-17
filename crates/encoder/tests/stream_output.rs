@@ -1,20 +1,16 @@
-//! The **fragmented-stream** output mode: no files on disk, and a stream a buffer can hold.
+//! The fragmented-stream output mode: no files on disk, and a stream a buffer can hold.
 //!
-//! This is the mode the in-memory replay buffer is built on. What it has to prove, and what
-//! the file-segmenting mode's own test (`segmenting.rs`) cannot:
+//! This is the mode the in-memory replay buffer is built on. These tests prove what
+//! `segmenting.rs` cannot:
 //!
-//! 1. **Nothing is written to disk while recording.** That is the entire point — an idle
-//!    replay buffer must not churn the SSD — so it is asserted directly rather than inferred
-//!    from "no segment files were found".
-//! 2. The pipe delivers a stream that **splits into fragments with monotonic media times**,
-//!    carrying both a video and an audio stream.
-//! 3. Those fragments, put back together with the header, are a **real clip** — remuxed with
-//!    `-c copy` into a file ffprobe reads as video + audio of the right length. That is the
-//!    save path, exercised end to end from bytes that only ever existed in memory.
+//! 1. Nothing is written to disk while recording (an idle replay buffer must not churn the SSD),
+//!    asserted directly rather than inferred from "no segment files were found".
+//! 2. The pipe splits into fragments with monotonic media times, carrying video and audio.
+//! 3. Fragments plus the header form a real clip: a `-c copy` remux that ffprobe reads as
+//!    video + audio of the right length, from bytes that only ever existed in memory.
 //!
-//! Fed in real time, for the same reason `segmenting.rs` is: the encoder's media timeline is
-//! the wall clock, so 3 seconds of stubbed frames handed over in one burst is — correctly —
-//! a few milliseconds of media.
+//! Fed in real time, as in `segmenting.rs`: the media timeline is the wall clock, so a burst of
+//! stubbed frames is a few milliseconds of media.
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
@@ -25,9 +21,8 @@ use std::time::{Duration, Instant};
 
 /// Drive the encoder for `seconds` of wall clock, reading its output stream on another thread.
 ///
-/// The reader thread is not optional: ffmpeg blocks the moment its stdout pipe fills, and a
-/// blocked ffmpeg stops draining its stdin — which stalls the `submit_video` calls below and
-/// hangs the test rather than failing it.
+/// The reader is required: a full stdout pipe blocks ffmpeg, which stops draining stdin, which
+/// stalls `submit_video` and hangs the test instead of failing it.
 fn record_stream(seconds: u64, cfg: &EncodeConfig, bin: &FfmpegBinaries) -> (Vec<u8>, std::path::PathBuf) {
     let mut enc = FfmpegEncoder::spawn(bin, cfg).expect("spawn the encoder");
     let stream = enc
@@ -75,8 +70,7 @@ fn stream_cfg(dir: &std::path::Path) -> EncodeConfig {
         48,
         30,
         dir.to_path_buf(),
-        // MILLISECONDS, and also the forced-keyframe interval — which is what makes a
-        // fragment boundary a cut point.
+        // Milliseconds; also the forced-keyframe interval, which makes a fragment boundary a cut point.
         1_000,
     );
     cfg.output = EncodeOutput::FragmentedStream;
@@ -123,8 +117,8 @@ fn the_stream_splits_into_fragments_with_monotonic_media_times_and_both_streams(
     let starts: Vec<u64> = fragments.iter().map(|f| f.start_ms).collect();
     assert_eq!(starts[0], 0, "the first fragment starts at zero");
     assert!(
-        // Non-decreasing: on a loaded CI runner ffmpeg can emit a tiny extra fragment that shares
-        // its neighbour's start; time must never run backwards and must advance overall.
+        // Non-decreasing: a loaded runner can yield a tiny extra fragment sharing its neighbour's
+        // start; time must never run backwards and must advance overall.
         starts.windows(2).all(|w| w[0] <= w[1]) && starts.last() > starts.first(),
         "media time must advance monotonically: {starts:?}"
     );
@@ -133,9 +127,8 @@ fn the_stream_splits_into_fragments_with_monotonic_media_times_and_both_streams(
         "every fragment starts on a keyframe, or a clip cut could begin mid-GOP"
     );
 
-    // Both streams, in the header the encoder's own ffmpeg wrote. Checked here rather than only
-    // through a remux, because a header missing a track would show up as a clip that silently
-    // has one stream — the defect the concat path was fixed for.
+    // Both streams must be in the header the encoder wrote; a header missing a track would show up
+    // only as a clip with one stream.
     assert!(
         header.windows(4).any(|w| w == b"vide"),
         "the header must declare a video track"
@@ -146,7 +139,7 @@ fn the_stream_splits_into_fragments_with_monotonic_media_times_and_both_streams(
     );
 }
 
-/// The save path, from bytes that never touched the disk until this moment.
+/// The save path, from bytes that never touched disk until now.
 #[test]
 fn the_fragments_remux_into_a_playable_clip_with_both_streams() {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
@@ -158,10 +151,8 @@ fn the_fragments_remux_into_a_playable_clip_with_both_streams() {
     let fragments = splitter.push(&bytes).expect("the stream must split");
     let header = splitter.header().expect("a header").to_vec();
 
-    // Exactly what a clip is: the header once, then a contiguous range of fragments. Take all
-    // but the first, so the range does not begin at the start of the stream — a clip's range
-    // starts wherever the trigger was, not at zero, and starting it at zero would hide a
-    // timestamp bug.
+    // A clip is the header once plus a contiguous range of fragments. Dropping the first fragment
+    // makes the range start mid-stream, as a trigger does; starting at zero would hide a timestamp bug.
     let mut assembled = header;
     for fragment in fragments.iter().skip(1) {
         assembled.extend_from_slice(&fragment.bytes);
@@ -169,8 +160,7 @@ fn the_fragments_remux_into_a_playable_clip_with_both_streams() {
     let stream_path = dir.path().join("assembled.mp4");
     std::fs::write(&stream_path, &assembled).expect("writing the assembled stream");
 
-    // The clip path: `-c copy`, no re-encoding. `localplay_media::edit`'s remux, which is what
-    // the splicer will call once the buffer feeds it a reader instead of a file.
+    // The clip path: `-c copy`, no re-encoding (`localplay_media::edit`'s remux).
     let clip_path = dir.path().join("clip.mp4");
     edit::remux_lossless(&bin, &stream_path, &clip_path).expect("the clip must remux");
 

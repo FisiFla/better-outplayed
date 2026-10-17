@@ -1,60 +1,45 @@
 //! How many frames per second this machine can actually encode, measured before it records.
 //!
-//! # What this is, and what it is NOT
+//! # What this is, and what it is not
 //!
-//! This is a **diagnostic and a pacing aid**. It is not what makes the media timeline track
-//! real time, and no measurement could be: that is the frame-rate conversion being off
-//! ([`video_output_args`]'s `-fps_mode passthrough`), which makes the muxer take each frame's
-//! arrival timestamp instead of resampling it onto a rigid `1/R` grid. That property does not
-//! depend on throughput at all. A machine that cannot keep up now drops frames — visible as a
-//! held frame in the picture — while the clock stays honest.
+//! A diagnostic and a pacing aid, not what makes the media timeline track real time. That is the
+//! frame-rate conversion being off ([`video_output_args`]'s `-fps_mode passthrough`), which makes
+//! the muxer keep each frame's arrival timestamp. A machine that cannot keep up drops frames
+//! (a held frame in the picture) while the clock stays honest.
 //!
-//! What this number *can* answer is how fast this machine encodes at the resolution and with
-//! the encoder that will actually be used. Pacing capture to it (see
-//! `localplay_recorder::FpsDecision`) stops the pipeline paying for captures — on Windows, a
-//! 33 MB GPU-to-CPU readback each — that the encoder will throw away, and it is how a user
-//! learns that `encode.fps = 30` is not reachable at 4K here. Adapting to it never guaranteed
-//! anything about the timeline, and the ledger says so.
+//! What this number answers is how fast this machine encodes at the resolution and with the
+//! encoder that will be used. Pacing capture to it (`localplay_recorder::FpsDecision`) stops the
+//! pipeline paying for captures (on Windows a 33 MB GPU-to-CPU readback each) that the encoder
+//! would throw away, and tells a user that `encode.fps = 30` is not reachable at 4K here.
 //!
 //! # Why it cannot be a timeline guarantee
 //!
-//! It measures the *encode path*: raw frames into an encoder, out to the null muxer. The live
-//! pipeline is capture readback + copy + pipe + encode + segment muxing, and the gap between
-//! the two is not small. Measured on the dev host with a deliberately over-declared rate at a
-//! 4K output (software encoder): the probe reported **62fps sustainable**, and the pipeline
-//! then achieved **8 frames a second** end to end. On the Windows box this project is built
-//! for, NVENC is cheap and the WGC readback is not, so the probe's number there is *more*
-//! optimistic, not less — which is why an earlier change that declared
-//! `min(configured, measured)` to the pacer and the encoder did not fix the timeline.
+//! It measures the encode path only: raw frames into an encoder, out to the null muxer. The live
+//! pipeline adds capture readback, copy, pipe and segment muxing, and the gap is large: at a 4K
+//! output with a software encoder the probe reported 62fps sustainable and the pipeline achieved
+//! 8 frames a second end to end. On Windows NVENC is cheap and the WGC readback is not, so the
+//! probe is more optimistic there, not less.
 //!
 //! # What it measures, exactly
 //!
-//! The same ffmpeg invocation the recorder uses — [`video_input_args`] and
-//! [`video_output_args`], shared with [`crate::FfmpegEncoder::spawn`] so the two cannot
-//! describe different encoders — writing to the null muxer instead of to scratch segments.
-//! Frames go in over `pipe:0` as raw BGRA, exactly as the live capture feeds them, and the
-//! *only* thing counted is a frame ffmpeg accepted: a write that completes means the pipe had
-//! room for those bytes, which means the encoder has consumed that much of the stream.
+//! The same ffmpeg invocation the recorder uses ([`video_input_args`] and [`video_output_args`],
+//! shared with [`crate::FfmpegEncoder::spawn`]) writing to the null muxer. Frames go in over
+//! `pipe:0` as raw BGRA, and only a frame ffmpeg accepted is counted: a completed write means the
+//! encoder consumed that much of the stream.
 //!
-//! Two honest limitations, both stated rather than hidden:
+//! Two limitations:
 //!
-//! * **It is a lower bound on a software encoder and an accurate figure on a hardware one.**
-//!   A GPU encoder's throughput is fixed-function — it depends on the resolution, not on the
-//!   picture — while libx264's depends heavily on content. The probe's frames carry a
-//!   detailed moving pattern precisely so that the software case is not flattered (see
-//!   [`probe_frame`]), and the shipping path uses a hardware encoder (spec §3.2).
-//! * **It measures the encode path, not the capture path.** The frames are synthetic: no
-//!   GPU-to-CPU readback, no window composition, no game. That is not a rounding error — it
-//!   is the 62-vs-8 above — so the encoder's drop counter and its rate-limited warning remain
-//!   the report of what the *pipeline* actually achieved, and that report is now about held
-//!   frames rather than about a clock that drifts.
+//! * It is a lower bound on a software encoder and accurate on a hardware one: a GPU encoder's
+//!   throughput depends on resolution, not picture, while libx264's depends on content, so the
+//!   probe frames carry a detailed moving pattern (see [`probe_frame`]).
+//! * It does not measure the capture path (no readback, window composition or game), so the
+//!   encoder's drop counter and rate-limited warning remain the report of what the pipeline achieved.
 //!
 //! # Bounds
 //!
-//! Bounded in time: frames are fed for [`PROBE_BUDGET`], and the child has
-//! [`PROBE_DRAIN_TIMEOUT`] to finish after that — past which it is killed and reaped, never
-//! leaked. Bounded in memory: one frame buffer at the capture's own size, the same order as
-//! the frames the pipeline already holds (33.2 MB at 3840x2160).
+//! Frames are fed for [`PROBE_BUDGET`] and the child has [`PROBE_DRAIN_TIMEOUT`] to finish, past
+//! which it is killed and reaped. Memory is one frame buffer at the capture's own size (33.2 MB
+//! at 3840x2160).
 
 use crate::ffmpeg::{video_input_args, video_output_args};
 use crate::EncodeConfig;
@@ -66,32 +51,25 @@ use std::time::{Duration, Instant};
 
 /// How long frames are fed to the encoder before the rate is computed.
 ///
-/// This is the entire startup cost of adapting, so it is a compromise, and the compromise is
-/// deliberate:
+/// The entire startup cost of adapting, so a compromise:
 ///
-/// * at 30fps this is ~45 frames, which averages out the pipe's fill and the muxer's
-///   short-term jitter rather than reporting one scheduling hiccup;
-/// * 1.5s is long enough that a hardware encoder's session setup and first submissions
-///   (measured in the low hundreds of milliseconds, and excluded outright — see
-///   [`feed`]) cannot dominate the result;
-/// * and it is short enough to be a startup cost rather than a stall. A user who does not
-///   want to pay it sets `encode.adapt_fps = false` and gets the configured rate declared
-///   unmeasured, exactly as before.
+/// * at 30fps this is ~45 frames, averaging out pipe fill and muxer jitter;
+/// * long enough that a hardware encoder's session setup (low hundreds of milliseconds, excluded
+///   by [`feed`]) cannot dominate;
+/// * short enough to be a startup cost. `encode.adapt_fps = false` skips it and declares the
+///   configured rate unmeasured.
 pub const PROBE_BUDGET: Duration = Duration::from_millis(1500);
 
 /// How long the encoder child gets to finish after the feeding stops.
 ///
-/// After its stdin closes, a healthy child encodes what is already in the pipe and exits in
-/// well under a second. This is the ceiling for a wedged one, not a budget an honest one
-/// needs: past it the child is killed and the probe fails with a clear error rather than
-/// hanging startup or leaving a process behind.
+/// A healthy child exits in well under a second once stdin closes; this is the ceiling for a
+/// wedged one, which is killed and the probe fails rather than hanging startup.
 pub const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A shortest window a rate may be computed over.
 ///
-/// Division by a zero (or near-zero) duration yields infinity or an absurd number, and an
-/// absurd number here would be *declared as the pipeline's frame rate*. A millisecond is far
-/// below any real measurement window and far above the arithmetic that produces nonsense.
+/// Dividing by (nearly) zero gives an absurd number that would be declared as the pipeline's
+/// frame rate. A millisecond is far below any real window and far above nonsense arithmetic.
 const MIN_RATE_WINDOW: Duration = Duration::from_millis(1);
 
 /// What the probe measured.
@@ -103,26 +81,23 @@ pub struct ThroughputMeasurement {
     pub frames: u64,
     /// How long that window lasted, measured from the first accepted frame.
     pub window: Duration,
-    /// The size of the frames that were fed — the capture's own size, i.e. the rawvideo
-    /// pipe. Encode cost is dominated by the pixel count, which is why the probe runs at
-    /// this size and not at a small stand-in.
+    /// The size of the frames fed, the capture's own size. Encode cost is dominated by pixel count,
+    /// so the probe runs at this size, not a small stand-in.
     pub source_size: (u32, u32),
     /// The size the encoder wrote. Differs from [`ThroughputMeasurement::source_size`] when
-    /// `encode.output_size` asks for scaling, and the *encoding* cost follows this one — so
-    /// a report of what was measured has to name both.
+    /// `encode.output_size` scales, and the encoding cost follows this one.
     pub output_size: (u32, u32),
 }
 
 /// Measure the encode rate this machine can sustain at `cfg.source_size`.
 ///
-/// `cfg` is the *recording's* configuration — same codec, same encoder, same geometry, same
-/// bitrate and keyframe schedule — with `budget` replacing the live pipeline as the source of
-/// frames. The declared rate in `cfg.fps` is passed through to ffmpeg unchanged (it is part of
-/// the invocation being measured), and the caller decides what to do with the number.
+/// `cfg` is the recording's configuration (codec, encoder, geometry, bitrate, keyframe schedule)
+/// with `budget` replacing the live pipeline as the source of frames. `cfg.fps` is passed to
+/// ffmpeg unchanged, and the caller decides what to do with the number.
 ///
 /// Fails, with ffmpeg's own words where there are any, rather than guessing: an encoder that
-/// cannot start, dies mid-probe, accepts no frames at all, or refuses to exit is a *failed
-/// measurement*, and the caller must not treat a missing number as "fast enough".
+/// cannot start, dies mid-probe, accepts no frames or refuses to exit is a failed measurement,
+/// never "fast enough".
 pub fn measure_sustainable_fps(
     bin: &FfmpegBinaries,
     cfg: &EncodeConfig,
@@ -131,8 +106,7 @@ pub fn measure_sustainable_fps(
     measure_with_drain(bin, cfg, budget, PROBE_DRAIN_TIMEOUT)
 }
 
-/// [`measure_sustainable_fps`] with the drain ceiling as a parameter, so the bound can be
-/// tested without waiting out the production one.
+/// [`measure_sustainable_fps`] with the drain ceiling as a parameter, so the bound can be tested quickly.
 fn measure_with_drain(
     bin: &FfmpegBinaries,
     cfg: &EncodeConfig,
@@ -151,8 +125,7 @@ fn measure_with_drain(
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(video_input_args(cfg))
         .args(video_output_args(cfg))
-        // The null muxer: the encode is real, the container is not. Nothing is written to
-        // disk, so a probe cannot fill a scratch directory or leave a file behind.
+        // The null muxer: the encode is real, the container is not, so a probe leaves nothing on disk.
         .args(["-f", "null", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -163,7 +136,7 @@ fn measure_with_drain(
 
     let sink = child.stdin.take().context("the probe child's stdin is unavailable")?;
     let frame = probe_frame(cfg.source_size);
-    // The bytes of one row of the frame: how far the pattern is rotated between frames.
+    // One row of the frame in bytes: how far the pattern is rotated between frames.
     let stride = (cfg.source_size.0 as usize * 4).max(1);
     let frame_len = frame.len();
     let writer = std::thread::Builder::new()
@@ -171,9 +144,8 @@ fn measure_with_drain(
         .spawn(move || feed(sink, &frame, stride, budget))
         .context("spawning the probe's writer thread")?;
 
-    // The whole call is bounded: the feeding window plus the drain ceiling. On expiry the
-    // child is killed and reaped, which also breaks the writer's blocked write, so the join
-    // below cannot park here.
+    // The whole call is bounded by the feeding window plus the drain ceiling. On expiry the child is
+    // killed and reaped, which breaks the writer's blocked write so the join below cannot park.
     let waited = wait_with_deadline(&mut child, budget + drain);
     let fed = writer.join().map_err(|_| anyhow::anyhow!("the probe's writer thread panicked"))?;
     let (frames, window) = fed;
@@ -222,17 +194,14 @@ fn measure_with_drain(
 
 /// Frames accepted per second, from a count and the window they were accepted over.
 ///
-/// `None` — rather than a number — when there is nothing honest to compute:
+/// `None` when there is nothing honest to compute:
 ///
-/// * `frames == 0`: nothing was accepted, which is a failed probe, not a rate of zero;
-/// * a window shorter than [`MIN_RATE_WINDOW`]: dividing by (nearly) zero yields infinity or
-///   a number in the millions, and the caller would *declare* it as a frame rate. An absurd
-///   duration is therefore refused instead of propagated.
+/// * `frames == 0`: nothing was accepted, a failed probe rather than a rate of zero;
+/// * a window shorter than [`MIN_RATE_WINDOW`]: the quotient would be absurd and the caller
+///   would declare it as a frame rate.
 ///
-/// The division is by the window that actually elapsed rather than by the nominal budget: a
-/// window that overran (a blocked write, a frame that took longer than the deadline to be
-/// accepted) would otherwise inflate the rate, and this number decides how fast the pipeline
-/// declares itself to be running.
+/// Divides by the window that actually elapsed, not the nominal budget, since an overrun would
+/// inflate the rate that decides how fast the pipeline declares itself to be.
 pub fn frames_per_second(frames: u64, window: Duration) -> Option<f64> {
     if frames == 0 || window < MIN_RATE_WINDOW {
         return None;
@@ -241,28 +210,21 @@ pub fn frames_per_second(frames: u64, window: Duration) -> Option<f64> {
     fps.is_finite().then_some(fps)
 }
 
-/// Write `frame` to `sink` as fast as it is accepted, until `budget` elapses or the sink
-/// stops taking it. Returns the frames accepted in the measured window, and how long that
-/// window was.
+/// Write `frame` to `sink` as fast as it is accepted, until `budget` elapses or the sink stops
+/// taking it. Returns the frames accepted in the measured window and how long it was.
 ///
-/// The first frame is written but **not counted**, and the window starts when its write
-/// completes. That write is the expensive one: it does not finish until ffmpeg has opened
-/// the encoder *and* pulled those bytes through the pipe, so on a machine whose encoder takes
-/// a few hundred milliseconds to initialise, counting it would report a rate below what the
-/// machine sustains. Under-declaring is not a harmless error here — it makes the recording
-/// run slower than the hardware can, for the life of the process.
+/// The first frame is written but not counted, and the window starts when its write completes:
+/// that write does not finish until ffmpeg has opened the encoder and pulled the bytes, so
+/// counting it would under-report and make the recording run slower than the hardware can.
 ///
-/// The last frame may overrun the budget by its own write: a write that completes after the
-/// deadline still means the encoder accepted that frame, and dropping it from the count would
-/// bias the rate down. The overrun is therefore bounded by one frame's encode time, and the
-/// caller's overall deadline ([`PROBE_DRAIN_TIMEOUT`]) is what bounds the call.
+/// The last frame may overrun the budget by its own write; dropping it from the count would bias
+/// the rate down. The overrun is bounded by one frame's encode time and the caller's deadline
+/// ([`PROBE_DRAIN_TIMEOUT`]).
 ///
-/// Each frame is written from a rotating offset, which costs no copy and means no two frames
-/// are byte-identical — an encoder asked to encode the same picture 45 times would report a
-/// rate no real content could reach (see [`probe_frame`]).
+/// Each frame is written from a rotating offset (no copy), so no two frames are byte-identical;
+/// repeating one picture would report a rate no real content could reach (see [`probe_frame`]).
 ///
-/// A sink that stops accepting frames (a dead child: the write fails with a broken pipe) ends
-/// the loop instead of hanging, and dropping `sink` at the end of this function is the
+/// A sink that stops accepting frames (broken pipe) ends the loop, and dropping `sink` is the
 /// child's EOF.
 fn feed(mut sink: impl Write, frame: &[u8], stride: usize, budget: Duration) -> (u64, Duration) {
     let mut accepted: u64 = 0;
@@ -271,15 +233,12 @@ fn feed(mut sink: impl Write, frame: &[u8], stride: usize, budget: Duration) -> 
     let mut offset = 0usize;
 
     loop {
-        // One frame, in two slices, so the rotation costs no memcpy. `split_at` yields
-        // `(frame[..offset], frame[offset..])`, so the halves are written tail-first: the
-        // bytes the encoder receives are `frame[offset..] ++ frame[..offset]`, i.e. the
-        // pattern rotated by `offset`. Writing them in the other order rebuilds the frame
-        // byte for byte and every frame is the same picture again — which is exactly what
-        // the rotation exists to prevent (found by
-        // `the_feeder_writes_whole_frames_and_rotates_them`). Splitting one frame across two
-        // writes is invisible to ffmpeg: the pipe is a byte stream, and it reassembles
-        // exactly this many bytes into one frame.
+        // One frame in two slices, so the rotation costs no memcpy. `split_at` yields
+        // `(frame[..offset], frame[offset..])`, so the halves are written tail-first: ffmpeg receives
+        // `frame[offset..] ++ frame[..offset]`, the pattern rotated by `offset`. The other order rebuilds
+        // the frame byte for byte, making every frame the same picture (caught by
+        // `the_feeder_writes_whole_frames_and_rotates_them`). Splitting a frame across two writes is
+        // invisible to ffmpeg: the pipe is a byte stream.
         let (head, tail) = frame.split_at(offset);
         if sink.write_all(tail).is_err() || sink.write_all(head).is_err() {
             break;
@@ -287,7 +246,7 @@ fn feed(mut sink: impl Write, frame: &[u8], stride: usize, budget: Duration) -> 
         offset = (offset + stride) % frame.len().max(1);
 
         match started {
-            // The warm-up frame: written, deliberately not counted (see the doc above).
+            // The warm-up frame: written, deliberately not counted.
             None => started = Some(Instant::now()),
             Some(start) => {
                 accepted += 1;
@@ -303,29 +262,23 @@ fn feed(mut sink: impl Write, frame: &[u8], stride: usize, budget: Duration) -> 
 
 /// The frame the probe feeds: one BGRA frame at the capture's own source size.
 ///
-/// Two deliberate choices, both about not measuring a cheaper encoder than the one that will
-/// record:
+/// Two choices, both about not measuring a cheaper encoder than the one that will record:
 ///
-/// * **the real capture size.** Encode cost is dominated by the pixel count, so a small probe
-///   frame would predict a rate several times too high for a 4K capture — the exact mistake
-///   that produced issue #1's ~24fps-against-30 mismatch in the first place. One frame at
-///   4K is 33.2 MB, the same magnitude as a frame the live pipeline already holds, and it is
-///   the whole memory cost of this probe.
-/// * **a detailed, moving pattern.** A flat (black) frame is a degenerate case for a software
-///   encoder: it is nearly free to encode, and identical consecutive frames cost almost
-///   nothing, so a black probe would report a rate that real content cannot hold. The pattern
-///   is a deterministic pseudo-random field and [`feed`] rotates it between frames, so the
-///   probe never flatters the encoder. On a hardware encoder this costs nothing and changes
-///   nothing: its rate is a property of the resolution, not of the picture.
+/// * the real capture size: encode cost is dominated by pixel count, so a small frame would
+///   predict a rate several times too high for 4K. One 4K frame is 33.2 MB, the probe's whole
+///   memory cost.
+/// * a detailed, moving pattern: a flat frame is nearly free for a software encoder, and
+///   identical consecutive frames cost almost nothing. The pattern is a deterministic
+///   pseudo-random field that [`feed`] rotates between frames. A hardware encoder is unaffected
+///   (its rate depends on resolution, not picture).
 ///
-/// Deterministic on purpose: the same size always produces the same bytes, so two runs of the
-/// probe are comparable (and a failure is reproducible).
+/// Deterministic, so two runs are comparable and a failure is reproducible.
 fn probe_frame(size: (u32, u32)) -> Vec<u8> {
     let len = (size.0 as usize)
         .saturating_mul(size.1 as usize)
         .saturating_mul(4);
     let mut frame = vec![0u8; len];
-    // xorshift64* — the point is a detailed pattern, not cryptography.
+    // xorshift64*: the point is a detailed pattern, not cryptography.
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut i = 0usize;
     while i < len {
@@ -345,8 +298,7 @@ mod tests {
     use super::*;
     use crate::VideoCodec;
 
-    /// A configuration at a small size — these tests are about the probe's arithmetic and
-    /// its bounds, not about how fast a 4K encode is on the machine running them.
+    /// A configuration at a small size: these tests are about the arithmetic and bounds, not 4K speed.
     fn cfg(fps: u32) -> EncodeConfig {
         EncodeConfig::for_tests_software(VideoCodec::H264, 64, 48, fps, ".".into(), 1000)
     }
@@ -365,9 +317,8 @@ mod tests {
         assert_eq!(frames_per_second(100, Duration::from_secs(4)), Some(25.0));
     }
 
-    /// The zero-duration case, and the absurd one: a rate computed by dividing by (nearly)
-    /// nothing is not a measurement, and this number would be *declared* as the pipeline's
-    /// frame rate. Refusing it is the point — an invented rate is worse than no rate.
+    /// The zero-duration and absurd cases: a rate computed by dividing by (nearly) nothing is not a
+    /// measurement and would be declared as the frame rate.
     #[test]
     fn a_zero_or_absurd_duration_yields_no_rate_instead_of_a_huge_one() {
         assert_eq!(frames_per_second(30, Duration::ZERO), None);
@@ -380,8 +331,8 @@ mod tests {
 
     // ---- the probe against a real ffmpeg ----------------------------------------------
 
-    /// The frame the probe sends is deterministic and not uniform — a flat frame would let a
-    /// software encoder report a rate real content cannot hold.
+    /// The probe frame is deterministic and not uniform; a flat frame would let a software encoder
+    /// report a rate real content cannot hold.
     #[test]
     fn the_probe_frame_is_deterministic_and_has_detail_in_it() {
         let frame = probe_frame((16, 4));
@@ -396,9 +347,8 @@ mod tests {
         );
     }
 
-    /// Every frame written is a whole frame, and no two consecutive frames are identical —
-    /// the rotation is what keeps an encoder from encoding the same picture 45 times and
-    /// reporting a rate no content could reach.
+    /// Every frame written is a whole frame and no two consecutive frames are identical; the
+    /// rotation keeps an encoder from encoding one picture repeatedly.
     #[test]
     fn the_feeder_writes_whole_frames_and_rotates_them() {
         let frame = probe_frame((16, 4));
@@ -430,11 +380,11 @@ mod tests {
         assert_eq!(&second[frame.len() - stride..], &frame[..stride]);
     }
 
-    /// The real encoder, on this host, through the real probe. Needs `test-encoders` because
-    /// that is what makes libx264 reachable off Windows (there is no other encoder here).
+    /// The real encoder, through the real probe. Needs `test-encoders`, which makes libx264
+    /// reachable off Windows.
     ///
-    /// What is asserted is what the probe *promises*: a plausible positive rate, and a call
-    /// that finishes inside its budget plus a small margin rather than running away.
+    /// Asserts what the probe promises: a plausible positive rate, and a call that finishes inside
+    /// its budget plus a small margin.
     #[cfg(feature = "test-encoders")]
     #[test]
     fn the_probe_measures_the_real_encoder_within_its_budget() {
@@ -470,18 +420,16 @@ mod tests {
         );
     }
 
-    /// A wedged child must be killed and reported rather than waited out. The deadline is
-    /// what keeps startup bounded, and a *leaked* ffmpeg would sit on the user's machine for
-    /// the rest of the session — so the writer thread has to end too, which it does as soon
-    /// as the killed child closes the read end of the pipe.
+    /// A wedged child must be killed and reported rather than waited out. A leaked ffmpeg would sit
+    /// on the user's machine for the session, so the writer thread must end too, which it does once
+    /// the killed child closes the pipe's read end.
     #[cfg(unix)]
     #[test]
     fn a_wedged_encoder_is_killed_and_reported_within_its_deadline() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a temp dir");
         let stub = dir.path().join("ffmpeg");
-        // `exec` so the child that is killed is the `sleep` itself: a shell that forked would
-        // leave an orphan behind and this test would be measuring the wrong thing.
+        // `exec` so the child killed is `sleep` itself; a forking shell would leave an orphan.
         std::fs::write(&stub, "#!/bin/sh\nexec sleep 120\n").expect("writing the stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("making the stub executable");
@@ -501,14 +449,12 @@ mod tests {
         );
     }
 
-    /// An encoder that cannot start must produce an error that names what happened — never a
-    /// number. This is the "if the encoder dies, say so rather than guess" half.
+    /// An encoder that cannot start must produce an error naming what happened, never a number.
     #[test]
     fn a_dead_encoder_is_an_error_not_a_rate() {
         let mut cfg = cfg(30);
-        // The same shape the hardware path takes: a named encoder. A name ffmpeg does not
-        // know stands in for a vendor encoder that cannot open its runtime (the measured
-        // `h264_amf` / "DLL amfrt64.dll failed to open" case).
+        // The hardware path's shape: a named encoder. An unknown name stands in for a vendor encoder
+        // that cannot open its runtime (`h264_amf` / "DLL amfrt64.dll failed to open").
         cfg.software_encoder = Some("definitely_not_an_encoder");
         let err = measure_sustainable_fps(&ffmpeg(), &cfg, Duration::from_millis(200))
             .expect_err("a missing encoder cannot be measured");

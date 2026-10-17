@@ -1,22 +1,13 @@
 //! Two audio tracks in one MP4: the game/system audio and the microphone.
 //!
-//! The feature is "one more input", and what it has to get right is exactly that: the second
-//! audio input is *declared* (a second loopback listener, `-map 2:a`, its own format), it is
-//! *tagged* so a player can tell the tracks apart, and it carries **its own** audio — a
-//! mixed-up mapping, or a second input accidentally folded into the first, would produce a
-//! file that still has two audio streams and is still wrong.
+//! The risk is a second input that is declared but mixed up: a wrong `-map` or a folded-in input
+//! still yields two audio streams and is still wrong. So the sources feed far-apart tones (200 Hz
+//! game, 6 kHz mic) and each track is measured in the other tone's band. Streams and tags come
+//! from ffprobe's JSON, read by this file's scanner (the media crate's `MediaInfo` keeps only the
+//! first audio stream and no tags).
 //!
-//! So the two sources feed deliberately different, far-apart tones (200 Hz for the game
-//! audio, 6 kHz for the microphone) and each resulting track is measured in the *other*
-//! tone's band. A track that carries its own tone and not the other's is the proof the two
-//! inputs stayed separate; the streams and their tags come from ffprobe's own JSON, read by
-//! this file's scanner for the second audio stream and by the workspace's `MediaInfo` for
-//! everything it already knows how to read.
-//!
-//! Fed in real time, like every other end-to-end test here: the video input is timestamped
-//! from arrival (`-use_wallclock_as_timestamps 1`) and the audio timeline is the sample
-//! count, so a burst would encode correctly as a few milliseconds of media and there would
-//! be nothing left to measure.
+//! Fed in real time like every other end-to-end test: video is timestamped from arrival and audio
+//! from the sample count, so a burst would encode as a few milliseconds of media.
 
 use localplay_capture::stub::{StubCapture, StubConfig};
 use localplay_capture::{AudioBuffer, AudioFormat, CaptureBackend};
@@ -29,34 +20,28 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The game audio's tone and the microphone's. Five octaves apart on purpose: see
-/// [`band_energy_db`], which has to be able to tell them apart by tens of dB.
+/// The game and microphone tones, five octaves apart so [`band_energy_db`] separates them by tens of dB.
 const GAME_TONE_HZ: f64 = 200.0;
 const MIC_TONE_HZ: f64 = 6_000.0;
 
-/// The width of the band measured around a tone, and how far the *other* tone's energy has
-/// to be below this track's own for the track to count as carrying this tone.
-///
-/// 20 dB is far above the AAC noise floor in a 200 Hz band and far below the separation a
-/// five-octave gap gives, so it is a threshold no honest signal can drift across.
+/// Width of the band measured around a tone. The other tone must sit 20 dB below the track's own,
+/// far above the AAC noise floor and far below what a five-octave gap gives.
 const MEASURE_BAND_HZ: u32 = 200;
 const SEPARATION_DB: f64 = 20.0;
 
-/// Below this a track counts as silent, which is the failure the two tones are there to
-/// catch in the first place (an unmapped or unmixed-up-but-empty track).
+/// Below this a track counts as silent (an unmapped or empty track).
 const AUDIBLE_DB: f64 = -40.0;
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 48;
 const FPS: u32 = 30;
 const SEGMENT_MS: u64 = 1_000;
-/// How long the pipeline is driven for, in wall-clock seconds.
+/// Wall-clock seconds the pipeline is driven for.
 const FEED: Duration = Duration::from_secs(3);
-/// The single-track test needs no tone measurement, so it only has to produce a segment.
+/// The single-track test needs no tone measurement, only a segment.
 const FEED_WITHOUT_MIC: Duration = Duration::from_millis(1_500);
 
-/// Both tests here drive a real encoder against the wall clock, so they take turns rather
-/// than measuring each other's CPU contention (the same reasoning as `timeline.rs`).
+/// Both tests drive a real encoder against the wall clock, so they take turns (as in `timeline.rs`).
 fn wall_clock_slot() -> MutexGuard<'static, ()> {
     static SLOT: OnceLock<Mutex<()>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(()))
@@ -76,7 +61,7 @@ impl Tone {
         Self { hz, phase: 0.0, pts: Duration::ZERO }
     }
 
-    /// 480 frames of 48 kHz stereo s16le — one 10 ms block, like `StubAudio`'s.
+    /// One 10 ms block: 480 frames of 48 kHz stereo s16le.
     fn block(&mut self) -> AudioBuffer {
         const RATE: f64 = 48_000.0;
         const FRAMES: usize = 480;
@@ -95,9 +80,8 @@ impl Tone {
     }
 }
 
-/// Drive the encoder for `feed` of wall clock: video from the capture stub, and one 10 ms
-/// audio block per source per 10 ms of real time — the schedule both audio backends publish
-/// on. Returns the microseconds of audio fed per track (they are pushed in lockstep).
+/// Drive the encoder for `feed` of wall clock: video from the capture stub plus one 10 ms audio
+/// block per source per 10 ms. Returns the microseconds of audio fed per track (pushed in lockstep).
 fn feed_for(
     encoder: &mut FfmpegEncoder,
     video: &mut StubCapture,
@@ -122,8 +106,7 @@ fn feed_for(
     }
 }
 
-/// The microphone's MP4: two audio tracks, tagged, each carrying its own tone, and no
-/// disturbance to the video timeline.
+/// Two tagged audio tracks, each carrying its own tone, with the video timeline undisturbed.
 #[test]
 fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
     let _slot = wall_clock_slot();
@@ -138,7 +121,7 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         dir.path().to_path_buf(),
         SEGMENT_MS,
     );
-    // The opt-in, as a caller would set it from config.toml.
+    // The opt-in, as config.toml sets it.
     cfg.mic_audio = Some(MicAudioSpec::default());
 
     let mut encoder =
@@ -166,7 +149,7 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
     assert!(segments.len() >= 2, "3s of wall clock at 1s segments: got {}", segments.len());
     let first = &segments[0];
 
-    // ---- what the container says ----------------------------------------------------
+    // What the container says.
     let json = probe_json(&bin, first);
     let streams = streams_of(&json);
     let video_streams: Vec<&ProbedStream> =
@@ -193,8 +176,7 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         "and the second one is named: {streams:#?}"
     );
 
-    // The workspace's own probe reads the same document — the two views have to agree about
-    // the file, not merely both exist.
+    // The media crate's probe must agree with the scanner about the file.
     let info = MediaInfo::from_ffprobe_json(&json).expect("the media crate parses this probe");
     assert!(info.video.is_some(), "a video stream is still there");
     let first_audio = info.audio.expect("an audio stream is still there");
@@ -202,7 +184,7 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
     assert_eq!(first_audio.sample_rate, 48_000);
     assert_eq!(first_audio.channels, 2);
 
-    // ---- what each track actually carries -------------------------------------------
+    // What each track carries.
     let game_own = band_energy_db(&bin, first, 0, GAME_TONE_HZ);
     let game_other = band_energy_db(&bin, first, 0, MIC_TONE_HZ);
     let mic_own = band_energy_db(&bin, first, 1, MIC_TONE_HZ);
@@ -227,7 +209,7 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
          own band against {mic_other:.1} dB in the other"
     );
 
-    // ---- and how the three streams sit against each other ---------------------------
+    // How the three streams sit against each other.
     let mut video_ms = 0u64;
     let mut game_ms = 0u64;
     let mut mic_ms = 0u64;
@@ -243,15 +225,13 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         segments.len()
     );
 
-    // The two audio tracks are fed identically, so their media clocks must agree to within
-    // an AAC frame; a gap here would mean one track lost blocks.
+    // Both audio tracks are fed identically, so their clocks agree to within an AAC frame.
     assert!(
         game_ms.abs_diff(mic_ms) <= 120,
         "the game and microphone tracks must cover the same time: {game_ms}ms against \
          {mic_ms}ms"
     );
-    // The video timeline is the arrival clock (see the module comment), so it has to cover
-    // the feed as well — and a second audio input must not have disturbed it.
+    // Video follows the arrival clock, so it covers the feed; a second audio input must not disturb it.
     assert!(
         video_ms.abs_diff(game_ms) <= 500,
         "3s of capture must still encode as ~3s of video alongside two audio tracks: \
@@ -263,12 +243,9 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
     );
 }
 
-/// The pre-existing shape, still: no microphone, one audio track, exactly as before.
+/// Without a microphone: one untagged audio track and no microphone port.
 ///
-/// This is the end-to-end half of the byte-identical contract (the other half is the
-/// argument-list test in `src/ffmpeg.rs`): with `mic_audio: None` the file a segment muxer
-/// writes carries one video stream and ONE audio stream, untagged, and the encoder reports
-/// no microphone port.
+/// End-to-end half of the byte-identical contract (the argument-list half is in `src/ffmpeg.rs`).
 #[test]
 fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
     let _slot = wall_clock_slot();
@@ -305,8 +282,7 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
         "an encoder spawned without a microphone must produce the single-track output it \
          always did — no second input, no mapping, no tags: {streams:#?}"
     );
-    // No mapping means no title metadata at all: the one audio stream is untagged, exactly
-    // as it was before the microphone input existed.
+    // No mapping means no title metadata: the one audio stream is untagged.
     assert_eq!(
         streams.iter().find(|s| s.codec_type == "audio").and_then(|s| s.title.clone()),
         None,
@@ -314,21 +290,17 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
     );
 }
 
-/// Every way a microphone block can be refused, refused **out loud**.
+/// Every way a microphone block can be refused, refused out loud.
 ///
-/// The one outcome that must not exist anywhere on this path is "drop the block and carry
-/// on": that leaves a recording whose container says two tracks and whose second track is
-/// empty or shortened, and nothing downstream can tell. So both refusals are errors that
-/// name themselves — one when the encoder has no second input at all, one when the block's
-/// format contradicts what the child was told (which would put the track on a timeline of
-/// the wrong length: 48kHz PCM read under a 44.1kHz declaration plays 8.8% fast and slides
-/// against the picture for the whole clip).
+/// Dropping a block silently leaves a container that says two tracks with an empty or shortened
+/// second one. So both refusals are named errors: no second input at all, and a block whose format
+/// contradicts what the child was told (48kHz PCM under a 44.1kHz declaration plays 8.8% fast).
 #[test]
 fn a_microphone_block_the_encoder_cannot_use_is_refused_out_loud() {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let dir = tempfile::tempdir().expect("a scratch temp dir");
 
-    // 1. Spawned WITHOUT a microphone: there is no second input to hand a block to.
+    // 1. No microphone input to hand a block to.
     let cfg = EncodeConfig::for_tests_software(
         VideoCodec::H264,
         WIDTH,
@@ -347,7 +319,7 @@ fn a_microphone_block_the_encoder_cannot_use_is_refused_out_loud() {
     );
     drop(without);
 
-    // 2. Spawned WITH a microphone, but the block's own format is not what was declared.
+    // 2. A microphone input, but the block's format differs from the declared one.
     let mut cfg = cfg;
     cfg.mic_audio =
         Some(MicAudioSpec { sample_rate: 44_100, channels: 1, sample_format: SampleFormat::S16Le });
@@ -362,7 +334,7 @@ fn a_microphone_block_the_encoder_cannot_use_is_refused_out_loud() {
     );
 }
 
-/// The scratch directory's segments, in ffmpeg's own order.
+/// The scratch directory's segments, in ffmpeg's order.
 fn segments_in(dir: &Path) -> Vec<PathBuf> {
     let mut segments: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read the scratch dir")
@@ -374,7 +346,7 @@ fn segments_in(dir: &Path) -> Vec<PathBuf> {
     segments
 }
 
-/// `ffprobe`'s JSON for one file, so the scanner below and `MediaInfo` read the same bytes.
+/// `ffprobe`'s JSON for one file, so the scanner and `MediaInfo` read the same bytes.
 fn probe_json(bin: &FfmpegBinaries, path: &Path) -> String {
     let out = Command::new(&bin.ffprobe)
         .args(["-v", "error", "-print_format", "json", "-show_streams", "-show_format"])
@@ -394,10 +366,9 @@ fn probe_json(bin: &FfmpegBinaries, path: &Path) -> String {
 #[derive(Debug, Clone)]
 struct ProbedStream {
     codec_type: String,
-    /// The stream's title, which is how the two audio tracks are told apart. See
-    /// [`track_title`] for why this is not simply the JSON key `title`.
+    /// The stream's title, which tells the two audio tracks apart (see [`track_title`]).
     title: Option<String>,
-    /// `stream.duration`, in whole milliseconds, when ffprobe reports one.
+    /// `stream.duration` in whole milliseconds, when ffprobe reports one.
     duration_ms: Option<u64>,
 }
 
@@ -416,12 +387,9 @@ fn audio_duration_of(streams: &[ProbedStream], index: usize) -> u64 {
 
 /// The `streams` array of an ffprobe document, one entry per stream.
 ///
-/// A deliberately small scanner rather than a JSON dependency: the workspace's `MediaInfo`
-/// keeps only the **first** audio stream (that is the media crate's contract, and the
-/// microphone is the second one), and it does not carry tags at all, which are the whole
-/// point of `-metadata:s:a:0 title=Game Audio`. The parser has to see every stream and its
-/// title, so it reads exactly the slice of JSON ffprobe emits here — objects of scalars and
-/// one nested `tags` object — and panics rather than guessing when the shape is not there.
+/// A small scanner instead of a JSON dependency: `MediaInfo` keeps only the first audio stream and
+/// no tags, and this test needs every stream and its title. It reads the slice of JSON ffprobe
+/// emits here (objects of scalars plus one nested `tags` object) and panics on any other shape.
 fn streams_of(json: &str) -> Vec<ProbedStream> {
     let streams_at = json.find("\"streams\"").expect("ffprobe json has a streams array");
     let open = streams_at + json[streams_at..].find('[').expect("streams is an array");
@@ -478,29 +446,19 @@ fn matching_delimiter(s: &str, at: usize, open: char, close: char) -> usize {
     panic!("no matching {close} for the {open} at byte {at}");
 }
 
-/// The title of a stream, as the container actually carries it.
+/// The title of a stream, as the container carries it.
 ///
-/// The encoder is *told* `-metadata:s:a:0 title=Game Audio`, and ffmpeg's MP4 muxer stores a
-/// stream's `title` metadata in the track's `name` atom — which is what ffprobe reports back
-/// and what a player shows as the track's name. Measured here, on a segment written by this
-/// very argument list:
-///
-/// ```text
-/// "tags": { "language": "und", "handler_name": "SoundHandler", "name": "Game Audio" }
-/// ```
-///
-/// So `name` is read first and `title` is accepted as well, so that a container that spells
-/// the tag its own way is reported for what it is rather than as "no tag at all". The
-/// needles carry their quotes, so `codec_name` and `handler_name` cannot match either one.
+/// ffmpeg's MP4 muxer stores `-metadata:s:a:0 title=...` in the track's `name` atom, so ffprobe
+/// reports `"tags": { "handler_name": "SoundHandler", "name": "Game Audio" }`. `name` is read
+/// first and `title` accepted too, so a different spelling is reported as itself rather than as
+/// "no tag". The needles carry their quotes so `codec_name` and `handler_name` cannot match.
 fn track_title(object: &str) -> Option<String> {
     string_field(object, "name").or_else(|| string_field(object, "title"))
 }
 
 /// The value of a `"key": "value"` pair inside one stream object, if present.
 ///
-/// `title` lives under `tags` rather than directly on the stream, but the objects ffprobe
-/// emits for a stream have no other field of that name, and the keys searched for here
-/// (`codec_type`, `name`, `title`, `duration`) are unambiguous within one object.
+/// Keys searched (`codec_type`, `name`, `title`, `duration`) are unambiguous within one object.
 fn string_field(object: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let after_key = object.find(&needle)? + needle.len();
@@ -510,12 +468,10 @@ fn string_field(object: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// The mean volume of one audio stream inside a narrow band around `hz`, in dB.
+/// Mean volume of one audio stream in a narrow band around `hz`, in dB.
 ///
-/// `volumedetect` prints the mean level of what it is handed; behind a narrow `bandpass`
-/// that number is the energy this track carries *at that frequency*, which is what tells the
-/// two tones apart. A track that has no tone at `hz` reads tens of dB lower than one that
-/// has it, and a track that is silent reads `-inf`.
+/// Behind a narrow `bandpass`, `volumedetect` reads the track's energy at that frequency: tens of
+/// dB lower if the tone is absent, `-inf` if silent.
 fn band_energy_db(bin: &FfmpegBinaries, path: &Path, stream: usize, hz: f64) -> f64 {
     let filter = format!("bandpass=f={hz}:width_type=h:w={MEASURE_BAND_HZ},volumedetect");
     let out = Command::new(&bin.ffmpeg)
@@ -534,7 +490,7 @@ fn band_energy_db(bin: &FfmpegBinaries, path: &Path, stream: usize, hz: f64) -> 
         .unwrap_or_else(|| panic!("no `mean_volume` in ffmpeg's output: {stderr}"))
 }
 
-/// `[volumedetect] mean_volume: -23.4 dB`, or `-inf dB` for silence.
+/// Parses `[volumedetect] mean_volume: -23.4 dB`, or `-inf dB` for silence.
 fn mean_volume_db(stderr: &str) -> Option<f64> {
     let line = stderr.lines().find(|line| line.contains("mean_volume:"))?;
     let value = line.split("mean_volume:").nth(1)?.trim().strip_suffix("dB")?.trim();

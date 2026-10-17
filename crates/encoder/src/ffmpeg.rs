@@ -1,14 +1,11 @@
-//! One ffmpeg process, a pipe video input, **up to two optional loopback-TCP audio inputs**,
+//! One ffmpeg process, a pipe video input, up to two optional loopback-TCP audio inputs,
 //! segmented MP4 output.
 //!
-//! Video arrives on `pipe:0` — the child's stdin, which `std::process` hands us as a
-//! write end directly, so it needs no socket. Audio arrives on
-//! `tcp://127.0.0.1:{port}`: we bind a listener on an ephemeral loopback port and
-//! ffmpeg dials it, because for an input URL ffmpeg's tcp protocol is the CLIENT.
+//! Video arrives on `pipe:0` (the child's stdin). Audio arrives on `tcp://127.0.0.1:{port}`: we
+//! bind a listener on an ephemeral loopback port and ffmpeg dials it (for an input URL ffmpeg's
+//! tcp protocol is the client).
 //!
-//! ## Up to two audio inputs, one transport, one clock discipline
-//!
-//! The child declares up to three inputs, in this order:
+//! ## Inputs
 //!
 //! | input | stream | transport |
 //! |---|---|---|
@@ -16,99 +13,59 @@
 //! | 1 | system/game audio ([`EncodeConfig::game_audio`]) | `tcp://127.0.0.1:{game_audio_port}` |
 //! | 2 | microphone (`EncodeConfig::mic_audio`) | `tcp://127.0.0.1:{mic_audio_port}` |
 //!
-//! **Input 1 exists only when [`EncodeConfig::game_audio`] is true**, and input 2 only when
-//! [`EncodeConfig::mic_audio`] is `Some`. With `game_audio` off there is no audio input at
-//! all: `[audio] enabled = false` asks for a video-only recording, and the child is told
-//! about no audio — no listener is bound, no `-c:a` is passed and the container carries no
-//! audio stream. With both on, the output carries both tracks:
-//! `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and `Microphone`. A microphone with the
-//! game audio off is refused at [`FfmpegEncoder::spawn`] rather than recorded, because a
-//! one-track container would carry it under the name `Game Audio`. The microphone is a **second listener bound the same way**, pumped by the
-//! same [`pump_audio`] function on its own thread — its timing conventions are not a
-//! reimplementation but the same code: PCM is written as it is submitted, the media timeline
-//! is the sample count, starvation shows up as a stall in ffmpeg's own input, and a full
-//! queue drops and counts a block rather than blocking the capture loop
-//! ([`enqueue_or_drop`]). One writer thread *per input* is load-bearing, not tidiness:
-//! ffmpeg will not pull one input far ahead of another, so writing two inputs
-//! synchronously from one thread deadlocks the moment either sink's buffer fills.
+//! Input 1 exists only when `game_audio` is true and input 2 only when `mic_audio` is `Some`.
+//! With `game_audio` off there is no audio input at all (no listener, no `-c:a`, no audio
+//! stream). With both on the output is `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and
+//! `Microphone`. A microphone with the game audio off is refused at [`FfmpegEncoder::spawn`],
+//! because a one-track container would carry it as `Game Audio`.
+//!
+//! The microphone is pumped by the same [`pump_audio`] on its own thread: PCM is written as
+//! submitted, the media timeline is the sample count, and a full queue drops and counts a block
+//! rather than blocking capture ([`enqueue_or_drop`]). One writer thread per input is
+//! load-bearing: ffmpeg will not pull one input far ahead of another, so writing two inputs
+//! from one thread deadlocks as soon as either sink's buffer fills.
 //!
 //! ## Why audio does not come in on `pipe:1`
 //!
-//! Writing audio into the child's stdout (`-i pipe:1`) is a Unix-only trick, and an
-//! accident of POSIX rather than a supported interface. ffmpeg's pipe protocol parses
-//! the descriptor number out of the URL and then calls a plain CRT `read(fd, ...)`.
-//! Windows opens descriptor 1 as write-only, so `read(1, ...)` fails with `EBADF` and
-//! the audio input is dead on arrival. POSIX happens to permit reading fd 1, which is
-//! precisely why the existing suite passed on macOS while the transport was broken on
-//! the platform this project actually ships to. The trick was never portable.
-//!
-//! ## Why not Windows named pipes
-//!
-//! Named pipes would work on Windows, but the development host is macOS and cannot
-//! exercise them: the transport would ship unverified on the very platform it exists
-//! for. ffmpeg's `tcp://` protocol is supported on every platform, so loopback TCP
-//! collapses this to ONE code path with no `#[cfg]` — and that path is genuinely
-//! exercised by the macOS test suite, which is the only place it can be run here.
+//! Reading the child's stdout (`-i pipe:1`) is a POSIX accident: ffmpeg calls a plain CRT
+//! `read(fd, ...)`, Windows opens descriptor 1 write-only, so it fails with `EBADF` and the
+//! input is dead. It passed on macOS while broken on the shipping platform. Loopback TCP is
+//! supported on every platform, so it is one code path with no `#[cfg]` that the macOS suite
+//! exercises.
 //!
 //! ## This is IPC, not egress
 //!
-//! The listener is explicitly bound to `127.0.0.1` (never a wildcard, never a public
-//! interface) and ffmpeg connects back to that same address, so neither the port nor
-//! the peer can leave the host. The project's zero-egress rule (spec §7.3, enforced by
-//! `crates/events/tests/no_egress.rs`) is about OUTBOUND traffic; two processes of
-//! this application talking over the loopback interface are not egress. The accepted
-//! connection's peer is checked to be a loopback address as well, so a stray
-//! connection cannot silently feed the encoder.
+//! The listener is bound to `127.0.0.1` (never a wildcard) and the accepted peer is checked to be
+//! loopback, so neither the port nor the peer can leave the host. The zero-egress rule
+//! (`crates/events/tests/no_egress.rs`) is about outbound traffic.
 //!
 //! ## The media timeline is the wall clock, not the frame count
 //!
-//! A capture source delivers frames at whatever rate it manages — WGC hands over one
-//! frame per compositor tick, which on a 36fps-ish delivery is *not* the configured
-//! `encode.fps`. If the encoder assigned timestamps from a declared frame rate
-//! (`-r 30`) the media timeline would advance at `frames / 30` while the wall clock
-//! advanced at `frames / 36`, and the two would drift apart without bound: measured on
-//! real hardware, 25.4s of wall clock produced 19.0s of media (919 frames, `span=19000ms`
-//! against `need=28690ms`), so `trigger_ms + post_ms` could never be reached and every
-//! hotkey press timed out with "the encoder produced no segment covering the trigger".
+//! WGC delivers one frame per compositor tick, which need not be the configured `encode.fps`.
+//! Stamping from a declared rate (`-r 30`) lets the media timeline advance at `frames / 30`
+//! while the wall clock advances at `frames / 36`: 25.4s of wall clock produced 19.0s of media,
+//! so `trigger_ms + post_ms` was never reached and every hotkey press timed out.
 //!
-//! Video input timestamps are therefore taken from the wall clock at the moment each
-//! frame is *read* (`-use_wallclock_as_timestamps 1`), which is the arrival time of the
-//! frame. Segments then cover wall-clock time — `segments * segment_time` is real
-//! seconds — even when the delivery rate differs from the configured one, and a stall in
-//! capture shows up as a gap in the timeline rather than as a slower-than-real-time clock.
-//! The capture loop additionally rate-limits itself to `encode.fps` (see `FramePacer` in
-//! the CLI), so in the ordinary case the two agree and no frames are wasted.
+//! Video timestamps are therefore the arrival time of each frame
+//! (`-use_wallclock_as_timestamps 1`), so segments cover real seconds and a capture stall shows
+//! as a gap, not a slower clock. The capture loop also rate-limits itself to `encode.fps`
+//! (`FramePacer`), so normally the two agree.
 //!
-//! The nominal rate is declared with the rawvideo demuxer's own `-framerate`, NOT with
-//! the CLI's input `-r`. This is not cosmetic: `-r` before `-i` sets the CLI's notion of
-//! an input frame rate, and ffmpeg then *re-stamps* every decoded frame onto a rigid
-//! 1/fps grid, throwing the arrival time away — measured with `-debug_ts`, a pipe fed at
-//! 15fps with wallclock stamps and input `-r 30` reached the muxer as pts 0, 1/30, 2/30,
-//! … while the same pipe with `-framerate 30` reached it as 0, 0.100, 0.233, … i.e. the
-//! real arrival times. `-r` silently undoes the whole fix, so it must not be used here.
+//! The nominal rate is declared with the rawvideo demuxer's own `-framerate`, never the CLI's
+//! input `-r`: `-r` makes ffmpeg re-stamp every frame onto a rigid 1/fps grid, throwing the
+//! arrival time away (`-debug_ts`: a 15fps pipe with `-r 30` reached the muxer as pts 0, 1/30,
+//! 2/30; with `-framerate 30` as 0, 0.100, 0.233).
 //!
-//! Audio is deliberately *not* stamped that way. Its input is raw PCM whose timeline is
-//! already exact: s16le at 48kHz, muxed from the running sample count, gives 1/48000 s
-//! per sample with no accumulation error and no dependence on when a block happened to
-//! be read off the socket (and it is drained in full rather than rate-limited, because
-//! dropping audio to pace video would desync the clip). Stamping audio from the wall
-//! clock would replace that exact timeline with socket-arrival jitter. The two streams
-//! are reconciled by the same clock the trigger uses — the capture loop's — so the small
-//! drift between the audio device's crystal and the system clock is what remains, and
-//! `MediaInfo::av_drift` measures it on every clip.
+//! Audio is not stamped that way: raw s16le PCM at 48kHz muxed from the running sample count is
+//! exact, while socket-arrival time would add jitter. Audio is drained in full, never
+//! rate-limited, because dropping it to pace video would desync the clip. The residual drift
+//! between the audio device's clock and the system clock is what `MediaInfo::av_drift` measures.
 //!
 //! ## Threading
 //!
-//! Each input is drained by its own writer thread, fed by a **bounded** `mpsc` channel,
-//! so `submit_video`/`submit_audio` never block the caller. ffmpeg will not pull one
-//! input far ahead of the other (its muxer buffers to interleave audio and video), so
-//! writing both streams in bursts from the calling thread deadlocks as soon as either
-//! sink's buffer fills. Decoupling the two writes lets the submits arrive in any order.
-//!
-//! The payload's buffer is **moved** into the channel, not cloned: `Frame`/`AudioBuffer`
-//! are taken by value in the trait for exactly that reason. The clone this replaced
-//! copied the whole pixel buffer on every frame — 3840x2160 BGRA is 33.2MB, ~1GB/s of
-//! pure memcpy at 30fps — on the path that was already failing to keep up.
+//! Each input is drained by its own writer thread fed by a bounded `mpsc` channel, so
+//! `submit_video`/`submit_audio` never block the caller. The payload's buffer is moved into the
+//! channel, not cloned (a 3840x2160 BGRA frame is 33.2MB).
 
 use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat, VideoInput};
 use anyhow::{bail, Context, Result};
@@ -123,112 +80,77 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long the audio thread waits for ffmpeg to dial the loopback input before
-/// giving up. ffmpeg connects while opening its inputs, well before it reads a frame
-/// of video, so this only elapses when the child failed to start at all.
+/// How long the audio thread waits for ffmpeg to dial the loopback input. ffmpeg connects while
+/// opening its inputs, so this only elapses when the child failed to start at all.
 const AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Poll interval while waiting for that connection. The listener is non-blocking, so
-/// we re-check instead of sitting in a blocking `accept()` that could never return.
+/// Poll interval while waiting for that connection (the listener is non-blocking).
 const AUDIO_CONNECT_POLL: Duration = Duration::from_millis(20);
 
-/// How long a hardware encoder is waited on: for its next request for input, and for its tail
+/// How long a hardware encoder is waited on, for its next request for input and for its tail
 /// after a drain.
 ///
-/// One constant for both because they are the same question asked at opposite ends — "is the
-/// encoder still working?" — and because a timeout here is a *report* rather than a hang: an
-/// encoding frame that never comes asks for input no more, and a drain that never completes has
-/// already given the recording everything it is going to. Two seconds is far longer than either
-/// takes when the machine is healthy (measured on the box: 90 frames of 4K through the loop in
-/// three seconds) and short enough that a wedged encoder is reported during the recording rather
-/// than after it.
+/// A timeout here is a report, not a hang. Two seconds is far longer than either takes on a
+/// healthy machine (90 frames of 4K through the loop took three seconds) and short enough that
+/// a wedged encoder is reported during the recording rather than after it.
 #[cfg(windows)]
 pub(crate) const MFT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a failure report waits for ffmpeg's stderr before giving up on including it.
-/// The text is normally already sitting in the pipe buffer, so this is a ceiling on a
-/// pathological case, not a delay on the ordinary one (see `drain_stderr`).
+/// How long a failure report waits for ffmpeg's stderr. The text is normally already in the pipe
+/// buffer, so this only bounds a pathological case (see `drain_stderr`).
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
-/// Poll interval while a failure report waits out [`STDERR_DRAIN_BUDGET`].
-///
-/// The reader signals completion by sending on a channel and this waits for it on the
-/// *reporting* thread, so the wait has to be a poll loop; five milliseconds is far below the
-/// hundred-millisecond scale the report is spent on and keeps each readiness check cheap.
+/// Poll interval while a failure report waits out [`STDERR_DRAIN_BUDGET`]: the reader signals
+/// on a channel, so the reporting thread polls; 5ms is far below the report's timescale.
 const STDERR_DRAIN_POLL: Duration = Duration::from_millis(5);
 
-/// How long a writer failure waits for ffmpeg to become reapable, so its exit status and
-/// stderr can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
+/// How long a writer failure waits for ffmpeg to become reapable so its exit status and stderr
+/// can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
 ///
-/// The broken pipe is noticed the moment ffmpeg closes its stdin, which can be a few
-/// milliseconds before the process itself can be waited on. This is spent only on a path
-/// that has already failed, and it is a deadline, not a guarantee: past it the error is
-/// reported with the symptom alone.
+/// The broken pipe is noticed a few milliseconds before the process can be waited on. Spent only
+/// on a path that has already failed; past the deadline the error carries the symptom alone.
 const CHILD_DEATH_GRACE: Duration = Duration::from_millis(250);
 
 /// Poll interval while waiting out that grace period.
 const CHILD_DEATH_POLL: Duration = Duration::from_millis(10);
 
-/// How many video frames may sit in the queue between the capture loop and the writer
-/// thread before submits start being dropped.
+/// How many video frames may sit between the capture loop and the writer thread before submits
+/// are dropped.
 ///
-/// The queue is bounded because an unbounded one grows without limit whenever ffmpeg
-/// reads slower than capture produces — the opposite of the project's flat-RAM principle,
-/// and it fails by exhausting memory rather than by losing frames.
-///
-/// The number is small on purpose, and its size is dominated by the frame, not by the
-/// count: at 3840x2160 BGRA one frame is 3840*2160*4 = 33_177_600 B (~33.2 MB), so four
-/// queued frames are ~133 MB, and with the fifth frame the writer thread holds while
-/// blocked inside `write()` the encoder's worst case is ~166 MB. The slack that buys is
-/// also small on purpose: at 30fps a frame is 33 ms, so four frames ride out ~133 ms of
-/// ffmpeg not reading — long enough to cover a segment being finalised (moov written,
-/// file closed, next one opened) without dropping anything, far short of letting a
-/// wedged encoder accumulate a gigabyte.
+/// Bounded because an unbounded queue grows without limit whenever ffmpeg reads slower than
+/// capture produces. Small because the frame dominates: at 3840x2160 BGRA one frame is
+/// 33_177_600 B, so four queued frames plus the one the writer holds is ~166 MB worst case. At
+/// 30fps four frames ride out ~133 ms of ffmpeg not reading, enough to cover a segment being
+/// finalised, far short of letting a wedged encoder accumulate a gigabyte.
 const VIDEO_QUEUE_FRAMES: usize = 4;
 
-/// How many 10 ms audio blocks may be queued before audio submits start being dropped.
+/// How many 10 ms audio blocks may be queued before audio submits are dropped.
 ///
-/// Blocks are 1920 B at 48kHz stereo s16le, so this is ~576 KB — three seconds of slack, and
-/// ~1600x cheaper per millisecond than the video queue. Audio is given far more slack than
-/// video for that reason, and because of what the queue is actually for.
-///
-/// The drop path exists for an encoder that is *permanently* behind: better a hole in the
-/// sound than a capture loop blocked behind a wedged child. What a queue of a few hundred
-/// milliseconds does not survive is the child stopping its *reading* for a second or so,
-/// which is what Windows ffmpeg was measured doing at the first segment's boundary
-/// (`docs/verification-status.md` §10.4): at 320 ms of slack that transient stall discarded
-/// 760 ms of a 3 s feed — a quarter of the audio, permanently, from a pause the encoder
-/// recovered from on its own. A few hundred kilobytes is the wrong thing to trade that for,
-/// so the slack is measured in seconds, with the observed worst case multiplied out. The
-/// microphone's queue (`FfmpegEncoder::mic_tx`) is sized the same way, because it carries the
-/// same kind of payload and is read by the same child.
+/// Blocks are 1920 B at 48kHz stereo s16le, so this is ~576 KB: three seconds of slack. The drop
+/// path exists for an encoder that is permanently behind. Windows ffmpeg stops reading for a
+/// second or so at the first segment's boundary, and at 320 ms of slack that transient discarded
+/// 760 ms of a 3 s feed for good, so the slack is measured in seconds. The microphone's queue
+/// (`FfmpegEncoder::mic_tx`) is sized the same way.
 const AUDIO_QUEUE_BLOCKS: usize = 300;
 
-/// The format the **game/system** audio input has always been declared with: raw s16le PCM
-/// at 48kHz stereo.
+/// The format the game/system audio input is declared with: raw s16le PCM at 48kHz stereo.
 ///
-/// Named rather than inlined because the microphone input is declared by the same function
-/// ([`audio_input_args`]): two inputs declared by one piece of code cannot drift from each
-/// other, which is what makes "both audio streams share one clock discipline" mechanical
-/// rather than a promise. These are the pipeline's published values
-/// (`localplay_capture::AudioFormat::default`), not settings.
+/// Named because the microphone input is declared by the same function ([`audio_input_args`]),
+/// so both inputs share one clock discipline mechanically. These are the pipeline's published
+/// values (`localplay_capture::AudioFormat::default`), not settings.
 const GAME_AUDIO_SAMPLE_RATE: u32 = 48_000;
 const GAME_AUDIO_CHANNELS: u16 = 2;
 
-/// What an audio input is called in error messages and in the writer thread's name.
-///
-/// The game audio keeps the exact wording every existing report already uses, so a
-/// single-audio failure reads as it did before the microphone existed; the second input
-/// names itself, which is the difference between "the audio input failed" and "the
-/// microphone input failed".
+/// What an audio input is called in error messages and the writer thread's name. The game audio
+/// keeps the original wording; the second input names itself.
 const GAME_AUDIO_LABEL: &str = "audio";
 const MICROPHONE_LABEL: &str = "microphone";
 
 /// Bytes queued by the caller, written to the child by a dedicated thread.
 type WriterHandle = JoinHandle<std::io::Result<()>>;
 
-/// Seconds per scratch segment — which is also the forced-keyframe interval, and therefore
-/// what makes a clip a lossless concatenation of whole segments (spec §6.3).
+/// Seconds per scratch segment, which is also the forced-keyframe interval and so what makes a
+/// clip a lossless concatenation of whole segments.
 pub fn keyframe_seconds(cfg: &EncodeConfig) -> f64 {
     cfg.segment_ms as f64 / 1000.0
 }
@@ -238,55 +160,39 @@ fn gop_frames(cfg: &EncodeConfig) -> u32 {
     (cfg.fps as f64 * keyframe_seconds(cfg)).round().max(1.0) as u32
 }
 
-/// The ffmpeg arguments that declare the **video input and its rate**.
+/// The ffmpeg arguments that declare the video input and its rate.
 ///
-/// Shared by the two places that drive this encoder — the long-lived child that records
-/// ([`FfmpegEncoder::spawn`]) and the startup throughput probe that measures what the
-/// machine can sustain before it is asked to record anything
-/// (`crate::throughput::measure_sustainable_fps`) — because a measurement of a *different*
-/// ffmpeg invocation is not a measurement of this one. The geometry, the pixel format and
-/// above all the declared rate have to be the same on both sides for the number the probe
-/// returns to mean anything about the recording that follows.
+/// Shared by the recording child ([`FfmpegEncoder::spawn`]) and the startup throughput probe
+/// (`crate::throughput::measure_sustainable_fps`): a measurement of a different invocation is not
+/// a measurement of this one, so geometry, pixel format and declared rate must match.
 ///
-/// `-framerate` is the rawvideo demuxer's own option and deliberately NOT the CLI's input
-/// `-r`: `-r` makes ffmpeg treat the input as constant-rate and re-stamp every frame onto a
-/// rigid 1/fps grid, which discards the arrival timestamp the next option exists to record
-/// (see the module comment for the measurement). Both spellings declare the same nominal
-/// rate to the rawvideo demuxer; only this one leaves the real timestamps alone.
+/// `-framerate` is the rawvideo demuxer's own option, not the CLI's input `-r`, which would
+/// re-stamp every frame onto a rigid 1/fps grid and discard the arrival timestamp (see the
+/// module comment).
 pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
     let mut args: Vec<String> = ["-f", "rawvideo", "-pix_fmt", "bgra"].map(str::to_string).to_vec();
-    // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size (what the
-    // capture backend delivers), never the encode output size.
+    // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size, never the output size.
     args.extend(["-s".to_string(), format!("{}x{}", cfg.source_size.0, cfg.source_size.1)]);
-    // The nominal rate: what the pipeline declares the stream to be. It is one number for
-    // both consumers — this argument and the pacer that feeds the pipe — see
-    // `localplay_recorder::FpsDecision`.
+    // The nominal rate: one number for this argument and the pacer (`localplay_recorder::FpsDecision`).
     args.extend(["-framerate".to_string(), cfg.fps.to_string()]);
-    // Timestamps come from the moment each frame is read, i.e. its arrival time, not from a
-    // declared frame rate. This is what keeps the media timeline glued to the wall clock:
-    // `segments * segment_time` stays real seconds even when capture delivers at a rate
-    // other than `cfg.fps`, so the post-roll the hotkey waits for is actually reached.
-    // Video only — audio's timeline is the exact 48kHz sample count and must not be
-    // jittered by socket arrival (module comment: "The media timeline is the wall clock,
-    // not the frame count").
+    // Timestamps are each frame's arrival time, which keeps `segments * segment_time` real seconds
+    // even when capture delivers at a rate other than `cfg.fps`. Video only: audio's timeline is the
+    // exact sample count and must not be jittered by socket arrival.
     args.extend(["-use_wallclock_as_timestamps".to_string(), "1".to_string()]);
     args.extend(["-i".to_string(), "pipe:0".to_string()]);
     args
 }
 
-/// The ffmpeg arguments for an **already-encoded** video input: an H.264 elementary stream on a
-/// pipe, produced by this process rather than by ffmpeg.
+/// The ffmpeg arguments for an already-encoded video input: an H.264 elementary stream on a pipe,
+/// produced by this process rather than by ffmpeg.
 ///
-/// This is the Tier 2 hybrid's video half. A hardware encoder MFT takes the captured texture
-/// straight from VRAM (`localplay_encoder::mft`), and what crosses the pipe is a few hundred
-/// kilobytes a second of H.264 instead of ~2 GB/s of raw pixels — measured on the box: 90 frames of
-/// 4K `ARGB32` in, an elementary stream out, no CPU copy.
+/// The hybrid's video half: a hardware encoder MFT takes the captured texture from VRAM
+/// (`localplay_encoder::mft`), so a few hundred kilobytes a second of H.264 cross the pipe
+/// instead of ~2 GB/s of raw pixels.
 ///
-/// The timeline flag is the same one, for the same reason, as [`video_input_args`]: an elementary
-/// stream carries no timestamps of its own, so ffmpeg has to be told to take them from when the
-/// bytes arrive. Measured on the box, both ways: streaming the encoder's output as it is produced
-/// gives **965 ms of container for 990 ms of paced frames**, and handing the same bytes over in one
-/// batch gives **196 ms**, because a batch makes every frame arrive at once.
+/// The timeline flag is the same as in [`video_input_args`]: an elementary stream carries no
+/// timestamps, so ffmpeg must stamp from arrival. Streaming the output as produced gave 965 ms of
+/// container for 990 ms of paced frames; handing the same bytes over in one batch gave 196 ms.
 pub fn video_input_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
     [
         "-f",
@@ -300,30 +206,22 @@ pub fn video_input_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
     .to_vec()
 }
 
-/// The ffmpeg arguments for what to do with that input: **nothing**. The video is copied through,
+/// The ffmpeg arguments for what to do with that input: nothing. The video is copied through,
 /// because the pixels were encoded on the GPU and never reached this process's memory.
 ///
-/// Deliberately almost empty, and the absences are the substance:
+/// The absences are the substance:
 ///
-/// * no `-c:v h264_*` and no `-b:v` — there is nothing left to encode, and the bitrate belongs to
-///   the MFT.
-/// * no `-g` and no **`-force_key_frames`**: neither can apply to a stream ffmpeg is only copying.
-///   The segment boundaries the replay path depends on therefore have to come from the encoder,
-///   which is why `MftEncoder` sets `MF_MT_MAX_KEYFRAME_SPACING` — measured on the box as three
-///   fragments a second apart, each a keyframe, read back by the project's own `FragmentSplitter`.
-/// * no `-fps_mode`: it describes a conversion onto a grid, and a copied stream has no frames to
-///   convert.
-/// * no `-vf scale`: scaling means decoding, decoding means the pixels, and the pixels are exactly
-///   what this path exists to keep out of this process. **A scaled output therefore has to be asked
-///   of the capture, not of ffmpeg** — so `encode.output_size` below the capture size is a reason to
-///   capture at that size, not to filter here.
+/// * no `-c:v h264_*` and no `-b:v`: nothing is left to encode, and the bitrate belongs to the MFT.
+/// * no `-g` and no `-force_key_frames`: neither applies to a copied stream, so segment
+///   boundaries come from the encoder (`MftEncoder` sets `MF_MT_MAX_KEYFRAME_SPACING`, measured
+///   as three fragments a second apart, each a keyframe).
+/// * no `-fps_mode`: a copied stream has no frames to convert.
+/// * no `-vf scale`: scaling means decoding, which is what this path keeps out of this process.
+///   A scaled output must be asked of the capture, not ffmpeg.
 pub fn video_output_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
     let mut args = vec!["-c:v".to_string(), "copy".to_string()];
-    // **`hvc1`, not ffmpeg's default `hev1`.** Both describe the same stream; the difference is
-    // whether the parameter sets are in the sample description or in-band, and `hev1` is what some
-    // players — Apple's among them — refuse to open at all. The clips from this pipeline get played
-    // on a Mac, so the tag that works everywhere is the one to write. It is meaningless for H.264
-    // and is not passed for it.
+    // `hvc1`, not ffmpeg's default `hev1`: some players (Apple's among them) refuse `hev1`, and these
+    // clips get played on a Mac. Meaningless for H.264, so not passed for it.
     if codec == crate::VideoCodec::Hevc {
         args.push("-tag:v".to_string());
         args.push("hvc1".to_string());
@@ -331,38 +229,26 @@ pub fn video_output_args_bitstream(codec: crate::VideoCodec) -> Vec<String> {
     args
 }
 
-/// The ffmpeg arguments that describe **the encoder for that video input**: how frames are
-/// passed to it, the scale filter when the output differs from the capture, the codec, its
-/// bitrate and its keyframe schedule.
+/// The ffmpeg arguments that describe the encoder for that video input: frame passing, the
+/// scale filter when the output differs from the capture, the codec, bitrate and keyframe schedule.
 ///
-/// Shared with the throughput probe for the same reason as [`video_input_args`]: the probe
-/// has to pay for the work the recording pays for. It writes to the null muxer, so the
-/// forced keyframes and the scale cost it exactly what they cost the segmenter.
+/// Shared with the throughput probe, which writes to the null muxer so the forced keyframes and
+/// the scale cost it what they cost the segmenter.
 pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // THE load-bearing option of the whole timeline. Do not remove it.
     //
-    // ffmpeg's default (`-fps_mode auto`) picks a constant-rate conversion for this output,
-    // and a constant-rate conversion can only produce a rigid `1/R` grid — so a stream whose
-    // frames arrive at anything other than the declared `-framerate R` gets *resampled onto
-    // that grid*: missing frames are free to invent (duplicated), surplus ones are dropped.
-    // With the segment muxer in play that is not a cosmetic metadata difference, it IS the
-    // media clock. Measured on the dev host with the real argument list (4K output,
-    // libx264, ~8 frames a second arriving against a declared 120): 1631 frames were
-    // encoded from 39 delivered, `dup=1592`, every segment reported `avg_frame_rate=120/1`,
-    // and the ring's media clock then advanced at (frames the encoder can emit) ÷ R rather
-    // than at the wall clock — the segments themselves appeared at 0.66 per second, so
-    // `span=` fell behind real time for ever (issue #2).
+    // ffmpeg's default (`-fps_mode auto`) picks a constant-rate conversion, which resamples a stream
+    // whose frames arrive at anything other than the declared `-framerate R` onto a rigid `1/R` grid
+    // (duplicating missing frames, dropping surplus ones). With the segment muxer that is the media
+    // clock: 4K libx264 with ~8 frames a second arriving against a declared 120 encoded 1631 frames
+    // from 39 delivered (`dup=1592`), and the ring's media clock fell behind real time for ever.
     //
-    // `passthrough` removes the conversion: each frame reaches the muxer with the timestamp
-    // it already has, which for this input is its arrival time (`-use_wallclock_as_timestamps
-    // 1`, see [`video_input_args`]). Media time then advances with the wall clock *by
-    // construction*, whatever rate frames arrive at, and a machine that cannot keep up drops
-    // frames — visible as holes in the picture and as a lower `avg_frame_rate` — instead of
-    // silently stretching the clock. `-vsync 0` is the same option's older spelling; the
-    // modern one is used because ffmpeg 5.1 renamed it (and the pinned Windows sidecar
-    // carries the new name: `strings binaries/ffmpeg.exe` finds `fps_mode` and its
-    // error text).
+    // `passthrough` removes the conversion: each frame keeps its arrival timestamp
+    // (`-use_wallclock_as_timestamps 1`, see [`video_input_args`]), so media time advances with the
+    // wall clock by construction, and a machine that cannot keep up drops frames instead of
+    // stretching the clock. `-vsync 0` is the older spelling; ffmpeg 5.1 renamed it and the pinned
+    // Windows sidecar carries the new name.
     args.extend(["-fps_mode".to_string(), "passthrough".to_string()]);
     // Frames arrive at `source_size`; when the caller asked for a different output size,
     // scale to it. Equal sizes add no filter, which avoids a pointless pass.
@@ -373,19 +259,15 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
         ]);
     }
     args.extend(["-c:v".to_string(), cfg.encoder_name().to_string()]);
-    // **`hvc1`, not ffmpeg's default `hev1`** — and this path needs it as much as the
-    // bitstream one does. Both describe the same stream and differ in where the parameter
-    // sets live, and `hev1` is what some players refuse to open at all. The tag went into
-    // the bitstream arguments first, which is the zero-copy hybrid's path — but that is not
-    // the path HEVC runs on where the hardware encoder refuses, and `ffprobe` on a clip from
-    // the raw path reported `codec_tag_string=hev1`. A test of the argument list would not
-    // have caught that; reading the clip did.
+    // `hvc1`, not ffmpeg's default `hev1`, on this raw path too: some players refuse `hev1`, and
+    // HEVC runs here where the hardware encoder refuses (`ffprobe` on such a clip reported
+    // `codec_tag_string=hev1`).
     if cfg.codec == crate::VideoCodec::Hevc {
         args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
     }
     args.extend(rate_control_args(cfg.encoder_name(), cfg.bitrate_kbps));
     args.extend(["-g".to_string(), gop_frames(cfg).to_string()]);
-    // Forced keyframes are what make segment boundaries cuttable (spec §6.3).
+    // Forced keyframes make segment boundaries cuttable.
     args.extend([
         "-force_key_frames".to_string(),
         format!("expr:gte(t,n_forced*{})", keyframe_seconds(cfg)),
@@ -393,17 +275,15 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     args
 }
 
-/// The arguments that make an ffmpeg encoder *hold* `bitrate_kbps` rather than aim near it.
+/// The arguments that make an ffmpeg encoder hold `bitrate_kbps` rather than aim near it.
 ///
-/// `-b:v` alone is an average target: the ledger (§18/§19) measured clips at ~1.9x the setting.
-/// A constant-bitrate setting needs three things the encoder is told together: the hardware
-/// encoders' own rate-control switch (`-rc cbr`, which NVENC and AMF name and QSV infers), a
-/// `-maxrate` equal to the target (a ceiling on the peaks) and a `-bufsize` of one second of
-/// that rate (the window the ceiling is enforced over). `-maxrate`/`-bufsize` are generic ffmpeg
-/// options, so the software encoders the tests use take them too.
+/// `-b:v` alone is an average target and measured clips at ~1.9x the setting. Constant bitrate
+/// needs three things together: the hardware encoders' rate-control switch (`-rc cbr`, named by
+/// NVENC and AMF, inferred by QSV), a `-maxrate` equal to the target and a `-bufsize` of one
+/// second of that rate. `-maxrate`/`-bufsize` are generic, so the software encoders the tests
+/// use take them too.
 ///
-/// Only the argument list is tested; whether a given driver then obeys it is a measurement on
-/// that hardware, and none was made for this change.
+/// Only the argument list is tested; whether a driver obeys it is a measurement on that hardware.
 pub fn rate_control_args(encoder: &str, bitrate_kbps: u32) -> Vec<String> {
     let rate = format!("{bitrate_kbps}k");
     let mut args = vec!["-b:v".to_string(), rate.clone()];
@@ -414,16 +294,12 @@ pub fn rate_control_args(encoder: &str, bitrate_kbps: u32) -> Vec<String> {
     args
 }
 
-/// The ffmpeg arguments that declare **one raw-PCM loopback audio input**: its format, its
-/// sample rate, its channel count and the URL ffmpeg dials.
+/// The ffmpeg arguments that declare one raw-PCM loopback audio input: format, sample rate,
+/// channel count and the URL ffmpeg dials.
 ///
-/// Both audio inputs are declared by this function — the game/system one from the constants
-/// above, the microphone from [`crate::MicAudioSpec`] — so the two cannot be declared
-/// differently: same demuxer, same option order, same meaning for every number. That is the
-/// "one clock discipline" of the module comment applied to the *transport*, and it is also
-/// what makes the microphone's format a checked value rather than a copy of a literal: a
-/// rate or channel count that disagrees with the PCM actually submitted shifts the
-/// microphone track against the other two streams instead of failing.
+/// Both audio inputs are declared here (the game audio from the constants above, the microphone
+/// from [`crate::MicAudioSpec`]), so they cannot be declared differently. A rate or channel count
+/// that disagrees with the PCM actually submitted shifts the track against the others instead of failing.
 fn audio_input_args(
     url: &str,
     sample_rate: u32,
@@ -442,31 +318,23 @@ fn audio_input_args(
     ]
 }
 
-/// The **complete** ffmpeg argument list for one recording child, program name excepted.
+/// The complete ffmpeg argument list for one recording child, program name excepted.
 ///
-/// Every argument this encoder ever passes is built here, as a pure function of the
-/// configuration and the two loopback URLs, and [`FfmpegEncoder::spawn`] does nothing with
-/// the result but hand it to `Command::args`. That is deliberate: it is what lets a test
-/// assert the whole argument list element for element, and in particular assert the
-/// microphone's contract — with [`EncodeConfig::mic_audio`] `None`, this vector is what it
-/// was before the second input existed, byte for byte
-/// (`the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list`).
+/// A pure function of the configuration and the two loopback URLs, so a test can assert the whole
+/// list element for element. With [`EncodeConfig::mic_audio`] `None` it is the one-track list
+/// byte for byte (`the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list`).
 ///
-/// `OsString` rather than `String` because the segment pattern at the end is a real path:
-/// an `EncodeConfig::scratch_dir` that is not valid UTF-8 must reach ffmpeg as the bytes it
-/// actually is. `Command::args` takes them as-is either way.
+/// `OsString` because the segment pattern is a real path: a non-UTF-8 `scratch_dir` must reach
+/// ffmpeg as the bytes it is.
 fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Vec<OsString> {
     let mut args: Vec<OsString> =
         ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
-    // (`-nostdin` is what keeps ffmpeg from consuming our stdin for interactive commands,
-    // which would steal raw video frames; `-loglevel error` is why a failure's reason is
-    // read out of stderr by `drain_stderr` rather than scraped from a progress line.)
+    // `-nostdin` keeps ffmpeg from consuming our stdin for interactive commands, which would steal
+    // raw video frames; `-loglevel error` is why a failure's reason is read from stderr by `drain_stderr`.
 
-    // Input 0 — video, in one of two shapes, and which one is the whole of Tier 2. Raw BGRA frames
-    // this process copied out of VRAM ([`video_input_args`], shared with the throughput probe), or
-    // an H.264 elementary stream it encoded *on the GPU* ([`video_input_args_bitstream`]). See
-    // [`VideoInput`] for what each costs — at 4K the difference is ~33 MB per frame against a few
-    // hundred kilobytes a second.
+    // Input 0, video, in one of two shapes: raw BGRA frames copied out of VRAM
+    // ([`video_input_args`], shared with the throughput probe), or an H.264 elementary stream
+    // encoded on the GPU ([`video_input_args_bitstream`]). See [`VideoInput`].
     args.extend(
         match cfg.video {
             VideoInput::RawPixels => video_input_args(cfg),
@@ -476,10 +344,8 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         .map(OsString::from),
     );
 
-    // Input 1 — system/game audio: raw s16le PCM over loopback TCP. This is the transport
-    // that works on Windows as well as here — see the module comment. Declared only when
-    // `game_audio` is on: `[audio] enabled = false` asks for a video-only recording, and a
-    // declared input feeds a track that would then have to be mapped, tagged and ended.
+    // Input 1, system/game audio: raw s16le PCM over loopback TCP (see the module comment). Declared
+    // only when `game_audio` is on, since a declared input would have to be mapped, tagged and ended.
     if cfg.game_audio {
         args.extend(
             audio_input_args(
@@ -493,9 +359,8 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         );
     }
 
-    // Input 2 — the microphone, when one was configured. Declared by the same function as
-    // input 1 and pumped by the same function too, so the second track cannot invent its
-    // own timing conventions; only the numbers come from the caller's `MicAudioSpec`.
+    // Input 2, the microphone, declared and pumped by the same functions as input 1 so the second
+    // track cannot invent its own timing conventions; only the numbers come from `MicAudioSpec`.
     if let Some(mic_url) = mic_url {
         let spec = cfg.mic_audio.expect(
             "a microphone URL is only ever passed when EncodeConfig::mic_audio is Some",
@@ -507,9 +372,8 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         );
     }
 
-    // What to do with input 0: scale (when asked for), codec, bitrate and the keyframe schedule —
-    // or, for a stream that arrived encoded, nothing but a copy. Shared with the probe for the same
-    // reason.
+    // What to do with input 0: scale, codec, bitrate and keyframe schedule, or a plain copy for a
+    // stream that arrived encoded. Shared with the probe.
     args.extend(
         match cfg.video {
             VideoInput::RawPixels => video_output_args(cfg),
@@ -518,32 +382,24 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         .into_iter()
         .map(OsString::from),
     );
-    // The audio codec and rate, which only exist when there is an audio input to encode. A
-    // `-c:a` with no audio stream is not an error ffmpeg reports — it is simply unused — but
-    // an argument list that mentions a track the recording does not have is the kind of thing
-    // a reader of `ffprobe` output has to resolve, so it is not passed.
+    // The audio codec and rate only exist when there is an audio input to encode; a `-c:a` with no
+    // audio stream is silently unused but misleading, so it is not passed.
     if cfg.game_audio {
         args.extend(["-c:a", "aac", "-b:a"].iter().map(OsString::from));
         args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
     }
 
-    // Only with a second audio input does the output have to be mapped explicitly: with
-    // ONE audio input ffmpeg's default stream selection already picks exactly input 0's
-    // video and input 1's audio, which is why the single-track list has never carried a
-    // `-map` (and why it still must not: with `mic_audio: None` the list is unchanged).
-    // With two audio inputs the default would pick ONE of them, so both are mapped and both
-    // are tagged — a two-track container whose tracks cannot be told apart is not the
-    // feature. Input order is the source of both indices: 1 is the game audio, which
-    // `Encoder::submit_audio` feeds, and 2 the microphone, which `Encoder::submit_mic_audio`
-    // feeds. (A microphone with `game_audio` off would shift those indices, which is why that
-    // combination is refused at spawn rather than mapped here.)
+    // Only with a second audio input does the output need an explicit `-map`: with one, ffmpeg's
+    // default selection already picks input 0's video and input 1's audio (and the single-track
+    // list must stay unchanged). With two, the default would pick one, so both are mapped and
+    // tagged. Input order sets the indices: 1 is the game audio (`Encoder::submit_audio`), 2 the
+    // microphone (`Encoder::submit_mic_audio`); a microphone with `game_audio` off would shift them,
+    // which is why that combination is refused at spawn.
     if mic_url.is_some() {
         args.extend(["-map", "0:v", "-map", "1:a", "-map", "2:a"].iter().map(OsString::from));
-        // The two tag strings come from `localplay-media`, which has to apply the same names
-        // again when it concatenates segments into a clip or a session file: a `-c copy` does
-        // not carry per-stream metadata, so these names are written twice in a recording's
-        // life, and two literals free to drift is exactly how a track ends up anonymous in the
-        // file the user opens.
+        // The tag strings come from `localplay-media`, which applies the same names again when it
+        // concatenates segments (`-c copy` does not carry per-stream metadata); two literals could drift
+        // and leave a track anonymous.
         for (index, title) in localplay_media::edit::audio_titles(2).iter().enumerate() {
             args.push(format!("-metadata:s:a:{index}").into());
             args.push(format!("title={title}").into());
@@ -556,34 +412,24 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
             args.extend(["-segment_time"].iter().map(OsString::from));
             args.push(keyframe_seconds(cfg).to_string().into());
             args.extend(["-segment_format", "mp4"].iter().map(OsString::from));
-            // Each segment starts at zero, which is what the concat at clip time relies on
-            // (spec §6.3): every segment is a self-contained unit starting at t=0.
+            // Each segment starts at zero, which the concat at clip time relies on.
             args.extend(["-reset_timestamps", "1"].iter().map(OsString::from));
-            // Continue the numbering instead of restarting it. ffmpeg's segment muxer supports
-            // this as `segment_start_number`; plain `-start_number` is *not* an option of this
-            // muxer and is silently ignored (measured: with `-start_number 5` the first file was
-            // still `seg-000000.mp4`), which would leave the encoder overwriting files the adopted
-            // ledger still names.
+            // Continue the numbering instead of restarting it. The segment muxer's option is
+            // `segment_start_number`; plain `-start_number` is silently ignored (with `-start_number 5` the
+            // first file was still `seg-000000.mp4`), which would overwrite files the adopted ledger names.
             args.extend(["-segment_start_number"].iter().map(OsString::from));
             args.push(cfg.start_number.to_string().into());
             args.push(cfg.scratch_dir.join(SEGMENT_PATTERN).into());
         }
         EncodeOutput::FragmentedStream => {
-            // A stream, not files: fragmented MP4 on the child's stdout, so nothing is written
-            // to the SSD while the user is merely waiting for something worth clipping.
+            // A stream, not files: fragmented MP4 on the child's stdout, so nothing is written to the SSD
+            // while the user is only waiting for something worth clipping.
             //
-            // `frag_keyframe` is what keeps `segment_ms` meaningful here. It starts a new
-            // fragment on every keyframe, and `video_output_args` already forces one per
-            // `segment_ms` (`-force_key_frames expr:gte(t,n_forced*…`) for the segmenter's
-            // sake — so a fragment boundary IS a segment boundary, the same cut granularity
-            // from the same interval, with no second keyframe argument to keep in step.
-            // Without it ffmpeg would fragment on its own schedule and a range of fragments
-            // would not line up with the trigger.
-            //
-            // `empty_moov` + `default_base_moof` make the stream self-describing from the
-            // first byte and free of a seek-back-to-patch-the-header requirement, which is
-            // what a pipe cannot provide. Measured shape: a 1249-byte `ftyp`+`moov`, then one
-            // `moof`+`mdat` per second carrying a monotonic `tfdt`.
+            // `frag_keyframe` starts a new fragment on every keyframe, and `video_output_args` already
+            // forces one per `segment_ms`, so a fragment boundary is a segment boundary with no second
+            // keyframe argument to keep in step. `empty_moov` + `default_base_moof` make the stream
+            // self-describing from the first byte, with no seek-back to patch the header (impossible on a
+            // pipe): a 1249-byte `ftyp`+`moov`, then one `moof`+`mdat` per second with a monotonic `tfdt`.
             args.extend(["-f", "mp4"].iter().map(OsString::from));
             args.extend(
                 ["-movflags", "empty_moov+frag_keyframe+default_base_moof"]
@@ -602,83 +448,61 @@ const SEGMENT_PATTERN: &str = "seg-%06d.mp4";
 
 pub struct FfmpegEncoder {
     child: Child,
-    /// The child's stdout, when it was spawned with [`EncodeOutput::FragmentedStream`].
-    ///
-    /// Taken by the first caller that asks (`Encoder::take_output_stream`), because a pipe has
-    /// exactly one reader: whoever holds it owns the stream, and the buffer that keeps the last
-    /// minute of footage in memory is the thing that should.
+    /// The child's stdout, when spawned with [`EncodeOutput::FragmentedStream`]. Taken by the first
+    /// caller (`Encoder::take_output_stream`): a pipe has one reader, which should be the in-memory buffer.
     output_stream: Option<std::process::ChildStdout>,
     video_tx: Option<SyncSender<Vec<u8>>>,
     audio_tx: Option<SyncSender<Vec<u8>>>,
-    /// The microphone's queue into its own pump thread. `None` when the child was spawned
-    /// without a second audio input — see [`EncodeConfig::mic_audio`].
+    /// The microphone's queue into its own pump thread; `None` without a second audio input.
     mic_tx: Option<SyncSender<Vec<u8>>>,
     video_writer: Option<WriterHandle>,
     audio_writer: Option<WriterHandle>,
     mic_writer: Option<WriterHandle>,
     encoder_name: &'static str,
-    /// The geometry the rawvideo pipe was declared with (`-s {w}x{h}`), reported back to
-    /// the caller so a frame of any other size can be refused instead of being sliced
-    /// into the pipe at the wrong stride (see `Encoder::source_size`).
+    /// The geometry the rawvideo pipe was declared with (`-s {w}x{h}`), so a frame of any other size
+    /// can be refused instead of sliced at the wrong stride (`Encoder::source_size`).
     source_size: (u32, u32),
-    /// The rate the rawvideo pipe was declared with (`-framerate {fps}`), reported back so
-    /// the caller that paces capture can pace to exactly the number the child was told
-    /// (see `Encoder::input_fps`).
+    /// The rate the rawvideo pipe was declared with (`-framerate {fps}`), so the caller paces
+    /// capture to exactly the number the child was told (`Encoder::input_fps`).
     input_fps: u32,
-    /// Whether this encoder takes GPU textures rather than pixels, carried from the config that
-    /// built it: the answer is what the caller uses to decide whether to ask capture for textures
-    /// at all, and asking an encoder that wants pixels would produce frames it then refuses.
+    /// Whether this encoder takes GPU textures rather than pixels, carried from its config; the
+    /// caller decides what to ask capture for from it.
     accepts_textures: bool,
     /// The hardware encoder MFT, when this is a [`VideoInput::EncodedBitstream`] encoder.
     ///
-    /// Opened lazily from the first frame rather than at construction, because it takes its device
-    /// from a frame (`MftEncoder::open_for_texture`): the device is the capture path's, and asking
-    /// the texture is how that is guaranteed rather than promised.
+    /// Opened lazily from the first frame, because it takes its device from the frame's texture
+    /// (`MftEncoder::open_for_texture`), which guarantees it is the capture path's device.
     #[cfg(windows)]
-    /// The hardware encoder, on its own thread — see [`crate::mft::MftFeed`].
+    /// The hardware encoder, on its own thread (see [`crate::mft::MftFeed`]).
     mft: Option<crate::mft::MftFeed>,
-    /// The loopback port the microphone input was bound to, reported by
-    /// `Encoder::mic_port`. `None` when there is no microphone input.
+    /// The loopback port the microphone input was bound to (`Encoder::mic_port`).
     mic_port: Option<u16>,
-    /// What the child was told the microphone input is (`-f/-ar/-ac`), kept so
-    /// [`Encoder::submit_mic_audio`] can refuse a block whose own format disagrees with the
-    /// declaration instead of putting the track on a timeline of the wrong length.
+    /// What the child was told the microphone input is (`-f/-ar/-ac`), so
+    /// [`Encoder::submit_mic_audio`] can refuse a block whose format disagrees with it.
     mic_spec: Option<crate::MicAudioSpec>,
-    /// Whether this encoder has the game-audio input at all. `false` is a video-only recording:
-    /// no listener, no `-c:a` in the argument list and no writer thread, so
-    /// [`Encoder::submit_audio`] refuses a block rather than queueing it nowhere and
-    /// [`Encoder::finish`] has no game-audio writer to join.
+    /// Whether this encoder has the game-audio input at all. `false` is video-only: no listener, no
+    /// `-c:a`, no writer thread, and [`Encoder::submit_audio`] refuses a block.
     game_audio: bool,
-    /// Frames dropped because a queue was full. Atomics because the count is written on
-    /// the submitting thread and read through `&self` (see `Encoder::dropped_frames`).
+    /// Frames dropped because a queue was full. Atomic: written on the submitting thread, read through `&self`.
     dropped_video: AtomicU64,
     dropped_audio: AtomicU64,
-    /// Microphone blocks dropped, for the same reason and by the same mechanism as
-    /// [`FfmpegEncoder::dropped_audio`].
+    /// Microphone blocks dropped, like [`FfmpegEncoder::dropped_audio`].
     dropped_mic_audio: AtomicU64,
-    /// Text already read out of ffmpeg's stderr, which a pipe can only give up once
-    /// (see [`FfmpegEncoder::drain_stderr`]). Two different reports can want it — the
-    /// writer failure that explains a dead encoder, and [`Encoder::finish`] — and the
-    /// second one must not be left saying nothing.
+    /// Text already read out of ffmpeg's stderr, which a pipe gives up only once (see
+    /// [`FfmpegEncoder::drain_stderr`]); both the writer-failure report and [`Encoder::finish`] may want it.
     drained_stderr: Option<String>,
-    /// The reader thread still blocked on ffmpeg's stderr, when one is in flight.
+    /// The reader thread still blocked on ffmpeg's stderr, if one is in flight.
     ///
-    /// Kept across calls so that a budget which expired *before* the words arrived does not
-    /// throw the reader away: the thread is still sitting on the pipe, and a later report —
-    /// with whatever budget it has — can collect what the child eventually writes. See
-    /// [`FfmpegEncoder::drain_stderr`].
+    /// Kept across calls so a budget that expired before the words arrived does not discard the
+    /// reader; a later report can collect what the child eventually writes.
     stderr_drain: Option<mpsc::Receiver<String>>,
 }
 
 impl FfmpegEncoder {
     pub fn spawn(bin: &FfmpegBinaries, cfg: &EncodeConfig) -> Result<Self> {
-        // Refused before anything is created or launched, because this is a *configuration*
-        // contradiction rather than a runtime failure and the caller should hear about it as one.
-        //
-        // An encoded bitstream cannot be scaled here: scaling means decoding, decoding means the
-        // pixels, and the pixels are the cost [`VideoInput::EncodedBitstream`] exists to remove. The
-        // alternative — quietly ignoring `output_size` and emitting the capture's size — would give
-        // the user a recording of the wrong geometry and no indication of why.
+        // Refused before anything is created, as a configuration contradiction. An encoded bitstream
+        // cannot be scaled here (scaling means decoding, the cost this variant removes), and silently
+        // emitting the capture's size would give the wrong geometry with no explanation.
         if cfg.video == VideoInput::EncodedBitstream && cfg.source_size != cfg.output_size {
             bail!(
                 "an encoded bitstream cannot be scaled by ffmpeg, and this encoder was asked for \
@@ -694,15 +518,11 @@ impl FfmpegEncoder {
         std::fs::create_dir_all(&cfg.scratch_dir)
             .with_context(|| format!("creating {}", cfg.scratch_dir.display()))?;
 
-        // Audio comes in over loopback TCP. Bind before spawning the child: the port
-        // has to be in the argument list, and `:0` makes the OS pick a free one, which
-        // we read back from the socket rather than guessing (racing another process
-        // for a fixed port is exactly what this avoids).
+        // Audio comes in over loopback TCP. Bind before spawning the child: the port is in the argument
+        // list, and `:0` lets the OS pick a free one, read back from the socket (no racing for a fixed port).
         //
-        // `[audio] enabled = false` is the exception and it is handled first: a video-only
-        // recording binds no listener and names no port, so there is no input to feed and no
-        // track to end. What it must *not* become is a second, quieter thing — see the refusal
-        // below, which is about the one combination that cannot be recorded honestly.
+        // `[audio] enabled = false` is handled first: a video-only recording binds no listener and
+        // names no port, so there is no input to feed and no track to end.
         let game_audio_input: Option<(TcpListener, u16)> = if cfg.game_audio {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .context("binding the audio input listener on 127.0.0.1")?;
@@ -714,21 +534,16 @@ impl FfmpegEncoder {
         } else {
             None
         };
-        // `ffmpeg_args` is the only reader, and it reads this only when `cfg.game_audio` is on:
-        // the URL exists as an argument exactly when the input does.
+        // `ffmpeg_args` reads this only when `cfg.game_audio` is on: the URL exists exactly when the input does.
         let audio_url = game_audio_input
             .as_ref()
             .map(|(_, port)| format!("tcp://127.0.0.1:{port}"))
             .unwrap_or_default();
 
-        // A microphone with no game audio is a *configuration* contradiction, like the scaling
-        // one above, and is refused here for the same reason: it would otherwise be recorded as
-        // something the file misdescribes. The container's audio tracks are named by position —
-        // `localplay_media::edit::audio_titles` calls the first `Game Audio` and the second
-        // `Microphone` — so this combination produces a one-track file labelled `Game Audio` that
-        // carries a voice, and every reader of it, this crate's splicer included, would believe
-        // the label. Refused rather than relabelled: the naming convention is not this function's
-        // to reinvent.
+        // A microphone with no game audio is refused like the scaling case above. Audio tracks are named
+        // by position (`localplay_media::edit::audio_titles`: `Game Audio`, then `Microphone`), so this
+        // would produce a one-track file labelled `Game Audio` that carries a voice. Refused rather than
+        // relabelled.
         if !cfg.game_audio && cfg.mic_audio.is_some() {
             bail!(
                 "a microphone without the game audio cannot be labelled: this build names a \
@@ -738,11 +553,9 @@ impl FfmpegEncoder {
             );
         }
 
-        // The microphone is a SECOND listener of exactly the same kind, bound at the same
-        // point (before the child exists) because its port has to be in the argument list
-        // too. Binding here is also what makes "the microphone could not be brought up" a
-        // failure of the start rather than a recording that quietly carries one track: a
-        // bind that fails returns from `spawn` with the error, and nothing is recorded.
+        // The microphone is a second listener of the same kind, bound before the child exists because
+        // its port is in the argument list. A failed bind fails the start rather than yielding a
+        // recording that quietly carries one track.
         let mic: Option<(TcpListener, u16)> = match cfg.mic_audio {
             Some(_) => {
                 let listener = TcpListener::bind("127.0.0.1:0")
@@ -759,16 +572,12 @@ impl FfmpegEncoder {
 
         let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
         cmd
-            // The whole argument list, built in one place so that what a test asserts is
-            // what the child is spawned with — see [`ffmpeg_args`], which is also where the
-            // microphone's input/mapping/tagging lives and where the byte-identical
-            // contract for `mic_audio: None` is explained.
+            // The whole argument list is built in [`ffmpeg_args`] so what a test asserts is what the child
+            // is spawned with.
             .args(ffmpeg_args(cfg, &audio_url, mic_url.as_deref()))
             .stdin(Stdio::piped())
-            // Stdout carries the encoded stream in `FragmentedStream` mode and nothing at all in
-            // `Segmented` mode (it used to carry the audio pipe, before that moved to loopback
-            // TCP). In `Segmented` mode it is routed to the null device so ffmpeg can never
-            // write into *our* stdout, where a stray byte would corrupt a caller's output.
+            // Stdout carries the encoded stream in `FragmentedStream` mode. In `Segmented` mode it goes to
+            // the null device so ffmpeg can never write into our stdout.
             .stdout(match cfg.output {
                 EncodeOutput::Segmented => Stdio::null(),
                 EncodeOutput::FragmentedStream => Stdio::piped(),
@@ -783,18 +592,14 @@ impl FfmpegEncoder {
             )
         })?;
 
-        // Video goes to the child's stdin; the audio listeners are moved into their
-        // threads, which accept ffmpeg's connections there.
-        //
-        // Stdout is the *output* in `FragmentedStream` mode, so it is taken here and kept for
-        // the caller that owns the in-memory buffer. In `Segmented` mode it was routed to the
-        // null device and `take()` yields `None`.
+        // Video goes to the child's stdin; the audio listeners move into their threads, which accept
+        // ffmpeg's connections. In `FragmentedStream` mode stdout is taken here for the caller that owns
+        // the in-memory buffer; in `Segmented` mode `take()` yields `None`.
         let output_stream = child.stdout.take();
         let video_in = child.stdin.take().context("child stdin unavailable")?;
 
         let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
-        // The hardware encoder's thread writes into this same video queue, so a frame's journey to
-        // ffmpeg is the same one whether it was encoded in this process or by the child.
+        // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream)
             .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, video_tx.clone()));
@@ -803,10 +608,9 @@ impl FfmpegEncoder {
             .spawn(move || pump(video_rx, video_in))
             .context("spawning video writer thread")?;
 
-        // The game-audio queue and its writer thread exist only when the input does, which is why
-        // both fields are `Option`s. `pump_audio` accepts the child's connection under a deadline,
-        // so this thread's result is also how a start that declared an input ffmpeg never opened is
-        // reported — the `audio_res` branch in `finish`.
+        // The game-audio queue and writer exist only when the input does. `pump_audio` accepts the
+        // child's connection under a deadline, so this thread's result is also how a declared input
+        // ffmpeg never opened is reported (the `audio_res` branch in `finish`).
         let (audio_tx, audio_writer) = match game_audio_input {
             Some((listener, port)) => {
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
@@ -819,12 +623,9 @@ impl FfmpegEncoder {
             None => (None, None),
         };
 
-        // The microphone pump is a thread of its own, and that is not tidiness: ffmpeg
-        // will not pull one input far ahead of the other, so a single thread writing both
-        // audio inputs would deadlock as soon as either socket's buffer filled (the module
-        // comment on threading; this bug was fixed once already). It runs the same
-        // `pump_audio` as the game audio — same accept-with-deadline, same blocking-mode
-        // fix, same drop policy — so the two tracks cannot diverge in timing conventions.
+        // The microphone pump is a thread of its own: a single thread writing both audio inputs
+        // deadlocks as soon as either socket's buffer fills. It runs the same `pump_audio` (accept with
+        // deadline, blocking-mode fix, drop policy), so the tracks share timing conventions.
         let (mic_tx, mic_writer, mic_port) = match mic {
             Some((listener, port)) => {
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
@@ -849,10 +650,9 @@ impl FfmpegEncoder {
             encoder_name: cfg.encoder_name(),
             source_size: cfg.source_size,
             input_fps: cfg.fps,
-            // Carried from the config rather than derived from the child's arguments: the answer is
-            // what the caller asks capture for, and it has to be available before a frame exists.
+            // Carried from the config: capture is asked before a frame exists.
             accepts_textures: cfg.accepts_textures(),
-            // Opened on the first frame, on its own thread — see the field.
+            // Opened on the first frame, on its own thread (see the field).
             #[cfg(windows)]
             mft,
             mic_port,
@@ -868,8 +668,7 @@ impl FfmpegEncoder {
     }
 }
 
-/// Copy queued chunks into a sink until the sender half is dropped, then close it.
-/// Returning ends the function, dropping `sink` and signalling EOF to ffmpeg.
+/// Copy queued chunks into a sink until the sender half is dropped, then close it (EOF to ffmpeg).
 fn pump<W: Write>(rx: mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<()> {
     for chunk in rx {
         sink.write_all(&chunk)?;
@@ -879,13 +678,9 @@ fn pump<W: Write>(rx: mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<(
 
 /// Accept ffmpeg's connection to the audio input, then stream the queued PCM into it.
 ///
-/// Dropping the socket at the end closes it, which is ffmpeg's EOF on the audio input.
-///
-/// `what` names the input in anything that fails (`"audio"` for the game/system input,
-/// `"microphone"` for the second one). Both inputs run this exact function — same accept
-/// with a deadline, same accepted-socket fix, same write loop — which is what the module
-/// comment means by one clock discipline: the microphone is not a second implementation of
-/// the transport, it is the same one on a different port.
+/// Dropping the socket at the end is ffmpeg's EOF on the input. `what` names the input in
+/// failures (`"audio"` or `"microphone"`); both run this same function, which is what makes the
+/// microphone share the game audio's clock discipline.
 fn pump_audio(
     listener: TcpListener,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -893,8 +688,7 @@ fn pump_audio(
     what: &str,
 ) -> std::io::Result<()> {
     let stream = accept_within(&listener, port, AUDIO_CONNECT_TIMEOUT, what)?;
-    // PCM arrives in small blocks (10ms = 1920 bytes at 48kHz stereo s16le) and ffmpeg
-    // is reading them in real time, so Nagle would add nothing but latency here.
+    // PCM arrives in small blocks (10ms = 1920 bytes at 48kHz stereo s16le) read in real time, so Nagle only adds latency.
     stream.set_nodelay(true).map_err(|e| {
         std::io::Error::new(e.kind(), format!("disabling Nagle on the {what} input socket: {e}"))
     })?;
@@ -903,15 +697,10 @@ fn pump_audio(
 
 /// Accept one connection, giving up after `timeout`.
 ///
-/// The listener is switched to non-blocking and polled rather than parked in a
-/// blocking `accept()`. If ffmpeg fails to start — bad arguments, a missing encoder, a
-/// child that exited on its own — nothing ever dials the port, and an indefinite
-/// `accept()` would hang `finish()` for no stated reason. Polling turns that into a
-/// message naming the port and the deadline. `WouldBlock` is the only error that means
-/// "not yet"; anything else is a real failure and is returned as-is.
-///
-/// `what` names the input the listener belongs to (`"audio"` / `"microphone"`) in the
-/// failure messages; it changes no behaviour.
+/// The listener is non-blocking and polled rather than parked in `accept()`: if ffmpeg fails to
+/// start nothing ever dials the port, and an indefinite `accept()` would hang `finish()`.
+/// `WouldBlock` is the only "not yet" error; anything else is returned as-is. `what` only
+/// shapes the failure messages.
 fn accept_within(
     listener: &TcpListener,
     port: u16,
@@ -928,33 +717,22 @@ fn accept_within(
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
-                // Belt and braces for the zero-egress note above: the listener is bound
-                // to loopback, so a non-loopback peer would mean our assumption about
-                // this socket is wrong, and PCM would be going somewhere unexpected.
+                // Belt and braces for the zero-egress note above: a non-loopback peer would mean PCM is going somewhere unexpected.
                 if !peer.ip().is_loopback() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("{what} input connection from non-loopback peer {peer}"),
                     ));
                 }
-                // The listener is non-blocking SOLELY so this poll loop can enforce a
-                // connect deadline; that has no business leaking into the stream we
-                // hand to the pump. BSD-derived platforms (macOS included) propagate
-                // O_NONBLOCK from the listener to the socket `accept()` returns, while
-                // Linux does not — so without this line the accepted socket is
-                // non-blocking only on the very host this suite runs on. A
-                // non-blocking socket makes `write_all` fail with `WouldBlock`
-                // (`EAGAIN`, os error 35) the instant ffmpeg's receive buffer fills,
-                // which is a race on how fast the pump fills it: the intermittent
-                // failure this line fixes, and the one that bit the game-audio input
-                // twice (docs/platform-traps.md, trap 1). The microphone listener is a
-                // SECOND copy of this accept path, so it needs this line for exactly the
-                // same reason — not "probably fine because the audio one works".
-                // A blocking accepted socket is the correct design here: the pump runs on
-                // its own dedicated thread fed by a bounded channel, so the backpressure
-                // of a blocking write can still never propagate to `submit_audio` /
-                // `submit_mic_audio` on the caller's thread: the submit drops the block
-                // instead of waiting for room (see `enqueue_or_drop`).
+                // The listener is non-blocking only so this poll loop can enforce a connect deadline; that must
+                // not leak into the stream handed to the pump. BSD-derived platforms (macOS included) propagate
+                // O_NONBLOCK from the listener to the accepted socket, Linux does not, so without this line the
+                // socket is non-blocking only on macOS. A non-blocking socket makes `write_all` fail with
+                // `WouldBlock` (`EAGAIN`, os error 35) the instant ffmpeg's receive buffer fills: an
+                // intermittent failure that bit the game-audio input twice. The microphone listener is a second
+                // copy of this accept path and needs the line for the same reason.
+                // Blocking is safe: the pump has its own thread fed by a bounded channel, so backpressure never
+                // reaches `submit_audio`/`submit_mic_audio`, which drop the block instead (`enqueue_or_drop`).
                 stream.set_nonblocking(false).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
@@ -983,36 +761,24 @@ fn accept_within(
 impl Encoder for FfmpegEncoder {
     /// Queue the frame for the rawvideo pipe, or drop it if the queue is full.
     ///
-    /// The frame is taken by value and its pixel buffer is moved into the queue — that
-    /// is what the ownership in the trait signature is for. The clone this replaces
-    /// copied 3840x2160 BGRA (33.2MB) per frame, ~1GB/s of pure memcpy at 30fps on the
-    /// path that is failing to keep up.
+    /// The frame's pixel buffer is moved into the queue, not cloned (33.2MB per 3840x2160 BGRA frame).
     ///
-    /// `try_send` rather than `send`, and a drop rather than an error, because this is a
-    /// live capture: this call sits in the same loop that has to keep pulling frames off
-    /// the capture backend, so blocking here would take the latency budget from a stream
-    /// that cannot be paused, and failing would stop recording because the GPU fell a few
-    /// milliseconds behind. Dropping the frame is the correct behaviour for a live
-    /// stream — the timeline is the wall clock (module comment), so a missing frame is a
-    /// brief repeat of its predecessor, not a shift of everything after it.
+    /// `try_send` and a drop rather than an error: this sits in the loop that must keep pulling
+    /// frames from a live capture, so blocking would eat the latency budget and failing would stop
+    /// recording because the GPU fell a few milliseconds behind. The timeline is the wall clock, so
+    /// a missing frame is a brief repeat, not a shift of everything after it. The drop is counted
+    /// (`Encoder::dropped_frames`) so a soak sees it.
     ///
-    /// The count is what stops the drop from being silent: `Encoder::dropped_frames`
-    /// reports it and the CLI logs it, so a soak sees the loss instead of inferring it.
-    ///
-    /// A disconnected channel is a different matter — the writer thread is gone, ffmpeg
-    /// is not reading, and nothing submitted afterwards can be encoded, so that is an
-    /// error rather than a drop. That error carries ffmpeg's own exit status and stderr
-    /// when they are known by then, because "video writer thread has stopped" is the
-    /// symptom, not the cause ([`FfmpegEncoder::explain_dead_writer`]).
+    /// A disconnected channel means the writer thread is gone and nothing can be encoded, so that is
+    /// an error, carrying ffmpeg's exit status and stderr when known (the writer error is only the
+    /// symptom; see [`FfmpegEncoder::explain_dead_writer`]).
     fn submit_video(&mut self, frame: Frame) -> Result<()> {
-        // The frame's geometry is checked by the caller (`pump_once_counted`), which is
-        // the only place that holds both the frame and the pipe's declared size.
+        // The frame's geometry is checked by the caller (`pump_once_counted`), the only place holding
+        // both the frame and the pipe's declared size.
         //
-        // A frame whose pixels are a GPU texture is encoded **here**, by the hardware MFT, and what
-        // reaches the queue is the H.264 it produced: a few kilobytes where the pixels would have
-        // been tens of megabytes. That is the whole of the hybrid from this function's point of
-        // view — the queue below, the writer thread behind it and the child's arguments are all
-        // unchanged, which is why the video input and codec are the only things that differ.
+        // A GPU-texture frame is encoded here by the hardware MFT and the H.264 it produced reaches the
+        // queue (kilobytes instead of tens of megabytes); the queue, writer thread and child arguments
+        // are unchanged.
         #[cfg(windows)]
         if let Some(texture) = frame.texture {
             let bytes = self.encode_texture(texture, frame.pts)?;
@@ -1023,12 +789,10 @@ impl Encoder for FfmpegEncoder {
             return queued.map_err(|e| self.explain_dead_writer(e));
         }
 
-        // What the caller cannot check is whether the frame has **pixels** at all. A frame whose
-        // pixels stayed in VRAM has an empty `data` by design (`localplay_capture::Frame`), and
-        // this encoder writes `data` to the child's stdin — so accepting one would feed ffmpeg a
-        // zero-length rawvideo frame, which it would read as the *next* frame's leading bytes.
-        // The result is a stream desync that surfaces as corruption seconds later with nothing
-        // pointing back here, which is exactly the class of failure worth an explicit refusal.
+        // The caller cannot check whether the frame has pixels at all. A frame whose pixels stayed in
+        // VRAM has an empty `data` by design (`localplay_capture::Frame`); writing it would feed ffmpeg
+        // a zero-length frame that it reads as the next frame's leading bytes, a stream desync that
+        // surfaces as corruption seconds later. Refuse it explicitly.
         if !frame.has_pixels() {
             bail!(
                 "this frame's pixels are not in CPU memory, and this encoder feeds ffmpeg a raw                  byte stream: a zero-length frame would be read as the next frame's bytes. A                  frame must carry pixels to reach this encoder."
@@ -1041,12 +805,11 @@ impl Encoder for FfmpegEncoder {
         queued.map_err(|e| self.explain_dead_writer(e))
     }
 
-    /// Queue an audio block, or drop it if the queue is full. Same reasoning as
-    /// [`Encoder::submit_video`]; the counter is `Encoder::dropped_audio_blocks`.
+    /// Queue an audio block, or drop it if the queue is full; same reasoning as
+    /// [`Encoder::submit_video`], counted in `Encoder::dropped_audio_blocks`.
     fn submit_audio(&mut self, audio: AudioBuffer) -> Result<()> {
-        // Refused, not dropped, when this encoder was never given an audio input at all: a caller
-        // feeding a track the recording does not have is a wiring mistake, not a full queue. Same
-        // shape and same reasoning as `submit_mic_audio`'s refusal.
+        // Refused, not dropped, when there is no audio input: feeding a track the recording lacks is a
+        // wiring mistake, not a full queue (same as `submit_mic_audio`).
         refuse_audio_without_input(self.game_audio)?;
         let queued = match self.audio_tx.as_ref() {
             Some(tx) => enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio"),
@@ -1055,17 +818,13 @@ impl Encoder for FfmpegEncoder {
         queued.map_err(|e| self.explain_dead_writer(e))
     }
 
-    /// Queue a **microphone** block on the second input, or drop it if that queue is full.
-    /// Same reasoning and the same drop counting as [`Encoder::submit_audio`]; the counter
-    /// is `Encoder::dropped_mic_audio_blocks`.
+    /// Queue a microphone block on the second input, or drop it if that queue is full; counted in
+    /// `Encoder::dropped_mic_audio_blocks`.
     ///
-    /// Unlike the game audio (whose format is a constant of the pipeline), the microphone's
-    /// format is what the *caller* declared in `EncodeConfig::mic_audio`, and it is what the
-    /// child was told (`-f/-ar/-ac`). A block whose own format disagrees with that
-    /// declaration is refused rather than queued: the bytes would be read as a different
-    /// length, so the microphone track would sit on a timeline of the wrong length for the
-    /// whole clip and nothing downstream could tell. Same failure mode as a frame of the
-    /// wrong geometry on the video pipe (`Encoder::source_size`), so the same answer.
+    /// The microphone's format is what the caller declared in `EncodeConfig::mic_audio` and what the
+    /// child was told (`-f/-ar/-ac`). A block whose own format disagrees is refused: its bytes
+    /// would be read as a different length and the track would sit on a wrong timeline for the
+    /// whole clip, undetectably (like a wrong-geometry frame, `Encoder::source_size`).
     fn submit_mic_audio(&mut self, audio: AudioBuffer) -> Result<()> {
         let Some(tx) = self.mic_tx.as_ref() else {
             bail!(
@@ -1094,16 +853,13 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn finish(&mut self) -> Result<()> {
-        // The hardware encoder's tail goes into the queue **before** the senders are dropped: a
-        // drain is what makes the last frames of a stream real, and after this line the pipe they
-        // belong in is closing. Best-effort with a warning rather than a failure — a recording
-        // missing its last few frames is worth more than one the user never gets because a drain
-        // timed out at the end of it.
+        // The hardware encoder's tail goes into the queue before the senders are dropped: the drain
+        // makes the last frames real, and the pipe is closing after this line. Best-effort with a
+        // warning, since a recording missing a few frames beats none because a drain timed out.
         #[cfg(windows)]
-        // The encoder's thread is closed and joined **before** the video sender is dropped: it holds
-        // a clone of that sender, and dropping ours first would tell ffmpeg the video had ended while
-        // the last frames were still on their way. Closing the queue ends its loop after the frames
-        // already in it have been taken, so nothing in flight is lost.
+        // The encoder's thread is closed and joined before the video sender is dropped: it holds a
+        // clone of that sender, and dropping ours first would tell ffmpeg the video had ended while the
+        // last frames were still on their way.
         #[cfg(windows)]
         if let Some(mut mft) = self.mft.take() {
             mft.shutdown();
@@ -1117,46 +873,39 @@ impl Encoder for FfmpegEncoder {
             }
         }
 
-        // Dropping the senders ends each pump loop, closing the video pipe and the
-        // audio sockets — which is what tells ffmpeg the inputs have ended.
+        // Dropping the senders ends each pump loop, closing the video pipe and audio sockets, which tells ffmpeg the inputs ended.
         self.video_tx.take();
         self.audio_tx.take();
         self.mic_tx.take();
 
-        // **The child is waited for first, and with a deadline.** This order is what makes the
-        // shutdown bounded, and getting it wrong is what this file's eight-minute hang was.
+        // The child is waited for first, and with a deadline. This order bounds the shutdown; getting
+        // it wrong caused an eight-minute hang.
         //
-        // A writer thread ends when its pipe does, and its pipe only breaks when ffmpeg stops
-        // reading or exits — so joining the writers *before* waiting on the child means a child that
-        // never exits takes the whole shutdown with it, silently, with the logger already stopped.
-        // Closing the inputs, bounding the wait, then joining gives every step a way out: a child
-        // that will not go is killed, its death breaks the pipes, and the writers follow.
+        // A writer thread ends when its pipe does, and the pipe only breaks when ffmpeg stops reading
+        // or exits, so joining the writers before waiting on the child lets a child that never exits
+        // take the whole shutdown with it. Close the inputs, bound the wait, then join: a child that
+        // will not go is killed, its death breaks the pipes, and the writers follow.
         //
-        // Bounded rather than patient because a recording tool that does not stop when asked is a
-        // worse defect than a slow one, and because a killed ffmpeg is *reported* below rather than
-        // passed over: its status and stderr are how a failed start explains itself.
+        // A killed ffmpeg is reported below, since its status and stderr explain a failed start.
         let status = wait_bounded(&mut self.child, SHUTDOWN_BUDGET);
 
-        // Join every writer before reporting: an audio thread may still be waiting
-        // out its connect deadline, and abandoning it would leave a listener that a
-        // later connection could reach after this encoder is done. Its own deadline bounds it, and
-        // the child's death above bounds the video writer.
+        // Join every writer before reporting: an audio thread may still be waiting out its connect
+        // deadline, and abandoning it would leave a listener a later connection could reach. Its own
+        // deadline bounds it, and the child's death above bounds the video writer.
         let video_res = join_writer(self.video_writer.take(), "video");
         let audio_res = join_writer(self.audio_writer.take(), GAME_AUDIO_LABEL);
         let mic_res = join_writer(self.mic_writer.take(), MICROPHONE_LABEL);
 
-        // The connect deadline is the one failure that leaves ffmpeg alive but silent:
-        // it never opened the input, so it never read video either, and waiting on it
-        // below would block forever. Kill it, then report the deadline along with
-        // whatever it managed to log. Either audio input hitting that deadline has the
-        // same consequence and the same handling — and past this point the report names
-        // which input it was, because `pump_audio` puts the label in the message.
+        // The connect deadline is the one failure that leaves ffmpeg alive but silent: it never opened
+        // the input, so it never read video either, and waiting on it would block forever. Kill it and
+        // report the deadline with whatever it logged. Either audio input hitting it is handled the
+        // same way; `pump_audio` puts the input's label in the message.
         let deadline = [audio_res.as_ref().err(), mic_res.as_ref().err()]
             .into_iter()
             .flatten()
             .find(|err| is_connect_deadline(err));
         if let Some(err) = deadline {
-            // Already waited for, and killed if it would not go: this reports rather than waits.
+            // Already waited for (and killed if it would not go): this reports rather than waits.
             let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
             bail!(
                 "{err:#}; ffmpeg status after the deadline was {}, stderr: {}",
@@ -1167,9 +916,8 @@ impl Encoder for FfmpegEncoder {
             );
         }
 
-        // ffmpeg's own exit status and stderr explain a failed start (a bad encoder
-        // name, for instance); the writer threads only ever see the symptom — a broken
-        // pipe. Report the cause first, and fall back to the writer errors.
+        // ffmpeg's exit status and stderr explain a failed start (a bad encoder name, say); the writer
+        // threads only see a broken pipe. Report the cause first, then the writer errors.
         match status {
             Some(status) if status.success() => {}
             Some(status) => {
@@ -1213,9 +961,8 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn dropped_frames(&self) -> u64 {
-        // Both counts where there are two, because to the caller they are one thing: frames captured
-        // and not encoded. The hardware encoder's queue is the other place a frame can be lost, and
-        // off Windows there is no such queue.
+        // Both counts where there are two: to the caller they are one thing, frames captured and not
+        // encoded. Off Windows there is no hardware-encoder queue.
         #[cfg(windows)]
         let from_the_encoder = self.mft.as_ref().map(|mft| mft.dropped()).unwrap_or(0);
         #[cfg(not(windows))]
@@ -1243,16 +990,13 @@ impl Encoder for FfmpegEncoder {
 impl FfmpegEncoder {
     /// Hand a captured texture to the hardware encoder's thread. Returns nothing, always.
     ///
-    /// It used to encode here and return the H.264, which is what made the pump wait for a
-    /// synchronous MFT — and the pump is what paces capture, so a 56.9 fps recording came out at
-    /// 35.0 with 2288 frames of 5700 dropped, while the copy this whole change removes was worth 70%
-    /// of the loop. Now the texture is handed over and the bytes travel from the encoder's thread
-    /// straight into the video queue.
+    /// Encoding here made the pump wait on a synchronous MFT, and the pump paces capture: a 56.9fps
+    /// recording came out at 35.0 with 2288 of 5700 frames dropped. The texture is now handed over
+    /// and the bytes travel from the encoder's thread straight into the video queue.
     ///
-    /// `pts` is taken and ignored on purpose: **Media Foundation's timestamps are the stream's, not
-    /// the caller's clock.** What is being asked for is a stream at `FRAME_RATE`, and its timestamps
-    /// have to march at that rate whether or not a frame was dropped on the way here — passing the
-    /// wall clock through would turn a dropped frame into a gap and leave a variable-rate stream.
+    /// `pts` is ignored on purpose: Media Foundation's timestamps are the stream's, not the caller's
+    /// clock. They must march at `FRAME_RATE` whether or not a frame was dropped on the way here;
+    /// passing the wall clock through would turn a dropped frame into a gap in a variable-rate stream.
     #[cfg(windows)]
     fn encode_texture(
         &mut self,
@@ -1267,17 +1011,13 @@ impl FfmpegEncoder {
 
     /// Complete a writer failure with ffmpeg's own exit status and stderr, if it has died.
     ///
-    /// The writer thread can only report the symptom: its `write` to the child's stdin
-    /// failed, so it stopped, so the channel is disconnected. It does not own the child,
-    /// and the fact that arrives at the caller is "…writer thread has stopped" — which is
-    /// exactly the unhelpful message a Windows capture produced when `h264_amf` could not
-    /// start (`Error: video writer thread has stopped`, with the real cause — a missing
-    /// `amfrt64.dll` — only ever in ffmpeg's stderr). This encoder owns the child, so it
-    /// can add the cause.
+    /// The writer thread only sees the symptom (its `write` to the child's stdin failed). A Windows
+    /// capture where `h264_amf` could not start reported only "video writer thread has stopped",
+    /// with the real cause (a missing `amfrt64.dll`) in ffmpeg's stderr. This encoder owns the child,
+    /// so it adds the cause.
     ///
-    /// Returns the error untouched when the child has not exited yet. That is a real
-    /// possibility (the pipe can break before the process is reapable) and inventing a
-    /// cause would be worse than reporting the symptom honestly.
+    /// Returns the error untouched when the child has not exited yet (the pipe can break before the
+    /// process is reapable); inventing a cause would be worse.
     fn explain_dead_writer(&mut self, err: anyhow::Error) -> anyhow::Error {
         match self.ffmpeg_death() {
             Some(cause) => anyhow::Error::msg(format!("{err}; {cause}")),
@@ -1287,14 +1027,12 @@ impl FfmpegEncoder {
 
     /// ffmpeg's exit status and stderr, when it has exited.
     ///
-    /// A short bounded grace period is spent waiting for the exit first. The broken pipe
-    /// is observed the instant ffmpeg closes its stdin, which can precede the moment the
-    /// process becomes reapable, and the whole point is to catch the cause. The wait only
-    /// happens on a path that has already failed — the run is ending either way — and it
-    /// is bounded, so a child that survives the grace period still produces an error.
+    /// A short bounded grace period is spent waiting first: the broken pipe is observed the instant
+    /// ffmpeg closes its stdin, which can precede the process being reapable. This only happens on a
+    /// path that has already failed, and is bounded, so a surviving child still yields an error.
     ///
-    /// `try_wait` reaps the child; a later [`Encoder::finish`] still gets the same status
-    /// from `Child::wait`, which returns the stored one.
+    /// `try_wait` reaps the child; a later [`Encoder::finish`] still gets the same status from
+    /// `Child::wait`.
     fn ffmpeg_death(&mut self) -> Option<String> {
         let deadline = Instant::now() + CHILD_DEATH_GRACE;
         let status = loop {
@@ -1312,36 +1050,26 @@ impl FfmpegEncoder {
         ))
     }
 
-    /// Everything ffmpeg wrote to stderr, but never at the cost of waiting longer than
-    /// `budget` for it.
+    /// Everything ffmpeg wrote to stderr, but never waiting longer than `budget` for it.
     ///
-    /// A plain `read_to_string` blocks until EVERY write end of the pipe is closed.
-    /// Normally the child holds the only one, so the read ends where the child does —
-    /// but a descendant that inherited the pipe and outlives a killed child keeps it
-    /// open, and the read would then hang the error path (measured: a stand-in that
-    /// forked a sleeper stalled the report for its whole 60s). Draining on its own
-    /// thread and taking whatever arrived keeps the report honest and bounded; on the
-    /// ordinary path the text is already buffered and this returns at once.
+    /// A plain `read_to_string` blocks until every write end of the pipe closes. A descendant that
+    /// inherited the pipe and outlives a killed child keeps it open (a stand-in that forked a
+    /// sleeper stalled the report for its whole 60s). Draining on its own thread and taking
+    /// whatever arrived keeps the report bounded; normally the text is already buffered.
     ///
-    /// A budget that expires **does not commit anything**: the reader is left in flight
-    /// ([`FfmpegEncoder::stderr_drain`]) and the next call, which may be the next report
-    /// with its own budget, still gets the words. Caching the timeout's empty string would
-    /// turn a transiently slow reader into a permanent one — every later report, the writer
-    /// failure's and [`Encoder::finish`]'s alike, would print nothing where ffmpeg's reason
-    /// should be. An empty string is only ever cached when it is the reader's own verdict,
-    /// which is what the channel disconnecting without a value means.
+    /// A budget that expires commits nothing: the reader stays in flight
+    /// ([`FfmpegEncoder::stderr_drain`]) so a later report still gets the words. Caching the
+    /// timeout's empty string would make every later report print nothing where ffmpeg's reason
+    /// should be; an empty string is cached only as the reader's own verdict (the channel
+    /// disconnecting without a value).
     ///
-    /// The text is remembered because a pipe can only be drained once, and more than one
-    /// report wants it: the writer failure that explains a dead encoder, and
-    /// [`Encoder::finish`]'s own failure. Without the cache the second one would print
-    /// nothing where ffmpeg's reason should be.
+    /// The text is remembered because a pipe can be drained once and both the writer-failure report
+    /// and [`Encoder::finish`] want it.
     fn drain_stderr(&mut self, budget: Duration) -> String {
         if let Some(text) = &self.drained_stderr {
             return text.clone();
         }
-        // Reuse a reader a previous, shorter budget left in flight rather than start a
-        // second one: `child.stderr` is already taken, and the reader that is already
-        // blocked on the pipe is the one that will see the words.
+        // Reuse a reader a shorter budget left in flight: `child.stderr` is already taken and that reader will see the words.
         let rx = match self.stderr_drain.take() {
             Some(rx) => rx,
             None => {
@@ -1365,16 +1093,14 @@ impl FfmpegEncoder {
                     self.drained_stderr = Some(text.clone());
                     return text;
                 }
-                // The reader ended without sending: nothing more can arrive, so an empty
-                // answer is its own verdict and may be pinned rather than polled for.
+                // The reader ended without sending: nothing more can arrive, so an empty answer is its own verdict and may be pinned.
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.drained_stderr = Some(String::new());
                     return String::new();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     if Instant::now() >= deadline {
-                        // Nothing yet and no budget left: report nothing but keep the
-                        // reader, so a later call with a longer budget can still collect it.
+                        // Nothing yet and no budget left: keep the reader so a later, longer call can still collect it.
                         self.stderr_drain = Some(rx);
                         return String::new();
                     }
@@ -1385,11 +1111,8 @@ impl FfmpegEncoder {
     }
 }
 
-/// Whether a writer error is an audio thread's connect deadline.
-///
-/// `accept_within` is the only place in this module that raises `TimedOut`, and the two
-/// audio threads are its only callers (one per audio input), so the error kind is the
-/// signal — and the message it carries names which input it was.
+/// Whether a writer error is an audio thread's connect deadline. `accept_within` is the only
+/// raiser of `TimedOut` in this module, so the error kind is the signal (the message names the input).
 fn is_connect_deadline(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -1398,17 +1121,13 @@ fn is_connect_deadline(err: &anyhow::Error) -> bool {
 
 /// Hand a payload to a writer thread, or drop it if the queue is full.
 ///
-/// `try_send` rather than `send`, and a drop rather than an error, because this is called
-/// from the live capture path: blocking here would stall the loop that has to keep pulling
-/// frames off the capture backend, and failing would stop recording because the GPU fell a
-/// few milliseconds behind. Dropping is the correct behaviour for a live stream — the
-/// media timeline is wall-clock (module comment), so a missing payload is a brief repeat
-/// of its predecessor rather than a shift of everything after it. The counter is what
-/// stops the drop from being silent: it is reported by `Encoder::dropped_frames` /
-/// `Encoder::dropped_audio_blocks` and logged by the CLI.
+/// `try_send` and a drop rather than an error: this runs on the live capture path, where blocking
+/// stalls the loop pulling frames and failing would stop recording because the GPU fell a few
+/// milliseconds behind. The timeline is wall-clock, so a missing payload is a brief repeat. The
+/// counter (`Encoder::dropped_frames` / `dropped_audio_blocks`, logged by the CLI) keeps the drop
+/// from being silent.
 ///
-/// A disconnected channel is a different matter — the writer thread is gone, ffmpeg is not
-/// reading, and nothing submitted afterwards can be encoded, so that is an error.
+/// A disconnected channel means the writer thread is gone and nothing can be encoded: an error.
 fn enqueue_or_drop<T>(tx: &SyncSender<T>, item: T, dropped: &AtomicU64, what: &str) -> Result<()> {
     match tx.try_send(item) {
         Ok(()) => Ok(()),
@@ -1420,14 +1139,12 @@ fn enqueue_or_drop<T>(tx: &SyncSender<T>, item: T, dropped: &AtomicU64, what: &s
     }
 }
 
-/// The refusal a video-only encoder gives an audio block, as a function so the refusal itself can
-/// be tested without a child process (the same shape as [`enqueue_or_drop`]).
+/// The refusal a video-only encoder gives an audio block, a function so it can be tested without
+/// a child process.
 ///
-/// A recording with `EncodeConfig::game_audio` false has **no audio input at all**: no listener was
-/// bound, no `-c:a` was passed, and the container will carry no audio stream. A block arriving at
-/// such an encoder is a wiring mistake rather than a full queue, so it is refused and named rather
-/// than silently dropped into nowhere — the disposition [`Encoder::submit_mic_audio`] already takes
-/// for a block with no microphone input.
+/// With `EncodeConfig::game_audio` false there is no audio input at all, so a block is a wiring
+/// mistake, not a full queue: refused and named rather than silently dropped (as
+/// [`Encoder::submit_mic_audio`] does for a block with no microphone input).
 fn refuse_audio_without_input(game_audio: bool) -> Result<()> {
     if game_audio {
         return Ok(());
@@ -1438,20 +1155,15 @@ fn refuse_audio_without_input(game_audio: bool) -> Result<()> {
     )
 }
 
-/// How long ffmpeg is given to exit on its own before it is killed.
-///
-/// Generous against what it takes in practice — a child whose inputs have closed exits in
-/// milliseconds — and short enough that a wedged one is reported during the shutdown rather than
-/// after it. See [`FfmpegEncoder::finish`] for why this bound exists at all.
+/// How long ffmpeg is given to exit on its own before it is killed. A child whose inputs have
+/// closed exits in milliseconds; see [`FfmpegEncoder::finish`] for why the bound exists.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Wait for a child to exit, for at most `budget`, and kill it if it will not.
 ///
-/// `std::process::Child::wait` has no timeout, and a shutdown path that can wait for ever is a hang
-/// rather than a slow exit. This project has one of those on record: a hybrid recording sat alive on
-/// a machine for eight minutes with its logger already stopped, blocked, and had to be killed by
-/// hand. Returns the status if there is one, and `None` when the child had to be killed for not
-/// providing one.
+/// `Child::wait` has no timeout and an unbounded shutdown is a hang: a hybrid recording once sat
+/// alive for eight minutes with its logger already stopped. Returns the status, or `None` when
+/// the child had to be killed for not providing one.
 fn wait_bounded(child: &mut Child, budget: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + budget;
     loop {
@@ -1517,8 +1229,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "20000k"), "{args:?}");
     }
 
-    /// A configuration the argument builders can be exercised with. Small on purpose: these
-    /// tests are about the argument *list*, not about encoding anything.
+    /// A configuration the argument builders can be exercised with; these tests are about the argument list only.
     fn args_cfg(fps: u32, segment_ms: u64) -> EncodeConfig {
         let mut cfg = EncodeConfig::for_tests_software(
             crate::VideoCodec::H264,
@@ -1532,10 +1243,8 @@ mod tests {
         cfg
     }
 
-    /// The rate in the child's argument list is `EncodeConfig::fps`, and nothing else. This
-    /// is the number the pacer is built from as well (see `Encoder::input_fps`): one value,
-    /// two consumers, which is the fix for issues #1/#2 — so a change that makes ffmpeg
-    /// declare a different rate from the one the pipeline paces to has to fail here.
+    /// The rate in the child's argument list is `EncodeConfig::fps` and nothing else: the pacer is
+    /// built from the same number (`Encoder::input_fps`), so declaring a different rate must fail here.
     #[test]
     fn the_declared_rate_is_the_configurations_fps_and_it_is_declared_as_framerate() {
         for fps in [10u32, 24, 30, 60] {
@@ -1560,14 +1269,11 @@ mod tests {
         }
     }
 
-    /// The hybrid's argument pair: what must be there, and — more importantly — what must not.
+    /// The hybrid's argument pair: what must be there, and more importantly what must not.
     ///
-    /// The absences carry the lessons this project paid for. `-force_key_frames` and `-g` cannot
-    /// apply to a stream ffmpeg is only copying, so a version that included them would look right
-    /// and impose nothing: the segment boundaries the replay path depends on would silently come
-    /// from nowhere. `-r` and `-framerate` on the input would re-grid it, which is the landmine
-    /// issue #2 recorded. And `-vf scale` would mean decoding, which would mean the pixels, which is
-    /// the entire cost this path exists to remove.
+    /// `-force_key_frames` and `-g` cannot apply to a copied stream, so including them would look
+    /// right and impose nothing. `-r` and `-framerate` on the input would re-grid it. `-vf scale`
+    /// would mean decoding the pixels this path exists to avoid.
     #[test]
     fn the_bitstream_args_copy_the_video_and_impose_nothing_on_it() {
         let input = video_input_args_bitstream(crate::VideoCodec::H264);
@@ -1598,11 +1304,8 @@ mod tests {
 
     /// The capability the caller asks capture with follows the configuration, both ways.
     ///
-    /// This is an agreement between two components that never meet: the recorder tells capture to
-    /// hand out textures based on what an encoder says it can take, and a disagreement in either
-    /// direction is a broken recording — one arriving with frames it refuses, or one with no pixels
-    /// at all. `RawPixels` must stay the answer by default, because that is the mode every existing
-    /// caller and every non-Windows build runs.
+    /// The recorder tells capture to hand out textures based on what an encoder says it can take; a
+    /// disagreement either way is a broken recording. `RawPixels` must stay the default.
     #[test]
     fn the_reported_texture_capability_follows_the_configuration() {
         let mut cfg = args_cfg(30, 1000);
@@ -1619,14 +1322,10 @@ mod tests {
 
     /// A bitstream input produces the hybrid's pair, and a scaled one is refused.
     ///
-    /// The absences carry as much as the presences. `-s` and `-framerate` describe a pipe of pixels
-    /// and must be gone; `-b:v` and `-force_key_frames` describe work ffmpeg is no longer doing. And
-    /// the refusal at the end is the point of the guard: a scaled output under this mode is a
-    /// contradiction — scaling means decoding, decoding means the pixels this mode exists to avoid —
-    /// so it has to be an error rather than a silently different geometry in the user's recording.
-    ///
-    /// What must *not* change is as important: the audio input and the output packaging are the same
-    /// arguments, because that is the whole argument for doing it this way.
+    /// `-s` and `-framerate` describe a pipe of pixels and must be gone; `-b:v` and
+    /// `-force_key_frames` describe work ffmpeg does not do here. A scaled output is a contradiction
+    /// (scaling means decoding), so it must be an error, not a silently different geometry. The
+    /// audio input and output packaging are unchanged.
     #[test]
     fn a_bitstream_input_copies_the_video_and_refuses_to_scale_it() {
         let mut cfg = args_cfg(30, 1000);
@@ -1650,16 +1349,14 @@ mod tests {
         assert!(text.windows(2).any(|w| w == ["-c:a", "aac"]), "audio is unchanged: {text:?}");
         assert!(text.windows(2).any(|w| w == ["-f", "segment"]), "so is the output: {text:?}");
 
-        // A scaled output is refused, and refused before anything is created or launched — the
-        // binary named here does not exist, which is the point.
+        // A scaled output is refused before anything is launched; the binary named here does not exist.
         cfg.source_size = (1280, 720);
         cfg.output_size = (640, 360);
         let bin = FfmpegBinaries {
             ffmpeg: "/nonexistent/ffmpeg".into(),
             ffprobe: "/nonexistent/ffprobe".into(),
         };
-        // Matched rather than `expect_err`, which would need `Debug` on an encoder that owns a
-        // child process and has no business deriving it.
+        // Matched rather than `expect_err`, which would need `Debug` on an encoder that owns a child process.
         let refused = match FfmpegEncoder::spawn(&bin, &cfg) {
             Ok(_) => panic!("a scaled bitstream must be refused, and this one was not"),
             Err(err) => err,
@@ -1670,9 +1367,8 @@ mod tests {
         );
     }
 
-    /// The scale filter is added only when the output size differs, and the GOP follows the
-    /// declared rate — both of which the throughput probe inherits, because it builds its
-    /// argument list from these same two functions.
+    /// The scale filter is added only when the output size differs, and the GOP follows the declared
+    /// rate; the throughput probe inherits both.
     #[test]
     fn the_output_arguments_scale_only_when_asked_and_size_the_gop_from_the_rate() {
         let same = args_cfg(30, 1000);
@@ -1701,12 +1397,9 @@ mod tests {
 
     /// The frame-rate conversion is off, on every arm.
     ///
-    /// This is the option that makes the media timeline the wall clock rather than a declared
-    /// grid (see [`video_output_args`] and the module comment): with the default constant-rate
-    /// conversion, ffmpeg *invents* frames to fill a declared `1/R` grid, so media time
-    /// advances at (frames the encoder can emit) ÷ R instead of tracking real time. A change
-    /// that removes it, renames it back to a spelling the sidecar does not know, or moves it
-    /// before the input (where it would be ignored) has to fail here.
+    /// This makes the media timeline the wall clock (see [`video_output_args`]): with the default
+    /// conversion ffmpeg invents frames to fill a declared `1/R` grid. Removing it, using a spelling
+    /// the sidecar does not know, or moving it before the input (where it is ignored) must fail here.
     #[test]
     fn frames_are_passed_through_and_never_resampled_onto_a_declared_grid() {
         for (fps, segment_ms) in [(30u32, 1000u64), (60, 500), (120, 1000)] {
@@ -1724,17 +1417,10 @@ mod tests {
         }
     }
 
-    /// The audio bitrate in the child's argument list is `EncodeConfig::audio_bitrate_kbps`, and
-    /// nothing else.
+    /// The audio bitrate in the child's argument list is `EncodeConfig::audio_bitrate_kbps` and nothing else.
     ///
-    /// This is the audio half of the defect the video bitrate had: `[audio] bitrate_kbps` was
-    /// parsed and then dropped, so the number that reached ffmpeg's `-b:a` came from the
-    /// configuration *constructor* instead of from the file. The byte-for-byte argument-list test
-    /// below cannot catch a regression here — it runs with the constructor's own 128 kbps, so a
-    /// re-hardcoded `-b:a 128k` would still match it, which is exactly the "a default equal to a
-    /// hardcoded constant makes an inert path indistinguishable from a working one" shape this
-    /// project has paid for twice. Asking for a value the constructor would never pick is what
-    /// makes this bite.
+    /// The byte-for-byte test below runs with the constructor's own 128 kbps, so a re-hardcoded
+    /// `-b:a 128k` would still match it; asking for a value the constructor would never pick makes this bite.
     #[test]
     fn the_audio_bitrate_in_the_argument_list_is_the_configurations() {
         let mut cfg = args_cfg(30, 1_000);
@@ -1751,16 +1437,12 @@ mod tests {
         );
     }
 
-    /// `[audio] enabled = false` is a video-only recording, and it has to be visible in the
-    /// argument list rather than implied by it: no audio **input**, and no audio encoder
-    /// arguments either.
+    /// `[audio] enabled = false` is a video-only recording, visible in the argument list: no audio
+    /// input and no audio encoder arguments.
     ///
-    /// The failure this rules out is the quiet one. An audio input left in the list is a listener
-    /// nothing ever dials, so ffmpeg waits out `AUDIO_CONNECT_TIMEOUT` at the start of every
-    /// recording for a track that does not exist; a `-c:a` left in it describes a stream no input
-    /// can produce. Neither is an error — the recording works and the flags are decoration —
-    /// which is exactly how this file's own `-start_number`/`-segment_start_number` and
-    /// `-r`/`-framerate` mistakes read.
+    /// An audio input left in the list is a listener nothing dials, so ffmpeg waits out
+    /// `AUDIO_CONNECT_TIMEOUT` at every start; a stray `-c:a` describes a stream no input can produce.
+    /// Neither is an error, which is how the `-start_number` and `-r` mistakes read.
     #[test]
     fn the_argument_list_without_the_game_audio_declares_no_audio_input_or_codec() {
         let mut cfg = args_cfg(30, 1_000);
@@ -1788,13 +1470,9 @@ mod tests {
         );
     }
 
-    /// A block offered to an encoder with no audio input is **refused** — not queued, and not
-    /// silently dropped. The recording has no audio stream for it, so there is nowhere for it to
-    /// go, and a quiet drop would leave the caller believing the sound was captured.
-    ///
-    /// The disposition is the microphone's, for the same reason: [`Encoder::submit_mic_audio`]
-    /// refuses a block when the encoder was spawned without a microphone, and names the
-    /// configuration key responsible so the reader knows which half to fix.
+    /// A block offered to an encoder with no audio input is refused, not queued and not silently
+    /// dropped: a quiet drop would leave the caller believing the sound was captured. Same
+    /// disposition as [`Encoder::submit_mic_audio`] with no microphone.
     #[test]
     fn a_block_offered_to_an_encoder_without_the_game_audio_is_refused() {
         let err = refuse_audio_without_input(false)
@@ -1811,24 +1489,18 @@ mod tests {
         refuse_audio_without_input(true).expect("an encoder with the game audio accepts the block");
     }
 
-    /// The argument list as the os-string vector `Command::args` receives it, for
-    /// comparison with a written-out expectation. Every element is ASCII here; only the
-    /// segment pattern is a path, and it is derived the same way on both sides.
+    /// The argument list as the os-string vector `Command::args` receives it. Every element is
+    /// ASCII except the segment pattern path, which is derived the same way on both sides.
     fn strings(args: &[OsString]) -> Vec<String> {
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
-    /// The microphone's contract, in the direction that must never regress: with
-    /// `mic_audio: None` the child is spawned with **exactly** the arguments it was spawned
-    /// with before the second audio input existed.
+    /// With `mic_audio: None` the child is spawned with exactly the one-track arguments.
     ///
-    /// The baseline below is transcribed element for element from `FfmpegEncoder::spawn` as
-    /// it stood before this change — written out in full, deliberately, because an
-    /// expectation built from the builders under test would assert nothing at all. Adding,
-    /// removing, reordering or re-spelling anything on the single-audio path fails here, and
-    /// that is the point: an argument list that only *looks* equivalent is how the
-    /// `-start_number`/`-segment_start_number` and `-r`/`-framerate` mistakes happened (see
-    /// the comments in [`ffmpeg_args`]).
+    /// The baseline is written out in full, deliberately: an expectation built from the builders
+    /// under test would assert nothing. Adding, removing, reordering or re-spelling anything on the
+    /// single-audio path fails here (the `-start_number` and `-r` mistakes looked equivalent; see
+    /// [`ffmpeg_args`]).
     #[test]
     fn the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list() {
         let cfg = args_cfg(30, 1_000);
@@ -1841,8 +1513,7 @@ mod tests {
             "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
             // Input 1: raw s16le PCM over loopback TCP.
             "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
-            // The video encoder: the passthrough frame-rate mode, the codec, its bitrate,
-            // its GOP and its forced keyframes.
+            // The video encoder: passthrough frame-rate mode, codec, bitrate, GOP and forced keyframes.
             "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
             "-force_key_frames", "expr:gte(t,n_forced*1)",
             // The audio codec, then the segment muxer and its numbering.
@@ -1852,8 +1523,7 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect();
-        // The one element that is a real path, built the way the encoder builds it, so the
-        // comparison does not depend on the platform's path separator.
+        // The one real path, built the way the encoder builds it, so the comparison does not depend on the path separator.
         expected.push(cfg.scratch_dir.join("seg-%06d.mp4").to_string_lossy().into_owned());
 
         assert_eq!(
@@ -1865,22 +1535,16 @@ mod tests {
         );
     }
 
-    /// The other direction: enabling the microphone adds *its own input* and the
-    /// mapping/tagging, and moves nothing else.
+    /// Enabling the microphone adds its own input and the mapping/tagging, and moves nothing else.
     ///
-    /// The frozen shapes are all visible here: input 2 is `tcp://127.0.0.1:{mic_audio_port}`
-    /// declared from the caller's `MicAudioSpec`, and the output carries
-    /// `-map 0:v -map 1:a -map 2:a` with `-metadata:s:a:0 title=Game Audio` and
-    /// `-metadata:s:a:1 title=Microphone`. The video arguments — including the
-    /// `-fps_mode passthrough` that keeps the media timeline on the wall clock — are the
-    /// same elements in the same order as the single-audio list, because the second audio
-    /// input is declared between them and changes nothing about them.
+    /// Input 2 is `tcp://127.0.0.1:{mic_audio_port}` declared from the caller's `MicAudioSpec`, and
+    /// the output carries `-map 0:v -map 1:a -map 2:a` with `title=Game Audio` and `title=Microphone`.
+    /// The video arguments are the same elements in the same order as the single-audio list.
     #[test]
     fn enabling_the_microphone_adds_its_own_input_its_mapping_and_its_tags() {
         let mut cfg = args_cfg(30, 1_000);
-        // Deliberately NOT the default spec. The sample rate and the channel count are
-        // numbers the child is *told* (`-ar` / `-ac`), and a spec that never reaches them
-        // would put the microphone track on a timeline of the wrong length.
+        // Deliberately not the default spec: the rate and channel count are numbers the child is told
+        // (`-ar` / `-ac`), and a spec that never reached them would put the track on a wrong timeline.
         cfg.mic_audio = Some(crate::MicAudioSpec {
             sample_rate: 44_100,
             channels: 1,
@@ -1899,10 +1563,7 @@ mod tests {
             "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
             "-force_key_frames", "expr:gte(t,n_forced*1)",
             "-c:a", "aac", "-b:a", "128k",
-            // What a second audio input makes necessary, and the only two things this
-            // change adds: both audio streams are mapped explicitly (without maps ffmpeg
-            // would pick ONE of them) and each is tagged, because a two-track container
-            // whose tracks cannot be told apart is not the feature.
+            // What a second audio input needs: both streams mapped explicitly (without maps ffmpeg picks one) and tagged.
             "-map", "0:v", "-map", "1:a", "-map", "2:a",
             "-metadata:s:a:0", "title=Game Audio",
             "-metadata:s:a:1", "title=Microphone",
@@ -1930,13 +1591,12 @@ mod tests {
 
     #[test]
     fn a_full_queue_drops_the_payload_and_counts_it_instead_of_blocking_or_failing() {
-        // Capacity 1, and nothing drains it: this is the "encoder cannot keep up" state.
+        // Capacity 1, nothing drains it: the "encoder cannot keep up" state.
         let (tx, rx) = mpsc::sync_channel::<u32>(1);
         let dropped = AtomicU64::new(0);
 
         enqueue_or_drop(&tx, 1, &dropped, "video").expect("a free slot accepts the payload");
-        // These must return immediately and successfully — `send` here would block the
-        // capture loop forever, and an error would stop the recording.
+        // These must return immediately and successfully: blocking would stall capture, an error would stop recording.
         enqueue_or_drop(&tx, 2, &dropped, "video").expect("a full queue drops, it does not fail");
         enqueue_or_drop(&tx, 3, &dropped, "video").expect("a full queue drops, it does not fail");
 
@@ -1964,10 +1624,8 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 0, "a failure is not a drop");
     }
 
-    /// A pipe can only be read once, and two reports want ffmpeg's words: the writer
-    /// failure that explains a dead encoder, and the failure [`Encoder::finish`] raises
-    /// afterwards. The second one must not be left with nothing — that would move the
-    /// unexplained failure from one place to another.
+    /// A pipe can be read once but two reports want ffmpeg's words (the writer failure and the
+    /// failure [`Encoder::finish`] raises afterwards); the second must not be left with nothing.
     #[cfg(unix)]
     #[test]
     fn stderr_is_remembered_so_a_second_report_is_not_left_empty() {
@@ -1978,8 +1636,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        // The child is written by hand here because `spawn` needs a real ffmpeg and an
-        // audio listener; this is the smallest thing that has a child with stderr.
+        // Written by hand because `spawn` needs a real ffmpeg and audio listener; the smallest thing with a child that has stderr.
         let mut encoder = FfmpegEncoder {
             child,
             output_stream: None,
@@ -1995,14 +1652,13 @@ mod tests {
             accepts_textures: false,
             mic_port: None,
             mic_spec: None,
-            // No audio input at all: this test hands the struct a child and nothing else, and
-            // `audio_tx`/`audio_writer` above are `None` to match.
+            // No audio input: `audio_tx`/`audio_writer` above are `None` to match.
             game_audio: false,
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
             drained_stderr: None,
-            // No report has asked for ffmpeg's stderr yet, so no reader is in flight.
+            // No report has asked for stderr yet, so no reader is in flight.
             stderr_drain: None,
         };
         encoder.child.wait().unwrap();
@@ -2013,18 +1669,14 @@ mod tests {
         assert_eq!(second, first, "the second report gets the same words, not nothing");
     }
 
-    /// A budget that runs out before the words arrive must not be mistaken for a child that
-    /// said nothing.
+    /// A budget that runs out before the words arrive must not be mistaken for a child that said nothing.
     ///
-    /// This is the defect the poll loop and the `stderr_drain` field exist for: the previous
-    /// shape waited with `recv_timeout` and cached the `String::default()` a timeout produced,
-    /// so one slow drain became a *permanent* claim that ffmpeg was silent — every later
-    /// report, including `Encoder::finish`'s, printed an empty line where the child's reason
-    /// should be. The stub here holds its words back past a deliberately short budget so the
-    /// timeout is certain rather than race-dependent, and the same encoder must still hand them
-    /// over to a later call that can outlast it.
+    /// Caching the `String::default()` a timeout produced made one slow drain a permanent claim that
+    /// ffmpeg was silent, so later reports printed an empty line where its reason should be. The stub
+    /// holds its words back past a short budget so the timeout is certain, and the same encoder must
+    /// still hand them to a later call that can outlast it.
     ///
-    /// Unix-only like its siblings: the stand-in is a `#!/bin/sh` script (§10.7).
+    /// Unix-only: the stand-in is a `#!/bin/sh` script.
     #[cfg(unix)]
     #[test]
     fn a_drain_that_times_out_is_not_remembered_as_an_empty_report() {
@@ -2032,8 +1684,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("ffmpeg");
-        // The words arrive after the first budget, not before it; the trailing sleep keeps the
-        // pipe open a little longer, which is also what the reader thread is waiting on.
+        // The words arrive after the first budget; the trailing sleep keeps the pipe open, which the reader waits on.
         std::fs::write(
             &stub,
             "#!/bin/sh\nsleep 0.5; echo 'late words from ffmpeg' >&2; sleep 1\n",
@@ -2065,22 +1716,16 @@ mod tests {
 
     /// A shutdown is bounded: a child that will not exit is killed rather than waited for.
     ///
-    /// This is the defect the bounded wait exists for, and it is worth a test because it was
-    /// invisible in every other way. A hybrid recording sat alive on the box for eight minutes
-    /// after its logger had stopped — blocked, with no line saying why and nothing that would ever
-    /// have ended it, until it was killed by hand.
+    /// A hybrid recording once sat alive for eight minutes after its logger stopped, with nothing
+    /// that would ever end it. The stub child never exits and never reads, like that wedged ffmpeg,
+    /// so the assertion is about time: `finish` has to come back. An error naming the kill is the
+    /// success case; the failure pinned is a call that never returns.
     ///
-    /// The stub child here never exits and never reads, which is what that wedged ffmpeg looked
-    /// like. So the assertion is about **time**: `finish` has to come back. What it returns is a
-    /// report, and an error naming the kill is the *success* case — the failure this pins is a call
-    /// that never returns at all.
+    /// The bound allows for the audio input's own connect deadline, the one other fixed wait on this
+    /// path; everything else is bounded by `SHUTDOWN_BUDGET`.
     ///
-    /// The bound allows for the audio input's own connect deadline, which is the one other fixed
-    /// wait on this path; everything else is bounded by `SHUTDOWN_BUDGET`.
-    ///
-    /// Unix-only, and it has to say so: the stand-in child is a `#!/bin/sh` script, like the one
-    /// below, so on Windows this test has nothing to run — and without the gate the whole crate's
-    /// test build fails there (§10.7).
+    /// Unix-only: the stand-in child is a `#!/bin/sh` script, and without the gate the crate's test
+    /// build fails on Windows.
     #[cfg(unix)]
     #[test]
     fn a_shutdown_does_not_wait_for_a_child_that_will_not_exit() {
@@ -2088,8 +1733,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("ffmpeg");
-        // `exec` so the process killed is the one that would not exit, rather than a shell
-        // standing in front of it.
+        // `exec` so the process killed is the one that would not exit, not a shell in front of it.
         std::fs::write(&stub, "#!/bin/sh\nexec sleep 600\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let bin = FfmpegBinaries {
@@ -2116,9 +1760,8 @@ mod tests {
             "a shutdown must end: the bound is {ceiling:?} and this took {took:?}, which is what \
              an unbounded wait on the child looks like"
         );
-        // The child never dials the audio socket either, so the *audio* connect deadline is what
-        // reports here — and the status it carries is the bounded wait's doing, which is why this
-        // asserts on the status being named rather than on which of the two paths named it.
+        // The child never dials the audio socket, so the audio connect deadline is what reports here;
+        // the assertion is that the bounded wait's status is named, whichever path named it.
         if let Err(err) = outcome {
             let text = err.to_string();
             assert!(
@@ -2130,11 +1773,9 @@ mod tests {
 
     /// A frame with no pixels is refused rather than written as a zero-length frame.
     ///
-    /// This guard is what makes the zero-copy plumbing safe to land *ahead* of the encoder that
-    /// consumes textures. A frame whose pixels stayed in VRAM has an empty `data` by design, and
-    /// this encoder writes `data` to ffmpeg's stdin — so accepting one would hand the child a
-    /// zero-length rawvideo frame, which it reads as the next frame's leading bytes. The damage
-    /// would then appear seconds later as a stream desync pointing at nothing in this function.
+    /// A frame whose pixels stayed in VRAM has an empty `data` by design; writing it would hand
+    /// ffmpeg a zero-length rawvideo frame that it reads as the next frame's leading bytes, a stream
+    /// desync that appears seconds later pointing at nothing in this function.
     #[test]
     fn a_frame_without_pixels_is_refused_rather_than_written_as_nothing() {
         use localplay_capture::{Frame, PixelFormat};
@@ -2168,8 +1809,7 @@ mod tests {
             "the refusal must name the reason rather than surfacing later as corruption: {err}"
         );
 
-        // And a frame with pixels still goes through, so the guard refuses a shape rather than
-        // quietly refusing work.
+        // A frame with pixels still goes through, so the guard refuses a shape, not work.
         let honest = Frame {
             data: vec![0u8; 64 * 64 * 4],
             pts: Duration::ZERO,
@@ -2182,16 +1822,14 @@ mod tests {
         encoder.finish().expect("flush the encoder");
     }
 
-    /// The message a Windows capture produced was `Error: video writer thread has stopped`
-    /// while the real cause — an `h264_amf` that could not initialise — sat in ffmpeg's
-    /// stderr. A dead writer must now carry the child's own exit status and words.
+    /// A dead writer carries the child's own exit status and words.
     ///
-    /// The stand-in child is a script that fails the way a hardware encoder does on a
-    /// machine with no vendor runtime: it says why on stderr and exits non-zero. No GPU is
-    /// needed, and the path under test — a pump thread noticing the broken pipe, then the
-    /// submitter asking the child what happened — is the one the real encoder uses.
+    /// A Windows capture once reported only `video writer thread has stopped` while the real cause
+    /// (an `h264_amf` that could not initialise) sat in ffmpeg's stderr. The stand-in child is a
+    /// script that says why on stderr and exits non-zero, as a hardware encoder does on a machine
+    /// with no vendor runtime; no GPU is needed.
     ///
-    /// Unix-only, like its sibling above: the stand-in is a `#!/bin/sh` script (§10.7).
+    /// Unix-only: the stand-in is a `#!/bin/sh` script.
     #[cfg(unix)]
     #[test]
     fn a_dead_writer_reports_ffmpegs_exit_status_and_stderr() {
@@ -2212,13 +1850,11 @@ mod tests {
             dir.path().to_path_buf(),
             1_000,
         );
-        // Spawning succeeds: the child starts and then fails, which is exactly the shape
-        // of an encoder that cannot initialise.
+        // Spawning succeeds: the child starts and then fails, like an encoder that cannot initialise.
         let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).unwrap();
 
-        // The channel only disconnects once the pump thread *tries* to write into the
-        // dead child and fails, so submit until that happens; each attempt is an
-        // independent frame the encoder may accept first.
+        // The channel only disconnects once the pump thread tries to write into the dead child, so
+        // submit until that happens; each attempt is an independent frame.
         let frame = || Frame {
             data: vec![0u8; 64 * 64 * 4],
             pts: Duration::ZERO,
@@ -2247,36 +1883,29 @@ mod tests {
         assert!(err.contains("exit status"), "and so is its exit status: {err}");
     }
 
-    /// The trap this codebase has been bitten by twice (`docs/platform-traps.md`, trap 1):
-    /// on macOS and the other BSD-derived platforms the socket `accept()` returns inherits
-    /// the **listener's** `O_NONBLOCK`, so a write that would have waited for ffmpeg to
-    /// drain the socket fails immediately with `WouldBlock` (`EAGAIN`, os error 35) the
-    /// moment the socket buffers fill. It shows up as a flake — "the pump fails only when it
-    /// happens to get ahead of ffmpeg" — so a test that hopes to hit the race proves
-    /// nothing; this one makes the state certain instead.
+    /// On macOS and other BSD-derived platforms the socket `accept()` returns inherits the
+    /// listener's `O_NONBLOCK`, so a write that should wait for ffmpeg to drain the socket fails
+    /// immediately with `WouldBlock` (`EAGAIN`, os error 35) once the buffers fill. It flakes
+    /// ("the pump fails only when it gets ahead of ffmpeg"), so this test makes the state certain
+    /// instead of hoping to hit the race.
     ///
-    /// [`accept_within`] forces the accepted socket back to blocking mode for exactly this
-    /// reason, and the microphone input is a **second copy of that accept path**
-    /// (`pump_audio` calls this and nothing else before writing), so it needs the same line.
-    /// The client here is a real ffmpeg on the same `s16le` transport the encoder declares,
-    /// paced to real time with `-re` and given a small receive buffer, so it cannot swallow
-    /// a megabyte whole: the writer has to *wait* for it.
+    /// [`accept_within`] forces the accepted socket back to blocking mode, and the microphone input
+    /// is a second copy of that accept path (`pump_audio` calls it and nothing else before writing).
+    /// The client is a real ffmpeg on the encoder's `s16le` transport, paced with `-re` and given a
+    /// small receive buffer, so the writer has to wait for it.
     ///
-    /// The two behaviours are told apart by the socket's own write timeout, which is the
-    /// discriminator `docs/platform-traps.md` names: a blocking socket honours it (the write
-    /// waits out the timeout and then reports `WouldBlock`), a non-blocking socket ignores it
-    /// and reports `WouldBlock` immediately. So the assertion is "the large write did not
-    /// fail at once", which is exactly "the accepted socket is blocking".
+    /// The two behaviours are told apart by the socket's write timeout: a blocking socket honours it
+    /// (waits, then reports `WouldBlock`), a non-blocking one ignores it and reports `WouldBlock` at
+    /// once. So the assertion is that the large write did not fail at once.
     ///
-    /// The client is ffmpeg rather than a `TcpStream::connect`: the tree's outbound sockets
-    /// are enumerated by `crates/events/tests/no_egress.rs` and a new one belongs in that
-    /// list deliberately. ffmpeg dialling a listener we bound is the production shape anyway.
+    /// The client is ffmpeg rather than a `TcpStream::connect` because outbound sockets are
+    /// enumerated by `crates/events/tests/no_egress.rs`, and ffmpeg dialling our listener is the
+    /// production shape anyway.
     #[cfg(feature = "test-encoders")]
     #[test]
     fn a_large_block_written_to_the_microphone_input_waits_instead_of_failing_with_eagain() {
-        /// How long a write is willing to wait for the reader. The assertion is about
-        /// whether this is *honoured*, so the number only has to be comfortably larger than
-        /// the few milliseconds a non-blocking socket needs to give up.
+        /// How long a write may wait for the reader; only has to be well above the few milliseconds a
+        /// non-blocking socket needs to give up.
         const WRITE_PATIENCE: Duration = Duration::from_millis(300);
 
         let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
@@ -2286,12 +1915,9 @@ mod tests {
         let mut client = localplay_media::sidecar_command(&bin.ffmpeg)
             .args([
                 "-hide_banner", "-loglevel", "error", "-nostdin",
-                // Real-time pacing: the reader takes the transport at the rate the PCM
-                // represents, so it cannot drain a burst faster than the socket buffers
-                // allow — which is the state that used to make `write_all` fail on macOS.
+                // Real-time pacing: the reader cannot drain a burst faster than the socket buffers allow.
                 "-re",
-                // A small receive buffer keeps the burst decisively larger than the
-                // socket's own capacity.
+                // A small receive buffer keeps the burst decisively larger than the socket's capacity.
                 "-recv_buffer_size", "32768",
                 "-f", "s16le", "-ar", "48000", "-ac", "2",
                 "-i", &format!("tcp://127.0.0.1:{port}"),
@@ -2309,11 +1935,9 @@ mod tests {
         stream
             .set_write_timeout(Some(WRITE_PATIENCE))
             .expect("the accepted socket takes a write timeout");
-        // Four megabytes — 22 s of 48kHz stereo s16le — written immediately after connect,
-        // like a pump that just received a burst, or that is catching up after a stall. It
-        // is several times what a real-time-paced reader absorbs before it starts pacing
-        // (measured on this host: ffmpeg takes ~1 MiB at once and then reads at the PCM's
-        // own rate), so the write has to wait rather than being swallowed whole.
+        // Four megabytes (22 s of 48kHz stereo s16le) written right after connect, like a pump catching
+        // up after a stall. ffmpeg takes ~1 MiB at once and then reads at the PCM's own rate, so the
+        // write has to wait rather than being swallowed whole.
         let burst = vec![0u8; 4 * 1024 * 1024];
         let started = Instant::now();
         let outcome = stream.write_all(&burst);
@@ -2323,10 +1947,8 @@ mod tests {
         let _ = client.wait();
 
         match outcome {
-            // A reader that swallowed a megabyte inside the write timeout would mean
-            // nothing ever had to wait, so this run would be inconclusive rather than
-            // wrong: a non-blocking socket cannot reach this arm (it fails at once), so
-            // the regression could not hide here.
+            // A reader that swallowed the burst would make this run inconclusive, not wrong: a non-blocking
+            // socket fails at once and cannot reach this arm.
             Ok(()) => eprintln!(
                 "note: the client drained the whole {}-byte burst within {WRITE_PATIENCE:?}; \
                  the write never had to wait",
@@ -2349,8 +1971,7 @@ mod tests {
         }
     }
 
-    /// The bitstream arguments follow the codec, and that is the whole of what makes the hybrid
-    /// codec-agnostic: ffmpeg is told what it is reading, told to copy it rather than encode it, and
+    /// The bitstream arguments follow the codec: ffmpeg is told what it is reading, to copy it, and
     /// given the container tag that makes the result openable.
     #[test]
     fn the_bitstream_arguments_follow_the_codec() {
@@ -2359,7 +1980,7 @@ mod tests {
         let hevc = video_input_args_bitstream(crate::VideoCodec::Hevc);
         assert!(hevc.windows(2).any(|w| w == ["-f", "hevc"]), "{hevc:?}");
 
-        // Both outputs are copies — the encoder has already run, whichever it was.
+        // Both outputs are copies, whichever encoder ran.
         for args in [
             video_output_args_bitstream(crate::VideoCodec::H264),
             video_output_args_bitstream(crate::VideoCodec::Hevc),
@@ -2367,11 +1988,9 @@ mod tests {
             assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]), "{args:?}");
         }
 
-        // **`hvc1` is the container's business, not the codec's, and only HEVC needs it.** `hev1` and
-        // `hvc1` describe the same stream; the difference is where the parameter sets live, and
-        // `hev1` is what some players refuse to open at all. The clips from this pipeline get played
-        // on a Mac, so the tag that works everywhere is the one to write — and H.264 must not be
-        // given it, because `hvc1` on an AVC track is a lie about the codec.
+        // `hvc1` is the container's business and only HEVC needs it. `hev1` and `hvc1` describe the same
+        // stream, but some players refuse `hev1`, and these clips get played on a Mac. H.264 must not
+        // get it: `hvc1` on an AVC track misstates the codec.
         let hevc_out = video_output_args_bitstream(crate::VideoCodec::Hevc);
         assert!(hevc_out.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "{hevc_out:?}");
         assert_eq!(
@@ -2383,11 +2002,9 @@ mod tests {
 
     /// The container tag, on the raw path too.
     ///
-    /// This was written for the bitstream arguments only, and that is the zero-copy hybrid's path —
-    /// which is not the path HEVC runs on where the hardware encoder refuses: there the raw path is
-    /// what a HEVC recording goes through, and `ffprobe` on a real clip from it reported
-    /// `codec_tag_string=hev1`. A test of the arguments would not have caught that; reading the
-    /// clip did. The tag is a muxer option and belongs to both.
+    /// HEVC takes the raw path where the hardware encoder refuses, and `ffprobe` on a real clip from
+    /// it reported `codec_tag_string=hev1`; an argument-only test would not have caught that. The
+    /// tag is a muxer option and belongs to both paths.
     #[test]
     fn the_raw_output_args_carry_the_hevc_tag_too() {
         let dir = std::env::temp_dir();
