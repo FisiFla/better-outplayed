@@ -6,13 +6,12 @@ use localplay_media::binaries::run_with_timeout;
 use std::time::Duration;
 
 
-/// The wall clock the session fixtures start at: deliberately enormous, so that a
-/// timeline offset computed against the wall start instead of the media epoch is
-/// unmistakably wrong rather than merely imprecise.
+/// The wall clock the session fixtures start at: deliberately enormous, so a timeline offset
+/// computed against the wall start instead of the media epoch is unmistakably wrong.
 pub(crate) const WALL_START_MS: i64 = 1_700_000_000_000;
 
-/// A cap nothing reaches and an age nothing exceeds: the policy is a no-op, so a test
-/// that is not about the policy cannot trip over it.
+/// A cap nothing reaches and an age nothing exceeds: the policy is a no-op, so a test not about
+/// it cannot trip over it.
 pub(crate) const GENEROUS: StorageConfigView =
     StorageConfigView { max_total_bytes: u64::MAX, max_age_days: 3_650 };
 
@@ -58,9 +57,9 @@ impl Fixture {
         Deps { bins: None, ..self.deps() }
     }
 
-    /// Index a clip whose file exists on disk but is never opened or decoded — an
-    /// empty stand-in. Enough for the list, favourite, policy and validation
-    /// tests. A test about a *missing* file removes it explicitly after this.
+    /// Index a clip whose file exists on disk but is never opened or decoded: an empty stand-in,
+    /// enough for the list, favourite, policy and validation tests. A test about a missing file
+    /// removes it afterwards.
     pub(crate) fn add_row(&self, name: &str, started_at_ms: u64, duration_ms: u64, size_bytes: u64) -> i64 {
         let path = self.paths.clips_dir.join(name);
         std::fs::write(&path, b"").unwrap();
@@ -93,18 +92,16 @@ impl Fixture {
         (id, path)
     }
 
-    /// A **finished** session whose recorded file is a real, decodable video.
+    /// A finished session whose recorded file is a real, decodable video.
     ///
-    /// The wall start and the media epoch are deliberately different numbers, and far
-    /// apart: that is the entire reason the column exists, and a fixture with the two
-    /// equal cannot tell one clock from the other.
+    /// The wall start and media epoch are deliberately different and far apart, which is the reason
+    /// the column exists; equal values could not tell the two clocks apart.
     ///
-    /// The segments and the recorded file live in **different** directories, which is the
-    /// real layout (see the recorder's `session_file_path`: the concatenation is written
-    /// into a sessions output directory, not among the segments it was built from).
+    /// The segments and the recorded file live in different directories, as in the real layout (the
+    /// recorder's `session_file_path` writes the concatenation into a sessions output directory).
     pub(crate) fn add_finished_session(&self, seconds: u32, media_epoch_ms: i64) -> (i64, PathBuf) {
-        // Inside the same temporary root the fixture owns — `AppPaths` deliberately does
-        // not publish the app-data directory itself.
+        // Inside the same temporary root the fixture owns; `AppPaths` does not publish the app-data
+        // directory itself.
         let root = self
             .paths
             .clips_dir
@@ -141,9 +138,8 @@ impl Fixture {
         (id, final_path)
     }
 
-    /// A session row that is still running, so it has no concatenated file. `mode` is
-    /// which engine opened it — a buffer run and a full-session run both look like this
-    /// until one of them stops.
+    /// A session row that is still running, so it has no concatenated file. `mode` is which engine
+    /// opened it; a buffer run and a full-session run look alike until one stops.
     pub(crate) fn add_running_session(&self, mode: &str) -> (i64, PathBuf) {
         let dir = self
             .paths
@@ -161,10 +157,8 @@ impl Fixture {
     }
 }
 
-/// Encode `seconds` of `testsrc2` into `path` with ffmpeg, exactly as a clip would be.
-///
-/// `-g 10` at 10 fps puts a keyframe every second, so the file has the keyframe
-/// structure a real clip has and a stream-copy cut has something to work with.
+/// Encode `seconds` of `testsrc2` into `path` with ffmpeg, as a clip would be. `-g 10` at 10 fps
+/// puts a keyframe every second, so a stream-copy cut has keyframe structure to work with.
 pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32) {
     let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
@@ -182,9 +176,9 @@ pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32)
 
 /// Hash the video packets ffmpeg reads from `src` at `seek_ms`, for `dur_ms` if given.
 ///
-/// `-f md5` hashes packet *payloads*, so two equal hashes mean two byte-identical
-/// streams. Nothing is decoded or encoded on either side of the comparison, which is
-/// what makes it evidence about a stream copy rather than a proxy for one.
+/// `-f md5` hashes packet payloads, so equal hashes mean byte-identical streams. Nothing is
+/// decoded or encoded on either side, which makes it evidence about a stream copy rather than a
+/// proxy for one.
 pub(crate) fn stream_md5(bins: &FfmpegBinaries, src: &Path, seek_ms: u64, dur_ms: Option<u64>) -> String {
     let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])

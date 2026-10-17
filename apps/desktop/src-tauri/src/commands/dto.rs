@@ -53,13 +53,12 @@ impl From<&Clip> for ClipDto {
 /// One recording session, as the Sessions list sees it.
 ///
 /// Mirrored by hand in `src/lib/types.ts`, and pinned by a test below that asserts the exact
-/// JSON keys — the same contract the clip and storage DTOs carry.
+/// JSON keys.
 ///
-/// `media_epoch_ms` is deliberately **not** here. It is the anchor the store subtracts to
-/// turn an event's absolute media time into a timeline offset, and the offsets arrive
-/// already computed; exposing the epoch as well would invite the frontend to do the
-/// subtraction a second time, which is precisely the cross-clock defect the column was added
-/// to fix.
+/// `media_epoch_ms` is deliberately not here. It is the anchor the store subtracts to turn an
+/// event's absolute media time into a timeline offset, and offsets arrive already computed;
+/// exposing the epoch would invite the frontend to subtract a second time, the cross-clock
+/// defect the column was added to fix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDto {
     pub id: i64,
@@ -69,8 +68,8 @@ pub struct SessionDto {
     /// `"buffer"` or `"session"` (see `localplay_store::SESSION_MODE_*`). A buffer session
     /// has no concatenated file: the row exists to group one run's clips and events.
     pub mode: String,
-    /// Wall clock, ms since the Unix epoch. **Not** comparable with `offset_ms`, which is
-    /// media time — two different clocks, on purpose, and the reason both are named.
+    /// Wall clock, ms since the Unix epoch. Not comparable with `offset_ms`, which is media time:
+    /// two different clocks, on purpose.
     pub started_at_ms: i64,
     /// When it stopped. **`None` means it is still recording.**
     pub ended_at_ms: Option<i64>,
@@ -83,15 +82,14 @@ pub struct SessionDto {
     pub favourite: bool,
     /// Where the segments are, so an operator can find the footage without the database.
     pub scratch_dir: String,
-    /// How long the recorded media is, in ms — the axis the review timeline is drawn against.
+    /// How long the recorded media is, in ms: the axis the review timeline is drawn against.
     ///
-    /// `0` means **unknown**, not "zero length": a session recovered from a crash has no
-    /// concatenated file to probe, and every row written before schema v4 predates the column.
-    /// A front-end must disable its scrubber on 0 rather than draw an axis of no length and
-    /// pretend the recording was empty.
+    /// `0` means unknown, not "zero length": a session recovered from a crash has no concatenated
+    /// file to probe, and rows written before schema v4 predate the column. A front-end must
+    /// disable its scrubber on 0.
     ///
-    /// Deliberately not derivable from `started_at_ms`/`ended_at_ms`, which are the wall-clock
-    /// window: a session whose encoder could not keep up is shorter than the clock says.
+    /// Not derivable from `started_at_ms`/`ended_at_ms`, the wall-clock window: a session whose
+    /// encoder could not keep up is shorter than the clock says.
     pub duration_ms: i64,
 }
 
@@ -116,14 +114,14 @@ impl From<&Session> for SessionDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEventDto {
     pub id: i64,
-    /// The integration's tag — `"kill"`, `"death"`, `"round_start"`, or the `"bookmark"` a
-    /// hotkey clip writes. Passed through verbatim: this layer does not know the vocabulary
-    /// and must not, so a tag it has never seen is a marker that exists rather than an error.
-    /// The UI colours unknown tags neutrally for the same reason.
+    /// The integration's tag: `"kill"`, `"death"`, `"round_start"`, or the `"bookmark"` a hotkey
+    /// clip writes. Passed through verbatim: this layer does not know the vocabulary, so a tag it
+    /// has never seen is a marker that exists rather than an error. The UI colours unknown tags
+    /// neutrally.
     pub kind: String,
-    /// The marker's position on the **session timeline**, in ms of media time from the
-    /// session's start. Computed by the store, in one SQL expression, so the scrubber, the
-    /// tests and any future consumer cannot disagree about what a position means.
+    /// The marker's position on the session timeline, in ms of media time from the session's start.
+    /// Computed by the store in one SQL expression, so the scrubber, the tests and any consumer
+    /// agree on what a position means.
     pub offset_ms: i64,
     /// The integration's own detail, as JSON text, verbatim. `None` for a bookmark, which
     /// has no source to describe.
@@ -145,19 +143,17 @@ impl From<&SessionEvent> for SessionEventDto {
     }
 }
 
-/// The storage panel's data: what is on disk, what the cap is, and what the policy makes
-/// of it (spec §8.1).
+/// The storage panel's data: what is on disk, what the cap is, and what the policy makes of it.
 ///
-/// Every count and every byte here is about the clips **that are on disk** — the same set
-/// the listing shows, from the same function (`clips_on_disk`). `missing_count` is how many
-/// indexed rows that leaves out, and it exists so the panel can *say* so: a number smaller
-/// than the index, unexplained, is the kind of quiet discrepancy this replaced.
+/// Every count and byte is about the clips that are on disk, the set the listing shows, from the
+/// same function (`clips_on_disk`). `missing_count` is how many indexed rows that leaves out, so
+/// the panel can say so rather than show an unexplained smaller number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StorageStats {
     /// Clips whose file is there. Not the number of rows in the index.
     pub clip_count: usize,
-    /// Bytes those clips actually occupy. Summed from the clips, not from what the rows
-    /// recorded — see `clips_on_disk` for why that distinction cost a wrong screen.
+    /// Bytes those clips actually occupy, summed from the clips, not from what the rows recorded
+    /// (see `clips_on_disk`).
     pub total_bytes: u64,
     /// Indexed rows whose file is gone: not counted above, and named here rather than
     /// silently dropped.
@@ -166,9 +162,8 @@ pub struct StorageStats {
     pub favourite_bytes: u64,
     pub cap_bytes: u64,
     pub max_age_days: u64,
-    /// Whether the policy's verdict is that the cap can be met. `false` means the
-    /// favourites alone exceed it (spec §8.1: the manager stops rather than delete a
-    /// favourite to satisfy a cap it cannot meet).
+    /// Whether the policy's verdict is that the cap can be met. `false` means the favourites alone
+    /// exceed it: the manager stops rather than delete a favourite to satisfy a cap it cannot meet.
     pub cap_met: bool,
     /// How far the favourited clips alone exceed the cap. Non-zero is the warning.
     pub over_cap_by_bytes: u64,
@@ -191,18 +186,16 @@ pub struct ThumbnailRef {
     pub cached: bool,
 }
 
-/// What `delete_clip` did, in the vocabulary of spec §8.2.
+/// What `delete_clip` did.
 ///
 /// The row goes first and the file second; this reports each half separately, because the
-/// interesting states are the mismatches — a row deleted whose file could not be unlinked
-/// is an orphan that a later sweep (or the user) has to deal with, and it must never be
-/// reported as a clean delete.
+/// interesting states are the mismatches: a row deleted whose file could not be unlinked is an
+/// orphan for a later sweep or the user, and must never be reported as a clean delete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeleteOutcome {
     pub id: i64,
-    /// Whether this call's own `DELETE` removed a row. `false` means the clip was already
-    /// gone from the index — in which case nothing was unlinked, because no committed row
-    /// named the file (spec §8.2).
+    /// Whether this call's own `DELETE` removed a row. `false` means the clip was already gone from
+    /// the index, in which case nothing was unlinked because no committed row named the file.
     pub row_deleted: bool,
     pub file_removed: bool,
     /// Set when the row was deleted but the file could not be unlinked.
@@ -241,8 +234,8 @@ mod tests {
 
     #[test]
     fn the_dto_json_matches_the_typescript_interface() {
-        // `src/lib/types.ts` mirrors these structs by hand. Without this, a rename on
-        // either side is discovered by a user looking at an empty list.
+        // `src/lib/types.ts` mirrors these structs by hand. Without this, a rename on either side is
+        // found by a user looking at an empty list.
         let f = Fixture::new();
         f.add_row("shape.mp4", 1, 2, 3);
 

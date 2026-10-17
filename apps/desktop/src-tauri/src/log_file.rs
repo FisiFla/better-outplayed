@@ -1,9 +1,9 @@
 //! A size-capped, rotating log file.
 //!
-//! The shell is a background application that can run for months; an append-only log would
-//! grow without bound, against the minimal-resource principle. `base.log` is renamed to
-//! `base.log.1` (and `.1` to `.2`, …) once it reaches `max_bytes`; at most `keep` rotated
-//! files survive, so the directory is bounded by roughly `(keep + 1) * max_bytes`.
+//! The shell can run for months in the background, so an append-only log would grow without
+//! bound. `base.log` is renamed to `base.log.1` (and `.1` to `.2`, ...) once it reaches
+//! `max_bytes`; at most `keep` rotated files survive, bounding the directory to roughly
+//! `(keep + 1) * max_bytes`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

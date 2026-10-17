@@ -20,13 +20,10 @@ serde_json = "1"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# `protocol-asset` is what serves clip files to the <video> element (spec §9) without a
-# hand-rolled file server.
-# `tray-icon` is what Tauri v2 gates `tauri::tray` / the menu API behind: without it there
-# is no system tray at all. `image-png` is what lets `Image::from_bytes` decode the PNG tray
-# icons this crate embeds (`icons/tray-*.png`); without it the only icon source would be
-# `include_image!`'s raw RGBA at build time. Nothing else is enabled — no dialog, no shell,
-# no filesystem plugin — and no capability grants the webview anything new.
+# `protocol-asset` serves clip files to the <video> element without a hand-rolled file server.
+# `tray-icon` is what Tauri v2 gates `tauri::tray` and the menu API behind. `image-png` lets
+# `Image::from_bytes` decode the embedded PNG tray icons (`icons/tray-*.png`). No shell or
+# filesystem plugin is enabled, and no capability grants the webview anything new.
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 # The folder picker for the settings panel's clips directory (`dialog:allow-open` in
 # capabilities/default.json — open dialogs only, which return a path and grant no
@@ -34,18 +31,17 @@ tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"]
 tauri-plugin-dialog = "2"
 # One running instance owns the global hotkey, the tray and the capture session.
 tauri-plugin-single-instance = "2"
-# The Phase 1 crates are reused as-is. Nothing here re-implements them: the shell reads
-# the index, edits clips and probes them, and it *records* through the same engine the CLI
-# drives (`localplay-recorder`), which owns capture, audio, the encoder and the ring.
+# The shell reads the index, edits clips and probes them with these crates, and records through
+# the same engine the CLI drives (`localplay-recorder`), which owns capture, audio, the encoder
+# and the ring.
 localplay-media = { path = "../../../crates/media" }
 localplay-store = { path = "../../../crates/store" }
 localplay-recorder = { path = "../../../crates/recorder" }
 # The settings writer edits keys in place with their comments and formatting intact
 # (`toml_edit`), rather than re-serialising structs and destroying a hand-edited file.
 toml_edit = "0.25"
-# The global clip hotkey (spec §7.4). The desktop shell installs the *same* `RegisterHotKey`
-# listener the CLI does, from the same `[hotkeys] clip` key — there is one hotkey
-# implementation in this repository, and this is the dependency that makes that true.
+# The global clip hotkey: the shell installs the same `RegisterHotKey` listener as the CLI, from
+# the same `[hotkeys] clip` key, so there is one hotkey implementation.
 localplay-events = { path = "../../../crates/events" }
 tauri-plugin-notification = "2"
 drag = "2.1.1"

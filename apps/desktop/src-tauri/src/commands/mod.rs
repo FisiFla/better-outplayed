@@ -1,25 +1,18 @@
-//! The desktop shell's command layer — everything the IPC commands actually do.
+//! The desktop shell's command layer: everything the IPC commands actually do.
 //!
 //! # Why the logic lives here and not in the `#[tauri::command]` functions
 //!
-//! Every function in this module is a plain function over explicit dependencies: a
-//! [`Store`], an optional [`FfmpegBinaries`], a set of paths, a storage policy. None of
-//! them takes a `State`, an `AppHandle` or a window, and none of them is `async`. The
-//! `#[tauri::command]` wrappers in `lib.rs` resolve the application state and delegate,
-//! and contain no logic of their own.
-//!
-//! That split is the whole point of this file. It is what lets the suite below drive the
-//! real command bodies against a **real** SQLite store and **real** ffmpeg-produced files
-//! on disk, with no Tauri runtime and no window — a window this repository's development
-//! host has no display for, and which a test suite must never open anyway (spec §12).
+//! Every function here is a plain, non-async function over explicit dependencies (a [`Store`],
+//! an optional [`FfmpegBinaries`], a set of paths, a storage policy), taking no `State`,
+//! `AppHandle` or window. The wrappers in `lib.rs` resolve the application state and delegate.
+//! That lets the tests drive the real command bodies against a real SQLite store and real
+//! ffmpeg-produced files, with no Tauri runtime and no window.
 //!
 //! # What these commands do not do
 //!
 //! No command here captures the screen, enumerates windows or synthesises input, and none
-//! of them ever re-encodes: `trim_clip` is [`localplay_media::edit::trim_lossless`], a
-//! stream copy (`-c copy`), and the UI says so. The `events` table is not read — game
-//! event markers are Phase 4 and the timeline draws none (see `src/lib/components/
-//! Timeline.svelte`).
+//! re-encodes: `trim_clip` is [`localplay_media::edit::trim_lossless`], a stream copy
+//! (`-c copy`), and the UI says so.
 
 use localplay_media::FfmpegBinaries;
 use localplay_store::Store;
@@ -43,10 +36,9 @@ pub use settings::*;
 
 /// The app-data-relative directories the shell reads and writes.
 ///
-/// `clips_dir` is where the recorder writes clips and where a trim's new file goes — next
-/// to its parent, which is what makes a trimmed clip visible to the CLI's storage policy
-/// without any extra wiring. `thumbnails_dir` is a cache: nothing but this app reads it,
-/// and losing it costs one ffmpeg run per clip.
+/// `clips_dir` is where the recorder writes clips and where a trim's new file goes, next to its
+/// parent, so a trimmed clip is visible to the CLI's storage policy with no extra wiring.
+/// `thumbnails_dir` is a cache only this app reads; losing it costs one ffmpeg run per clip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     pub clips_dir: PathBuf,
@@ -57,9 +49,8 @@ pub struct AppPaths {
 impl AppPaths {
     /// Resolve the paths for `app_data_dir` under the `[storage]` settings.
     ///
-    /// An empty `clips_dir` means the `clips` directory under the application data
-    /// directory — the same rule the CLI applies, which is what makes the two binaries
-    /// operate on one library instead of two.
+    /// An empty `clips_dir` means the `clips` directory under the application data directory, the
+    /// CLI's rule, so the two binaries operate on one library.
     pub fn resolve(app_data_dir: &Path, clips_dir_setting: &str) -> Self {
         let clips_dir = if clips_dir_setting.is_empty() {
             app_data_dir.join("clips")
@@ -75,11 +66,10 @@ impl AppPaths {
 
     /// The directories the asset protocol must be allowed to serve.
     ///
-    /// Playback (`<video>`) only ever requests paths under `clips_dir`; the thumbnails
-    /// directory is here because a cached JPEG is served to an `<img>` the same way. Both
-    /// are handed to the runtime scope in `lib.rs`; the static scope in `tauri.conf.json`
-    /// covers the default layout only, and a configured `storage.clips_dir` is exactly the
-    /// case that needs the runtime one.
+    /// Playback requests only paths under `clips_dir`; the thumbnails directory is here because a
+    /// cached JPEG is served to an `<img>` the same way. Both go to the runtime scope in `lib.rs`;
+    /// the static scope in `tauri.conf.json` covers the default layout only, and a configured
+    /// `storage.clips_dir` needs the runtime one.
     pub fn asset_roots(&self) -> [&Path; 2] {
         [self.clips_dir.as_path(), self.thumbnails_dir.as_path()]
     }
@@ -87,11 +77,9 @@ impl AppPaths {
 
 /// Everything a command needs, passed explicitly.
 ///
-/// `bins` is optional because ffmpeg is discovered at startup and a missing ffmpeg must
-/// not stop the shell from opening: listing clips and reading the storage policy need no
-/// ffmpeg at all, and the two commands that do need it fail with
-/// [`ErrorCode::FfmpegUnavailable`] and the discovery error rather than taking the window
-/// down with them.
+/// `bins` is optional because ffmpeg is discovered at startup and a missing one must not stop
+/// the shell opening: listing clips and the storage policy need none, and the two commands that
+/// do fail with [`ErrorCode::FfmpegUnavailable`] and the discovery error.
 #[derive(Clone, Copy)]
 pub struct Deps<'a> {
     pub store: &'a Store,
@@ -115,7 +103,7 @@ impl<'a> Deps<'a> {
     }
 }
 
-/// The storage policy as the commands see it (spec §8.1).
+/// The storage policy as the commands see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageConfigView {
     pub max_total_bytes: u64,
