@@ -6,14 +6,12 @@ pub mod platform;
 pub mod target;
 pub mod stub;
 
-// The microphone backend: a cross-platform module (so the recorder's microphone path is
-// testable off Windows) whose real implementation is the `#[cfg(windows)]` half inside it.
+// The microphone backend is cross-platform so the recorder's microphone path is testable off
+// Windows; the real implementation is the `#[cfg(windows)]` half inside it.
 pub mod wasapi_mic;
 
-// The synthetic microphone the recorder's microphone path is tested with off Windows (see
-// `wasapi_mic::StubMicrophone`). Re-exported because it is a first-class part of the crate's
-// public surface: a test that wires up a microphone needs it, and the real backend only
-// exists on Windows.
+// The synthetic microphone the recorder's microphone path is tested with off Windows. Re-exported
+// because tests that wire up a microphone need it and the real backend only exists on Windows.
 pub use wasapi_mic::StubMicrophone;
 
 #[cfg(windows)]
@@ -23,10 +21,8 @@ pub mod wgc;
 
 /// The monotonic clock base shared by the video and audio backends.
 ///
-/// Both backends take their `pts` from this one `Instant`, so A/V alignment is
-/// derivable: the two streams are measured from the same origin (spec §5.1) rather
-/// than each starting a private timeline at its own `start` call. `Instant` is the
-/// QPC clock on Windows, which is what the spec means by "QPC-based".
+/// Both take their `pts` from this one `Instant` (QPC on Windows), so A/V alignment is derivable
+/// rather than each stream starting a private timeline at its own `start` call.
 #[cfg(windows)]
 pub(crate) fn clock_base() -> std::time::Instant {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -35,29 +31,22 @@ pub(crate) fn clock_base() -> std::time::Instant {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
-    /// Windows Graphics Capture hands us BGRA8.
+    /// Windows Graphics Capture delivers BGRA8.
     Bgra8,
 }
 
 /// A captured frame's pixels, still in GPU memory, on a platform that can hand them over.
 ///
-/// Wrapped rather than used bare because the `windows` crate's COM interfaces implement neither
-/// `Clone`, `PartialEq` nor `Debug`, and [`Frame`] has all three. A bare `ID3D11Texture2D` field
-/// would therefore strip three derives off every frame on every platform, which is a large blast
-/// radius for one platform's optimisation. The three impls below are the interface's own
-/// semantics, spelled out once, here:
+/// Wrapped because the `windows` crate's COM interfaces implement neither `Clone`, `PartialEq`
+/// nor `Debug`, and [`Frame`] has all three; a bare `ID3D11Texture2D` field would strip them from
+/// every frame on every platform. The impls below spell out the interface's semantics:
 ///
-/// * **`Clone` is an `AddRef`**, not a copy of pixels. It is what keeps a texture alive after
-///   WGC's frame — and the pool slot behind it — has been released, which is the lifetime
-///   question this whole path turns on.
-/// * **`PartialEq` is identity**: equal when they are the same COM object. A frame has never
-///   meant "same contents" and comparing 33.2MB to answer that would be absurd.
-/// * **`Debug` prints the pointer**, because the interface has no `Debug` of its own and a
-///   frame's log line should not need one.
+/// * `Clone` is an `AddRef`, not a pixel copy. It keeps a texture alive after WGC's frame and
+///   its pool slot have been released.
+/// * `PartialEq` is identity (the same COM object), not "same contents".
+/// * `Debug` prints the pointer.
 ///
-/// Off Windows this type is **uninhabited**, so `Frame::texture` can only ever be `None` there —
-/// which is the honest statement rather than a placeholder: every other capture backend copies
-/// its pixels into `Frame::data`, so there is nothing to hand over.
+/// Off Windows this type is uninhabited, so `Frame::texture` is always `None` there.
 #[cfg(windows)]
 pub struct GpuTexture(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D);
 
@@ -68,7 +57,7 @@ impl GpuTexture {
         Self(texture)
     }
 
-    /// The texture itself, for the encoder that will bind it to a media buffer.
+    /// The texture itself, for the encoder that binds it to a media buffer.
     pub fn as_raw(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
         &self.0
     }
@@ -76,8 +65,8 @@ impl GpuTexture {
 
 #[cfg(windows)]
 impl Clone for GpuTexture {
-    /// `AddRef`, by way of a `QueryInterface` for the same interface — the `windows` crate's
-    /// interfaces are not `Clone`, and re-querying is its own safe idiom for taking a reference.
+    /// `AddRef`, by way of a `QueryInterface` for the same interface (the `windows` crate's
+    /// interfaces are not `Clone`).
     fn clone(&self) -> Self {
         use windows::core::Interface;
 
@@ -106,53 +95,50 @@ impl std::fmt::Debug for GpuTexture {
     }
 }
 
-/// See the Windows variant above: off Windows there is no such thing as a frame whose pixels
-/// never reached the CPU, so this type has no values at all.
+/// Off Windows no frame keeps its pixels on the GPU, so this type has no values.
 #[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuTexture {}
 
 /// A single captured frame.
 ///
-/// The pixels are in [`Frame::data`] **unless** the backend delivered them as a GPU texture and
-/// the encoder asked for that: in that case `data` is empty *by design*, because the pixels never
-/// left VRAM. A consumer that needs bytes must therefore ask ([`Frame::has_pixels`]) rather than
-/// finding an empty buffer and treating it as a black frame.
+/// The pixels are in [`Frame::data`] unless the backend delivered a GPU texture the encoder asked
+/// for: then `data` is empty by design. A consumer that needs bytes must ask
+/// ([`Frame::has_pixels`]) rather than treat an empty buffer as a black frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub data: Vec<u8>,
-    /// Monotonic, from the same clock as `AudioBuffer::pts` (spec §5.1).
+    /// Monotonic, from the same clock as `AudioBuffer::pts`.
     pub pts: Duration,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
-    /// The frame's pixels in VRAM, when the backend produced them there and the encoder asked
-    /// for them that way. `None` is the ordinary case and the only case off Windows.
+    /// The frame's pixels in VRAM, when the backend produced them there and the encoder asked for
+    /// that. `None` is the ordinary case, and the only one off Windows.
     pub texture: Option<GpuTexture>,
 }
 
 impl Frame {
     /// Whether this frame's pixels are in [`Frame::data`].
     ///
-    /// `false` means the pixels are in [`Frame::texture`], not that there are none: the two are
-    /// alternatives, and a frame with neither is a bug rather than a black picture.
+    /// `false` means they are in [`Frame::texture`], not that there are none; a frame with neither
+    /// is a bug.
     pub fn has_pixels(&self) -> bool {
         !self.data.is_empty()
     }
 }
 
-/// Where a capture backend's time has gone, in total, since it started.
+/// Where a capture backend's time has gone since it started.
 ///
-/// See [`CaptureBackend::frame_timings`] for why the two are separated rather than summed.
+/// See [`CaptureBackend::frame_timings`] for why the two parts are separated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameTimings {
     /// Time spent with no frame to work on: polling the frame pool and sleeping between polls.
     ///
-    /// This is *not* work. It is the display's refresh interval showing up as idle time inside a
-    /// blocking call, and it is the number that must be subtracted before any claim about the cost
-    /// of capture means anything.
+    /// Not work: it is the display's refresh interval showing up as idle time, and must be subtracted
+    /// before any claim about the cost of capture means anything.
     pub waiting: Duration,
-    /// Time spent actually converting a frame: the readback and its copy, or the handover blit.
+    /// Time spent converting a frame: the readback and its copy, or the handover blit.
     pub copying: Duration,
 }
 
@@ -164,8 +150,7 @@ pub struct AudioFormat {
 
 impl Default for AudioFormat {
     fn default() -> Self {
-        // Fixed at 48kHz stereo: the audio timeline must be exactly derivable
-        // from the byte count (spec §13).
+        // Fixed at 48kHz stereo so the audio timeline is exactly derivable from the byte count.
         Self { sample_rate: 48_000, channels: 2 }
     }
 }
@@ -179,27 +164,21 @@ impl AudioFormat {
 
 /// The sample encoding an endpoint's native (mix) format uses.
 ///
-/// Reported, never converted by hand: the WASAPI backend opens its stream asking for
-/// 48kHz stereo s16le whatever the endpoint natively uses, and the audio engine's sample
-/// rate converter does the work (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). This type exists
-/// so the capture log can say what the engine is converting *from*.
+/// Reported, never converted by hand: the WASAPI backend asks for 48kHz stereo s16le whatever the
+/// endpoint uses and the audio engine converts (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). This type
+/// lets the log say what the engine converts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleEncoding {
-    /// 32-bit float in [-1, 1].
     F32,
-    /// 16-bit signed PCM.
     I16,
-    /// 32-bit signed PCM.
     I32,
-    /// Anything else (8-bit PCM, 64-bit float, an unrecognised SubFormat GUID).
     Other,
 }
 
 /// An endpoint's native (mix) format, as the capture backends found it.
 ///
-/// Log evidence only: the canonical format the pipeline runs on is
-/// [`AudioFormat::default`] and the backend always asks the engine for that, so nothing
-/// downstream ever sees one of these.
+/// Log evidence only: the pipeline runs on [`AudioFormat::default`], so nothing downstream sees
+/// one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeAudioFormat {
     pub sample_rate: u32,
@@ -208,13 +187,9 @@ pub struct NativeAudioFormat {
 }
 
 impl NativeAudioFormat {
-    /// Whether the endpoint is *not* already the canonical 48kHz stereo s16le, i.e. the
-    /// audio engine's converter has work to do.
-    ///
-    /// This changes no behaviour — the stream is opened with auto-conversion either way
-    /// — it only labels the log line. A `true` here together with audible, correctly
-    /// sized audio in the produced clip is what shows the engine-side conversion is
-    /// really happening.
+    /// Whether the endpoint is not already the canonical 48kHz stereo s16le, i.e. the engine's
+    /// converter has work to do. Only labels the log line; the stream is opened with
+    /// auto-conversion either way.
     pub fn needs_conversion(&self) -> bool {
         let canonical = AudioFormat::default();
         self.sample_rate != canonical.sample_rate
@@ -223,62 +198,42 @@ impl NativeAudioFormat {
     }
 }
 
-/// How long an unbroken run of silence must last before the absence of audio is worth a
-/// warning, when the endpoint is being sample-rate-converted.
+/// How long an unbroken run of silence must last, on a sample-rate-converted endpoint, before
+/// the absence of audio is worth a warning.
 ///
-/// This is a judgement call, not a measurement. The failure mode being looked for is
-/// external and **unverified at runtime**: on some Windows 11 builds a loopback capture
-/// stream opened with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` has been reported to deliver
-/// only silence (Rust/cpal and screenpipe users). We cannot tell "the converter delivered
-/// nothing" apart from "the machine was genuinely quiet" by looking at samples: a muted
-/// game, a paused desktop and a broken converter all yield the same all-zero stream.
-///
-/// Thirty seconds is chosen to be:
-/// - **long enough** that a clip whose game does produce sound will have produced at least
-///   one non-silent sample and cleared the watch (games play their first SFX within a
-///   second or two of launching), and that ordinary transients — a silent splash or
-///   loading screen, the gap before the first sound, a brief mute toggle — cannot
-///   accumulate to it, because the run resets the moment any real audio arrives;
-/// - **short enough** that a broken converter is named in the first half-minute of a clip
-///   rather than after a whole session; and
-/// - a round number a human reading the log can reason about.
-///
-/// The residual false positive — a machine that is legitimately silent (muted, idle) for
-/// the whole window — is exactly why this warns and neither fails nor stops the capture.
+/// A judgement call, not a measurement. On some Windows 11 builds a loopback stream opened with
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` has been reported to deliver only silence (unverified
+/// here), and samples cannot tell a broken converter from a muted game or paused desktop.
+/// Thirty seconds is long enough that a game's first sound clears the watch and ordinary
+/// transients (splash screens, a mute toggle) cannot accumulate to it, since any real audio
+/// resets the run, yet short enough to name a broken converter in the first half-minute. It warns
+/// rather than fails because a legitimately silent machine would trip it.
 pub const CONVERTED_SILENCE_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// Watches a capture session for the reported failure mode where an auto-converted WASAPI
-/// loopback stream delivers only silence.
+/// Watches a capture session for the reported failure where an auto-converted WASAPI loopback
+/// stream delivers only silence.
 ///
-/// Pure and platform-independent on purpose: it consumes a stream of `(duration, silent)`
-/// observations and decides whether to raise the warning, so the decision is unit-testable
-/// on a host with no audio APIs. The WASAPI backend owns one and feeds it each 10ms block;
-/// nothing here touches WASAPI.
-///
-/// The watch raises **at most one** warning per session, and only when *all* of these hold:
-/// - the endpoint needed engine-side conversion (`converting`): if it was already 48kHz
-///   stereo s16 there is no conversion to blame, and silence is just silence;
-/// - the audio is a single unbroken run of silence at least [`CONVERTED_SILENCE_THRESHOLD`]
-///   long; and
-/// - no real (non-silent) audio has ever been observed — one real sample proves the
-///   converter is delivering audio, which permanently disarms the warning.
+/// Pure and platform-independent so the decision is unit-testable off Windows; the WASAPI backend
+/// feeds it each 10ms block. It raises at most one warning per session, and only when the endpoint
+/// needed engine-side conversion (otherwise silence is just silence), the audio is one unbroken
+/// silent run of at least [`CONVERTED_SILENCE_THRESHOLD`], and no real audio was ever observed
+/// (one real sample proves the converter works and disarms the warning).
 #[derive(Debug, Clone)]
 pub struct ConvertedSilenceWatch {
     /// Whether the audio engine was doing sample-rate conversion for this session.
     converting: bool,
     /// Whether the single warning has already been raised.
     warned: bool,
-    /// Whether any real (non-silent) audio has been observed: if so, conversion works.
+    /// Whether any real (non-silent) audio has been observed.
     proven_audible: bool,
     /// Total audio observed, over the whole session.
     elapsed: Duration,
-    /// Length of the unbroken run of silence currently in progress.
+    /// Length of the unbroken run of silence in progress.
     silent_run: Duration,
 }
 
 impl ConvertedSilenceWatch {
-    /// A watch for a session whose endpoint did (`converting = true`) or did not require
-    /// engine-side conversion.
+    /// A watch for a session whose endpoint did (`converting`) or did not need engine-side conversion.
     pub fn new(converting: bool) -> Self {
         Self {
             converting,
@@ -289,19 +244,15 @@ impl ConvertedSilenceWatch {
         }
     }
 
-    /// Observe one block of audio of length `block`, and report whether the warning should
-    /// be raised *now*.
+    /// Observe one block of length `block`; returns `true` if the warning should be raised now.
     ///
-    /// Returns `true` at most once in the watch's lifetime: the first call that sees the
-    /// unbroken silence cross the threshold — with conversion in play and no audio ever
-    /// heard — returns `true` and latches, and every later call returns `false`. A block
-    /// containing any real audio resets the silence run to zero and disarms the watch
-    /// permanently (a non-silent sample falsifies the hypothesis it exists to test).
+    /// Returns `true` at most once: the first call that sees unbroken silence cross the threshold,
+    /// with conversion in play and no audio ever heard, latches. A block with any real audio resets
+    /// the run and disarms the watch permanently.
     pub fn observe(&mut self, block: Duration, silent: bool) -> bool {
         self.elapsed += block;
         if !silent {
-            // Real audio proves the conversion is working; from here on silence is just
-            // silence and the warning would be a false positive. Clear it for good.
+            // Real audio proves conversion works; later silence is just silence. Disarm for good.
             self.silent_run = Duration::ZERO;
             self.proven_audible = true;
             return false;
@@ -323,23 +274,21 @@ impl ConvertedSilenceWatch {
         self.warned
     }
 
-    /// Total audio observed so far, over the whole session.
+    /// Total audio observed so far.
     pub fn elapsed(&self) -> Duration {
         self.elapsed
     }
 
-    /// Length of the unbroken run of silence currently in progress.
+    /// Length of the unbroken run of silence in progress.
     pub fn silent_run(&self) -> Duration {
         self.silent_run
     }
 }
 
-/// Whether a block of interleaved s16le audio is entirely silent — every sample zero.
+/// Whether a block of interleaved s16le audio is entirely silent (every sample zero).
 ///
-/// The engine's own silent flag is turned into explicit zeros before a block reaches this
-/// (see the WASAPI backend's `append_packet`), so an all-zero block is the single
-/// representation of "no audio" the pipeline has. An empty slice is vacuously silent; real
-/// blocks are never empty.
+/// The engine's silent flag is turned into explicit zeros before a block reaches this (see the
+/// WASAPI backend's `append_packet`). An empty slice is vacuously silent.
 pub fn is_silent_block(samples: &[u8]) -> bool {
     samples.iter().all(|&byte| byte == 0)
 }
@@ -358,41 +307,28 @@ pub trait CaptureBackend: Send {
     fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>>;
     fn stop(&mut self) -> anyhow::Result<()>;
 
-    /// Close any frames the backend has buffered, without copying their pixels to CPU
-    /// memory. Returns how many were discarded. Used to skip the (expensive) readback
-    /// for frames the pacer will not keep.
+    /// Close any frames the backend has buffered without copying their pixels to CPU memory, and
+    /// return how many were discarded. Lets the caller skip the readback for frames the pacer will
+    /// not keep (at 3840x2160 BGRA that is a 33.2MB GPU copy plus a row-by-row CPU copy per frame).
     ///
-    /// This is the cheap half of [`CaptureBackend::next_frame`], and the caller decides
-    /// which half to use *before* paying for a frame: the rate-limiting pacer in the CLI
-    /// discards the frames it has no slot for (see `pump_once_counted`), and at
-    /// 3840x2160 BGRA the readback it skips is a 33.2MB GPU copy plus a row-by-row CPU
-    /// copy per frame. Implementations must therefore do no allocation, no pixel copy and
-    /// no blocking wait here, must release what they close (an unclosed frame occupies a
-    /// backend buffer and starves the next one), and must bound their loop.
+    /// Implementations must do no allocation, no pixel copy and no blocking wait, must release what
+    /// they close (an unclosed frame occupies a backend buffer and starves the next one), and must
+    /// bound their loop. Counting contract: a frame is either returned by
+    /// [`CaptureBackend::next_frame`] or counted here, so the caller's counters account for every
+    /// frame offered.
     ///
-    /// Counting contract: a frame is either returned by [`CaptureBackend::next_frame`] or
-    /// counted here, so the caller's materialised and discarded counters together account
-    /// for every frame the backend offered.
-    ///
-    /// The default is correct for a backend that owns no frame pool — there is nothing
-    /// buffered to close, so there is nothing to discard. The stub overrides it to model a
-    /// paced source, and WGC overrides it to close the frames its pool is holding.
+    /// The default suits a backend with no frame pool (nothing to discard); the stub overrides it to
+    /// model a paced source and WGC to close the frames its pool holds.
     fn discard_pending(&mut self) -> anyhow::Result<usize> {
         Ok(0)
     }
 
-    /// How this backend has spent its time since it started: **waiting** for frames, and
-    /// **copying** them.
+    /// How this backend has spent its time since it started: waiting for frames, and copying them.
     ///
-    /// [`CaptureBackend::next_frame`] is one number to its caller, and one number cannot answer the
-    /// question the whole of Tier 2 rests on: *is the readback the cost?* A backend that spends its
-    /// time waiting for a 60 Hz display reports the same figure as one that spends it copying 33 MB
-    /// out of VRAM, and those two have opposite remedies — one is fixed by removing the copy, the
-    /// other is not fixed by removing anything.
-    ///
-    /// `None` for a backend that does not measure it. A backend that does is expected to account
-    /// for the whole of the time it spends inside `next_frame`: waiting plus copying, with nothing
-    /// unaccounted between them.
+    /// `next_frame` is one number, which cannot say whether the readback is the cost: a backend
+    /// waiting on a 60 Hz display reports the same figure as one copying 33 MB out of VRAM, and the
+    /// remedies are opposite. `None` for a backend that does not measure it; one that does must
+    /// account for all the time spent inside `next_frame` (waiting plus copying).
     fn frame_timings(&self) -> Option<FrameTimings> {
         None
     }
@@ -400,24 +336,17 @@ pub trait CaptureBackend: Send {
     /// Ask this backend to hand frames over as GPU textures instead of copying their pixels to
     /// [`Frame::data`].
     ///
-    /// Off by default, and a backend that cannot do it says so by leaving it off: the default is a
-    /// no-op, and a backend that ignores it keeps delivering pixels, which every consumer
-    /// understands. Only a backend whose frames are *born* on the GPU can save anything here — on
-    /// this project that is Windows Graphics Capture, where the copy out of VRAM is ~97% of what
-    /// the 4K pipeline does (§14 of `docs/verification-status.md`).
-    ///
-    /// Textures are only useful to an encoder that can *take* one (a hardware MFT through a
-    /// `IMFDXGIDeviceManager`), and that encoder must be on the same D3D11 device. A caller that
-    /// turns this on without one gets frames with no pixels in them and, in this project, an
-    /// encoder that refuses them by name rather than writing a zero-length frame into a pipe.
+    /// Off by default; a backend that cannot do it ignores the call and keeps delivering pixels. Only
+    /// a backend whose frames are born on the GPU saves anything (WGC, where the copy out of VRAM is
+    /// ~97% of the 4K pipeline's cost). The caller needs an encoder that can take a texture (a
+    /// hardware MFT through an `IMFDXGIDeviceManager`) on the same D3D11 device; without one, frames
+    /// carry no pixels and the encoder refuses them by name rather than writing a zero-length frame.
     fn deliver_textures(&mut self, _textures: bool) {}
 
     /// The frame geometry this backend delivers.
     ///
-    /// Infallible by design: the size is fixed once the backend is constructed (the
-    /// monitor's native resolution for WGC, the configured size for the stub), so
-    /// there is no state that can be "not started yet" to report around. The encoder
-    /// declares its rawvideo pipe with exactly this size, so the two never disagree.
+    /// Infallible: the size is fixed at construction (the monitor's native resolution for WGC, the
+    /// configured size for the stub). The encoder declares its rawvideo pipe with exactly this size.
     fn native_size(&self) -> (u32, u32);
 }
 
@@ -437,13 +366,11 @@ mod tests {
 
     #[test]
     fn the_canonical_audio_format_is_48khz_stereo_s16() {
-        // The format the WASAPI backend asks the audio engine for, and the one the
-        // encoder's audio pipe is declared as (`-f s16le -ar 48000 -ac 2`).
+        // The format the WASAPI backend asks the engine for and the encoder's audio pipe is declared as.
         let canonical = AudioFormat::default();
         assert_eq!(canonical.sample_rate, 48_000);
         assert_eq!(canonical.channels, 2);
-        // 10ms of it: 480 frames x 2 channels x 2 bytes. This is the block `next_buffer`
-        // slices out and the granularity the rest of the pipeline counts in.
+        // 10ms of it: 480 frames x 2 channels x 2 bytes, the granularity the pipeline counts in.
         assert_eq!(canonical.bytes_per_10ms(), 1_920);
     }
 
@@ -454,11 +381,10 @@ mod tests {
 
     #[test]
     fn any_other_rate_channel_count_or_encoding_is_flagged_for_engine_conversion() {
-        // The rates that used to make `start()` refuse: 44.1kHz USB DACs and 96kHz
-        // wireless headsets are exactly what the engine-side conversion is for.
+        // 44.1kHz USB DACs and 96kHz wireless headsets are what engine-side conversion is for.
         assert!(native(44_100, 2, SampleEncoding::I16).needs_conversion());
         assert!(native(96_000, 2, SampleEncoding::I16).needs_conversion());
-        // The two other axes the engine also converts for us.
+        // The other two axes the engine converts.
         assert!(native(48_000, 6, SampleEncoding::I16).needs_conversion());
         assert!(native(48_000, 1, SampleEncoding::I16).needs_conversion());
         assert!(native(48_000, 2, SampleEncoding::F32).needs_conversion());
@@ -466,20 +392,17 @@ mod tests {
         assert!(native(48_000, 2, SampleEncoding::Other).needs_conversion());
     }
 
-    // --- Converted-silence watch -------------------------------------------------------
-    //
-    // The failure mode is externally reported and unverified at runtime; these tests pin
-    // the *decision*, not the report. They run off Windows because the logic is pure.
+    // --- Converted-silence watch ---
+    // These pin the decision, not the externally reported failure; pure logic, so they run off Windows.
 
-    /// Seconds, so the tests read in the units the threshold is documented in.
+    /// Seconds, to match the units the threshold is documented in.
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
 
     #[test]
     fn short_silence_does_not_warn() {
-        // One second short of the threshold, in 1s blocks: a silent splash screen or the gap
-        // before a game's first sound must not be mistaken for a broken converter.
+        // One second short of the threshold: a silent splash screen is not a broken converter.
         let mut watch = ConvertedSilenceWatch::new(true);
         for _ in 0..CONVERTED_SILENCE_THRESHOLD.as_secs() - 1 {
             assert!(!watch.observe(secs(1), true), "under the threshold: no warning");
@@ -489,8 +412,7 @@ mod tests {
 
     #[test]
     fn sustained_silence_with_conversion_warns_exactly_once() {
-        // The reported failure mode: a converted endpoint that never delivers audio.
-        // 4000 blocks of 10ms is 40s — well past the 30s threshold.
+        // A converted endpoint that never delivers audio: 40s of 10ms blocks, past the 30s threshold.
         let mut watch = ConvertedSilenceWatch::new(true);
         let mut warnings = 0;
         for _ in 0..4_000 {
@@ -518,8 +440,7 @@ mod tests {
 
     #[test]
     fn sustained_silence_without_conversion_never_warns() {
-        // An endpoint already at 48kHz stereo s16: silence is just silence. There is no
-        // conversion to blame, so a muted game or an idle desktop must never be flagged.
+        // Already 48kHz stereo s16: no conversion to blame, so a muted game is never flagged.
         let mut watch = ConvertedSilenceWatch::new(false);
         for _ in 0..10_000 {
             assert!(!watch.observe(Duration::from_millis(10), true), "nothing to blame");
@@ -529,9 +450,8 @@ mod tests {
 
     #[test]
     fn silence_broken_by_real_audio_resets_and_never_warns() {
-        // A run of silence UNDER the threshold, one block of real audio, then a run of
-        // silence WELL OVER it. Real audio proves the converter works, so the watch is both
-        // reset and permanently disarmed: the later silence is a mute, not the failure mode.
+        // Silence under the threshold, one real block, then silence well over it: real audio resets and
+        // permanently disarms the watch, so the later silence is a mute.
         let mut watch = ConvertedSilenceWatch::new(true);
         for _ in 0..20 {
             assert!(!watch.observe(secs(1), true));
@@ -547,8 +467,7 @@ mod tests {
 
     #[test]
     fn the_watch_counts_both_total_elapsed_and_the_current_silent_run() {
-        // The two durations the decision is made from, kept separately: total time observed
-        // and the unbroken silent run within it.
+        // Total time observed and the unbroken silent run within it are kept separately.
         let mut watch = ConvertedSilenceWatch::new(true);
         watch.observe(secs(5), false); // real audio
         watch.observe(secs(3), true); //  silence begins
@@ -560,7 +479,7 @@ mod tests {
     #[test]
     fn is_silent_block_is_true_only_for_an_all_zero_block() {
         assert!(is_silent_block(&[0, 0, 0, 0]));
-        // A single non-zero byte anywhere is real audio — even a sample of -1 (0xFFFF) or +1.
+        // A single non-zero byte anywhere is real audio, even -1 (0xFFFF) or +1.
         assert!(!is_silent_block(&[0, 0, 1, 0]));
         assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
         assert!(!is_silent_block(&[0, 0, 0, 0x80]));

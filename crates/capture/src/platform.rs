@@ -1,17 +1,14 @@
 //! Backend selection, so every `#[cfg(windows)]` line lives inside this crate.
 //!
-//! `cargo check --target x86_64-pc-windows-msvc` can type-check this crate from a
-//! non-Windows host (`cargo check` does not link), which is the only Windows gate
-//! available without Windows hardware. Keeping the selection here rather than in the
-//! CLI is what makes that gate cover the choice as well as the backends.
+//! `cargo check --target x86_64-pc-windows-msvc` type-checks this crate from a non-Windows host
+//! (it does not link), the only Windows gate without Windows hardware. Selecting here rather than
+//! in the CLI makes that gate cover the choice as well as the backends.
 //!
 //! # No silent stub fallback on Windows
 //!
-//! On Windows these functions either return a real backend or fail. There is
-//! deliberately **no** fallback to `StubCapture`/`StubAudio`: a synthetic stand-in would
-//! make the application look like it is buffering while capturing nothing, and the
-//! failure would only surface much later as an empty clip. The stubs exist for
-//! non-Windows development, and that is the only place they are selected.
+//! On Windows these functions return a real backend or fail. A synthetic stand-in would make the
+//! application look like it is buffering while capturing nothing, surfacing only later as an
+//! empty clip. The stubs are selected only off Windows.
 
 use crate::stub::StubConfig;
 use crate::target::CaptureTarget;
@@ -20,19 +17,16 @@ use anyhow::Result;
 
 /// The video backend for this platform.
 ///
-/// `stub` describes the synthetic source used off Windows. On Windows the real
-/// backend reports the monitor's own native size through
-/// [`CaptureBackend::native_size`], so `stub` is not consulted there.
+/// `stub` describes the synthetic source used off Windows. On Windows the real backend reports
+/// the monitor's native size through [`CaptureBackend::native_size`], so `stub` is not consulted.
 pub fn default_video_backend(
     stub: StubConfig,
     target: &CaptureTarget,
 ) -> Result<Box<dyn CaptureBackend>> {
     #[cfg(windows)]
     {
-        // The stub's size is irrelevant here: WGC reports the monitor it will capture,
-        // and the caller reads that back via `native_size`. No warning, because a
-        // configured `encode.output_size` that differs from the monitor is now scaled
-        // rather than mis-read.
+        // The stub's size is irrelevant: WGC reports the monitor it will capture and the caller reads it
+        // back via `native_size`. A configured `encode.output_size` that differs is scaled, so no warning.
         let _ = stub;
         Ok(Box::new(crate::wgc::WgcCapture::new(target)?))
     }
@@ -51,10 +45,9 @@ pub fn default_video_backend(
 
 /// The audio backend for this platform.
 ///
-/// `format` is what the synthetic source produces off Windows. On Windows the WASAPI
-/// backend always produces `AudioFormat::default()` (48kHz stereo s16le) and refuses an
-/// endpoint that cannot supply that rate, so a different request is reported rather
-/// than silently ignored.
+/// `format` is what the synthetic source produces off Windows. On Windows the WASAPI backend
+/// always produces `AudioFormat::default()` (48kHz stereo s16le), so a different request is
+/// reported rather than silently ignored.
 pub fn default_audio_backend(format: AudioFormat) -> Result<Box<dyn AudioBackend>> {
     #[cfg(windows)]
     {
@@ -74,20 +67,17 @@ pub fn default_audio_backend(format: AudioFormat) -> Result<Box<dyn AudioBackend
     }
 }
 
-/// `CoInitializeEx(COINIT_MULTITHREADED)` for the calling thread, shared by both
-/// Windows backends.
+/// `CoInitializeEx(COINIT_MULTITHREADED)` for the calling thread, shared by both Windows backends.
 ///
-/// Returns whether *this* call took the apartment, which is exactly when the caller owes
-/// a matching `CoUninitialize`. Already-initialised threads (`S_FALSE`) and threads that
-/// live in a different apartment (`RPC_E_CHANGED_MODE`) both report `false`: COM is
-/// usable either way, and neither case may be uninitialised by us.
+/// Returns whether this call took the apartment, i.e. when the caller owes a matching
+/// `CoUninitialize`. Already-initialised threads (`S_FALSE`) and threads in a different apartment
+/// (`RPC_E_CHANGED_MODE`) report `false`: COM is usable either way and we must not uninitialise it.
 #[cfg(windows)]
 pub(crate) fn init_com() -> Result<bool> {
     use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-    // SAFETY: COM is being initialised for the current thread; a null reserved pointer
-    // is the documented value.
+    // SAFETY: COM is being initialised for the current thread; a null reserved pointer is the documented value.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr == S_OK {
         return Ok(true);
