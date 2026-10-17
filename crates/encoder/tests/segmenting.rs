@@ -1,12 +1,7 @@
-//! Drives the encoder with stub sources and asserts it produces segments
-//! containing BOTH a video and an audio stream.
+//! Drives the encoder with stub sources and asserts segments contain both a video and an audio stream.
 //!
-//! Fed in real time, because the encoder's media timeline is the wall clock (see the
-//! module comment in `localplay_encoder::ffmpeg`): handing 3 seconds of stubbed frames over
-//! in one burst puts every one of them within a few milliseconds of arrival and encodes,
-//! correctly, as a few milliseconds of media. A live capture delivers frames over the
-//! seconds they represent, and that is what this test now does — with the assertions
-//! unchanged.
+//! Fed in real time: the media timeline is the wall clock (see `localplay_encoder::ffmpeg`), so
+//! a burst of stubbed frames encodes as a few milliseconds of media.
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, FfmpegEncoder, Encoder, VideoCodec};
@@ -24,8 +19,7 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         48,
         30,
         dir.path().to_path_buf(),
-        // MILLISECONDS. See the note in Task 10 — this unit is easy to get wrong
-        // and a ">= 2 segments" assertion will not catch it.
+        // Milliseconds. A ">= 2 segments" assertion alone would not catch a unit mistake.
         1_000,
     );
 
@@ -35,9 +29,8 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     video.start().unwrap();
     audio.start().unwrap();
 
-    // 3 seconds of *wall clock* of stub capture => at least 2 completed segments. Both
-    // stubs are paced by real time and `next_frame` waits at most 5ms for the next frame,
-    // so this loop drives them exactly as the CLI's capture loop does.
+    // 3 seconds of wall clock => at least 2 completed segments. Both stubs are real-time paced and
+    // `next_frame` waits at most 5ms, so this drives them as the CLI's capture loop does.
     let until = Instant::now() + Duration::from_secs(3);
     let mut frames = 0u64;
     while Instant::now() < until {
@@ -64,9 +57,8 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     let info = localplay_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
     assert!(info.video.is_some(), "segment must contain video");
     assert!(info.audio.is_some(), "segment must contain audio");
-    // Guards the `segment_ms` unit. Passing 1 instead of 1_000 silently produces
-    // 1ms segments, which still satisfies the ">= 2 segments" check above — so
-    // without this assertion the unit error goes unnoticed.
+    // Guards the `segment_ms` unit: 1 instead of 1_000 yields 1ms segments, which still pass the
+    // ">= 2 segments" check above.
     assert!(
         (900..=1300).contains(&info.duration_ms),
         "segment duration {}ms should be ~1000ms (segment_ms is milliseconds)",
@@ -74,12 +66,10 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     );
 }
 
-/// The segment numbering can be continued, which is what stops a second run overwriting
-/// the files the adopted ledger points at.
+/// Segment numbering can be continued, so a second run cannot overwrite the files the adopted
+/// ledger points at.
 ///
-/// Deliberately fed in a burst: the assertion is about which *filenames* ffmpeg opens, and
-/// that does not depend on how the timeline looks. The first output file is created as soon
-/// as ffmpeg writes a packet into it.
+/// Fed in a burst on purpose: the assertion is about which filenames ffmpeg opens, not the timeline.
 #[test]
 fn the_encoder_starts_segment_numbering_at_start_number() {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");

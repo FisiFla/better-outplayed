@@ -1,38 +1,27 @@
 //! Ask this machine what hardware video encoders it has, and whether they take a GPU texture.
 //!
-//! The same shape as `xtask probe`, and for the same reason: it is the most that can be learned
-//! about the hardware encode path without opening a window or starting a capture session. It
-//! starts Media Foundation, enumerates the hardware H.264 encoder MFTs, and for each one runs the
-//! handshake the Tier 2 zero-copy encoder will have to run — passing it a device manager built
-//! over a D3D11 device of the kind Windows Graphics Capture requires.
-//!
-//! Run it on the machine in question:
+//! The same shape as `xtask probe`: it starts Media Foundation, enumerates the hardware H.264
+//! encoder MFTs, and runs the zero-copy handshake on each, passing a device manager built over a
+//! D3D11 device of the kind Windows Graphics Capture requires. A machine with no hardware
+//! encoder MFT, or one that refuses the handshake, cannot take the zero-copy path at all.
 //!
 //! ```text
 //! cargo run --release -p localplay-encoder --example mft_probe
 //! ```
-//!
-//! What it answers: whether the design in `docs/plans/2026-09-25-localplay-tier-2-zero-copy.md`
-//! has anything to stand on. A machine with no hardware encoder MFT, or one whose MFT refuses the
-//! D3D11 handshake, cannot take this path at all — and that is much cheaper to learn here than
-//! after the encoder is written.
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-
-    // `cargo run --example mft_probe -- hevc` asks the same questions about HEVC. A codec is not a
-    // flag on this probe's findings, it *is* the question: which MFTs will agree to produce it, and
-    // whether the ARGB32 handshake survives the different profile and level it needs.
+    // `-- hevc` asks the same questions about HEVC: which MFTs produce it, and whether the ARGB32
+    // handshake survives its different profile and level.
     let codec = if std::env::args().any(|arg| arg.eq_ignore_ascii_case("hevc")) {
         localplay_encoder::VideoCodec::Hevc
     } else {
         localplay_encoder::VideoCodec::H264
     };
-    // The probes below ask about formats and sizes, not about rates, so they negotiate with the
-    // example config's own bitrate. The recording path passes `encode.bitrate_kbps` down instead,
-    // because there it is the number the clip is really made at.
+    // The probes ask about formats and sizes, not rates, so they use the example's own bitrate; the
+    // recording path passes `encode.bitrate_kbps` instead.
     const BITRATE_KBPS: u32 = 20_000;
-    // Unfiltered, so that "no encoder for this codec" can be told apart from "the filter is wrong".
+    // Unfiltered, so "no encoder for this codec" is distinguishable from "the filter is wrong".
     match localplay_encoder::mft::list_hardware_video_encoders() {
         Ok(names) => {
             println!("--- every hardware video encoder MFT here, unfiltered: {} ---", names.len());
@@ -70,9 +59,8 @@ fn main() -> anyhow::Result<()> {
     let usable = encoders.iter().filter(|e| e.accepts_d3d11).count();
     println!("\nof those, {usable} accepted MFT_MESSAGE_SET_D3D_MANAGER over a BGRA-capable D3D11 device");
 
-    // Whether frames would need converting before an encoder will take them. WGC delivers BGRA8; an
-    // encoder that lists NV12 but not RGB32 means a Video Processor MFT belongs in the chain, on the
-    // GPU, rather than a CPU conversion loop — which is the cost this plan exists to remove.
+    // If the encoder lists NV12 but not RGB32, a GPU Video Processor MFT belongs in the chain
+    // rather than a CPU conversion loop. WGC delivers BGRA8.
     let takes_bgra = encoders.iter().any(|e| {
         e.input_subtypes
             .iter()
@@ -89,24 +77,19 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(err) => println!("video processor MFTs: could not be asked: {err}"),
     }
-    // The encoder core itself, at the resolution that matters. Everything above is a query; this
-    // is the thing: configure a 4K encoder, hand it a GPU texture, and see whether it takes it
-    // without a single pixel crossing the CPU.
+    // The encoder core at 4K: hand it a GPU texture and see whether it takes it with no pixel
+    // crossing the CPU.
     if usable > 0 {
         println!("\n--- the encoder core, at 3840x2160 ---");
         let size = (3840u32, 2160u32);
-        // The device is the *probe's* own here. In the real pipeline it is capture's, and that is
-        // the whole reason `MftEncoder::open` takes one rather than making its own.
+        // The device is the probe's own; in the real pipeline it is capture's, which is why
+        // `MftEncoder::open` takes one rather than making its own.
         let device = localplay_encoder::mft::create_capture_kind_device()?;
 
-        // **The format is the question for HEVC, so ask it directly.** The H.264 encoder takes the
-        // BGRA texture below and converts inside itself; the HEVC one refuses that format outright
-        // (`0xC00D6D76`, "the input type is not supported for D3D device"). Both are asked here, of
-        // the same device, so the answer is about the format rather than about a guess — and NV12 is
-        // what the capture handover will have to produce for the HEVC path to exist at all.
-        // **The question that should have come first: what does the encoder say it wants?**
-        // 0xC00D6D76 is MF_E_UNSUPPORTED_D3D_TYPE, and the documented way to find out which type it
-        // will take is to ask it rather than to guess at attributes.
+        // For HEVC the format is the question. The H.264 encoder takes the BGRA texture below and
+        // converts inside itself; the HEVC one refuses it (`0xC00D6D76`, MF_E_UNSUPPORTED_D3D_TYPE:
+        // "the input type is not supported for D3D device"). Ask the encoder which type it wants rather
+        // than guessing at attributes; the capture handover must produce NV12 for HEVC.
         if codec == localplay_encoder::VideoCodec::Hevc {
             println!("\n--- what the encoder says it offers ---");
             for (what, value) in localplay_encoder::mft::probe_available_types(codec, size)? {
@@ -122,8 +105,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // **And if the encoder still will not have it, find out what it objects to.** One attribute
-        // at a time, because three guesses have already failed and a fourth would be luck.
+        // If the encoder still refuses, find out what it objects to, one attribute at a time.
         if codec == localplay_encoder::VideoCodec::Hevc {
             println!("\n--- which attribute of the output type it objects to ---");
             for (what, verdict) in localplay_encoder::mft::probe_output_types(codec, size)? {
@@ -184,23 +166,18 @@ fn main() -> anyhow::Result<()> {
                       windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                   )?;
                 encoder.start()?;
-                // Feed it a second of frames and collect what comes out. What is being tested is
-                // that H.264 bytes exist at all — that a captured texture reaches the encoder with
-                // no CPU copy *and* that the encoder is willing to make a stream of it.
+                // Feed it a second of frames and collect the output: H.264 bytes must exist, i.e. a captured
+                // texture reaches the encoder with no CPU copy and the encoder makes a stream of it.
                 let mut total = 0usize;
                 let mut frames = 0usize;
                 let mut stream: Vec<u8> = Vec::new();
-                // Streamed into ffmpeg *as they are produced*, not collected and handed over at the
-                // end. That distinction is the whole of this test: an H.264 elementary stream has no
-                // timestamps, so the only ones ffmpeg can use are the times the bytes arrive — and a
-                // batch write makes every frame arrive at once. Measured the wrong way first: 30
-                // frames paced over a second produced a 196ms fragment, because the probe had
-                // buffered them. The pipeline streams, so the probe has to as well.
+                // Streamed into ffmpeg as produced, not batched: an H.264 elementary stream has no timestamps,
+                // so ffmpeg uses arrival times, and a batch write makes every frame arrive at once (30 frames
+                // paced over a second once produced a 196ms fragment).
                 let mut sink = FfmpegSink::spawn()?;
-                // Paced at 30fps, deliberately, for the same reason.
+                // Paced at 30fps for the same reason.
                 let pace = std::time::Duration::from_millis(33);
-                // Three seconds, not one: with a keyframe a second this is where the
-                // one-fragment-per-keyframe contract becomes visible rather than assumed.
+                // Three seconds, so the one-fragment-per-keyframe contract is visible (one keyframe a second).
                 let seconds = 3;
                 for index in 0..(30 * seconds) {
                     let at = std::time::Instant::now();
@@ -230,9 +207,8 @@ fn main() -> anyhow::Result<()> {
                     "the stream starts {:02x?}",
                     &stream[..stream.len().min(8)]
                 );
-                // Step 6's question, asked rather than assumed. An H.264 elementary stream carries
-                // no timestamps of its own, so what ffmpeg does with these bytes — and whether what
-                // comes out is the fragmented MP4 the ring parses — is not something to guess at.
+                // Whether what ffmpeg makes of the bare bitstream is the fragmented MP4 the ring parses; an
+                // elementary stream carries no timestamps, so this is asked rather than assumed.
                 println!("\n--- the bitstream into ffmpeg ---");
                 match sink.finish() {
                     Ok(fmp4) => {
@@ -259,8 +235,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if usable == 0 {
-        // Not an error: it is a finding, and the one the plan most needs. Exit non-zero so a
-        // script notices, but print the reason rather than a stack trace.
+        // A finding, not an error. Exit non-zero so a script notices, but print the reason, not a stack trace.
         anyhow::bail!("no hardware encoder on this machine accepts the D3D11 handshake");
     }
     Ok(())
@@ -268,16 +243,9 @@ fn main() -> anyhow::Result<()> {
 
 /// An ffmpeg child taking an H.264 elementary stream on stdin and writing fragmented MP4 to stdout.
 ///
-/// The command line is the project's own fragmented-MP4 shape — the one `EncodeConfig` uses for a
-/// replay buffer, `empty_moov+frag_keyframe+default_base_moof` — because the question is not whether
-/// ffmpeg can make *a* container but whether it can make *this* one out of bytes a hardware MFT
-/// produced.
-///
-/// `-use_wallclock_as_timestamps 1` on the input is load-bearing: an elementary stream carries no
-/// timestamps of its own, and this is what tells ffmpeg to take them from when the bytes arrive
-/// rather than inventing a rigid grid — the lesson of issue #2, which cost an afternoon the first
-/// time round. Which is also why this is a *stream* and not a batch: arrival times only mean
-/// something if the bytes arrive when they were made.
+/// The command line is the project's replay-buffer shape (`empty_moov+frag_keyframe+default_base_moof`).
+/// `-use_wallclock_as_timestamps 1` is load-bearing: an elementary stream has no timestamps, and
+/// this takes them from arrival instead of a rigid grid, so the bytes must arrive when they were made.
 #[cfg(windows)]
 struct FfmpegSink {
     child: std::process::Child,
@@ -318,8 +286,7 @@ impl FfmpegSink {
             .spawn()
             .context("spawning ffmpeg")?;
 
-        // ffmpeg blocks on a full stdout, so the reading happens on its own thread or the writes
-        // below would deadlock — the same reason the encoder's own reader thread exists.
+        // ffmpeg blocks on a full stdout, so it is read on its own thread or the writes below deadlock.
         let mut stdout = child.stdout.take().context("ffmpeg's stdout")?;
         let reading = std::thread::spawn(move || {
             let mut out = Vec::new();
@@ -334,7 +301,7 @@ impl FfmpegSink {
         })
     }
 
-    /// Hand ffmpeg one access unit's worth of bitstream, as it is produced.
+    /// Hand ffmpeg one access unit of bitstream as it is produced.
     fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         use anyhow::Context;
         use std::io::Write;
@@ -342,8 +309,7 @@ impl FfmpegSink {
             return Ok(());
         }
         self.stdin.write_all(bytes).context("writing the bitstream")?;
-        // Flushed per access unit: buffering here would put the frames back in a batch, which is the
-        // mistake this whole method exists to avoid.
+        // Flushed per access unit: buffering would turn the frames back into a batch.
         self.stdin.flush().context("flushing to ffmpeg")
     }
 
@@ -373,10 +339,8 @@ impl FfmpegSink {
 
 /// A BGRA texture of `size` on `device`, standing in for a captured frame.
 ///
-/// Zero-filled: what is being tested is whether the encoder will take a *surface* of this format at
-/// this size, and the pixels' value has no bearing on that. Created with the bind flags Windows
-/// Graphics Capture's own frames carry, because a texture the encoder refuses on those grounds
-/// would look like a format refusal and is not one.
+/// Zero-filled (pixel values do not matter). Created with the bind flags WGC's own frames carry,
+/// so a refusal on those grounds cannot be mistaken for a format refusal.
 #[cfg(windows)]
 fn fake_frame(
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
