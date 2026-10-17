@@ -231,7 +231,7 @@
 
   .verdict.ok {
     border-color: var(--accent-dim);
-    background: rgba(94, 234, 212, 0.06);
+    background: rgba(139, 123, 255, 0.06);
   }
 
   .verdict.bad {

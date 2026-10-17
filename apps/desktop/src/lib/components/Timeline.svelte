@@ -255,9 +255,9 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    background: rgba(94, 234, 212, 0.16);
-    border-left: 1px solid rgba(94, 234, 212, 0.5);
-    border-right: 1px solid rgba(94, 234, 212, 0.5);
+    background: rgba(139, 123, 255, 0.16);
+    border-left: 1px solid rgba(139, 123, 255, 0.5);
+    border-right: 1px solid rgba(139, 123, 255, 0.5);
     pointer-events: none;
   }
 
@@ -268,7 +268,7 @@
     width: 2px;
     margin-left: -1px;
     background: var(--accent);
-    box-shadow: 0 0 6px rgba(94, 234, 212, 0.6);
+    box-shadow: 0 0 6px rgba(139, 123, 255, 0.6);
     pointer-events: none;
   }
 
@@ -336,7 +336,7 @@
 
   .handle:hover::before,
   .handle:focus-visible::before {
-    box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.35);
+    box-shadow: 0 0 0 3px rgba(139, 123, 255, 0.35);
   }
 
   .handle:focus-visible {
