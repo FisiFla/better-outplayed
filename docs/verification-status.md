@@ -1787,3 +1787,46 @@ and needs a run with a lower cap or a longer `--seconds`.
 
 Result at `13063a2` on the Windows test machine (NVIDIA RTX-class GPU, 3840x2160/30fps, `h264_nvenc`): **28 passed, 0 failed,
 2 not performed** (`silence_detector`, `eviction`).
+
+---
+
+## 24. The MFT bitrate overshoot was the declared frame rate (2026-10-17)
+
+§18-§19 left both MFTs writing about twice the configured `bitrate_kbps`. The media types declared
+30fps while the texture path fed 60, so the encoder budgeted `bitrate / 30` per frame. Fixed in
+`crates/encoder/src/mft.rs`: both types now declare the effective encode fps. H.264 asks for level
+5.2 when 4K60 needs it. Keyframe spacing is one second of frames, and media time is counted from
+the frame number.
+
+Measured on the Windows test machine (NVIDIA RTX-class GPU, NVENC MFTs, 3840x2160, `zero_copy = true`,
+`[audio] enabled = false`, `encode.bitrate_kbps = 20000`). Each row is one run of the release CLI
+with `--self-test-clip-after 45`, and the numbers are `ffprobe` on the clip (about 35 s). Every run
+was in one interactive session, but whatever was on the desktop was not controlled, so the
+H.264 rows at the same settings vary by about ±5%.
+
+| change (one at a time) | codec | clip `bit_rate` | x target | keyframes / s |
+|---|---|---|---|---|
+| none (as on `main`) | H.264 | 39,779,675 | 1.99 | 2.0 |
+| none (as on `main`) | HEVC | 36,486,396 | 1.82 | 0.93 |
+| declare 60fps | H.264 | 20,479,689 / 18,671,560 | 1.02 / 0.93 | 0.99 / 0.94 |
+| declare 60fps | HEVC | 18,772,073 | 0.94 | 0.47 |
+| + `CODECAPI_AVEncMPVGOPSize = 60` | HEVC | 18,384,640 | 0.92 | 0.46 (accepted, ignored) |
+| + keyframe spacing 30 | HEVC | 17,668,406 | 0.88 | 0.44 (ignored) |
+| + `CODECAPI_AVEncVideoForceKeyFrame` once a second | HEVC | 18,528,045 | 0.93 | 0.93 |
+| + `CODECAPI_AVLowLatencyMode = 0` | H.264 | 18,726,046 / 18,408,213 | 0.94 / 0.92 | 0.94 / 0.92 |
+| + low latency off, `AVEncMPVDefaultBPictureCount = 2` | H.264 | 19,273,754 | 0.96 | 0.94 (B-frames refused, `E_INVALIDARG`) |
+| + `CODECAPI_AVEncCommonQualityVsSpeed = 70` | H.264 | 18,654,397 | 0.93 | 0.93 (accepted) |
+| + `CODECAPI_AVEncVideoContentType = 1` | H.264 | 18,552,586 | 0.93 | 0.94 (refused) |
+| **shipped** (60fps + forced keyframe) | H.264 | 18,629,093 | 0.93 | 0.93 |
+| **shipped** (60fps + forced keyframe) | HEVC | 18,638,679 | 0.93 | 0.93 |
+
+**What ships.** The real frame rate, plus a keyframe forced once a second through
+`CODECAPI_AVEncVideoForceKeyFrame`. The forced keyframe is there because the HEVC MFT ignores
+`MF_MT_MAX_KEYFRAME_SPACING` and `AVEncMPVGOPSize`: it keyframes every 2 s, which would make each
+fragment two segments long. Low-latency mode stays on. Turning it off, setting quality-vs-speed,
+the content type and B-frames each moved the rate by less than the noise between runs, and no
+clip ever contained a B-frame. Keyframes per second fall a little short of 1.0 because the cadence
+counts frames and fewer than 60 a second reach the encoder.
+
+**Not measured.** Picture quality per bit, a game rather than the desktop, other vendors' MFTs, and
+rates other than 60fps.
