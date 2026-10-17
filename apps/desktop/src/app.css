@@ -60,13 +60,6 @@
   --d-base: 180ms;
   --d-slow: 260ms;
 
-  /* Legacy names, kept as aliases while the components are migrated (removed in Phase 3). */
-  --panel: var(--surface-1);
-  --panel-2: var(--surface-2);
-  --line: var(--border);
-  --muted: var(--text-muted);
-  --accent-dim: var(--accent-strong);
-
   color-scheme: dark;
   font-family: var(--font-ui);
   font-size: 14px;
@@ -117,7 +110,7 @@ code,
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--text-muted);
 }
 
 /* -- shell layout -------------------------------------------------------------------- */
@@ -227,7 +220,7 @@ code,
   flex-direction: column;
   gap: 10px;
   padding: 14px 16px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--border);
 }
 
 button {
@@ -376,15 +369,53 @@ kbd {
   align-items: center;
   gap: 4px;
   padding: 1px 7px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 999px;
   font-size: 11px;
-  color: var(--muted);
+  color: var(--text-muted);
 }
 
-.empty {
-  padding: 24px 16px;
-  color: var(--muted);
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-3);
+  padding: var(--s-7) var(--s-5);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.empty-state p {
+  max-width: 44ch;
+}
+
+.empty-state svg {
+  color: var(--text-faint);
+}
+
+/* A view appears with a short cross-fade; detail pages also slide in. Whole-section only,
+   so the recording poll never re-runs it. */
+@keyframes view-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
+.view > section {
+  animation: view-in var(--d-base) var(--ease);
+}
+
+.view > section.page {
+  animation: page-in var(--d-slow) var(--ease);
 }
 
 /* -- sessions chunk: narrower master list when the window is small -------------------- */
