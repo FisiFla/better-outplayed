@@ -195,10 +195,10 @@ Rust-side, and the webview is granted nothing new.
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 108 vitest tests
+cd apps/desktop && npm test          # 225 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
-cd apps/desktop && npm run shots     # 14 headless screenshots, 201 assertions, 0 failures
+cd apps/desktop && npm run shots     # 20 headless screenshots, 225 assertions, 0 failures
 cd apps/desktop/src-tauri && cargo test    # 103 tests, against a real store and real ffmpeg
 cd apps/desktop/src-tauri && cargo clippy  # no warnings in shipping code
 ```

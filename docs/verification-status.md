@@ -1498,6 +1498,9 @@ out ~190ms over three fragments instead, which is a property of the synthetic st
 how the synthetic audio is muxed; the two feeds were not isolated against each other, so treat
 the difference as unattributed rather than as a defect in either.
 
+*(2026-10-17: this section's test is the desktop hotkey test, not `ram_clip`; the `ram_clip`
+fixture mentioned in §20 and §22 now renders its stream offline, see those sections.)*
+
 **The splice cuts on the fragment grid.** A clip takes the whole fragments overlapping
 `[trigger−pre, trigger+post]`, so it overhangs the window by whatever the grid quantises to at
 each end — the §7 note that "it can run up to one segment past the request" is this — and on a
@@ -1683,6 +1686,13 @@ not `window`/`truncated_front` — which is why the next person to touch this fi
 the window a function of the ring's reported front rather than of an assumed `0`, instead of
 re-running it until it passes.
 
+**Update (2026-10-17).** The fixture this section blames is gone: `ring_of_stub_capture` now
+renders its stream **offline** (ffmpeg from lavfi sources into a fragmented MP4, a keyframe a
+second) and pushes it into the ring, so what the ring holds no longer depends on host speed
+(`4c8138e`). The real-time capture -> encoder -> ring path keeps its own, separate test. The
+diagnosis above describes the old real-time fixture; whether the intermittent failure is fully
+gone is **unverified** beyond the runs since the change.
+
 ---
 
 ## 21. `xtask verify` on Windows, run for the first time (2026-10-15)
@@ -1750,6 +1760,13 @@ fragment stream, or a stub whose frames are produced by count rather than by the
 because a test whose subject is ring arithmetic should not also be a test of how busy the machine
 is. Until then this file's tests are quiet when run alone and can fail under load, which is worth
 knowing before a red CI run on this file is read as a regression.
+
+**Update (2026-10-17).** The deterministic fixture this section asked for has landed
+(`4c8138e`): `ring_of_stub_capture` renders a fixed fragmented stream offline instead of
+feeding a real-time stub capture to a live ffmpeg, so neither the SIGKILL-on-shutdown nor the
+load-dependent `truncated_front` mechanism above applies to it any more. The real-time path is
+still covered by its own test, which can still be load-sensitive. The description above is kept
+as the record of the old fixture.
 
 ## 23. `xtask verify` re-run after the harness was corrected (2026-10-16)
 
