@@ -12,6 +12,15 @@ to disk the instant you press a hotkey or your game reports an event.
 > directory still carry the original `localplay` name — so `localplay-cli`, `localplay-encoder`
 > and `%LOCALAPPDATA%\localplay` below are all current, and only the repository was renamed.
 
+![The library: a grid of clip cards](docs/screenshots/library.png)
+
+| Clip page | Sessions | Storage |
+|---|---|---|
+| ![A clip with its trim timeline](docs/screenshots/clip.png) | ![A session with its markers](docs/screenshots/sessions.png) | ![The storage view](docs/screenshots/storage.png) |
+
+*Rendered headlessly in Chromium from fixture data (`npm run shots` in `apps/desktop`), not captured
+from the real window: WebView2, real-DPI sizing and Inter on Windows have not been seen.*
+
 ---
 
 ## Non-negotiable principles

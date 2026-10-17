@@ -9,6 +9,13 @@ versions. For what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **Desktop UI overhaul**: a navigation rail (Library, Sessions, Storage, Health, Settings), a
+  clip-card grid, per-view pages, Inter / JetBrains Mono, Lucide icons and a role-named dark
+  token set. Polish: view cross-fades, Esc / Alt+Left to leave a clip page, toasts that
+  dismiss themselves (6 s notices, 12 s errors), one empty-state style, `prefers-reduced-motion`
+  honoured (and set in the screenshot run). README screenshots are refreshed from `npm run shots`.
+  **Unverified:** everything was rendered in headless Chromium against fixtures; WebView2, real
+  DPI scaling (150%) and Inter's variable-font rendering on Windows have not been seen.
 - **Health page** in the desktop window: recorder state, the encoder the last recording ran,
   free disk space where clips are stored, how each game-event source started, and the last
   warnings and errors from the log.
