@@ -171,6 +171,15 @@ code,
   overflow-y: auto;
 }
 
+/*
+ * The clip page now sits under the recorder bar and a Back row, so its player gives up some
+ * height to keep the timeline on screen at the default window; the clip page's own redesign
+ * replaces this cap.
+ */
+[data-region='clip-page'] video.player {
+  max-height: 40vh;
+}
+
 [data-region='storage'],
 [data-region='health'],
 [data-region='settings'] {
@@ -180,7 +189,7 @@ code,
 }
 
 /* Sessions: master list beside the open session. */
-.sessions {
+.view > section.sessions {
   display: grid;
   grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
 }
@@ -190,6 +199,12 @@ code,
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--border);
+}
+
+/* The session list was capped for the old sidebar; in its own pane it takes the height. */
+.sessions .master ul {
+  flex: 1 1 auto;
+  max-height: none;
 }
 
 .sessions .detail {
@@ -211,7 +226,7 @@ code,
 
 .crumbs {
   flex: none;
-  padding: var(--s-2) var(--s-3) 0;
+  padding: var(--s-1) var(--s-3) 0;
 }
 
 /* -- primitives ---------------------------------------------------------------------- */

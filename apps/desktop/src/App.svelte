@@ -677,7 +677,8 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    padding: 2px 8px 2px 2px;
+    padding: 0 8px 0 2px;
+    font-size: 12px;
     color: var(--text-muted);
   }
 
