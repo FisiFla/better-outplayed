@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(events[0].event_name, "GameStart");
         assert_eq!(events[1].event_name, "MinionsSpawning");
         assert_eq!(events[2].event_name, "ChampionKill");
-        assert_eq!(events[2].killer_name.as_deref(), Some("FisiFla#EUW"));
+        assert_eq!(events[2].killer_name.as_deref(), Some("TestPlayer#EUW"));
         assert_eq!(events[2].victim_name.as_deref(), Some("ZedMain"));
         assert_eq!(events[2].assisters, vec!["SupportMain".to_string()]);
 
@@ -249,8 +249,8 @@ mod tests {
         // The fixture fills both fields with the same player under the two naming schemes
         // a patch may use; both must match an event line, and neither may appear twice.
         let names = snapshot.player_names();
-        assert!(names.contains(&"FisiFla#EUW"), "got {names:?}");
-        assert!(names.contains(&"FisiFla"), "got {names:?}");
+        assert!(names.contains(&"TestPlayer#EUW"), "got {names:?}");
+        assert!(names.contains(&"TestPlayer"), "got {names:?}");
         assert_eq!(names.len(), 2, "no duplicates: {names:?}");
     }
 

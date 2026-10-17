@@ -391,8 +391,8 @@ fn a_full_event_history_is_derived_in_order_and_each_event_is_emitted_once() {
         kinds(&history),
         vec![EventKind::Kill, EventKind::Death, EventKind::Dragon]
     );
-    assert!(payload_of(&history, EventKind::Kill).contains("\"killer\":\"FisiFla#EUW\""));
-    assert!(payload_of(&history, EventKind::Death).contains("\"victim\":\"FisiFla#EUW\""));
+    assert!(payload_of(&history, EventKind::Kill).contains("\"killer\":\"TestPlayer#EUW\""));
+    assert!(payload_of(&history, EventKind::Death).contains("\"victim\":\"TestPlayer#EUW\""));
     assert!(payload_of(&history, EventKind::Dragon).contains("\"monster\":\"DRAGON\""));
 
     // Two more events arrive later, one at a time.
