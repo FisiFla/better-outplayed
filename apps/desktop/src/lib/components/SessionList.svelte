@@ -7,9 +7,10 @@
    * order (`started_at DESC, id DESC`), which is the same order the retention rules use;
    * sorting again here would be a second opinion that could silently disagree with it.
    */
+  import Icon from './Icon.svelte';
   import { sessionLengthLabel } from '../sessions';
   import type { SessionView } from '../sessions';
-  import { formatDateTime } from '../time';
+  import { formatBytes, formatDateTime } from '../time';
 
   interface Props {
     sessions: SessionView[];
@@ -31,26 +32,34 @@
   <ul>
     {#each sessions as session (session.id)}
       <li class:selected={session.id === selectedId}>
-        <button class="row" type="button" onclick={() => onSelect(session.id)}>
+        <button
+          class="row"
+          type="button"
+          aria-current={session.id === selectedId ? 'true' : undefined}
+          onclick={() => onSelect(session.id)}
+        >
+          <span class="badge" aria-hidden="true">{session.title.charAt(0).toUpperCase()}</span>
           <span class="title">{session.title}</span>
           <span class="when muted">{formatDateTime(session.startedAtMs)}</span>
           <span class="facts mono muted">
             {sessionLengthLabel(session)}
-            {#if session.running}· recording{/if}
+            {#if session.running}<span class="live">· recording</span>{/if}
+            · {formatBytes(session.sizeBytes)}
           </span>
         </button>
 
         <div class="actions">
           <button
             type="button"
-            class="star"
+            class="icon star"
             aria-pressed={session.favourite}
+            aria-label={session.favourite ? 'Unfavourite session' : 'Favourite session'}
             title={session.favourite
               ? 'Favourite: protected from both session retention rules'
               : 'Protect this session from the retention rules'}
             onclick={() => onFavourite(session.id, !session.favourite)}
           >
-            {session.favourite ? '★' : '☆'}
+            <Icon name="star" size={14} />
           </button>
 
           {#if confirming === session.id}
@@ -59,7 +68,15 @@
             </button>
             <button type="button" onclick={() => (confirming = null)}>Cancel</button>
           {:else}
-            <button type="button" onclick={() => (confirming = session.id)}>Delete</button>
+            <button
+              type="button"
+              class="icon"
+              aria-label="Delete this session"
+              title="Delete this session"
+              onclick={() => (confirming = session.id)}
+            >
+              <Icon name="trash-2" size={14} />
+            </button>
           {/if}
         </div>
       </li>
@@ -70,88 +87,114 @@
 <style>
   ul {
     margin: 0;
-    padding: 0;
+    padding: var(--s-1) var(--s-2) var(--s-3);
     list-style: none;
     overflow-y: auto;
-    /*
-     * The sidebar's second scroll area. Without a cap this sizes to its content and
-     * pushes the storage panel below the fold — with no way to reach it, since the
-     * sidebar itself does not scroll. The clip list stays the flexible one: this one
-     * neither grows (0) nor holds space beyond its cap, keeps one row visible at
-     * minimum, and yields the rest to clips.
-     */
-    flex: 0 1 auto;
-    min-height: 80px;
-    max-height: 30vh;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .empty {
+    margin: 0;
+    padding: var(--s-4);
+    color: var(--text-muted);
   }
 
   li {
-    border-bottom: 1px solid var(--line);
-    padding: 6px 10px 8px;
+    position: relative;
+    border-radius: var(--r-md);
+    border: 1px solid transparent;
+    transition: background var(--d-fast) var(--ease);
+  }
+
+  li:hover {
+    background: var(--surface-2);
   }
 
   li.selected {
-    background: var(--panel-2);
+    background: var(--accent-soft);
+    border-color: var(--accent);
   }
 
   .row {
     display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 2px 8px;
+    grid-template-columns: 36px minmax(0, 1fr);
+    grid-template-areas:
+      'badge title'
+      'badge when'
+      'badge facts';
+    gap: 1px var(--s-3);
+    align-items: center;
     width: 100%;
-    padding: 0;
+    padding: var(--s-2) var(--s-3);
     border: 0;
     background: transparent;
     text-align: left;
     cursor: pointer;
   }
 
-  .row:hover .title {
+  .row:hover:not(:disabled) {
+    background: transparent;
+  }
+
+  .badge {
+    grid-area: badge;
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--r-md);
+    background: var(--surface-3);
     color: var(--accent);
+    font: var(--t-heading);
+  }
+
+  .selected .badge {
+    background: var(--accent-strong);
+    color: #fff;
   }
 
   .title {
-    font-size: 13px;
-    font-weight: 600;
+    grid-area: title;
+    font: var(--t-heading);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    /* leave room for the overlaid actions */
+    padding-right: 64px;
   }
 
   .when {
-    font-size: 11px;
+    grid-area: when;
+    font: var(--t-small);
   }
 
   .facts {
-    grid-column: 1 / -1;
-    font-size: 11px;
+    grid-area: facts;
+    font: var(--t-small);
+    font-feature-settings: 'tnum';
+  }
+
+  .live {
+    color: var(--rec);
   }
 
   .actions {
+    position: absolute;
+    top: var(--s-2);
+    right: var(--s-2);
     display: flex;
-    gap: 6px;
+    gap: var(--s-1);
     align-items: center;
-    margin-top: 5px;
     opacity: 0;
-    transition: opacity 150ms ease-out;
+    transition: opacity var(--d-base) var(--ease);
   }
 
-  li:hover .actions {
-    opacity: 1;
-  }
-
-  li:focus-within .actions {
-    opacity: 1;
-  }
-
+  li:hover .actions,
+  li:focus-within .actions,
   li.selected .actions {
     opacity: 1;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .actions {
-      transition: none;
-    }
   }
 
   @media (hover: none) {
@@ -161,16 +204,27 @@
   }
 
   .actions button {
-    padding: 1px 7px;
-    font-size: 11px;
+    padding: 3px 6px;
+    font: var(--t-small);
+    background: var(--surface-3);
+  }
+
+  .actions .icon {
+    display: inline-grid;
+    place-items: center;
+    padding: 4px;
   }
 
   .star {
-    color: var(--muted);
+    color: var(--text-muted);
   }
 
   .star[aria-pressed='true'] {
     color: var(--star);
     border-color: var(--star);
+  }
+
+  .star[aria-pressed='true'] :global(svg) {
+    fill: currentColor;
   }
 </style>
