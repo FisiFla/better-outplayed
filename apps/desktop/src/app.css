@@ -395,3 +395,10 @@ kbd {
   padding: 24px 16px;
   color: var(--muted);
 }
+
+/* -- sessions chunk: narrower master list when the window is small -------------------- */
+@media (max-width: 1100px) {
+  .view > section.sessions {
+    grid-template-columns: 300px minmax(0, 1fr);
+  }
+}

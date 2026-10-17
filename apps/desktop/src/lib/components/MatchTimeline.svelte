@@ -90,21 +90,88 @@
 {/if}
 
 <style>
-  .matches { display: flex; flex-direction: column; gap: 8px; }
-  h3 { margin: 0; font-size: 13px; }
-  .axis { position: relative; height: 18px; background: var(--surface, #222); border-radius: 4px; }
-  .span {
-    position: absolute; top: 0; bottom: 0; min-width: 4px; overflow: hidden;
-    background: var(--accent, #4a8); color: #000; font-size: 11px; text-align: center;
-    border-radius: 3px; opacity: 0.85;
+  .matches {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-3);
   }
-  .match { border: 1px solid var(--border, #444); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
-  .match header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-  .caveat { margin: 0; font-size: 11px; }
-  .dots { display: flex; flex-wrap: wrap; gap: 3px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; }
-  .score { font-size: 12px; border-collapse: collapse; width: 100%; }
-  .score th, .score td { text-align: left; padding: 1px 8px 1px 0; }
-  .score .team th { color: var(--muted); font-size: 11px; padding-top: 4px; }
-  .score .local td { font-weight: 600; }
+  h3 {
+    margin: 0;
+    font: var(--t-heading);
+  }
+  .axis {
+    position: relative;
+    height: 22px;
+    background: var(--surface-3);
+    border-radius: var(--r-sm);
+  }
+  .span {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    min-width: 4px;
+    overflow: hidden;
+    background: var(--accent-strong);
+    color: #fff;
+    font: var(--t-micro);
+    line-height: 22px;
+    text-align: center;
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px var(--bg);
+  }
+  .match {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: var(--s-3) var(--s-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+  }
+  .match header {
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    flex-wrap: wrap;
+  }
+  .match header button {
+    margin-left: auto;
+  }
+  .caveat {
+    margin: 0;
+    font: var(--t-small);
+  }
+  .dots {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .score {
+    font: var(--t-small);
+    border-collapse: collapse;
+    width: 100%;
+  }
+  .score th,
+  .score td {
+    text-align: left;
+    padding: 3px var(--s-3) 3px 0;
+  }
+  .score caption {
+    text-align: left;
+    padding-bottom: var(--s-1);
+  }
+  .score .team th {
+    color: var(--text-muted);
+    font: var(--t-micro);
+    padding-top: var(--s-2);
+  }
+  .score .local td {
+    font-weight: 600;
+    color: var(--accent);
+  }
 </style>
