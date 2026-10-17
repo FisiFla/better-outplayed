@@ -277,7 +277,7 @@ const FAVOURITES_OVER_CAP_FIXTURE = {
   },
 };
 
-// The state the first instrumented run found on the box: the index still held rows whose
+// A state the index can be left in: it still held rows whose
 // files a cleanup had deleted. The clips list filtered them out and the storage panel did
 // not, so the panel read "Indexed clips 12 (0 favourite), In use 1.2 GiB" directly above
 // "No clips are indexed yet". Both count the clips that are on disk now, and the rows they
@@ -2287,6 +2287,7 @@ async function main() {
           viewport: VIEWPORT,
           deviceScaleFactor: 1,
           colorScheme: 'dark',
+          reducedMotion: 'reduce',
         });
         if (state.fixture) {
           await context.addInitScript(installMockSource, state.fixture);

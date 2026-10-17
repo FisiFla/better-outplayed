@@ -1,3 +1,9 @@
+<script module lang="ts">
+  /** A notice is confirmation and can go quickly; an error is given time to be read. */
+  export const NOTICE_MS = 6000;
+  export const ERROR_MS = 12000;
+</script>
+
 <script lang="ts">
   /**
    * The error and notice banners, as a stack in the bottom-right corner. The classes and
@@ -14,6 +20,18 @@
   }
 
   let { error, notice, onDismissError, onDismissNotice }: Props = $props();
+
+  // Each message gets its own timer, restarted when the text changes.
+  $effect(() => {
+    if (notice === null) return;
+    const timer = setTimeout(onDismissNotice, NOTICE_MS);
+    return () => clearTimeout(timer);
+  });
+  $effect(() => {
+    if (error === null) return;
+    const timer = setTimeout(onDismissError, ERROR_MS);
+    return () => clearTimeout(timer);
+  });
 </script>
 
 <div class="toasts" data-region="toasts">

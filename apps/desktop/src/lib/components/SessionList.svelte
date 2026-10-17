@@ -27,7 +27,10 @@
 </script>
 
 {#if sessions.length === 0}
-  <p class="empty">No sessions yet — full-session recordings appear here.</p>
+  <div class="empty-state">
+    <Icon name="list-video" size={40} />
+    <p>No sessions yet — full-session recordings appear here.</p>
+  </div>
 {:else}
   <ul>
     {#each sessions as session (session.id)}
@@ -93,12 +96,6 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-  }
-
-  .empty {
-    margin: 0;
-    padding: var(--s-4);
-    color: var(--text-muted);
   }
 
   li {

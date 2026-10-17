@@ -41,6 +41,7 @@
     back,
     healthBadge,
     INITIAL_VIEW,
+    canGoBack,
     navigate,
     openClip,
     openSession,
@@ -500,6 +501,18 @@
     }
   }
 
+  /** Esc / Alt+Left leave a clip page, unless the key belongs to a field or a menu. */
+  function onKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented || !canGoBack(view)) return;
+    const escape = event.key === 'Escape';
+    const altLeft = event.key === 'ArrowLeft' && event.altKey;
+    if (!escape && !altLeft) return;
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest('input, textarea, select, [contenteditable]')) return;
+    event.preventDefault();
+    view = back(view);
+  }
+
   onMount(() => {
     // Thumbnails are requested per clip, so they must wait for the list to arrive — which
     // is why this is one sequential step rather than three independent ones.
@@ -524,6 +537,8 @@
     };
   });
 </script>
+
+<svelte:window onkeydown={onKeydown} />
 
 <div class="shell">
   <NavRail
@@ -630,6 +645,7 @@
               {/key}
             {:else if loaded}
               <div class="empty-state">
+                <Icon name="list-video" size={32} />
                 <p>Select a session to see its markers and cut a clip out of it.</p>
               </div>
             {/if}
@@ -682,21 +698,4 @@
     color: var(--text-muted);
   }
 
-  /*
-   * A view with nothing selected: one sentence in a pane as tall as the view. Centred and
-   * bounded it reads as the pane's state rather than a stray line of text.
-   */
-  .empty-state {
-    display: grid;
-    place-items: center;
-    flex: 1;
-    height: 100%;
-    padding: 24px 16px;
-  }
-
-  .empty-state p {
-    max-width: 44ch;
-    text-align: center;
-    color: var(--muted);
-  }
 </style>

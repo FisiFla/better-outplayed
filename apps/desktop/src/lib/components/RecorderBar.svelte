@@ -302,7 +302,7 @@
   }
 
   dt {
-    color: var(--muted);
+    color: var(--text-muted);
     font-size: 11px;
   }
 

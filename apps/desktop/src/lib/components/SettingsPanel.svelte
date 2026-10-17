@@ -403,7 +403,7 @@
   }
 
   .field span {
-    color: var(--muted);
+    color: var(--text-muted);
   }
 
   .row {

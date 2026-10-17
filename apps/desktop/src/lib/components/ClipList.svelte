@@ -109,12 +109,12 @@
 <svelte:window onpointerdown={outside} />
 
 {#if clips.length === 0 && filtering}
-  <div class="empty">
+  <div class="empty-state">
     <Icon name="search" size={32} />
     <p>No clips match the current search and filters.</p>
   </div>
 {:else if clips.length === 0}
-  <div class="empty">
+  <div class="empty-state">
     <Icon name="clapperboard" size={40} />
     <p>
       No clips are indexed yet. Start recording above, then take one with
@@ -483,23 +483,4 @@
     background: var(--surface-2);
   }
 
-  .empty {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: var(--s-3);
-    padding: var(--s-7) var(--s-5);
-    color: var(--text-muted);
-    text-align: center;
-  }
-
-  .empty p {
-    max-width: 44ch;
-  }
-
-  .empty :global(svg) {
-    color: var(--text-faint);
-  }
 </style>
