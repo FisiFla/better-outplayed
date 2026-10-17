@@ -154,3 +154,87 @@ fn concat_keeps_the_audio_track_names_the_encoder_wrote() {
         "and so is the video"
     );
 }
+
+/// Each chapter as `(start ms, end ms, title)`, read back with ffprobe as a player would.
+fn chapters(bin: &FfmpegBinaries, path: &std::path::Path) -> Vec<(u64, u64, String)> {
+    let out = Command::new(&bin.ffprobe)
+        .args(["-v", "error", "-print_format", "json", "-show_chapters"])
+        .arg(path)
+        .output()
+        .expect("spawn ffprobe");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ffprobe json");
+    let ms = |v: &serde_json::Value| {
+        (v.as_str().unwrap().parse::<f64>().unwrap() * 1000.0).round() as u64
+    };
+    json["chapters"]
+        .as_array()
+        .expect("ffprobe must report a chapters array")
+        .iter()
+        .map(|c| {
+            let title = c["tags"]["title"].as_str().unwrap().to_string();
+            (ms(&c["start_time"]), ms(&c["end_time"]), title)
+        })
+        .collect()
+}
+
+#[test]
+fn chapters_are_written_without_costing_a_stream_or_a_track_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let clip = two_track_fixture(dir.path(), "chapters");
+    let marks = [
+        edit::Chapter { start_ms: 500, title: "Kill".into() },
+        edit::Chapter { start_ms: 1200, title: "Round start".into() },
+    ];
+
+    edit::add_chapters(&bin, &clip, &marks, 2000).expect("adding chapters");
+
+    assert_eq!(
+        chapters(&bin, &clip),
+        vec![
+            (0, 500, edit::LEAD_IN_TITLE.to_string()),
+            (500, 1200, "Kill".to_string()),
+            (1200, 2000, "Round start".to_string()),
+        ]
+    );
+    let expected: Vec<Option<String>> = edit::audio_titles(2)
+        .iter()
+        .map(|t| Some((*t).to_string()))
+        .collect();
+    assert_eq!(audio_names(&bin, &clip), expected, "the remux must keep both named tracks");
+    assert!(MediaInfo::probe(&bin, &clip).unwrap().video.is_some());
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".chapters."))
+        .collect();
+    assert!(leftovers.is_empty(), "scratch files left behind: {leftovers:?}");
+}
+
+#[test]
+fn a_clip_with_no_chapter_inside_it_is_left_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let clip = fixture(dir.path());
+    let before = std::fs::read(&clip).unwrap();
+
+    edit::add_chapters(&bin, &clip, &[], 3000).expect("no chapters");
+    let late = [edit::Chapter { start_ms: 3000, title: "Late".into() }];
+    edit::add_chapters(&bin, &clip, &late, 3000).expect("only a chapter past the end");
+
+    assert_eq!(std::fs::read(&clip).unwrap(), before);
+}
+
+#[test]
+fn a_failed_chapter_remux_leaves_the_clip_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let clip = fixture(dir.path());
+    let before = std::fs::read(&clip).unwrap();
+    // A directory in the scratch output's place makes ffmpeg's write fail.
+    std::fs::create_dir(clip.with_extension("chapters.mp4")).unwrap();
+
+    let marks = [edit::Chapter { start_ms: 0, title: "Kill".into() }];
+    assert!(edit::add_chapters(&bin, &clip, &marks, 3000).is_err());
+    assert_eq!(std::fs::read(&clip).unwrap(), before, "the original clip must survive");
+}

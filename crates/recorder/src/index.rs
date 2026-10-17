@@ -10,7 +10,8 @@ use localplay_replay::splice::ClipMetadata;
 use localplay_store::retention::{
     execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
 };
-use localplay_store::{NewClip, NewEvent, Store};
+use localplay_media::edit::Chapter;
+use localplay_store::{Event, NewClip, NewEvent, Store};
 use std::path::{Path, PathBuf};
 
 /// Wall-clock now, in ms since the Unix epoch: the clock `clips.created_at` and the storage age rule use.
@@ -89,6 +90,45 @@ pub fn index_clip(store: &Store, clip: &ClipMetadata, started_at_ms: u64) -> Opt
             );
             None
         }
+    }
+}
+
+/// The chapter marks for a clip covering `[started_at_ms, started_at_ms + duration_ms)` on the
+/// media timeline: one per game event in that span, at its offset into the clip.
+///
+/// `trigger` is the game event that asked for the clip, as `(kind, at_ms)`; it is not in the index
+/// yet when the chapters are written, so it is passed alongside. Bookmarks are left out: they mark
+/// why a clip was taken, not what happened in the game. Repeats of one kind at one instant become
+/// one mark.
+pub fn clip_chapters(
+    events: &[Event],
+    trigger: Option<(&str, u64)>,
+    started_at_ms: u64,
+    duration_ms: u64,
+) -> Vec<Chapter> {
+    let end_ms = started_at_ms.saturating_add(duration_ms);
+    let mut marks: Vec<(u64, &str)> = events
+        .iter()
+        .map(|e| (e.at_ms, e.kind.as_str()))
+        .chain(trigger.map(|(kind, at)| (at, kind)))
+        .filter(|&(at, kind)| kind != BOOKMARK_KIND && (started_at_ms..end_ms).contains(&at))
+        .collect();
+    marks.sort_unstable();
+    marks.dedup();
+    marks
+        .into_iter()
+        .map(|(at, kind)| Chapter { start_ms: at - started_at_ms, title: chapter_title(kind) })
+        .collect()
+}
+
+/// `bomb_planted` becomes `Bomb planted`: the tag is the only name an event has here, and an
+/// unknown tag must still produce a title.
+fn chapter_title(kind: &str) -> String {
+    let spaced = kind.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => spaced,
     }
 }
 
@@ -314,6 +354,40 @@ fn report_sessions_shortfall(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn event(kind: &str, at_ms: u64) -> Event {
+        Event { id: 0, session_id: Some(1), kind: kind.into(), at_ms, payload: None, clip_id: None }
+    }
+
+    #[test]
+    fn a_clip_marks_every_event_in_its_span_at_its_offset() {
+        let events = [
+            event("round_start", 9_999),
+            event("round_start", 10_000),
+            event("kill", 12_000),
+            event("bomb_planted", 14_000),
+            event("death", 40_000),
+        ];
+        let marks = clip_chapters(&events, Some(("kill", 25_000)), 10_000, 30_000);
+        let got: Vec<(u64, &str)> = marks.iter().map(|c| (c.start_ms, c.title.as_str())).collect();
+        assert_eq!(
+            got,
+            [(0, "Round start"), (2_000, "Kill"), (4_000, "Bomb planted"), (15_000, "Kill")],
+            "the 9.999s round start is before the clip and the 40s death after its end"
+        );
+    }
+
+    #[test]
+    fn a_trigger_already_in_the_index_is_one_mark_not_two() {
+        let marks = clip_chapters(&[event("kill", 5_000)], Some(("kill", 5_000)), 0, 10_000);
+        assert_eq!(marks.len(), 1);
+    }
+
+    #[test]
+    fn a_clip_with_only_bookmarks_gets_no_chapters() {
+        let marks = clip_chapters(&[event(BOOKMARK_KIND, 5_000)], None, 0, 10_000);
+        assert!(marks.is_empty(), "{marks:?}");
+    }
 
     /// The clip metadata a ring's `trigger` hands back, without running ffmpeg.
     fn metadata(path: PathBuf, size_bytes: u64) -> ClipMetadata {

@@ -75,7 +75,8 @@ pub use config::{
 };
 pub use fps::FpsDecision;
 pub use index::{
-    cleanup_pass, index_bookmark, index_clip, index_event, now_ms, open_clip_index, unix_seconds,
+    cleanup_pass, clip_chapters, index_bookmark, index_clip, index_event, now_ms, open_clip_index,
+    unix_seconds,
     CleanupReport, BOOKMARK_KIND,
 };
 pub use pump::{
@@ -95,7 +96,7 @@ use localplay_encoder::{
 };
 use localplay_events::process::{GamesSection, PresenceChange, WatchHandle};
 use localplay_events::{CaptureClock, GameEvent};
-use localplay_media::FfmpegBinaries;
+use localplay_media::{edit, FfmpegBinaries};
 use localplay_replay::buffer::{BufferConfig, BufferStats};
 use localplay_replay::splice::ClipMetadata;
 use localplay_store::Store;
@@ -1512,6 +1513,13 @@ impl Ledger {
         }
     }
 
+    fn bin(&self) -> &FfmpegBinaries {
+        match self {
+            Ledger::Memory(ring) => ring.bin(),
+            Ledger::Session(session) => session.bin(),
+        }
+    }
+
     /// Splice a clip around `trigger_ms` out of this ledger's footage.
     fn trigger(&self, trigger_ms: u64, stem: &str, pre_ms: u64, post_ms: u64) -> Result<ClipMetadata> {
         match self {
@@ -1747,7 +1755,7 @@ impl Engine {
         self.account(counts);
 
         let stem = format!("clip-{}", unix_seconds());
-        let clip = self.ledger.trigger(trigger_ms, &stem, pre_ms, post_ms)?;
+        let mut clip = self.ledger.trigger(trigger_ms, &stem, pre_ms, post_ms)?;
         tracing::info!(
             "wrote {} ({}ms, {} bytes, encoder={})",
             clip.path.display(),
@@ -1756,9 +1764,14 @@ impl Engine {
             clip.encoder
         );
 
-        // Index the clip just written. `started_at_ms` is on the ledger's timeline (`ledger_origin_ms`
-        // plus the run-relative window start), the timeline the footage is measured on.
+        // `started_at_ms` is on the ledger's timeline (`ledger_origin_ms` plus the run-relative
+        // window start), the timeline the footage and the events are measured on.
         let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(pre_ms);
+        let at_ms = self.ledger.origin_ms() + trigger_ms;
+        // Before indexing, so the row records the final size.
+        let trigger = reason.event().map(|event| (event.kind.as_tag(), at_ms));
+        self.write_chapters(&mut clip, started_at_ms, trigger);
+
         let id = index_clip(&self.store, &clip, started_at_ms);
         // The clip carries its recording session's game so the library can filter without a join. Best effort.
         if let Some(id) = id {
@@ -1772,7 +1785,6 @@ impl Engine {
         // An event-triggered clip says why it exists, and so does a manual one (the user's own bookmark).
         // `at` is the trigger instant (`pre_ms` into the clip), so the marker lands on the moment that
         // caused it. A failed insert is reported, not fatal: the clip file is on disk either way.
-        let at_ms = self.ledger.origin_ms() + trigger_ms;
         let session_id = Some(self.session);
         let recorded = match reason.event() {
             Some(event) => index_event(&self.store, event, at_ms, id, session_id),
@@ -1787,6 +1799,44 @@ impl Engine {
 
         self.status.clips.fetch_add(1, Ordering::Relaxed);
         Ok(RecordedClip { metadata: clip, id, started_at_ms })
+    }
+
+    /// Mark the clip's game events as MP4 chapters. Best effort: the clip is already saved, so a
+    /// failure is logged and the clip kept as written.
+    ///
+    /// Only events indexed by now are marked; one that happens during the post-roll is still
+    /// queued behind this clip and is not in the file.
+    fn write_chapters(
+        &self,
+        clip: &mut ClipMetadata,
+        started_at_ms: u64,
+        trigger: Option<(&str, u64)>,
+    ) {
+        let end_ms = started_at_ms.saturating_add(clip.duration_ms);
+        let events = match self.store.events_in_range(self.session, started_at_ms, end_ms) {
+            Ok(events) => events,
+            Err(err) => {
+                let path = clip.path.display();
+                tracing::warn!("no chapters for {path}: reading its events failed: {err:#}");
+                return;
+            }
+        };
+        let chapters = clip_chapters(&events, trigger, started_at_ms, clip.duration_ms);
+        if chapters.is_empty() {
+            return;
+        }
+        match edit::add_chapters(self.ledger.bin(), &clip.path, &chapters, clip.duration_ms) {
+            Ok(()) => {
+                if let Ok(meta) = std::fs::metadata(&clip.path) {
+                    clip.size_bytes = meta.len();
+                }
+                tracing::info!("marked {} chapters in {}", chapters.len(), clip.path.display());
+            }
+            Err(err) => tracing::warn!(
+                "could not add chapters to {} ({err:#}); the clip is kept without them",
+                clip.path.display()
+            ),
+        }
     }
 
     /// Record an event that did not ask for a clip (see [`Recorder::note_event`]).
