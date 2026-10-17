@@ -1216,19 +1216,14 @@ const states = [
         'the sessions detail pane says what to do instead of showing a blank pane',
       );
       await showView(page, 'Storage');
-      // The storage panel is a disclosure: what it shows without being opened is the state
-      // itself — the two numbers and the cap's verdict — which is the whole claim for
-      // holding the arithmetic back, so it is asserted rather than assumed.
+      // Storage is a full view, not a disclosure: the numbers and the arithmetic are both on
+      // screen the moment the view opens.
       check(
         this.name,
-        await page.locator('.storage summary').getByText('0 B / 50 GiB').isVisible(),
-        'the storage summary carries the numbers with the panel closed',
+        await page.locator('.storage .figures').getByText('0 B / 50 GiB').isVisible(),
+        'the storage header carries the numbers',
       );
-      check(
-        this.name,
-        !(await page.locator('.storage dl').isVisible()),
-        'and the arithmetic is what the disclosure withholds',
-      );
+      check(this.name, await page.locator('.storage dl').isVisible(), 'and the arithmetic is on screen with them');
       check(this.name, await page.getByText('50 GiB').first().isVisible(), 'the storage panel names the cap');
       // The default view is the library; the screenshot is of it.
       await showView(page, 'Library');
@@ -1581,9 +1576,6 @@ const states = [
         'all eight clips are indexed',
       );
       await showView(page, 'Storage');
-      // The figures and the verdict live behind the storage panel's disclosure — this state
-      // is about what is inside it, and about the bar it draws, so it opens it first.
-      await page.locator('[data-region=storage] .storage summary').click();
       const verdict = page.locator('.panel .verdict.bad');
       check(this.name, (await verdict.count()) === 1, 'exactly one bad verdict is rendered');
       const text = ((await verdict.first().textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -1637,7 +1629,7 @@ const states = [
     fixture: NO_FFMPEG_FIXTURE,
     async verify(page) {
       // The startup warning is one of the three things this state photographs, and it is
-      // rendered in the storage panel, so the disclosure is opened before the capture.
+      // rendered in the storage panel, so it is read from the Storage view.
       const banner = page.locator('.banner.error');
       await banner.waitFor({ state: 'visible', timeout: 10_000 });
       const text = ((await banner.textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -1645,7 +1637,6 @@ const states = [
       const placeholders = await page.locator('.thumb.placeholder').count();
       check(this.name, placeholders === 6, `every row falls back to the placeholder (${placeholders} of 6)`);
       await showView(page, 'Storage');
-      await page.locator('[data-region=storage] .storage summary').click();
       const warnings = page.locator('.verdict.bad');
       check(this.name, (await warnings.count()) === 1, 'the startup warning is rendered in the storage panel');
       check(
@@ -1991,7 +1982,6 @@ const states = [
       );
 
       await showView(page, 'Settings');
-      await page.locator('.settings summary').click();
       const panel = page.locator('.settings');
       check(this.name, await panel.getByRole('heading', { name: 'Library' }).isVisible(), 'the library section opens');
       check(
@@ -2055,7 +2045,7 @@ const states = [
       );
 
       await auditContrast(page, this.name, {
-        '.settings summary': 'settings disclosure',
+        '.settings .subnav button': 'settings sub-nav',
         '.settings input[type="text"]': 'settings field',
       });
     },
@@ -2134,7 +2124,6 @@ const states = [
         'the clips list shows the two clips the panel will count',
       );
       await showView(page, 'Storage');
-      await page.locator('[data-region=storage] .storage summary').click();
       const panel = page.locator('[data-region=storage] .storage');
       const text = ((await panel.locator('dl').textContent()) ?? '').replace(/\s+/g, ' ').trim();
       report(this.name, `storage figures: ${JSON.stringify(text)}`);
