@@ -14,11 +14,11 @@ pub struct VideoStream {
     pub width: u32,
     pub height: u32,
     pub bit_rate: Option<u64>,
-    /// Per-stream duration (`stream.duration`), in ms. `None` when ffprobe does not
-    /// report one for this stream (some containers omit it).
+    /// Per-stream duration (`stream.duration`), in ms. `None` when ffprobe reports none (some
+    /// containers omit it).
     pub duration_ms: Option<u64>,
-    /// Per-stream start time (`stream.start_time`), in ms. May be negative for a
-    /// stream with an edit list. `None` when ffprobe does not report one.
+    /// Per-stream start time (`stream.start_time`), in ms; may be negative for a stream with an
+    /// edit list. `None` when not reported.
     pub start_ms: Option<i64>,
 }
 
@@ -41,11 +41,9 @@ pub struct MediaInfo {
     pub audio: Option<AudioStream>,
 }
 
-/// One stream, reduced to the parameters a lossless concatenation depends on.
-///
-/// Deliberately coarser than [`VideoStream`]/[`AudioStream`]: this is not a description
-/// of a file, it is the *shape* two files must share before `-f concat -c copy` may be
-/// trusted to treat them as one continuous timeline.
+/// One stream, reduced to the parameters a lossless concatenation depends on. Coarser than
+/// [`VideoStream`]/[`AudioStream`]: not a description of a file but the shape two files must
+/// share before `-f concat -c copy` can be trusted to treat them as one timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamShape {
     /// `codec_type` as ffprobe spells it: `video`, `audio`, `subtitle`, …
@@ -70,13 +68,11 @@ impl StreamShape {
     }
 }
 
-/// **Every** stream of a file, in muxer order.
+/// Every stream of a file, in muxer order.
 ///
-/// [`MediaInfo`] holds one `video` and one `audio`, because that is all an A/V drift
-/// calculation needs. That is not enough to see a *dropped track*: a file that should
-/// carry 1 video + 2 audio streams and instead carries 1 + 1 has a perfectly good
-/// `video` and `audio` as far as `MediaInfo` is concerned. Anything that concatenates
-/// streams has to count them, which is what this type is for.
+/// [`MediaInfo`] holds one `video` and one `audio`, enough for A/V drift but not to see a
+/// dropped track: a file that should carry 1 video + 2 audio and carries 1 + 1 looks fine to it.
+/// Anything concatenating streams has to count them, which is what this type is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamLayout {
     pub streams: Vec<StreamShape>,
@@ -91,7 +87,7 @@ impl StreamLayout {
         self.streams.iter().filter(|s| s.kind == "audio").count()
     }
 
-    /// `1 video, 2 audio` — the shape in the words a refusal message wants.
+    /// `1 video, 2 audio`: the shape in the words a refusal message wants.
     pub fn counts_summary(&self) -> String {
         let v = self.video_count();
         let a = self.audio_count();
@@ -148,13 +144,9 @@ pub fn stream_layout(bin: &FfmpegBinaries, path: &Path) -> Result<StreamLayout> 
         .with_context(|| format!("reading the stream layout of {}", path.display()))
 }
 
-/// A/V offset observed **within one produced file**.
-///
-/// This compares the audio stream's timeline to the video stream's timeline in the
-/// muxed clip — the observable that matters for the criteria. It is deliberately
-/// *not* a measurement of clock divergence between the two live capture sources:
-/// that would require instrumenting the capture path (QPC vs the audio device clock)
-/// and is a different quantity.
+/// A/V offset observed within one produced file: the audio timeline against the video timeline
+/// in the muxed clip. Not a measurement of clock divergence between the live capture sources
+/// (that would need instrumenting the capture path, QPC vs the audio device clock).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AvDrift {
     /// Video stream duration, ms.
@@ -165,9 +157,8 @@ pub struct AvDrift {
     pub video_start_ms: Option<i64>,
     /// Audio stream start time when ffprobe reported one.
     pub audio_start_ms: Option<i64>,
-    /// `video_end - audio_end` (end = start + duration; start defaults to 0 when
-    /// ffprobe does not report one). Negative when the audio stream runs **longer**
-    /// than the video stream.
+    /// `video_end - audio_end` (end = start + duration; start defaults to 0 when unreported).
+    /// Negative when the audio runs longer than the video.
     pub delta_ms: i64,
 }
 
@@ -259,18 +250,13 @@ impl MediaInfo {
         Self::from_ffprobe_json(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// The A/V offset of **this file**: video end minus audio end, in ms.
+    /// The A/V offset of this file: video end minus audio end, in ms.
     ///
-    /// Returns `None` unless both an audio and a video stream are present *and*
-    /// ffprobe reported a per-stream duration for both — there is nothing honest to
-    /// compute otherwise, and the caller should log what is available instead.
-    ///
-    /// End = `start_ms` (default `0` when unreported) + `duration_ms`. `delta_ms` is
-    /// `video_end - audio_end`, so it goes **negative when the audio runs longer than
-    /// the video**.
-    ///
-    /// This measures drift *within the produced clip*. It is not the divergence
-    /// between the live video and audio capture clocks.
+    /// `None` unless both streams are present and ffprobe reported a duration for both; there is
+    /// nothing honest to compute otherwise, and the caller should log what it has. End is
+    /// `start_ms` (default `0`) plus `duration_ms`, so the result goes negative when the audio runs
+    /// longer than the video. This measures drift within the produced clip, not the divergence
+    /// between the live capture clocks.
     pub fn av_drift(&self) -> Option<AvDrift> {
         let video = self.video.as_ref()?;
         let audio = self.audio.as_ref()?;
@@ -290,33 +276,28 @@ impl MediaInfo {
 
 /// Encode exactly one frame with `encoder` and throw the output away.
 ///
-/// `Ok` means this machine can actually drive that encoder; `Err` carries **ffmpeg's own
-/// words** about why it cannot, because that is the only actionable diagnosis there is (a
-/// missing `amfrt64.dll` names itself).
+/// `Ok` means this machine can drive that encoder; `Err` carries ffmpeg's own words about why
+/// not, the only actionable diagnosis (a missing `amfrt64.dll` names itself).
 ///
-/// This exists because `ffmpeg -encoders` cannot answer the question. That list is what
-/// ffmpeg was *compiled* with, not what its runtime can initialise: measured on the Windows test machine (an RTX 3090)
-/// with no AMD hardware or driver at all, ffmpeg advertised `h264_amf` and then died
-/// with `DLL amfrt64.dll failed to open` the moment it was asked to open the encoder. The
-/// design spec called for this smoke test alongside the encoder list (§5.2, and §13 lists
-/// the encoder list alone as a risk) and it is the difference between failing at startup
-/// and failing mid-capture.
+/// `ffmpeg -encoders` cannot answer this: it lists what ffmpeg was compiled with, not what its
+/// runtime can initialise. On a Windows test machine with an NVIDIA GPU and no AMD hardware or
+/// driver, ffmpeg advertised `h264_amf` and then died with `DLL amfrt64.dll failed to open` on
+/// opening it. This smoke test is the difference between failing at startup and failing
+/// mid-capture.
 ///
-/// One 320x240 BGRA frame (307 200 bytes) goes in over `pipe:0` as rawvideo, exactly as the
-/// live capture feeds the real encoder, and the output goes to the null muxer. There is
-/// deliberately no `-f lavfi` test source: a strip-down ffmpeg build may not carry those
-/// filters, and the point is to exercise the encoder, not a filter graph. The child's exit
-/// status is the answer — a frame ffmpeg accepted is what proves the encoder opened.
+/// One 320x240 BGRA frame (307 200 bytes) goes in over `pipe:0` as rawvideo, as live capture
+/// feeds the real encoder, and the output goes to the null muxer. There is no `-f lavfi` test
+/// source: a stripped ffmpeg build may lack those filters, and the point is to exercise the
+/// encoder, not a filter graph. A frame ffmpeg accepted proves the encoder opened.
 ///
-/// Nothing here touches the screen or synthesises input: it is a synthetic frame, not a
-/// capture.
+/// Nothing here touches the screen or synthesises input.
 pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), String> {
     let size = format!("{}x{}", SMOKE_SIZE.0, SMOKE_SIZE.1);
     let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args([
         "-hide_banner",
-        // Keeps ffmpeg from reading the probe's own stdin for interactive commands; the
-        // frame still arrives on the `pipe:0` input below.
+        // Keeps ffmpeg from reading the probe's own stdin for interactive commands; the frame still
+        // arrives on `pipe:0`.
         "-nostdin",
         "-f",
         "rawvideo",
@@ -344,7 +325,7 @@ pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), Str
 
 /// ffmpeg's explanation of a failed probe, condensed onto one line.
 ///
-/// Shapes this handles, both measured against ffmpeg 9.0.2:
+/// Shapes handled (measured on ffmpeg 9.0.2):
 ///
 /// ```text
 /// Input #0, rawvideo, from 'pipe:0':                     <- filtered: description
@@ -354,15 +335,14 @@ pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), Str
 /// Error while opening encoder for output stream #0:0 …   <- ffmpeg's own summary
 /// ```
 ///
-/// The description lines are dropped (they say nothing about the failure), the reasons are
-/// kept first because that is where the missing DLL or driver is *named*, and the closing
-/// summary is kept because it is ffmpeg's statement of what went wrong overall. Middle
-/// lines are usually a restatement of the first two, so only the first two and the last are
-/// used, and the result is capped so it cannot become a wall of text in a log or a table.
+/// Description lines are dropped. The first two reasons are kept because that is where the
+/// missing DLL or driver is named, and the closing summary because it is ffmpeg's overall
+/// statement; middle lines mostly restate the first two. The result is capped so it cannot
+/// become a wall of text in a log or table.
 ///
-/// Public because it is the *only* actionable diagnosis of a failing ffmpeg child, and the
-/// encoder's own probes (`localplay_encoder::probe`, `localplay_encoder::throughput`) have
-/// to report the same words this side does rather than a paraphrase of them.
+/// Public because it is the only actionable diagnosis of a failing ffmpeg child, and the
+/// encoder's probes (`localplay_encoder::probe`, `localplay_encoder::throughput`) must report
+/// the same words rather than a paraphrase.
 pub fn ffmpeg_reason(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
@@ -383,11 +363,11 @@ pub fn ffmpeg_reason(stderr: &str) -> String {
 }
 
 /// ffmpeg's non-diagnostic output: the description of the input and output it is about to
-/// build, its stream mapping, and the progress line. None of it says why an encoder failed,
-/// and all of it would otherwise be read as "the reason" because it comes first.
+/// build, its stream mapping and the progress line. None says why an encoder failed, yet all
+/// would be read as "the reason" because they come first.
 ///
-/// `Stream #` and `Duration:` are matched after trimming, so the two-space indentation
-/// ffmpeg uses inside a stream block does not defeat the match.
+/// `Stream #` and `Duration:` are matched after trimming, so ffmpeg's two-space indentation
+/// inside a stream block does not defeat the match.
 fn is_ffmpeg_chatter(line: &str) -> bool {
     const CHATTER: [&str; 9] = [
         "Input #",
@@ -403,27 +383,22 @@ fn is_ffmpeg_chatter(line: &str) -> bool {
     CHATTER.iter().any(|prefix| line.starts_with(prefix))
 }
 
-/// The frame a smoke test encodes: 320x240 BGRA, i.e. 307 200 bytes.
+/// The frame a smoke test encodes: 320x240 BGRA, 307 200 bytes.
 ///
-/// The size is **not** free to shrink. Hardware encoders have vendor minimum sizes, and a
-/// probe that trips one reports a working encoder as unusable — which is the opposite of
-/// what this test is for:
+/// The size is not free to shrink. Hardware encoders have vendor minimum sizes, and a probe
+/// tripping one reports a working encoder as unusable:
 ///
-/// - **NVENC** rejects anything under 145x145 *at the driver*, with "Frame Dimension less
-///   than the minimum supported value" (ffmpeg trac #9251: 144x144 fails, 145x145 works). A
-///   64x64 probe would therefore have called a perfectly good NVIDIA GPU unusable.
-/// - **QSV** has a minimum around 128x96.
-/// - **AMF** documents 64x64 for H.264 but 192x128 for HEVC, and one probe size has to
-///   serve both codecs.
+/// - NVENC rejects anything under 145x145 at the driver ("Frame Dimension less than the minimum
+///   supported value"; ffmpeg trac #9251: 144x144 fails, 145x145 works).
+/// - QSV has a minimum around 128x96.
+/// - AMF documents 64x64 for H.264 but 192x128 for HEVC, and one probe size serves both codecs.
 ///
-/// 320x240 clears every one of those, is 16-pixel aligned in both directions, and is one
-/// frame of 300 KiB: large enough to be a real encode, small enough that feeding it costs
-/// nothing.
+/// 320x240 clears all of them, is 16-pixel aligned both ways, and is real enough to be an
+/// encode while cheap to feed.
 const SMOKE_SIZE: (u32, u32) = (320, 240);
 
 /// How long a smoke test may take before the encoder is declared unusable. An encoder that
-/// needs the GPU runtime and cannot get it fails in milliseconds; this is a ceiling on a
-/// wedged child, not a budget an honest one needs.
+/// cannot get the GPU runtime fails in milliseconds; this is a ceiling on a wedged child.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ceiling on the length of a returned reason, in characters.
@@ -434,16 +409,15 @@ fn seconds_to_ms(seconds: Option<&str>) -> u64 {
     seconds_to_ms_opt(seconds).unwrap_or(0)
 }
 
-/// Like [`seconds_to_ms`], but preserves "ffprobe did not report this" as `None`
-/// instead of collapsing it to `0`.
+/// Like [`seconds_to_ms`], but keeps "ffprobe did not report this" as `None` instead of `0`.
 fn seconds_to_ms_opt(seconds: Option<&str>) -> Option<u64> {
     seconds
         .and_then(|s| s.parse::<f64>().ok())
         .map(|s| (s * 1000.0).round() as u64)
 }
 
-/// Parse a decimal-seconds string (possibly negative, e.g. an edit-list start time)
-/// into whole milliseconds.
+/// Parse a decimal-seconds string (possibly negative, e.g. an edit-list start) into whole
+/// milliseconds.
 fn seconds_to_ms_i64_opt(seconds: Option<&str>) -> Option<i64> {
     seconds
         .and_then(|s| s.parse::<f64>().ok())
@@ -483,8 +457,8 @@ mod tests {
         assert!(MediaInfo::from_ffprobe_json(json).is_err());
     }
 
-    /// A missing per-stream duration stays `None` rather than silently becoming 0,
-    /// so the drift computation can refuse to invent a number.
+    /// A missing per-stream duration stays `None` rather than becoming 0, so the drift computation
+    /// can refuse to invent a number.
     #[test]
     fn missing_stream_duration_stays_none() {
         let json = r#"{
@@ -544,8 +518,7 @@ mod tests {
         assert_eq!(info.av_drift().unwrap().delta_ms, 100);
     }
 
-    /// The negative case asked for by the criteria: audio longer than video makes
-    /// the delta negative (the audio runs past the picture).
+    /// The negative case: audio longer than video makes the delta negative.
     #[test]
     fn av_drift_negative_when_audio_outlasts_video() {
         let (video, audio) = stream_durations(3_900, 4_000);
@@ -558,9 +531,8 @@ mod tests {
         assert_eq!(info.av_drift().unwrap().delta_ms, -100);
     }
 
-    /// When start times are reported they shift the end timestamps: a video that
-    /// starts 50 ms late but has the same duration ends 50 ms later than the audio,
-    /// so it reads as the video outlasting the picture's counterpart.
+    /// Reported start times shift the end timestamps: a video starting 50 ms late with the same
+    /// duration ends 50 ms after the audio.
     #[test]
     fn av_drift_accounts_for_stream_start_times() {
         let video = VideoStream {
@@ -600,11 +572,10 @@ mod tests {
         assert!(info.av_drift().is_none(), "no audio stream means no drift");
     }
 
-    /// The probe size is a hardware constraint, not a preference — see [`SMOKE_SIZE`]. This
-    /// is the guard against "shrink it, it is only a smoke test": NVENC fails under 145x145
-    /// **at the driver**, QSV under roughly 128x96, and AMF's HEVC encoder under 192x128.
-    /// A probe below any of those would report working hardware as unusable, which is worse
-    /// than not probing at all.
+    /// The probe size is a hardware constraint, not a preference (see [`SMOKE_SIZE`]). This guards
+    /// against "shrink it, it is only a smoke test": NVENC fails under 145x145 at the driver, QSV
+    /// under roughly 128x96, AMF's HEVC under 192x128, and a probe below any reports working
+    /// hardware as unusable.
     #[test]
     fn the_smoke_frame_clears_every_vendors_minimum_size() {
         assert!(
@@ -621,22 +592,19 @@ mod tests {
         );
     }
 
-    /// The real machinery, end to end: a real child, a real frame over `pipe:0`, a real
-    /// exit status, and ffmpeg's real words. `libx264` is the encoder this suite's software
-    /// path already requires (`crates/encoder/tests/segmenting.rs`), so needing it here
-    /// adds no new expectation of the test host.
-    ///
-    /// This is what a hardware vendor's smoke test rides on: the difference between a
-    /// usable and an unusable encoder is only the exit status of exactly this child.
+    /// The real machinery end to end: a real child, a real frame over `pipe:0`, a real exit status
+    /// and ffmpeg's real words. `libx264` is already required by this suite's software path
+    /// (`crates/encoder/tests/segmenting.rs`), so it adds no new expectation of the test host. A
+    /// hardware vendor's smoke test differs only in the exit status of this same child.
     #[test]
     fn a_working_encoder_encodes_one_frame() {
         let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
         smoke_test_encoder(&bin, "libx264").expect("libx264 can encode a 320x240 frame");
     }
 
-    /// The other half: an encoder ffmpeg cannot open must fail *with ffmpeg's reason*, not
-    /// with "it did not work". On the Windows box the equivalent reason is
-    /// `DLL amfrt64.dll failed to open`, which is only ever in the child's stderr.
+    /// The other half: an encoder ffmpeg cannot open must fail with ffmpeg's reason, not "it did
+    /// not work". On Windows the equivalent is `DLL amfrt64.dll failed to open`, only ever in the
+    /// child's stderr.
     #[test]
     fn an_encoder_that_cannot_open_reports_ffmpegs_own_reason() {
         let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
@@ -653,16 +621,15 @@ mod tests {
         assert!(!reason.contains('\n'), "a reason is one line: {reason}");
     }
 
-    /// A hanging encoder has to be bounded, not waited out. The stand-in never reads its
-    /// stdin, never writes to it, and never exits; the probe must give up on the deadline
-    /// instead of wedging startup. The encoded "frame" is deliberately far larger than any
-    /// pipe buffer, so the writer thread would block forever if the timeout were not real.
+    /// A hanging encoder must be bounded, not waited out. The stand-in never reads or exits; the
+    /// probe must give up on the deadline instead of wedging startup. The frame is far larger than
+    /// any pipe buffer, so the writer thread would block forever if the timeout were not real.
     #[cfg(unix)]
     #[test]
     fn an_encoder_that_hangs_is_bounded_by_the_timeout() {
         use std::os::unix::fs::PermissionsExt;
-        // `sleep`ing longer than the probe's own deadline, with the frame arriving on a
-        // pipe nobody reads.
+        // `sleep`ing longer than the probe's own deadline, with the frame arriving on a pipe nobody
+        // reads.
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("ffmpeg");
         std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();

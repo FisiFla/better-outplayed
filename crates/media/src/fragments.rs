@@ -1,24 +1,21 @@
-//! Splitting ffmpeg's **fragmented MP4** output into self-contained fragments.
+//! Splitting ffmpeg's fragmented MP4 output into self-contained fragments.
 //!
 //! This is what makes an in-memory replay buffer possible. With `-f mp4 -movflags
-//! empty_moov+frag_keyframe+default_base_moof` on a pipe, ffmpeg writes one small
-//! `ftyp`+`moov` header and then a stream of `moof`+`mdat` pairs — one pair per forced
-//! keyframe. Measured on a 6s 320x180 capture: a 1249-byte header, then 6 fragments a second
-//! apart, each carrying a `tfdt` (base media decode time) in its track's timescale.
+//! empty_moov+frag_keyframe+default_base_moof` on a pipe, ffmpeg writes one small `ftyp`+`moov`
+//! header and then `moof`+`mdat` pairs, one per forced keyframe. Measured on a 6s 320x180
+//! capture: a 1249-byte header, then 6 fragments a second apart, each carrying a `tfdt` (base
+//! media decode time) in its track's timescale.
 //!
-//! Two properties fall out of that shape, and both are load-bearing for a replay buffer:
+//! * A fragment is self-contained. `header + any contiguous range of fragments` is a valid
+//!   fragmented MP4, and `ffmpeg -i that -c copy out.mp4` makes it a normal clip: no
+//!   re-encoding, no temp segment files, nothing on disk until the user saves.
+//! * A fragment starts at a keyframe, because ffmpeg was told `frag_keyframe` and the encoder
+//!   forces one every `segment_ms`. A fragment boundary is a cut point with the file-based
+//!   segmenter's granularity.
 //!
-//! * **A fragment is self-contained.** `header + any contiguous range of fragments` is a valid
-//!   fragmented MP4, and `ffmpeg -i that -c copy out.mp4` turns it into a normal clip. That is
-//!   the whole clip path: no re-encoding, no temporary segment files, nothing on disk until the
-//!   user saves something.
-//! * **A fragment starts at a keyframe**, because ffmpeg was told `frag_keyframe` and the
-//!   encoder forces a keyframe every `segment_ms`. So a fragment boundary is a cut point, with
-//!   exactly the granularity the file-based segmenter has, from the same interval.
-//!
-//! The splitter is **incremental**: a caller pushes whatever bytes it just read from the pipe
-//! and gets back any fragments that are now complete. Nothing is buffered twice — each
-//! fragment's bytes are moved out as soon as its `mdat` has arrived.
+//! The splitter is incremental: push whatever bytes were just read from the pipe and get back
+//! any fragments now complete. Nothing is buffered twice; a fragment's bytes move out as soon as
+//! its `mdat` has arrived.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -28,52 +25,42 @@ use std::collections::HashMap;
 pub struct Fragment {
     /// Sequence number, counted from 0 in the order the splitter produced them.
     pub seq: u64,
-    /// Where this fragment's earliest video sample decodes, in ms — its `tfdt`, converted with
-    /// the **video** track's timescale.
-    ///
-    /// This is media time, run-relative, and monotonic across a stream. It is what the buffer
-    /// measures its span with and what a clip's range is selected against; nothing is decoded
-    /// to get it.
+    /// Where this fragment's earliest video sample decodes, in ms: its `tfdt`, converted with the
+    /// video track's timescale. Run-relative media time, monotonic across a stream, used to measure
+    /// the buffer's span and select a clip's range without decoding anything.
     pub start_ms: u64,
-    /// How long this fragment's video samples span, in ms — its `trun`/`tfhd` sample durations,
+    /// How long this fragment's video samples span, in ms, from its `trun`/`tfhd` sample durations
     /// converted with the video track's timescale.
     ///
-    /// **`0` means unknown**, not "instantaneous": a sample table this build cannot read leaves
-    /// the fragment usable but its length unclaimed, and a caller that needs a proven end must
-    /// treat 0 as "not measured" (see `MemorySegment::is_closed`). Reading it here rather than
-    /// taking it from the next fragment's `tfdt` is what keeps a ring's `span_ms` from lagging a
-    /// whole fragment behind the footage it is holding.
+    /// `0` means unknown, not "instantaneous": a sample table this build cannot read leaves the
+    /// fragment usable with its length unclaimed, and a caller needing a proven end must treat 0 as
+    /// "not measured" (see `MemorySegment::is_closed`). Reading it here rather than from the next
+    /// fragment's `tfdt` keeps a ring's `span_ms` from lagging a fragment behind the footage held.
     pub duration_ms: u64,
     /// The bytes: this fragment's `moof` and its `mdat`, and nothing else.
     pub bytes: Vec<u8>,
-    /// Whether the fragment starts on a keyframe.
-    ///
-    /// Always `true` for fragments this splitter produces, because ffmpeg was spawned with
-    /// `frag_keyframe`. It is carried rather than assumed so that the code which picks a clip's
-    /// first fragment *asserts* it: a clip that began mid-GOP would play its first frames as
-    /// garbage, and that is exactly the kind of silent damage a buffer should refuse to cause.
+    /// Whether the fragment starts on a keyframe. Always `true` for fragments this splitter
+    /// produces (`frag_keyframe`), but carried so the code picking a clip's first fragment asserts
+    /// it: a clip beginning mid-GOP would play garbage first.
     pub keyframe: bool,
 }
 
-/// An incremental splitter for ffmpeg's fragmented-MP4 output.
-///
-/// Not `Clone`: it owns the unconsumed tail of a stream, and two of them would be two readers.
+/// An incremental splitter for ffmpeg's fragmented-MP4 output. Not `Clone`: it owns the
+/// unconsumed tail of a stream, and two would be two readers.
 #[derive(Debug, Default)]
 pub struct FragmentSplitter {
     /// Bytes received but not yet consumed by a complete box.
     buf: Vec<u8>,
     /// `ftyp` + `moov`, once both have been seen. Kept whole: a clip is this plus a range of
-    /// fragments, and the header is the only part that is written once.
+    /// fragments.
     header: Option<Vec<u8>>,
-    /// Track id → `(is_video, timescale)`, read out of the `moov`.
-    ///
-    /// Needed to convert a fragment's `tfdt` into milliseconds: the value is in the *track's*
-    /// own timescale (measured: 15360 for video, 48000 for audio in the same stream), and the
+    /// Track id to `(is_video, timescale)`, read out of the `moov`. A fragment's `tfdt` is in its
+    /// track's own timescale (15360 for video, 48000 for audio in one measured stream), and the
     /// video one is the clock a clip's range is measured on.
     tracks: HashMap<u32, (bool, u32)>,
-    /// A `moof` whose `mdat` has not arrived yet, with the start time and sample span read out
-    /// of it. The duration is read here, with the start, because it is in the same `moof` — and
-    /// reading it when the fragment is assembled would leave the ring guessing instead.
+    /// A `moof` whose `mdat` has not arrived yet, with the start time and sample span read out of
+    /// it. The duration is read here because it is in the same `moof`, and reading it at assembly
+    /// would leave the ring guessing.
     pending: Option<(u64, u64, Vec<u8>)>,
     next_seq: u64,
 }
@@ -83,27 +70,21 @@ impl FragmentSplitter {
         Self::default()
     }
 
-    /// The `ftyp`+`moov` header, once it has been seen.
-    ///
-    /// `None` until then. A caller that wants to write a clip needs it, and it is the one piece
-    /// that must be remembered across evictions.
+    /// The `ftyp`+`moov` header once seen, `None` until then. A clip needs it, and it is the one
+    /// piece that must be remembered across evictions.
     pub fn header(&self) -> Option<&[u8]> {
         self.header.as_deref()
     }
 
-    /// Bytes received so far that do not yet form a complete box.
-    ///
-    /// Reported so a caller can bound its own memory: a stream that stops mid-box must not
-    /// grow a buffer for ever.
+    /// Bytes received that do not yet form a complete box, so a caller can bound its memory: a
+    /// stream stopping mid-box must not grow a buffer for ever.
     pub fn pending_bytes(&self) -> usize {
         self.buf.len()
     }
 
-    /// How many **audio** tracks the header declares.
-    ///
-    /// Needed by the save path, which has to re-apply the track names: a `-c copy` carries no
-    /// per-stream metadata, so `edit::audio_titles` must be told how many tracks to name. Zero
-    /// before the header has been seen.
+    /// How many audio tracks the header declares (zero before the header is seen). The save path
+    /// needs it to re-apply track names: a `-c copy` carries no per-stream metadata, so
+    /// `edit::audio_titles` must be told how many tracks to name.
     pub fn audio_tracks(&self) -> usize {
         self.tracks.values().filter(|(is_video, _)| !is_video).count()
     }
@@ -115,9 +96,8 @@ impl FragmentSplitter {
 
     /// Feed bytes just read from the pipe; returns whatever fragments that completed.
     ///
-    /// A fragment is only returned once its `mdat` has arrived in full, so every `Fragment` is
-    /// immediately usable — and immediately droppable, which is what lets a ring buffer evict
-    /// from the front without ever holding a half-box.
+    /// A fragment is returned only once its `mdat` has fully arrived, so each is immediately usable
+    /// and droppable, letting a ring evict from the front without holding a half-box.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Fragment>> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
@@ -131,8 +111,8 @@ impl FragmentSplitter {
             let body: Vec<u8> = self.buf.drain(..size).collect();
             match kind.as_str() {
                 "ftyp" => {
-                    // The header starts here; `moov` appends to it. Anything before this is not
-                    // part of the header, so it does not accumulate.
+                    // The header starts here; `moov` appends to it. Anything before it is not header and does not
+                    // accumulate.
                     self.header = Some(body);
                 }
                 "moov" => {
@@ -154,10 +134,8 @@ impl FragmentSplitter {
                 }
                 "mdat" => {
                     let Some((start_ms, duration_ms, moof)) = self.pending.take() else {
-                        // A bare `mdat` with no `moof` in front of it is not a fragment. This
-                        // is not an error — `free`/`skip` boxes and other muxer furniture are
-                        // legal at the top level — but it is not footage either, so it is
-                        // dropped rather than invented into a fragment.
+                        // A bare `mdat` with no `moof` is not a fragment. Not an error (`free`/`skip` boxes and other
+                        // muxer furniture are legal at top level) but not footage, so it is dropped.
                         continue;
                     };
                     let mut bytes = moof;
@@ -195,23 +173,20 @@ impl FragmentSplitter {
             };
             let scale = u64::from(*timescale);
             let start_ms = ticks.saturating_mul(1_000) / scale;
-            // A fragment whose length cannot be read is still usable, but its end must not be
-            // invented: reporting 0 makes `MemorySegment::is_closed` false, and the ring then
-            // treats it the way the file ledger treats an untrusted segment — held, not
-            // measured. That is the honest answer for a sample table this build cannot read.
+            // A fragment whose length cannot be read is still usable, but its end must not be invented:
+            // 0 makes `MemorySegment::is_closed` false, and the ring treats it as the file ledger treats
+            // an untrusted segment: held, not measured.
             let duration_ms = sample_span_ticks(traf).map_or(0, |t| t.saturating_mul(1_000) / scale);
             return Ok((start_ms, duration_ms));
         }
-        // A fragment with no video track is not something this pipeline produces (the video is
-        // input 0 and always mapped), so it is a malformed stream rather than a case to guess at.
+        // A fragment with no video track is not something this pipeline produces (video is input 0 and
+        // always mapped), so it is a malformed stream rather than a case to guess at.
         bail!("no video `tfdt` in this fragment: its start time cannot be placed on the timeline")
     }
 }
 
 /// The kind and declared size of the box at the front of `buf`, or `None` if fewer than eight
-/// bytes have arrived.
-///
-/// Returns the *total* size, header included — so `size` is what has to be drained.
+/// bytes have arrived. Returns the total size, header included, which is what has to be drained.
 fn peek_box(buf: &[u8]) -> Result<Option<(String, usize)>> {
     if buf.len() < 8 {
         return Ok(None);
@@ -220,8 +195,8 @@ fn peek_box(buf: &[u8]) -> Result<Option<(String, usize)>> {
     let kind = String::from_utf8_lossy(&buf[4..8]).into_owned();
     let size = match small {
         0 => {
-            // "to the end of the file" — meaningless on a live stream, and ffmpeg does not
-            // emit it. Treated as an error rather than guessed at.
+            // "To the end of the file" is meaningless on a live stream and ffmpeg does not emit it; treated
+            // as an error rather than guessed at.
             bail!("a `{kind}` box declares size 0 (extend to end of file) on a live stream");
         }
         1 => {
@@ -275,11 +250,9 @@ fn boxes(buf: &[u8]) -> Vec<(&[u8], String)> {
     out
 }
 
-/// The child boxes of `buf` of a given kind, skipping its own header.
-///
-/// Collected rather than returned as an iterator: these lists hold a handful of boxes, and an
-/// `impl Iterator` would have to carry `kind`'s lifetime as well as the buffer's to satisfy the
-/// borrow checker — a bound that says nothing useful about what this does.
+/// The child boxes of `buf` of a given kind, skipping its own header. Collected rather than
+/// returned as an iterator: the lists hold a handful of boxes, and an `impl Iterator` would
+/// carry `kind`'s lifetime as well as the buffer's for no useful reason.
 fn children<'a>(buf: &'a [u8], header: usize, kind: &str) -> Vec<&'a [u8]> {
     let body = buf.get(header..).unwrap_or(&[]);
     boxes(body)
@@ -347,25 +320,24 @@ fn base_media_decode_time(traf: &[u8]) -> Option<u64> {
 
 /// How many media ticks this `traf`'s samples span.
 ///
-/// A fragment's own bytes carry its duration, so this is a *measurement* rather than something
-/// to wait for. That matters: without it a ring has to borrow the file ledger's rule — "the next
-/// segment proves this one's end" — which costs a whole fragment of lag, so `span_ms`
-/// under-reports the footage the ring holds by exactly one fragment. A clip's window is resolved
-/// against `span_ms`, and that lag is the difference between a clip of the length the user asked
-/// for and one a fragment short of it (measured: 2200ms of a 3000ms request before this).
+/// A fragment's own bytes carry its duration, so this is a measurement, not something to wait
+/// for. Without it a ring borrows the file ledger's "the next segment proves this one's end",
+/// costing a whole fragment of lag so `span_ms` under-reports by one fragment, the difference
+/// between a clip of the requested length and one a fragment short (2200ms of a 3000ms request,
+/// measured).
 ///
-/// The two places a duration can hide, in the order ffmpeg uses them:
+/// A duration can hide in two places, in ffmpeg's order:
 ///
-/// * `trun`'s per-sample durations, when its flags say so (bit `0x000100`) — the general case,
-///   and what a variable-frame-rate stream needs;
-/// * `tfhd`'s `default_sample_duration` (bit `0x000008`), multiplied by the sample count.
+/// * `trun`'s per-sample durations, when its flags say so (bit `0x000100`): the general case,
+///   needed for variable frame rate;
+/// * `tfhd`'s `default_sample_duration` (bit `0x000008`) times the sample count.
 ///
-/// `None` when neither is present, which a caller must read as "unknown" rather than as zero.
+/// `None` when neither is present, which a caller must read as unknown, not zero.
 fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
     let tfhd = *children(traf, 0, "tfhd").first()?;
     // `tfhd`: version(1) flags(3) track_id(4), then whichever of base_data_offset (8 bytes),
     // sample_description_index, default_sample_duration, default_sample_size and
-    // default_sample_flags are present — in that order, four bytes each except the first.
+    // default_sample_flags are present, in that order, four bytes each except the first.
     let tf_flags = u32::from_be_bytes([tfhd[1], tfhd[2], tfhd[3], 0]) >> 8;
     let mut at = 8usize;
     if tf_flags & 0x00_0001 != 0 {
@@ -393,11 +365,10 @@ fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
     }
 
     if tr_flags & 0x00_0100 != 0 {
-        // Per-sample durations, one four-byte field per sample — but not the *only* field:
-        // each entry in `trun` carries whichever of duration, size, flags and composition
-        // offset the flags select, in that order. Reading with a four-byte stride instead of
-        // the real one sums sample sizes into the total, which is how a one-second fragment
-        // once measured 3576ms. The entry's width is what the flags say it is.
+        // Per-sample durations, but not the only field: each `trun` entry carries whichever of
+        // duration, size, flags and composition offset the flags select, in that order. A four-byte
+        // stride sums sample sizes into the total (a one-second fragment once measured 3576ms), so the
+        // entry width is what the flags say.
         let entry = 4
             + if tr_flags & 0x00_0200 != 0 { 4 } else { 0 } // sample_size
             + if tr_flags & 0x00_0400 != 0 { 4 } else { 0 } // sample_flags
@@ -417,11 +388,9 @@ fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// A real fragmented-MP4 stream from ffmpeg, in memory.
-    ///
-    /// Generated rather than pasted: a hand-written box structure would test the parser against
-    /// my idea of ffmpeg's output instead of its actual output, and the whole point of this
-    /// module is that it agrees with the muxer.
+    /// A real fragmented-MP4 stream from ffmpeg, in memory. Generated, not pasted: a hand-written
+    /// box structure would test the parser against an idea of ffmpeg's output, not its actual
+    /// output.
     fn stream(seconds: u32) -> Vec<u8> {
         let bin = localplay_media_ffmpeg();
         let out = crate::sidecar_command(&bin.ffmpeg)
@@ -485,9 +454,9 @@ mod tests {
             "and no fragment bytes: the header is the part that is written once"
         );
 
-        // `-force_key_frames` is one per second, so a 4s stream is four fragments. The exact
-        // count is ffmpeg's, so this asserts a band rather than a number — but a stream that
-        // produced ONE fragment would make a clip unable to cut anything, which must fail.
+        // `-force_key_frames` is one per second, so a 4s stream is four fragments. The count is
+        // ffmpeg's, so assert a band; a stream producing ONE fragment would leave a clip unable to cut
+        // anything and must fail.
         assert!(
             (3..=5).contains(&fragments.len()),
             "a 4s stream at 1s fragments should be about four, got {}",
@@ -542,8 +511,7 @@ mod tests {
 
     #[test]
     fn feeding_the_stream_one_byte_at_a_time_gives_the_same_fragments() {
-        // A pipe does not deliver whole boxes. This is the property that matters for a reader
-        // thread: how the bytes arrive must not change what they mean.
+        // A pipe does not deliver whole boxes. How the bytes arrive must not change what they mean.
         let data = stream(3);
         let mut all_at_once = FragmentSplitter::new();
         let expected = all_at_once.push(&data).expect("whole stream");
@@ -570,8 +538,8 @@ mod tests {
 
     #[test]
     fn a_stream_that_stops_mid_box_is_held_rather_than_guessed_at() {
-        // The failure mode this rules out: a reader that acted on a half-received `mdat` would
-        // hand the buffer a fragment with truncated samples — a clip that plays and then tears.
+        // A reader acting on a half-received `mdat` would hand the buffer a fragment with truncated
+        // samples: a clip that plays and then tears.
         let data = stream(3);
         let cut = data.len() - data.len() / 4;
         let mut splitter = FragmentSplitter::new();
