@@ -19,6 +19,9 @@ pub use wasapi_mic::StubMicrophone;
 mod audio_timeline;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod audio_recovery;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod audio_target;
+pub use audio_target::{GameAudioSource, GameFinder};
 
 #[cfg(windows)]
 pub mod wasapi;

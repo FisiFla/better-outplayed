@@ -33,26 +33,42 @@
 //! An invalidated endpoint (headset unplugged) or a new default output reopens the stream on the
 //! current default endpoint without resetting the timeline ([`RecoveringSource`]), so the outage
 //! is silence in the clip rather than an error or a track that ends early.
+//!
+//! # Per-application capture
+//!
+//! With [`GameAudioSource::App`] the running game is captured through process loopback
+//! (`ActivateAudioInterfaceAsync` on `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`, including its child
+//! processes), so voice chat and music stay out of the clip. Only the process id is handed to the
+//! audio service: the game is not opened, hooked or read. That virtual device follows default
+//! output changes by itself. Without a running game, or before Windows build 20348, the whole
+//! default output is captured as above ([`GameAudioOpener`]).
 
 #![cfg(windows)]
 
-use crate::audio_recovery::{RecoveringSource, SourceGone, SourceOpener};
+use crate::audio_recovery::{RecoveringSource, SourceGone};
+use crate::audio_target::{GameAudioOpener, LoopbackFactory};
 use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
 use crate::platform::init_com;
 use crate::{
     clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
-    NativeAudioFormat, SampleEncoding,
+    GameAudioSource, GameFinder, NativeAudioFormat, SampleEncoding,
 };
+use std::mem::ManuallyDrop;
+use std::sync::mpsc;
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
-use windows::core::IUnknown;
+use windows::core::{implement, Interface, IUnknown, Ref, HRESULT};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_E_DEVICE_INVALIDATED,
+    eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_E_DEVICE_INVALIDATED,
     AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -60,7 +76,15 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+use windows::Wdk::System::SystemServices::RtlGetVersion;
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, IAgileObject, IAgileObject_Impl, BLOB, CLSCTX_ALL,
+};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -77,16 +101,29 @@ const BYTES_PER_FRAME: usize = TARGET.channels as usize * 2;
 /// 100-nanosecond units per millisecond, for `IAudioClient::Initialize`.
 const HNS_PER_MS: i64 = 10_000;
 
+/// The first Windows build Microsoft documents process loopback for.
+const PROCESS_LOOPBACK_MIN_BUILD: u32 = 20348;
+
+/// The process-loopback stream buffer. The virtual device has no period to ask for; this is the
+/// one Microsoft's ApplicationLoopback sample uses.
+const PROCESS_BUFFER_HNS: i64 = 20 * HNS_PER_MS;
+
+/// How long process-loopback activation may take before it is treated as unavailable.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `WAVE_FORMAT_EXTENSIBLE`, i.e. "look at the SubFormat GUID".
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_PCM: u16 = 0x0001;
 
-/// WASAPI loopback capture of the default render endpoint, opened as 48kHz stereo s16le with the
-/// engine converting (see the module docs).
+/// WASAPI loopback capture of the game or the default render endpoint, opened as 48kHz stereo
+/// s16le with the engine converting (see the module docs).
 pub struct WasapiLoopback {
+    mode: GameAudioSource,
+    /// Taken by `start`; a restarted backend captures the whole output.
+    find_game: Option<GameFinder>,
     /// The open stream and the timeline it feeds, reopened across device changes.
-    source: Option<RecoveringSource<EndpointOpener>>,
+    source: Option<RecoveringSource<GameAudioOpener<WasapiFactory>>>,
     /// The stream generation `silence_watch` was armed for.
     watched_generation: u64,
     /// Whether this thread's COM apartment was taken by us and must be given back.
@@ -139,8 +176,16 @@ impl Drop for Client {
 }
 
 impl WasapiLoopback {
+    /// Whole-output capture.
     pub fn new() -> Result<Self> {
+        Self::with_source(GameAudioSource::System, None)
+    }
+
+    /// `find_game` names the game process to capture under [`GameAudioSource::App`].
+    pub fn with_source(mode: GameAudioSource, find_game: Option<GameFinder>) -> Result<Self> {
         Ok(Self {
+            mode,
+            find_game,
             source: None,
             watched_generation: 0,
             com_owned: false,
@@ -167,8 +212,22 @@ impl AudioBackend for WasapiLoopback {
         // Frame 0 is the moment capture began, so a session that opens on silence still starts its
         // audio alongside the video.
         let now = clock_base().elapsed();
-        let opened = EndpointOpener::new()
-            .and_then(|opener| RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now));
+        let find_game = match (self.mode, self.find_game.take()) {
+            (GameAudioSource::App, Some(find)) if process_loopback_supported() => Some(find),
+            (GameAudioSource::App, _) => {
+                tracing::warn!(
+                    min_build = PROCESS_LOOPBACK_MIN_BUILD,
+                    "game_audio = \"app\" needs Windows process loopback, which this system \
+                     lacks (or no game list was given); capturing the whole default output"
+                );
+                None
+            }
+            (GameAudioSource::System, _) => None,
+        };
+        let opened = WasapiFactory::new().and_then(|factory| {
+            let opener = GameAudioOpener::new(factory, find_game);
+            RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now)
+        });
         match opened {
             Ok(source) => {
                 self.source = Some(source);
@@ -264,15 +323,15 @@ impl Drop for WasapiLoopback {
     }
 }
 
-/// Opens loopback on whatever the default render endpoint is at the time.
-struct EndpointOpener {
+/// Opens process loopback on a game, or endpoint loopback on whatever the default output is now.
+struct WasapiFactory {
     enumerator: IMMDeviceEnumerator,
 }
 
 // SAFETY: as for `Client`: only the capture thread uses it, and the enumerator is free-threaded.
-unsafe impl Send for EndpointOpener {}
+unsafe impl Send for WasapiFactory {}
 
-impl EndpointOpener {
+impl WasapiFactory {
     fn new() -> Result<Self> {
         // SAFETY: the CLSID is the documented one; `None` means no aggregation.
         let enumerator: IMMDeviceEnumerator = unsafe {
@@ -289,18 +348,118 @@ impl EndpointOpener {
     }
 }
 
-impl SourceOpener for EndpointOpener {
+impl LoopbackFactory for WasapiFactory {
     type Stream = Client;
 
-    fn open(&mut self) -> Result<(Client, String)> {
+    fn open_process(&mut self, pid: u32) -> Result<Client> {
+        open_process_client(pid)
+    }
+
+    fn open_system(&mut self) -> Result<(Client, String)> {
         let device = self.default_device()?;
         let id = device_id(&device)?;
         Ok((open_client(&device)?, id))
     }
 
-    fn wanted(&mut self) -> Result<String> {
+    fn system_key(&mut self) -> Result<String> {
         device_id(&self.default_device()?)
     }
+}
+
+/// Whether this Windows build has process loopback. `RtlGetVersion` because `GetVersionEx`
+/// reports whatever the application manifest claims.
+fn process_loopback_supported() -> bool {
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a valid OSVERSIONINFOW with its size set, as the call requires.
+    let status = unsafe { RtlGetVersion(&mut info) };
+    let supported = status.is_ok() && info.dwBuildNumber >= PROCESS_LOOPBACK_MIN_BUILD;
+    tracing::debug!(build = info.dwBuildNumber, supported, "process loopback availability");
+    supported
+}
+
+/// Signals the waiting thread when process-loopback activation finishes. Agile, because the audio
+/// service may call it from any thread.
+#[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
+struct ActivationDone(mpsc::Sender<()>);
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationDone_Impl {
+    fn ActivateCompleted(
+        &self,
+        _operation: Ref<IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        // The receiver may have timed out and gone; nothing is left to tell then.
+        let _ = self.0.send(());
+        Ok(())
+    }
+}
+
+impl IAgileObject_Impl for ActivationDone_Impl {}
+
+/// Open process loopback on `pid` and its child processes and start it.
+fn open_process_client(pid: u32) -> Result<Client> {
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    // A VT_BLOB pointing at `params`, which outlives the activation below. Not dropped through
+    // PropVariantClear: the blob is on this stack, not CoTaskMemAlloc'd.
+    let activation = ManuallyDrop::new(PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_BLOB,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    blob: BLOB {
+                        cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        pBlobData: (&raw mut params).cast(),
+                    },
+                },
+            }),
+        },
+    });
+    let (done, completed) = mpsc::channel();
+    let handler: IActivateAudioInterfaceCompletionHandler = ActivationDone(done).into();
+    // SAFETY: the device path is the documented process-loopback constant, the IID matches the
+    // interface asked for, and `activation` and `params` stay alive until the result is read.
+    let operation = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*activation),
+            &handler,
+        )
+    }
+    .context("ActivateAudioInterfaceAsync(process loopback)")?;
+    completed
+        .recv_timeout(ACTIVATION_TIMEOUT)
+        .context("process loopback activation did not complete")?;
+    let mut result = HRESULT(0);
+    let mut activated: Option<IUnknown> = None;
+    // SAFETY: the operation has completed, so its result is ready; both out-parameters are valid.
+    unsafe { operation.GetActivateResult(&mut result, &mut activated) }
+        .context("IActivateAudioInterfaceAsyncOperation::GetActivateResult")?;
+    result.ok().with_context(|| format!("process loopback activation for pid {pid}"))?;
+    let audio: IAudioClient = activated
+        .context("process loopback activation returned no interface")?
+        .cast()
+        .context("process loopback interface is not an IAudioClient")?;
+
+    // The virtual device has no mix format or period to read; the engine converts into `TARGET`.
+    let client = start_stream(audio, PROCESS_BUFFER_HNS, false, || {
+        format!("IAudioClient::Initialize(process loopback for pid {pid}, requested 48kHz stereo s16)")
+    })?;
+    tracing::info!(pid, "WASAPI process loopback capture started");
+    Ok(client)
 }
 
 /// The endpoint's id string, which tells one device from another across reopens.
@@ -347,18 +506,6 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
     let raw_mix = MixFormatGuard(raw_mix);
     let native = native_format(raw_mix.0);
 
-    // What the engine is asked to deliver: our format, not the endpoint's. AUTOCONVERTPCM below has
-    // the engine convert into it, and only this format is published downstream.
-    let requested = requested_format();
-
-    // The event is auto-reset: each wait consumes one signal from the engine.
-    // SAFETY: no security attributes and no name are needed for a private event.
-    let event = unsafe {
-        CreateEventW(None, false, false, None)
-            .context("CreateEventW for the WASAPI capture event")?
-    };
-    let event = EventHandle(event);
-
     // A shared-mode, event-driven, loopback stream. The buffer must be at least one device period
     // long for the engine to signal the event at all, so ask for the endpoint's default period.
     let mut default_period = 0i64;
@@ -371,6 +518,52 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
     } else {
         10 * HNS_PER_MS
     };
+
+    let client = start_stream(audio, buffer_duration, native.needs_conversion(), || {
+        format!(
+            "IAudioClient::Initialize(loopback, AUTOCONVERTPCM, requested {}Hz stereo \
+             s16): the audio engine would not open the default render endpoint for \
+             capture (it reports {}Hz/{}ch/{:?} natively). No fallback format is used: \
+             capturing the endpoint's own format and labelling it 48kHz would \
+             desynchronise the clip",
+            TARGET.sample_rate, native.sample_rate, native.channels, native.encoding
+        )
+    })?;
+
+    // The endpoint's native format next to the requested one: `converting=true` plus audible 48kHz
+    // stereo audio in the clip shows the engine is converting, without a debugger.
+    tracing::info!(
+        native_sample_rate = native.sample_rate,
+        native_channels = native.channels,
+        native_sample_format = ?native.encoding,
+        requested_sample_rate = TARGET.sample_rate,
+        requested_channels = TARGET.channels,
+        requested_sample_format = "s16",
+        converting = native.needs_conversion(),
+        "WASAPI loopback capture started on the default render endpoint"
+    );
+    Ok(client)
+}
+
+/// Initialise `audio` as an event-driven loopback stream in [`TARGET`] format and start it.
+/// `refused` describes a failed `Initialize`.
+fn start_stream(
+    audio: IAudioClient,
+    buffer_duration: i64,
+    converting: bool,
+    refused: impl FnOnce() -> String,
+) -> Result<Client> {
+    // What the engine is asked to deliver: our format, not the endpoint's. AUTOCONVERTPCM below has
+    // the engine convert into it, and only this format is published downstream.
+    let requested = requested_format();
+
+    // The event is auto-reset: each wait consumes one signal from the engine.
+    // SAFETY: no security attributes and no name are needed for a private event.
+    let event = unsafe {
+        CreateEventW(None, false, false, None)
+            .context("CreateEventW for the WASAPI capture event")?
+    };
+    let event = EventHandle(event);
 
     // AUTOCONVERTPCM has the engine insert a channel matrixer and sample rate converter between the
     // endpoint's mix format and `requested`, and SRC_DEFAULT_QUALITY picks the converter meant for
@@ -397,16 +590,7 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
                 &requested,
                 None,
             )
-            .with_context(|| {
-                format!(
-                    "IAudioClient::Initialize(loopback, AUTOCONVERTPCM, requested {}Hz stereo \
-                     s16): the audio engine would not open the default render endpoint for \
-                     capture (it reports {}Hz/{}ch/{:?} natively). No fallback format is used: \
-                     capturing the endpoint's own format and labelling it 48kHz would \
-                     desynchronise the clip",
-                    TARGET.sample_rate, native.sample_rate, native.channels, native.encoding
-                )
-            })?;
+            .with_context(refused)?;
         audio
             .SetEventHandle(event.0)
             .context("IAudioClient::SetEventHandle")?;
@@ -417,20 +601,7 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
     // SAFETY: the stream is fully configured at this point.
     unsafe { audio.Start() }.context("IAudioClient::Start")?;
     let (anchor_hns, anchor) = qpc_anchor()?;
-
-    // The endpoint's native format next to the requested one: `converting=true` plus audible 48kHz
-    // stereo audio in the clip shows the engine is converting, without a debugger.
-    tracing::info!(
-        native_sample_rate = native.sample_rate,
-        native_channels = native.channels,
-        native_sample_format = ?native.encoding,
-        requested_sample_rate = TARGET.sample_rate,
-        requested_channels = TARGET.channels,
-        requested_sample_format = "s16",
-        converting = native.needs_conversion(),
-        "WASAPI loopback capture started on the default render endpoint"
-    );
-    Ok(Client { audio, capture, event, converting: native.needs_conversion(), anchor_hns, anchor })
+    Ok(Client { audio, capture, event, converting, anchor_hns, anchor })
 }
 
 /// The QPC in 100ns units and the shared clock, read back to back. `Instant` is QPC-based on

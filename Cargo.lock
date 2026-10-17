@@ -513,6 +513,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

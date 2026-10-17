@@ -66,6 +66,10 @@ monitor = 0
 # beats a substring match, the topmost window wins a tie). Empty records the monitor.
 # No visible window matching the title refuses to start rather than recording something else.
 window = ""
+# What the game-audio track records. "app": only the running game from [games] watch (and its
+# child processes), so voice chat and music stay out of the clip; while none runs, and on
+# Windows builds before 20348, everything the speakers play. "system": always everything.
+game_audio = "app"
 
 [encode]
 # auto | nvenc | qsv | amf
