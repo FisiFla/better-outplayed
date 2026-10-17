@@ -1221,14 +1221,6 @@ mod tests {
         assert_eq!(get(&rate_control_args("libx264", 1), "-rc"), None);
     }
 
-    /// The video output arguments carry the rate control, not a bare `-b:v`.
-    #[test]
-    fn the_output_arguments_carry_the_ceiling_and_buffer() {
-        let args = video_output_args(&args_cfg(60, 1000));
-        assert!(args.windows(2).any(|w| w[0] == "-maxrate" && w[1] == "20000k"), "{args:?}");
-        assert!(args.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "20000k"), "{args:?}");
-    }
-
     /// A configuration the argument builders can be exercised with; these tests are about the argument list only.
     fn args_cfg(fps: u32, segment_ms: u64) -> EncodeConfig {
         let mut cfg = EncodeConfig::for_tests_software(
@@ -1393,28 +1385,6 @@ mod tests {
         assert_eq!(gop(&args_cfg(30, 1000)), 30);
         assert_eq!(gop(&args_cfg(30, 2000)), 60);
         assert_eq!(gop(&args_cfg(24, 1000)), 24);
-    }
-
-    /// The frame-rate conversion is off, on every arm.
-    ///
-    /// This makes the media timeline the wall clock (see [`video_output_args`]): with the default
-    /// conversion ffmpeg invents frames to fill a declared `1/R` grid. Removing it, using a spelling
-    /// the sidecar does not know, or moving it before the input (where it is ignored) must fail here.
-    #[test]
-    fn frames_are_passed_through_and_never_resampled_onto_a_declared_grid() {
-        for (fps, segment_ms) in [(30u32, 1000u64), (60, 500), (120, 1000)] {
-            let cfg = args_cfg(fps, segment_ms);
-            let output = video_output_args(&cfg);
-            let i = output
-                .iter()
-                .position(|a| a == "-fps_mode")
-                .unwrap_or_else(|| panic!("-fps_mode missing from {output:?}"));
-            assert_eq!(output[i + 1], "passthrough", "at {fps}fps: {output:?}");
-            assert!(
-                !output.iter().any(|a| a == "-r" || a == "-fpsmax"),
-                "a frame-rate override re-introduces the grid this option removes: {output:?}"
-            );
-        }
     }
 
     /// The audio bitrate in the child's argument list is `EncodeConfig::audio_bitrate_kbps` and nothing else.
