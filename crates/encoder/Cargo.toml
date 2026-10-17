@@ -34,7 +34,7 @@ tempfile.workspace = true
 [features]
 # Gates the software (libx264) encode path and `EncodeConfig::for_tests_software`.
 # Deliberately NOT a default feature: a default would put the CPU-encoder path into
-# release builds, and the project has no CPU fallback by design (spec §3.2).
+# release builds, and the project has no CPU fallback by design.
 test-encoders = []
 
 # The integration tests build a software encoder, so they need the feature. Declaring

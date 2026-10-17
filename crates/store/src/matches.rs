@@ -1,25 +1,21 @@
 //! Full Match splitting: turning a session's marker timeline into per-match segments.
 //!
-//! A session recording is one long file; the game integrations write `game_start` and
-//! `game_end` markers onto its timeline (League: the Live Client appearing and going quiet;
-//! Counter-Strike/Dota: the GSI phase). This module is the pure rule that pairs them into
-//! [`MatchSegment`]s — the ranges a "Full Match" clip is cut from. It reads rows and returns
-//! values; it never touches the database or the file, so every edge of the pairing is
-//! testable without either.
+//! A session recording is one long file; the game integrations write `game_start` and `game_end`
+//! markers onto its timeline (League: the Live Client appearing and going quiet; Counter-Strike
+//! and Dota: the GSI phase). This pure rule pairs them into [`MatchSegment`]s, the ranges a
+//! "Full Match" clip is cut from. It never touches the database or the file.
 //!
-//! The pairing is deliberately forgiving about what a real session looks like, and explicit
-//! about every inference it makes (see [`MatchSegment::start_inferred`] and
-//! [`MatchSegment::complete`]), because a Full Match cut at a guessed boundary is a different
-//! claim from one cut at a recorded one:
+//! The pairing is forgiving about what a real session looks like and explicit about every
+//! inference (see [`MatchSegment::start_inferred`] and [`MatchSegment::complete`]), because a
+//! match cut at a guessed boundary is a different claim from one cut at a recorded one:
 //!
-//! * `game_start` … `game_end` — an ordinary, complete match.
-//! * `game_start` … `game_start` — the first game never ended (the integration lost the game,
-//!   or the player requeued faster than it noticed): it is closed at the next start and
-//!   marked incomplete.
-//! * `game_start` … end of session — the recording stopped mid-game: closed at the session's
-//!   media length (or at its last marker when the length is unknown), incomplete.
-//! * `game_end` with no open start — recording began mid-game: the match starts at the
-//!   previous match's end (or `0`), `start_inferred`.
+//! * `game_start` ... `game_end`: an ordinary, complete match.
+//! * `game_start` ... `game_start`: the first game never ended (the integration lost it, or the
+//!   player requeued faster than it noticed); closed at the next start, marked incomplete.
+//! * `game_start` ... end of session: the recording stopped mid-game; closed at the session's
+//!   media length (or its last marker when the length is unknown), incomplete.
+//! * `game_end` with no open start: recording began mid-game; the match starts at the previous
+//!   match's end (or `0`), `start_inferred`.
 
 use crate::SessionEvent;
 
@@ -33,25 +29,23 @@ pub struct MatchSegment {
     pub index: usize,
     pub start_ms: i64,
     pub end_ms: i64,
-    /// Whether a `game_end` marker closed it. `false` means the end is a boundary this
-    /// module chose (next start, end of footage), not one the game reported.
+    /// Whether a `game_end` marker closed it. `false` means the end is a boundary this module chose
+    /// (next start, end of footage), not one the game reported.
     pub complete: bool,
-    /// Whether the start is a boundary this module chose (`0` or the previous match's end)
-    /// because no `game_start` marker preceded the `game_end`.
+    /// Whether the start is a boundary this module chose (`0` or the previous match's end) because no `game_start` preceded the `game_end`.
     pub start_inferred: bool,
     /// The `game_start` payload (game mode, map), verbatim JSON text, when there was one.
     pub start_payload: Option<String>,
-    /// The `game_end` payload verbatim. For League this carries the end-of-game scoreboard
-    /// and the win/lose result; the desktop layer parses it, this crate does not know it.
+    /// The `game_end` payload verbatim. For League it carries the scoreboard and result; the desktop layer parses it.
     pub end_payload: Option<String>,
-    /// Every marker that falls inside `[start_ms, end_ms]`, the boundary markers included.
+    /// Every marker inside `[start_ms, end_ms]`, the boundary markers included.
     pub events: Vec<SessionEvent>,
 }
 
 /// Pair a session's markers into matches.
 ///
-/// `events` must be in timeline order (as [`crate::Store::events_for_session`] returns
-/// them). `media_length_ms` is the session file's length, `0` when unknown.
+/// `events` must be in timeline order (as [`crate::Store::events_for_session`] returns them).
+/// `media_length_ms` is the session file's length, `0` when unknown.
 pub fn split_matches(events: &[SessionEvent], media_length_ms: i64) -> Vec<MatchSegment> {
     struct Open {
         start_ms: i64,

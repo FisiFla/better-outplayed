@@ -1,13 +1,10 @@
-//! The storage manager's policy (spec §8) as pure, testable logic, plus the executor
-//! that applies a plan with the spec's deletion ordering (spec §8.2).
+//! The storage manager's policy as pure, testable logic, plus the executor that applies a plan.
 //!
-//! The split is deliberate. [`plan_cleanup`] *decides*: it reads nothing but the clip
-//! rows it is handed and the clock it is given, so both rules — and every interaction
-//! between them — are exhaustively unit-testable with no database and no filesystem.
-//! [`execute_cleanup`] *acts*: it deletes rows and unlinks files, and carries the one
-//! property the spec makes non-negotiable — the row delete is committed **before** the
-//! file is unlinked, and no file is ever unlinked unless a committed row delete handed
-//! back its path.
+//! [`plan_cleanup`] decides: it reads only the clip rows and clock it is given, so both rules and
+//! their interactions are unit-testable with no database or filesystem. [`execute_cleanup`] acts:
+//! it deletes rows and unlinks files, and carries the non-negotiable property that the row delete
+//! is committed before the file is unlinked, and no file is unlinked unless a committed row
+//! delete handed back its path.
 
 use crate::{Clip, Store};
 use anyhow::Result;
@@ -16,19 +13,18 @@ use std::path::{Component, Path, PathBuf};
 /// Milliseconds in a day; the age rule's unit conversion.
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
-/// The `[storage]` policy knobs as the storage manager sees them (spec §10).
+/// The `[storage]` policy knobs as the storage manager sees them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupPolicy {
-    /// Total bytes the clips directory may occupy, favourites included (spec §8.1).
+    /// Total bytes the clips directory may occupy, favourites included.
     pub max_total_bytes: u64,
-    /// A *non-favourited* clip whose `created_at` is more than this many days old is
-    /// deleted (spec §8.1). `0` means every clip created before `now_ms` is over the
-    /// limit — the rule is "older than", not "at least as old as".
+    /// A non-favourited clip whose `created_at` is more than this many days old is deleted. `0`
+    /// means every clip created before `now_ms` is over the limit: "older than", not "at least as old as".
     pub max_age_days: u64,
 }
 
-/// Why one clip is in a plan. A clip can carry both flags at once — the age and size
-/// rules can each select it — but it still appears in the plan exactly once.
+/// Why one clip is in a plan. Both flags can be set (the age and size rules can each select it),
+/// but the clip appears in the plan exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeletionReasons {
     /// Older than [`CleanupPolicy::max_age_days`].
@@ -50,77 +46,62 @@ pub struct PlannedDeletion {
 pub struct CleanupPlan {
     /// Clips to delete, oldest-created first (see [`plan_cleanup`]), each exactly once.
     pub deletions: Vec<PlannedDeletion>,
-    /// The cap the plan was made against, carried so the executor can check the
-    /// post-condition against the live store rather than against this forecast.
+    /// The cap the plan was made against, carried so the executor checks the post-condition against
+    /// the live store rather than this forecast.
     pub cap_bytes: u64,
     /// Total size of the library (favourites included) if every deletion here succeeds.
     pub bytes_after: u64,
-    /// The part of the overshoot that **no** cleanup pass may ever remove: how far the
-    /// favourited clips alone exceed the cap.
+    /// The part of the overshoot that no cleanup pass may ever remove: how far the favourited clips
+    /// alone exceed the cap.
     ///
-    /// Non-zero means the cap is unsatisfiable under the policy. Evicting every
-    /// non-favourited clip would still leave the favourites, so the size rule selects
-    /// nothing at all (spec §8.1: the manager "never deletes a clip to satisfy a cap it
-    /// cannot meet") and the caller is expected to warn with this number instead. In
-    /// that state `bytes_after` may exceed the cap by more than this: it also still
-    /// holds the non-favourited clips the rule declined to evict.
+    /// Non-zero means the cap is unsatisfiable. Evicting every non-favourited clip would still leave
+    /// the favourites, so the size rule selects nothing (the manager never deletes a clip to satisfy
+    /// a cap it cannot meet) and the caller warns with this number. `bytes_after` may then exceed the
+    /// cap by more than this, since it still holds the non-favourited clips the rule declined to evict.
     pub over_cap_by_bytes: u64,
 }
 
 impl CleanupPlan {
     /// Whether applying this plan brings the library at or under the cap.
     ///
-    /// Equal to `bytes_after <= cap_bytes`: while the favourites are within the cap the
-    /// size rule always reaches it (evicting everything else leaves the favourites), and
-    /// once they are not, nothing can.
+    /// Equal to `bytes_after <= cap_bytes`: while the favourites are within the cap the size rule
+    /// always reaches it, and once they are not, nothing can.
     pub fn cap_met(&self) -> bool {
         self.over_cap_by_bytes == 0
     }
 
-    /// The ids to delete, in plan order. Handy for assertions and for logging.
+    /// The ids to delete, in plan order.
     pub fn ids(&self) -> Vec<i64> {
         self.deletions.iter().map(|d| d.id).collect()
     }
 }
 
-/// Decide what one pass over `clips` deletes (spec §8.1), touching neither the
-/// filesystem nor the database.
+/// Decide what one pass over `clips` deletes, touching neither the filesystem nor the database.
 ///
-/// The rules, exactly as the spec states them:
+/// 1. Age: delete every non-favourited clip older than `max_age_days`.
+/// 2. Size: evict non-favourited clips least-recently-used first until the total is at or under
+///    `max_total_bytes`. If the favourites alone exceed the cap the rule is not applied at all.
+/// 3. Favourites are exempt from both rules.
 ///
-/// 1. **Age.** Delete every non-favourited clip older than `max_age_days`.
-/// 2. **Size.** Evict non-favourited clips least-recently-used first until the total
-///    size of the library is at or under `max_total_bytes`. If the favourites alone
-///    exceed the cap the rule is not applied at all — see below.
-/// 3. Favourites are exempt from *both* rules.
-///
-/// A clip both rules select appears once, flagged with both of its reasons.
+/// A clip both rules select appears once, flagged with both reasons.
 ///
 /// # When the cap cannot be met
 ///
-/// The reachable floor is the favourites: they are exempt, so evicting every other clip
-/// would still leave them. When that floor is itself above the cap, no deletion can
-/// satisfy it, and spec §8.1 is explicit that the manager logs a warning and stops
-/// rather than deleting clips to satisfy a cap it cannot meet. The size rule therefore
-/// selects nothing in that state, the age rule still applies (it is a retention rule,
-/// independent of the cap), and the unsatisfiable part is reported in
-/// [`CleanupPlan::over_cap_by_bytes`] for the caller to warn about. Deleting every
-/// non-favourited clip in the library would be the worst possible response to a
-/// mis-set cap: it destroys the material the user did not protect, and still cannot
-/// satisfy the cap that triggered it.
+/// The reachable floor is the favourites. When that floor is above the cap no deletion can satisfy
+/// it, so the manager warns and stops rather than delete clips for a cap it cannot meet. The size
+/// rule selects nothing in that state, the age rule still applies (a retention rule independent
+/// of the cap), and the unsatisfiable part is reported in [`CleanupPlan::over_cap_by_bytes`].
+/// Deleting every non-favourited clip would destroy material the user did not protect and still
+/// not satisfy the cap.
 ///
 /// # What "least recently used" means here
 ///
-/// A clip row is immutable — nothing in this application ever reads a clip back after
-/// writing it — so there is no access to order by and the schema has no column for one.
-/// The orderings available are `created_at` (wall clock, stamped by
-/// [`Store::insert_clip`]) and `started_at` (media time on the ring's own timeline).
-/// Media time is not comparable across captures: it restarts with the scratch directory
-/// and two runs can legitimately produce the same value. So the size rule orders by
-/// **`created_at`, oldest first**: the clip that has been in the library longest is the
-/// one evicted. Ties — two clips indexed within the same millisecond, the ordinary case
-/// for a burst — are broken by id, so a plan is deterministic for a given library and
-/// `now_ms`.
+/// A clip row is immutable and nothing reads a clip back, so there is no access time to order by.
+/// The candidates are `created_at` (wall clock, stamped by [`Store::insert_clip`]) and
+/// `started_at` (media time, which restarts with the scratch directory and so is not comparable
+/// across captures). The size rule therefore orders by `created_at`, oldest first. Ties (a burst
+/// indexed in the same millisecond) are broken by id, so a plan is deterministic for a given
+/// library and `now_ms`.
 pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> CleanupPlan {
     let max_age_ms = (policy.max_age_days as i64).saturating_mul(MS_PER_DAY);
 
@@ -128,14 +109,13 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
     let mut ordered: Vec<&Clip> = clips.iter().collect();
     ordered.sort_by_key(|c| (c.created_at_ms, c.id));
 
-    // One slot per clip, in `ordered` order: a clip the age rule selects is *marked*
-    // here rather than pushed onto a separate list, which is what makes it impossible
-    // for the size rule to put the same clip in the plan a second time.
+    // One slot per clip, in `ordered` order: the age rule marks a clip here instead of pushing it
+    // onto a list, so the size rule cannot put the same clip in the plan twice.
     let mut marked: Vec<Option<DeletionReasons>> = vec![None; ordered.len()];
 
-    // The age rule, and the running total the size rule works from. `saturating_sub`
-    // keeps a clip whose `created_at` is in the future (a clock that stepped backwards
-    // between two runs) from reading as ancient, and keeps the total from underflowing.
+    // The age rule, and the running total the size rule works from. `saturating_sub` keeps a clip
+    // with a future `created_at` (a clock that stepped backwards) from reading as ancient, and the
+    // total from underflowing.
     let mut remaining: u64 = clips.iter().map(|c| c.size_bytes).sum();
     for (i, clip) in ordered.iter().enumerate() {
         if !clip.favourite && now_ms.saturating_sub(clip.created_at_ms) > max_age_ms {
@@ -150,11 +130,10 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
     let over_cap_by_bytes = favourite_bytes.saturating_sub(policy.max_total_bytes);
 
     if over_cap_by_bytes == 0 {
-        // The size rule. It stops the moment the library is at or under the cap ("at or
-        // under": a library exactly at the cap is not over it), and skips favourites. A
-        // clip already selected for age is not deleted twice — its bytes left `remaining`
-        // above — but it is *flagged* as one the size rule would have evicted too, and
-        // only while the library is still over the cap, so the flag means what it says.
+        // The size rule stops once the library is at or under the cap (exactly at the cap is not over)
+        // and skips favourites. A clip already selected for age is not deleted twice (its bytes already
+        // left `remaining`) but is flagged as one the size rule would also have evicted, only while the
+        // library is still over the cap, so the flag means what it says.
         for (i, clip) in ordered.iter().enumerate() {
             if remaining <= policy.max_total_bytes {
                 break;
@@ -197,51 +176,44 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
 pub struct CleanupOutcome {
     /// Rows this pass deleted (and committed).
     pub deleted: usize,
-    /// Planned ids whose row delete failed; each is logged where it happens. Counted
-    /// rather than propagated, because one unreadable row must not abandon the rest of
-    /// a pass.
+    /// Planned ids whose row delete failed; each is logged where it happens. Counted, not
+    /// propagated, so one unreadable row does not abandon the pass.
     pub failed: usize,
     /// Bytes of file that a successful unlink removed from the disk.
     pub bytes_reclaimed: u64,
-    /// Paths a *deleted* row named whose `remove_file` failed: the file is on disk with
-    /// no row naming it, so a later sweep (or the user) has to deal with it.
+    /// Paths a deleted row named whose `remove_file` failed: on disk with no row naming them, for a later sweep or the user.
     pub orphaned: Vec<PathBuf>,
-    /// Paths a deleted row named that were already absent from the disk. The end state
-    /// is right — no row, no file — but a row pointing at nothing is worth reporting
-    /// rather than discovering later.
+    /// Paths a deleted row named that were already absent. The end state is right, but a row pointing at nothing is worth reporting.
     pub already_missing: Vec<PathBuf>,
     /// Total size of the store after the pass, re-read from the database.
     pub bytes_after: u64,
-    /// Whether the store is at or under the plan's cap **after** the pass.
+    /// Whether the store is at or under the plan's cap after the pass.
     ///
-    /// Measured, not forecast: a row delete or an unlink that failed leaves more bytes
-    /// behind than the plan predicted, and this is the number the caller should report.
+    /// Measured, not forecast: a failed row delete or unlink leaves more bytes than the plan predicted.
     pub cap_met: bool,
 }
 
-/// Whether a path read out of the index names one place regardless of the process's working
-/// directory: absolute, with no `..` component. The index is user-writable, so a relative
-/// path in a row would otherwise be unlinked relative to wherever the process happens to be.
+/// Whether a path read out of the index names one place regardless of the working directory:
+/// absolute, with no `..` component. The index is user-writable, so a relative path in a row
+/// would otherwise be unlinked relative to wherever the process happens to be.
 pub(crate) fn is_absolute_and_clean(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Apply a plan: for each id, delete the row and commit, then unlink the path that
-/// committed delete handed back (spec §8.2).
+/// Apply a plan: for each id, delete the row and commit, then unlink the path that committed
+/// delete handed back.
 ///
-/// The ordering is the safety property, not a detail. Deleting the row first means the
-/// index never names a file that is gone — the failure a user cannot recover from,
-/// because the file is the only copy. The reverse failure is recoverable: a file whose
-/// row is gone is invisible to the application and wastes disk, so it is reported (at
-/// WARN, with its path) rather than silently swallowed or retried blindly.
+/// The ordering is the safety property. Deleting the row first means the index never names a
+/// file that is gone, the failure a user cannot recover from since the file is the only copy.
+/// The reverse failure (a file whose row is gone) is recoverable, invisible and wastes disk, so
+/// it is reported at WARN with its path rather than swallowed or retried blindly.
 ///
-/// The only path ever unlinked is the one [`Store::delete_clip_returning_path`] returned
-/// for *this* id, and that method returns a path only when its own `DELETE` removed a
-/// row — so a plan id whose row has already disappeared deletes nothing at all.
+/// The only path ever unlinked is the one [`Store::delete_clip_returning_path`] returned for this
+/// id, and that returns a path only when its own `DELETE` removed a row, so a plan id whose row
+/// already disappeared deletes nothing.
 ///
-/// Errors are per-row: one failed row is counted in [`CleanupOutcome::failed`] (and
-/// logged) instead of ending the pass. The returned `Err` is reserved for the final
-/// re-read of the store.
+/// Errors are per-row: a failed row is counted in [`CleanupOutcome::failed`] and logged instead
+/// of ending the pass. The returned `Err` is reserved for the final re-read of the store.
 pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutcome> {
     let mut outcome = CleanupOutcome::default();
 
@@ -249,8 +221,7 @@ pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutco
         let path = match store.delete_clip_returning_path(entry.id) {
             Ok(Some(path)) => path,
             Ok(None) => {
-                // No committed row delete, so nothing here names a file: the file must be
-                // left exactly where it is.
+                // No committed row delete, so nothing names a file: leave it exactly where it is.
                 tracing::debug!(
                     "cleanup: clip #{} had no row left to delete; nothing was unlinked",
                     entry.id
@@ -310,9 +281,8 @@ mod tests {
 
     const DAY: i64 = MS_PER_DAY;
 
-    /// A clip row as `Store::list_clips` would hand it to `plan_cleanup`. `started_at_ms`
-    /// is deliberately derived from nothing meaningful: the policy must not read it (see
-    /// the "least recently used" note on [`plan_cleanup`]).
+    /// A clip row as `Store::list_clips` would hand it to `plan_cleanup`. `started_at_ms` is derived
+    /// from nothing meaningful: the policy must not read it (see the "least recently used" note on [`plan_cleanup`]).
     fn clip(id: i64, created_at_ms: i64, size_bytes: u64, favourite: bool) -> Clip {
         Clip {
             id,
@@ -423,8 +393,7 @@ mod tests {
 
     #[test]
     fn a_creation_time_in_the_future_is_never_too_old() {
-        // A wall clock that stepped backwards between two runs must not make the newest
-        // clip look like the oldest.
+        // A wall clock that stepped backwards between two runs must not make the newest clip look the oldest.
         let now = 10 * DAY;
         let clips = vec![clip(1, now + 5 * DAY, 1_000, false)];
 
@@ -506,16 +475,15 @@ mod tests {
     fn a_clip_selected_by_both_rules_appears_only_once() {
         let now = 1_000 * DAY;
         let clips = vec![
-            // Old enough for the age rule, and still the first eviction candidate for a
-            // size rule that has real work to do (the library is over the cap even after
-            // the age rule ran).
+            // Old enough for the age rule, and still the first candidate for a size rule that has real work
+            // to do (the library is over the cap even after the age rule ran).
             clip(1, now - 40 * DAY, 100, false),
             clip(2, now - DAY, 100, false),
             clip(3, now - DAY, 5, true),
         ];
 
-        // After the age rule: 205 - 100 = 105 bytes against a 10 byte cap, favourites
-        // well inside it, so the size rule runs and reaches #1 first.
+        // After the age rule: 205 - 100 = 105 bytes against a 10 byte cap, favourites well inside it, so
+        // the size rule runs and reaches #1 first.
         let plan = plan_cleanup(&clips, &policy(10, 7), now);
 
         assert_eq!(plan.ids(), vec![1, 2], "one entry per clip, #1 not one per rule");
@@ -573,9 +541,8 @@ mod tests {
     #[test]
     fn the_plan_is_ordered_oldest_first_and_deterministic_under_ties() {
         let now = 1_000 * DAY;
-        // All four are over age. #1 and #2 share a creation instant (a burst indexed in
-        // the same millisecond); the id breaks the tie, so the plan never depends on the
-        // order `list_clips` happened to return.
+        // All four are over age. #1 and #2 share a creation instant (a burst indexed in the same
+        // millisecond); the id breaks the tie, so the plan never depends on `list_clips`'s row order.
         let clips = vec![
             clip(4, now - 10 * DAY, 1, false),
             clip(2, now - 30 * DAY, 1, false),

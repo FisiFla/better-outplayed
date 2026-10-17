@@ -1,21 +1,18 @@
-//! The cleanup executor against a real database and real files (spec §8.2).
+//! The cleanup executor against a real database and real files.
 //!
-//! These tests are about one property, stated in the spec as a safety requirement rather
-//! than a detail: **the database row is deleted and committed before the file is
-//! unlinked, and no file is deleted unless a committed database row names it.**
+//! One property, stated as a safety requirement: the database row is deleted and committed before
+//! the file is unlinked, and no file is deleted unless a committed row names it.
 //!
-//! The plan itself is pure and covered exhaustively in `crates/store/src/cleanup.rs`;
-//! here a real [`Store`] over a real SQLite file, a real clips directory, and real
-//! unlinks show what the executor does to both — including the two ways the filesystem
-//! can disagree with the index (a missing file, an unlink that fails), and the case that
-//! must delete nothing at all (a plan id whose row is already gone).
+//! The plan is pure and covered in `crates/store/src/cleanup.rs`. Here a real [`Store`], clips
+//! directory and unlinks show what the executor does, including the two ways the filesystem can
+//! disagree with the index (a missing file, a failing unlink) and the case that must delete
+//! nothing (a plan id whose row is already gone).
 
 use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
 use localplay_store::{NewClip, Store};
 use std::path::PathBuf;
 
-/// A clips directory plus the database that indexes it, in a temp dir that outlives the
-/// test body.
+/// A clips directory plus the database that indexes it, in a temp dir that outlives the test body.
 struct Fixture {
     _dir: tempfile::TempDir,
     clips_dir: PathBuf,
@@ -34,8 +31,7 @@ impl Fixture {
         Self { _dir: dir, clips_dir, db_path, store }
     }
 
-    /// Write a clip file with `bytes` of content, index it, and return its row id and
-    /// path — the same pair a real clip leaves behind.
+    /// Write a clip file with `bytes` of content, index it, and return its row id and path.
     fn add_clip(&self, name: &str, bytes: usize) -> (i64, PathBuf) {
         let path = self.clips_dir.join(name);
         std::fs::write(&path, vec![0u8; bytes]).expect("write the clip file");
@@ -69,12 +65,10 @@ impl Fixture {
         self.store.list_clips().expect("list").iter().map(|c| c.id).collect()
     }
 
-    /// Backdate a row's creation time, the way an operator would with `sqlite3`.
+    /// Backdate a row's creation time, as an operator would with `sqlite3`.
     ///
-    /// The application deliberately has no API for this — `created_at` is stamped by the
-    /// store when a clip is indexed, never by the caller — so a test that wants an aged
-    /// clip has to reach the column the way a real aged library would have got there: the
-    /// row was written days ago. The clock is the only thing faked here.
+    /// The store stamps `created_at` itself and has no API to backdate it, so an aged clip is made by
+    /// reaching the column directly. The clock is the only thing faked.
     fn backdate(&self, id: i64, created_at_ms: i64) {
         let conn = rusqlite::Connection::open(&self.db_path).expect("a second connection");
         conn.execute(
@@ -197,15 +191,15 @@ fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
     assert!(fx.store.set_favourite(fav, true).expect("favourite the clip"));
     let stray = stray_file(&fx.clips_dir);
 
-    // A path a row names that `remove_file` cannot remove: a directory, as a directory
-    // named `*.mp4` would be if a user (or a half-finished copy) put one there.
+    // A path a row names that `remove_file` cannot remove: a directory, as one named `*.mp4` would
+    // be if a user or half-finished copy put it there.
     let doomed = fx.clips_dir.join("doomed.mp4");
     std::fs::create_dir_all(&doomed).expect("create the directory");
     std::fs::write(doomed.join("inside.bin"), b"still here").expect("write into it");
     let id = fx.index_only(doomed.clone(), 100);
 
-    // 200 bytes over a 100 byte cap, and the favourite alone is exactly the cap, so the
-    // size rule is satisfiable and the doomed clip is what it evicts.
+    // 200 bytes over a 100 byte cap, and the favourite alone is exactly the cap, so the size rule is
+    // satisfiable and the doomed clip is what it evicts.
     let plan = fx.plan(&policy(100, 3_650));
     assert_eq!(plan.ids(), vec![id]);
 
@@ -232,8 +226,8 @@ fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
 #[test]
 fn a_relative_or_dotdot_path_in_a_row_is_never_unlinked() {
     let fx = Fixture::new();
-    // A file reachable from the working directory by a relative path, and by a `..` path
-    // from an absolute one. Rows naming them lose the row and never the file.
+    // A file reachable from the working directory by a relative path, and by a `..` path from an
+    // absolute one. Rows naming them lose the row and never the file.
     let cwd = std::env::current_dir().expect("a working directory");
     let probe = tempfile::NamedTempFile::new_in(&cwd).expect("a file beside the cwd");
     let relative = PathBuf::from(probe.path().file_name().expect("a name"));
@@ -258,9 +252,8 @@ fn a_plan_id_whose_row_is_already_gone_deletes_nothing() {
     let plan = fx.plan(&policy(0, 3_650));
     assert_eq!(plan.ids(), vec![id]);
 
-    // The row disappears between planning and executing — another cleanup pass, a second
-    // instance, a hand-edited index. This is the case the ordering exists for: with no
-    // committed row delete, there is no authority to unlink anything.
+    // The row disappears between planning and executing (another cleanup pass, a second instance, a
+    // hand-edited index). With no committed row delete there is no authority to unlink anything.
     let removed = fx.store.delete_clip_returning_path(id).expect("delete the row");
     assert_eq!(removed.map(PathBuf::from), Some(path.clone()));
 
