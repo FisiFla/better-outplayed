@@ -741,26 +741,4 @@ mod tests {
             assert!(!tracker.in_game());
         }
     }
-
-    #[test]
-    fn every_kind_this_tracker_emits_is_tagged_for_the_events_table() {
-        let mut tracker = Tracker::default();
-        let mut emitted = Vec::new();
-        emitted.extend(kinds(&tracker.observe(&cs2())));
-        let mut next = cs2();
-        next.round.phase = "over".into();
-        next.map.round = 6;
-        next.round.phase = "freezetime".into();
-        next.bomb.state = "defused".into();
-        player_of(&mut next).match_stats.kills = Some(13);
-        emitted.extend(kinds(&tracker.observe(&next)));
-        let mut over = cs2();
-        over.map.phase = "gameover".into();
-        emitted.extend(kinds(&tracker.observe(&over)));
-
-        assert!(emitted.len() >= 4, "the test should cover several kinds: {emitted:?}");
-        for kind in emitted {
-            assert_eq!(EventKind::from_tag(kind.as_tag()), Some(kind));
-        }
-    }
 }

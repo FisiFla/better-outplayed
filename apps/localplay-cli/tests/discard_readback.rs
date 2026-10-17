@@ -1,7 +1,7 @@
 //! Regression test for the pacer's *discard* path: a frame the pacer will not keep must
 //! never be read back.
 //!
-//! The defect this file pins, measured on the box (RTX 3090, 3840x2160 at 144Hz, configured
+//! The defect this file pins, measured on the Windows test machine (RTX 3090, 3840x2160 at 144Hz, configured
 //! `fps = 30`): the capture backend delivered 53-75 frames per second, the pacer admitted
 //! 30, and **the discard happened after the expensive work**. `pump_once_counted` called
 //! `capture.next_frame(..)` first — for WGC that is the whole staging-texture GPU readback
@@ -45,7 +45,7 @@ use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 use std::time::{Duration, Instant};
 
-/// What the synthetic source offers. Deliberately four times the pacer's target: the box
+/// What the synthetic source offers. Deliberately four times the pacer's target: the Windows test machine
 /// delivered 53-75fps against a configured 30, and a source rate-matched to the target has
 /// no surplus at all — which is exactly why the defect went unnoticed until a high-refresh
 /// display was measured.
