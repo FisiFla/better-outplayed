@@ -14,6 +14,10 @@ pub mod wasapi_mic;
 // because tests that wire up a microphone need it and the real backend only exists on Windows.
 pub use wasapi_mic::StubMicrophone;
 
+// Cross-platform so its tests run off Windows; only the WASAPI loopback backend uses it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod audio_timeline;
+
 #[cfg(windows)]
 pub mod wasapi;
 #[cfg(windows)]
