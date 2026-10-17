@@ -208,6 +208,20 @@ code,
   flex: none;
 }
 
+.view-head h2 {
+  font: var(--t-display);
+  color: var(--text);
+}
+
+/* Line the Library title up with the filter bar and grid below it. */
+.library .view-head {
+  padding-inline: var(--s-5);
+}
+
+.sessions .master .view-head h2 {
+  font: var(--t-title);
+}
+
 .crumbs {
   flex: none;
   padding: var(--s-1) var(--s-3) 0;
