@@ -1,21 +1,13 @@
 //! Global hotkey listener via `RegisterHotKey`.
 //!
-//! # Failure is reported, never swallowed
+//! [`listen`] returns `Err` naming the chord when it cannot be registered, never failing
+//! silently: a hotkey that does not exist and says nothing is the worst outcome here. The
+//! usual cause is another process owning the combination, including a second copy of
+//! localplay, because `RegisterHotKey` is system-wide. The CLI and the desktop app on the same
+//! `config.toml` cannot both hold it; the loser is told, so neither clips twice.
 //!
-//! [`listen`] returns `Err` when the chord could not be registered, **naming the chord**. A
-//! hotkey that silently does not exist is the worst outcome this feature has: the user
-//! presses `Ctrl+F8` in a game, nothing happens, and nothing anywhere says why. The most
-//! common cause is another process already owning the combination — which includes a second
-//! copy of localplay itself, because `RegisterHotKey` registers a chord
-//! **system-wide**: the CLI and the desktop app pointed at the same `config.toml` cannot
-//! both hold it, and the loser is told so instead of both clipping (or, worse, one of them
-//! clipping twice).
-//!
-//! # Off Windows
-//!
-//! There is no global hotkey API in this crate for other platforms: [`listen`] returns a
-//! channel that never yields, and [`supported`] answers `false` so a front-end can say that
-//! out loud rather than promising a keypress nobody will ever hear.
+//! Off Windows [`listen`] returns a channel that never yields and [`supported`] answers
+//! `false`, so a front-end can say so rather than promise a keypress nobody will hear.
 
 use anyhow::Result;
 use std::fmt;
@@ -24,14 +16,12 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-/// How long [`listen`] waits for the registering thread to report its outcome.
-///
-/// `RegisterHotKey` is a local call that returns in microseconds; this bound exists so that
-/// a thread that somehow never reaches it cannot hang a front-end's startup.
+/// How long [`listen`] waits for the registering thread to report its outcome. The call itself
+/// takes microseconds; the bound keeps a thread that never reaches it from hanging startup.
 #[cfg(windows)]
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Key chord to listen for. Parsed from config (spec §10, `[hotkeys] clip`).
+/// Key chord to listen for, parsed from `[hotkeys] clip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
     pub ctrl: bool,
@@ -59,11 +49,9 @@ impl Hotkey {
     }
 }
 
-/// The chord as a user should read it: modifiers first, in a fixed order, then the key.
-///
-/// This is the one spelling both front-ends print — the CLI's startup line and the desktop
-/// shell's "press … to clip" — so a chord typed as `ctrl+f8` in `config.toml` reaches the
-/// user as `Ctrl+F8` in both. It is also what a registration failure names.
+/// The chord as a user should read it: modifiers first in a fixed order, then the key. Both
+/// front-ends print this spelling (`ctrl+f8` in config shows as `Ctrl+F8`), and a registration
+/// failure names it.
 impl fmt::Display for Hotkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (set, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")] {
@@ -73,8 +61,8 @@ impl fmt::Display for Hotkey {
         }
         match key_name(self.vk) {
             Some(name) => f.write_str(&name),
-            // Unreachable for a `Hotkey` that came from `parse`, and honest if one ever did
-            // not: print the virtual-key code rather than something that looks like a key.
+            // Unreachable for a `Hotkey` from `parse`; print the virtual-key code rather than something
+            // that looks like a key.
             None => write!(f, "VK({:#04x})", self.vk),
         }
     }
@@ -95,11 +83,8 @@ fn key_name(vk: u32) -> Option<String> {
     }
 }
 
-/// Whether this build can install a global hotkey at all.
-///
-/// `true` on Windows ([`listen`] uses `RegisterHotKey`). Off Windows the shipping pipeline
-/// is the synthetic stub anyway, and a front-end that shows a chord without asking this
-/// first would be promising a keypress that cannot arrive.
+/// Whether this build can install a global hotkey at all: `true` on Windows. A front-end that
+/// shows a chord without asking this would promise a keypress that cannot arrive.
 pub const fn supported() -> bool {
     cfg!(windows)
 }
@@ -120,9 +105,8 @@ fn parse_key(key: Option<&str>) -> Result<u32> {
     anyhow::bail!("unsupported key: {key}")
 }
 
-/// Start listening for one chord. Returns a channel that yields once per press.
-///
-/// A convenience over [`listen_all`] for the callers (the CLI) that hold a single chord.
+/// Start listening for one chord. Returns a channel that yields once per press. A convenience
+/// over [`listen_all`] for callers (the CLI) holding a single chord.
 pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     let presses = listen_all(vec![hk])?;
     let (tx, rx) = channel();
@@ -136,15 +120,14 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     Ok(rx)
 }
 
-/// Start listening for several chords at once. The channel yields the **index** (into `hks`)
-/// of the chord that was pressed.
+/// Start listening for several chords. The channel yields the index (into `hks`) of the chord
+/// pressed.
 ///
-/// **Blocks until the registration outcome is known**, so the `Err` is the truth about this
-/// process rather than a guess: on Windows, `RegisterHotKey` runs on a dedicated thread that
-/// owns the message queue it will receive `WM_HOTKEY` on, and the error it produces is
-/// carried back to this call. It is all-or-nothing — if any chord cannot be registered the
-/// ones already held are released and the error names the chord that failed and the likely
-/// cause, so a half-installed set never looks like a working one.
+/// Blocks until the registration outcome is known, so the `Err` is the truth about this
+/// process. On Windows `RegisterHotKey` runs on a dedicated thread that owns the message queue
+/// receiving `WM_HOTKEY`, and its error is carried back here. All-or-nothing: if any chord
+/// fails, the ones already held are released and the error names the failed chord and the
+/// likely cause, so a half-installed set never looks like a working one.
 #[cfg(windows)]
 pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -154,9 +137,8 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
 
     let chords = hks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     let (tx, rx) = channel();
-    // The registration outcome: `Ok(())` once every chord is held, `Err(message)` when one
-    // is not. A separate channel from the press channel, because one is a handshake and the
-    // other is a stream of events.
+    // The registration outcome: `Ok(())` once every chord is held, else `Err(message)`. A separate
+    // channel from the presses, because one is a handshake and the other a stream.
     let (report_tx, report_rx) = channel::<std::result::Result<(), String>>();
     std::thread::Builder::new()
         .name("localplay-hotkey".into())
@@ -216,11 +198,10 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     }
 }
 
-/// Non-Windows builds have no global hotkey; the caller polls instead.
+/// Non-Windows builds have no global hotkey.
 ///
-/// Deliberately still `Ok`: the CLI and the desktop shell share this one call site, and off
-/// Windows they get a channel that never yields. [`supported`] is how a front-end says so to
-/// its user instead of showing a dead chord.
+/// Deliberately still `Ok`: the CLI and desktop shell share this call site, and off Windows
+/// they get a channel that never yields. [`supported`] lets a front-end say so.
 #[cfg(not(windows))]
 pub fn listen_all(_hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     let (_tx, rx) = channel();
@@ -307,34 +288,24 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn listening_off_windows_reports_no_failure_and_never_fires() {
-        // The non-Windows stub is a working "there is no hotkey here", not an error: the CLI
-        // and the desktop shell share this call site. `wait_for_press` times out, which is
-        // what its own callers expect.
-        //
-        // **Gated to non-Windows, because that is the claim.** It used to run everywhere and
-        // asserted `listen(...).expect(...)` — which on Windows really tries to register the
-        // chord, and failed on the Windows test box with
-        // `RegisterHotKey failed: This operation requires an interactive window station
-        // (0x800705B3)`. An SSH login, a service account and a headless CI runner all lack that
-        // window station, so the assertion was about the host, not the code.
+        // The non-Windows stub is a working "there is no hotkey here", not an error: the CLI and the
+        // desktop shell share this call site. Gated to non-Windows because that is the claim: on
+        // Windows `listen` really registers the chord, which fails without an interactive window
+        // station (`0x800705B3`: SSH, a service account, a headless CI runner), so an assertion
+        // there would be about the host, not the code.
         let chord = Hotkey::parse("Ctrl+F8").unwrap();
         let rx = listen(chord).expect("the non-Windows listener is a stub, not a failure");
         assert!(!wait_for_press(&rx, Duration::from_millis(50)), "nothing may fire off Windows");
         assert!(!supported());
     }
 
-    /// The Windows counterpart: a chord this process cannot hold is **reported**, not panicked
-    /// and not silently a dead key.
+    /// The Windows counterpart: a chord this process cannot hold is reported, not panicked and not
+    /// silently a dead key.
     ///
-    /// Which of the two it is depends on the session rather than on the code: an interactive
-    /// desktop session holds the chord, and one without an interactive window station — SSH,
-    /// a service, a headless CI runner — cannot. Both are answered here.
-    ///
-    /// This test deliberately does **not** synthesise a keypress to prove the listener fires.
-    /// It cannot: this project's safety rules forbid generating input on a machine that runs an
-    /// anti-cheat, and a test is not a reason to make an exception. What is checkable without
-    /// input is that the failure is a message naming the chord, which is what the desktop shell
-    /// shows a user instead of a hotkey that does nothing.
+    /// Whether it is held depends on the session (an interactive desktop holds it; SSH, a service
+    /// or headless CI cannot); both outcomes are accepted. This test never synthesises a keypress:
+    /// that is forbidden on a machine running an anti-cheat. What is checkable without input is
+    /// that a failure is a message naming the chord.
     #[test]
     #[cfg(windows)]
     fn a_chord_this_process_cannot_hold_is_reported_and_never_panics() {

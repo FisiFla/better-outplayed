@@ -1,36 +1,28 @@
 //! Clip triggers and local-only game event sources.
 //!
-//! # What is in this crate
+//! * [`Trigger`] and [`EventKind`]: the vocabulary the replay buffer and the clip index speak.
+//! * [`hotkey`]: the global `RegisterHotKey` listener, which needs no game.
+//! * [`lol`]: the League of Legends Live Client Data poller.
+//! * [`gsi`]: the CS2 / Dota 2 Game State Integration listener.
+//! * [`process`]: is a watched game running? A process-list snapshot for titles that publish
+//!   nothing, Riot's Live Client Data API for the one that does. Off by default
+//!   (`games.auto_record = false`).
+//! * [`wire`]: the HTTP/1.1 framing the two integrations share.
 //!
-//! * [`Trigger`] and [`EventKind`] — the vocabulary the replay buffer and the clip index
-//!   speak (spec §5.3, §5.5).
-//! * [`hotkey`] — the global `RegisterHotKey` listener (spec §7.4), which needs no game.
-//! * [`lol`] — the League of Legends Live Client Data poller (spec §7.1).
-//! * [`gsi`] — the CS2 / Dota 2 Game State Integration listener (spec §7.2).
-//! * [`process`] — is a watched game running? A process-list snapshot for the titles that
-//!   publish nothing, Riot's own Live Client Data API for the one that does. Off by
-//!   default (`games.auto_record = false`).
-//! * [`wire`] — the HTTP/1.1 framing the two integrations share.
+//! # Loopback-only, by construction
 //!
-//! # Both integrations are loopback-only, by construction
-//!
-//! The application performs no outbound network requests (spec §2, §7.3). That is not a
-//! promise about behaviour, it is a property of the types:
-//!
-//! * the League client ([`lol::client::LoopbackClient`]) is address-pinned to an
-//!   [`lol::Endpoint`], and an `Endpoint` can only be built for a loopback address;
-//! * the GSI listener binds `127.0.0.1` ([`gsi::bind`]) and refuses any other address.
-//!
-//! `tests/no_egress.rs` checks both statically over the tree, including that the one
-//! place that relaxes TLS verification is the one file that cannot address anything but
-//! this machine.
+//! The application makes no outbound network requests, as a property of the types: the League
+//! client ([`lol::client::LoopbackClient`]) is pinned to an [`lol::Endpoint`], which can only be
+//! built for a loopback address, and the GSI listener binds `127.0.0.1` ([`gsi::bind`]) and
+//! refuses any other. `tests/no_egress.rs` checks both statically, including that the one file
+//! relaxing TLS verification cannot address anything but this machine.
 //!
 //! # What an integration produces
 //!
-//! A source derives [`GameEvent`]s and hands them to a driver over an [`EventSink`]
-//! channel. A driver (the CLI today) turns a highlight into a clip through the *same*
-//! trigger path as the hotkey — [`EventKind::is_highlight`] is the only policy in the
-//! way, and it exists so that a 30-round Counter-Strike match does not write 60 clips.
+//! A source derives [`GameEvent`]s and hands them to a driver over an [`EventSink`] channel. A
+//! driver turns a highlight into a clip through the same trigger path as the hotkey;
+//! [`EventKind::is_highlight`] is the only policy in the way, so a 30-round Counter-Strike
+//! match does not write 60 clips.
 
 use std::fmt;
 use std::sync::mpsc::Sender;
@@ -42,30 +34,27 @@ pub mod lol;
 pub mod process;
 pub mod wire;
 
-/// A request to clip. Both manual and automatic paths funnel through this, so the
-/// replay buffer has exactly one entry point (spec §5.3).
+/// A request to clip. Manual and automatic paths both funnel through this, so the replay
+/// buffer has one entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
     Hotkey,
     GameEvent { kind: EventKind, at: Instant },
 }
 
-/// What happened, in the vocabulary the integrations, the clip index and the session UI
-/// share.
+/// What happened, in the vocabulary the integrations, the clip index and the session UI share.
 ///
-/// The first six are the kinds spec §7.1 names. The four after them are what the GSI
-/// mapping (spec §7.2) needs in order to say "the bomb went down" without pretending that
-/// it is a League objective; they are additive, because `events.kind` is TEXT and the
-/// replay buffer never matches on a kind.
+/// The GSI kinds let the mapping say "the bomb went down" without pretending it is a League
+/// objective. Kinds are additive: `events.kind` is TEXT and the replay buffer never matches on
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
     Kill,
     Death,
     Assist,
-    /// A game-level milestone that has no sub-kind of its own: a League first blood, ace,
-    /// multi-kill or void grub, a Counter-Strike multi-kill or ace. Also the *group* tag
-    /// `mute_clips = ["objective"]` uses for every objective kind (see
-    /// [`EventKind::is_objective`]).
+    /// A game-level milestone with no sub-kind of its own (League first blood, ace, multi-kill or
+    /// void grub; Counter-Strike multi-kill or ace). Also the group tag `mute_clips =
+    /// ["objective"]` uses for every objective kind (see [`EventKind::is_objective`]).
     Objective,
     /// A League dragon taken (any type; the type is in the payload).
     Dragon,
@@ -110,8 +99,8 @@ impl EventKind {
         EventKind::Bookmark,
     ];
 
-    /// The string this kind is persisted as — `events.kind` (spec §5.5) and the `"kind"`
-    /// a front-end reads back. Stable: the desktop shell's timeline renders it.
+    /// The string this kind is persisted as (`events.kind`, and the `"kind"` a front-end reads
+    /// back). Stable: the desktop timeline renders it.
     pub fn as_tag(self) -> &'static str {
         match self {
             EventKind::Kill => "kill",
@@ -133,15 +122,15 @@ impl EventKind {
         }
     }
 
-    /// The inverse of [`EventKind::as_tag`], for reading a row back. `None` for a tag this
-    /// build does not know: a row written by a newer version is not an error.
+    /// The inverse of [`EventKind::as_tag`]. `None` for a tag this build does not know: a row
+    /// written by a newer version is not an error.
     pub fn from_tag(tag: &str) -> Option<EventKind> {
         EventKind::ALL.into_iter().find(|k| k.as_tag() == tag)
     }
 
     /// Whether this is [`EventKind::Objective`] or one of its sub-kinds. `mute_clips` treats the
-    /// tag `"objective"` as the whole group, so a player who muted objectives before the
-    /// sub-kinds existed still has every dragon and turret muted.
+    /// tag `"objective"` as the whole group, so muting objectives before the sub-kinds existed
+    /// still mutes every dragon and turret.
     pub fn is_objective(self) -> bool {
         matches!(
             self,
@@ -156,20 +145,13 @@ impl EventKind {
 
     /// Whether this kind is worth a clip on its own.
     ///
-    /// Clipping every derived event is not the same as clipping every *interesting* one.
-    /// A 30-round Counter-Strike match is ~60 round transitions, and a League game is a
-    /// loading screen before it is anything else: a clip for each of those would fill the
-    /// clips directory with footage nobody asked for, at `pre_seconds` apiece. So the
-    /// vocabulary itself says which kinds are highlights — the moments a player would have
-    /// reached for the hotkey for — and which are markers, recorded in `events` with no
-    /// clip attached so the session timeline still shows them.
+    /// A 30-round Counter-Strike match is ~60 round transitions and a League game starts with a
+    /// loading screen; clipping each would fill the clips directory with footage nobody asked
+    /// for. Highlights are the moments a player would have hit the hotkey for; the rest are
+    /// markers, recorded in `events` with no clip so the session timeline still shows them.
     ///
-    /// `GameEnd` is a highlight on purpose: the last seconds of a match are exactly the
-    /// footage people keep. `GameStart` is a loading screen. Round transitions are pacing,
-    /// not events.
-    ///
-    /// This is the single place the policy lives. A user who disagrees changes one match
-    /// arm here rather than hunting through a driver.
+    /// `GameEnd` is a highlight on purpose (the last seconds of a match are what people keep);
+    /// `GameStart` and round transitions are not. This is the single place the policy lives.
     pub fn is_highlight(self) -> bool {
         match self {
             EventKind::Kill
@@ -201,9 +183,9 @@ impl fmt::Display for EventKind {
 /// Which integration derived an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
-    /// League of Legends, Live Client Data API (spec §7.1).
+    /// League of Legends, Live Client Data API
     Lol,
-    /// Counter-Strike 2 / Dota 2, Game State Integration (spec §7.2).
+    /// Counter-Strike 2 / Dota 2, Game State Integration
     Gsi,
     /// The player, with a hotkey (a bookmark) — not an integration at all.
     Manual,
@@ -227,10 +209,9 @@ impl fmt::Display for Source {
 
 /// One event an integration derived, ready for the engine.
 ///
-/// The `source` is carried beside the payload as well as inside it, deliberately: a log
-/// line needs to name the integration without parsing JSON, and a reader of the `events`
-/// table needs the row to explain itself. The payload is one line of JSON (compact) — the
-/// `events.payload` column (spec §5.5), which holds the integration-specific detail.
+/// `source` is carried beside the payload as well as inside it: a log line names the
+/// integration without parsing JSON, and a reader of the `events` table gets a self-explaining
+/// row. The payload is one compact line of JSON, the integration-specific detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameEvent {
     pub source: Source,
@@ -239,15 +220,13 @@ pub struct GameEvent {
 }
 
 impl GameEvent {
-    /// Build an event whose payload is `detail`, rendered as one line of JSON. Rendering
-    /// cannot fail for a `serde_json::Value`, so this needs no `Result` — and the value is
-    /// produced by this crate, never echoed from a socket.
+    /// Build an event whose payload is `detail`, rendered as one line of JSON. Rendering a
+    /// `serde_json::Value` cannot fail, and the value is produced here, never echoed from a socket.
     pub fn new(source: Source, kind: EventKind, detail: serde_json::Value) -> Self {
         Self { source, kind, payload: Some(detail.to_string()) }
     }
 
-    /// An event with no detail at all. Used by the tests; a real derivation always has
-    /// something to say about what it saw.
+    /// An event with no detail, for tests; a real derivation always has something to say.
     pub fn bare(source: Source, kind: EventKind) -> Self {
         Self { source, kind, payload: None }
     }
@@ -260,12 +239,12 @@ impl GameEvent {
 
 /// Where an integration sends what it derived.
 ///
-/// Unbounded on purpose: the volume is a handful of events per minute, and a bounded queue
-/// would turn "the driver is busy taking the previous clip" into a dropped event — the one
-/// thing an event source must not do.
+/// Unbounded on purpose: the volume is a handful of events a minute, and a bounded queue would
+/// turn "the driver is busy taking the previous clip" into a dropped event, which an event
+/// source must never do.
 pub type EventSink = Sender<GameEvent>;
 
-/// Maps an instant onto the capture timeline, which is what the ledger indexes.
+/// Maps an instant onto the capture timeline the ledger indexes.
 #[derive(Debug)]
 pub struct CaptureClock {
     start: Instant,
@@ -310,8 +289,8 @@ mod tests {
 
     #[test]
     fn the_tags_are_the_ones_the_events_table_holds() {
-        // Pinned literally: these strings are in the database, and a rename would silently
-        // orphan every row already written.
+        // Pinned literally: these strings are in the database, and a rename would orphan every row
+        // already written.
         assert_eq!(EventKind::Kill.as_tag(), "kill");
         assert_eq!(EventKind::Objective.as_tag(), "objective");
         assert_eq!(EventKind::Dragon.as_tag(), "dragon");

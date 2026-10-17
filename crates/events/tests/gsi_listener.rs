@@ -1,18 +1,15 @@
-//! The GSI listener over real loopback sockets (spec §7.2).
+//! The GSI listener over real loopback sockets.
 //!
-//! The listener is started for real — a bound socket, the real request gate, the real token
-//! comparison, the real derivation — and driven by a hand-written HTTP client in this file.
-//! Nothing here is a mock of the listener; the only stand-in is the *game*, because no CS2 or
-//! Dota 2 client was run (the real-client check is still outstanding).
+//! The listener is real (bound socket, request gate, token comparison, derivation) and driven
+//! by a hand-written HTTP client. The only stand-in is the game: no CS2 or Dota 2 client was
+//! run, so the real-client check is still outstanding. Every socket is on `127.0.0.1` and
+//! every payload is a canned fixture.
 //!
-//! Every socket is on `127.0.0.1`, and every payload is a canned fixture. The tests assert
-//! four things the spec calls out explicitly:
-//!
-//! * a POST carrying the configured token is accepted and yields the expected events;
-//! * a POST with a wrong token, or with no auth block at all, is rejected and yields
-//!   nothing (fail closed);
-//! * a malformed body yields nothing, does not panic, and does not stop the listener;
-//! * the listener is bound to loopback, and refuses to bind anything else.
+//! Asserted:
+//! * a POST with the configured token is accepted and yields the expected events;
+//! * a wrong token, or no auth block, is rejected and yields nothing (fail closed);
+//! * a malformed body yields nothing, does not panic and does not stop the listener;
+//! * the listener binds loopback only and refuses anything else.
 
 use localplay_events::gsi::{self, GsiConfig, GsiListener};
 use localplay_events::{EventKind, GameEvent};
@@ -25,8 +22,7 @@ const CS2_COMPETITIVE: &str = include_str!("fixtures/gsi_cs2_competitive.json");
 const CS2_MENU: &str = include_str!("fixtures/gsi_cs2_menu.json");
 const DOTA_IN_GAME: &str = include_str!("fixtures/gsi_dota_in_game.json");
 
-/// The token the fixtures carry. Not a secret: it is in the fixtures on purpose so the
-/// positive path can be exercised, and every rejection case posts something else.
+/// The token the fixtures carry. Not a secret; every rejection case posts something else.
 const TOKEN: &str = "fixture-token-not-a-secret";
 
 /// A listener plus the channel its events arrive on.
@@ -98,7 +94,7 @@ fn with_token(fixture: &str, token: &str) -> String {
     fixture.replace(TOKEN, token)
 }
 
-/// A document with no `auth` block at all — what a cfg file without one produces.
+/// A document with no `auth` block at all, as a cfg file without one produces.
 fn without_auth(fixture: &str) -> String {
     let start = fixture.find("\"auth\"").expect("the fixture has an auth block");
     let end = fixture[start..].find("},").expect("the block ends") + start + 2;
@@ -126,8 +122,8 @@ fn a_post_with_the_configured_token_is_accepted_and_derives_the_expected_events(
     let harness = Harness::start();
     let addr = harness.addr();
 
-    // 1. The first payload of a match: an attach. The scoreboard on it (12 kills, 5 deaths,
-    //    3 assists) is adopted, not reported.
+    // 1. First payload of a match: an attach. Its scoreboard (12 kills, 5 deaths, 3 assists) is
+    //    adopted, not reported.
     let response = post(addr, "/gsi", CS2_COMPETITIVE);
     assert_eq!(status_of(&response), 200, "the token is the configured one: {response}");
     let attach = harness.drained();
@@ -179,8 +175,8 @@ fn a_post_with_a_wrong_token_is_rejected_and_derives_nothing() {
     let harness = Harness::start();
     let addr = harness.addr();
 
-    // A token that is one character different, one that is shorter, one that is longer, and
-    // an empty one: all refused, and none of them advances the game state.
+    // A token one character different, shorter, longer, or empty: all refused, none advances the
+    // game state.
     for wrong in [
         "fixture-token-not-a-secreu",
         "fixture-token-not-a-secret ",
@@ -208,8 +204,7 @@ fn a_post_with_no_auth_block_at_all_is_rejected() {
     assert_eq!(status_of(&post(addr, "/gsi", &body)), 403);
     assert!(harness.drained().is_empty());
 
-    // And the listener is still perfectly willing to serve a good payload afterwards: a
-    // rejection is not a broken listener.
+    // A rejection is not a broken listener: a good payload is still served.
     assert_eq!(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)), 200);
     assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
 }
@@ -295,8 +290,8 @@ fn a_dota_payload_is_derived_from_its_own_scoreboard() {
 
 #[test]
 fn the_main_menu_never_produces_an_event() {
-    // A client sitting in a menu posts the same shape as a match that has not started; it
-    // must never be mistaken for one, and it must never end a game either.
+    // A client in a menu posts the same shape as a match not yet started; it must never be taken
+    // for one, nor end a game.
     let harness = Harness::start();
     let addr = harness.addr();
 
@@ -326,9 +321,8 @@ fn a_listener_started_without_a_token_refuses_to_start() {
 fn a_flood_of_connections_is_answered_429_and_the_listener_recovers() {
     let harness = Harness::start();
     let addr = harness.addr();
-    // Well over the per-second cap, from several threads so it lands inside one window. Every
-    // connection is answered (nothing hangs), the excess with 429, and none of it becomes
-    // an event.
+    // Well over the per-second cap, from several threads so it lands in one window. Every
+    // connection is answered, the excess with 429, and none becomes an event.
     let total = gsi::MAX_REQUESTS_PER_WINDOW as usize * 3;
     let workers: Vec<_> = (0..8)
         .map(|_| {

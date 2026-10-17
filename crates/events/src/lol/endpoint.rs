@@ -1,15 +1,13 @@
-//! Where the Live Client Data API lives — and the type that cannot point anywhere else.
+//! Where the Live Client Data API lives, and the type that cannot point anywhere else.
 //!
-//! Spec §7.1 fixes both the address and the path. This module exists so that neither is a
-//! string a caller could substitute: an [`Endpoint`] can only be built for a **loopback**
-//! address, so every layer above it (the relaxed-TLS client, the poller) inherits that
-//! property and none of them can be aimed at another machine.
+//! An [`Endpoint`] can only be built for a loopback address, so every layer above it (the
+//! relaxed-TLS client, the poller) inherits that property and none can be aimed at another
+//! machine.
 //!
-//! Tests point a poller at a mock server with [`Endpoint::loopback`]. That is the same
-//! constructor the live endpoint uses, with a different port — there is no "test mode" flag
-//! and no environment variable, so a mock can never become the production default by
-//! omission. The production default is [`Endpoint::live_client`], and its address is a
-//! `const`.
+//! Tests point a poller at a mock with [`Endpoint::loopback`], the same constructor the live
+//! endpoint uses with a different port. There is no test-mode flag or environment variable, so
+//! a mock can never become the production default by omission. That default is
+//! [`Endpoint::live_client`], whose address is a `const`.
 
 use anyhow::{bail, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -28,9 +26,8 @@ pub const MAX_PATH_BYTES: usize = 512;
 
 /// An HTTPS endpoint the League client can be reached at: a loopback socket plus a path.
 ///
-/// The fields are private and the only constructor that is public checks the loopback
-/// property, which is the whole point: `TcpStream::connect` is reached from
-/// [`crate::lol::client`] through this type and never with a bare address.
+/// The fields are private and the only public constructor checks the loopback property, so
+/// `TcpStream::connect` is reached through this type and never with a bare address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     addr: SocketAddr,
@@ -38,21 +35,18 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// The real thing: `https://127.0.0.1:2999/liveclientdata/allgamedata` (spec §7.1).
+    /// The real thing: `https://127.0.0.1:2999/liveclientdata/allgamedata`.
     ///
-    /// Built from the constants directly rather than through [`Endpoint::loopback`], so
-    /// that this, the shipping default, cannot fail at run time. That the constants would
-    /// also satisfy the validating constructor is asserted by a test.
+    /// Built from the constants directly so the shipping default cannot fail at run time; a test
+    /// asserts the constants also satisfy the validating constructor.
     pub fn live_client() -> Self {
         Self { addr: LIVE_CLIENT_ADDR, path: ALL_GAME_DATA_PATH.to_string() }
     }
 
-    /// An endpoint on a loopback address.
+    /// An endpoint on a loopback address, for tests pointing a poller at a mock.
     ///
-    /// Used by the tests to point a poller at a mock server, and by nothing else. It
-    /// refuses any address that is not loopback — so a caller cannot reach the network, and
-    /// an accidental `Endpoint::loopback(SocketAddr::from(([0, 0, 0, 0], 2999)), ..)` is an
-    /// error rather than a listener on every interface.
+    /// Refuses any non-loopback address, so `0.0.0.0:2999` is an error rather than a listener on
+    /// every interface.
     pub fn loopback(addr: SocketAddr, path: &str) -> Result<Self> {
         if !addr.ip().is_loopback() {
             bail!(
@@ -82,15 +76,13 @@ impl Endpoint {
         self.addr.ip().is_loopback()
     }
 
-    /// The `Host:` header value — the address, never a name: the certificate being
-    /// self-signed means there is no name to match, and sending one would only invite a
-    /// resolver to be involved.
+    /// The `Host:` header value: the address, never a name. The certificate is self-signed, so
+    /// there is no name to match, and a name would only invite a resolver.
     pub fn host_header(&self) -> String {
         self.addr.to_string()
     }
 
-    /// The URL as a human would write it. For logs and error messages only; the client
-    /// never parses a URL (that is the point of this type).
+    /// The URL as a human would write it, for logs and errors only; the client never parses a URL.
     pub fn url(&self) -> String {
         format!("https://{}{}", self.addr, self.path)
     }
@@ -102,9 +94,9 @@ impl Default for Endpoint {
     }
 }
 
-/// A path is written into a request line, so anything that could end it early, start a new
-/// header, or smuggle a control character is refused rather than escaped. Paths here are
-/// compile-time constants or test literals; nothing a user can configure reaches this.
+/// A path goes into a request line, so anything that could end it early, start a header or
+/// smuggle a control character is refused rather than escaped. Callers pass constants or test
+/// literals; nothing user-configurable reaches this.
 fn is_valid_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() <= MAX_PATH_BYTES
@@ -130,8 +122,8 @@ mod tests {
 
     #[test]
     fn the_live_client_endpoint_would_pass_the_validating_constructor() {
-        // The production default is built field-by-field so that it cannot fail at run
-        // time; this states that the construction it skips would have accepted it.
+        // The default is built field-by-field so it cannot fail at run time; this states that the
+        // construction it skips would have accepted it.
         assert_eq!(
             Endpoint::loopback(LIVE_CLIENT_ADDR, ALL_GAME_DATA_PATH).expect("valid"),
             Endpoint::live_client()

@@ -1,23 +1,17 @@
-//! A runnable demonstration of the GSI listener with **no game anywhere near it**.
+//! A runnable demonstration of the GSI listener with no game involved.
 //!
 //! ```text
 //! CARGO_HOME="$PWD/target/cargo-home" cargo run -p localplay-events --example gsi_demo -- --seconds 30
 //! ```
 //!
-//! It prints the token it generated, the `gamestate_integration_localplay.cfg` it would ask
-//! a player to install, and a `curl` command that POSTs a realistic Counter-Strike payload
-//! to it. Then it prints every event its derivation produces from what arrives, until
-//! `--seconds` elapse.
+//! It prints the generated token, the `gamestate_integration_localplay.cfg` a player would
+//! install, and a `curl` command that POSTs a realistic Counter-Strike payload. It then prints
+//! every event derived from what arrives until `--seconds` elapse (there is no `timeout(1)` on
+//! macOS, hence the flag).
 //!
-//! What this demonstrates and what it does not: the listener, the request gate, the token
-//! comparison, the payload parse and the whole derivation are the real ones, driven by a
-//! real HTTP POST over loopback. What is not demonstrated is a game: the payload comes from
-//! `crates/events/tests/fixtures/gsi_cs2_competitive.json` or from your `curl`, and no CS2 or
-//! Dota 2 client is involved at any point. The token printed here is ephemeral and is not
-//! written anywhere.
-//!
-//! Exits on its own (there is no `timeout(1)` on macOS): the deadline is the point of the
-//! `--seconds` flag.
+//! The listener, request gate, token comparison, parse and derivation are the real ones over
+//! real loopback HTTP. The payload comes from `tests/fixtures/gsi_cs2_competitive.json` or your
+//! `curl`; no game client is involved. The token is ephemeral and written nowhere.
 
 use localplay_events::gsi::{self, GsiConfig};
 use localplay_events::{EventKind, GameEvent};
@@ -47,8 +41,7 @@ fn main() {
     }
 
     // A token for this run only. The application keeps its own in the app data directory
-    // (`gsi::load_or_create_token`); a demo that outlives its own process should not write
-    // anything.
+    // (`gsi::load_or_create_token`); a demo should not write anything.
     let token = token.unwrap_or_else(|| gsi::generate_token().expect("the OS provides randomness"));
 
     let (sink, events) = channel();

@@ -1,30 +1,24 @@
 //! The HTTP/1.1 framing the two loopback integrations share, and nothing else.
 //!
-//! Neither integration needs a general-purpose HTTP stack: the League poller makes one
-//! `GET` per second and reads one response, and the GSI listener reads one `POST` per
-//! state change. What they do need is framing that is bounded, cannot panic, and cannot
-//! be made to allocate without limit by whatever is on the other end of the socket —
-//! which is the part a hand-written reader has to get right, and therefore the part with
-//! the exhaustive tests at the bottom of this file.
+//! The League poller makes one `GET` a second and reads one response; the GSI listener reads
+//! one `POST` per state change. They need framing that is bounded, cannot panic and cannot be
+//! made to allocate without limit by the peer, which is the part a hand-written reader must
+//! get right and so has the exhaustive tests at the bottom.
 //!
-//! Deliberately absent: connection pooling, keep-alive, redirects, cookies, compression,
-//! and chunked *requests*. A response body in chunked form is decoded, because a server
-//! may legitimately send one; a request body must carry `Content-Length`, which is what
-//! the GSI client sends and what [`crate::gsi`] requires.
+//! Deliberately absent: pooling, keep-alive, redirects, cookies, compression and chunked
+//! requests. A chunked response body is decoded; a request body must carry `Content-Length`,
+//! which [`crate::gsi`] requires.
 //!
-//! # Reading a head does not lose the body
-//!
-//! [`Framed`] keeps whatever it read past the end of the head. That is the whole reason it
-//! is a type rather than two free functions: a response arrives in one TCP segment
-//! (headers and body together) often enough that a reader which discarded the surplus
-//! would work in testing and fail in the field.
+//! [`Framed`] keeps whatever it read past the end of the head, because a response often
+//! arrives headers and body in one segment; a reader that discarded the surplus would pass
+//! tests and fail in the field.
 
 use anyhow::{bail, Context, Result};
 use std::io::{ErrorKind, Read};
 
-/// The largest message head (start line plus headers) either side will read. Enough for
-/// every header a game client or a local HTTPS server sends, small enough that a peer
-/// cannot make the process allocate a megabyte per connection.
+/// The largest message head (start line plus headers) either side will read: enough for any
+/// header a game client or local HTTPS server sends, small enough that a peer cannot make the
+/// process allocate a megabyte per connection.
 pub const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 /// How much is taken from the socket at a time.
@@ -59,15 +53,13 @@ impl Head {
             .map(|(_, value)| value.as_str())
     }
 
-    /// `Content-Length`, when it is present and a valid number. A value that is not a
-    /// number is treated as absent rather than as a parse error of the whole message: the
-    /// caller decides what a message without a usable length means.
+    /// `Content-Length`, when present and a valid number. A non-number is treated as absent
+    /// rather than failing the whole message; the caller decides what that means.
     pub fn content_length(&self) -> Option<u64> {
         self.header("content-length")?.trim().parse().ok()
     }
 
-    /// Whether the body is chunked (`Transfer-Encoding: chunked`). Anything else in that
-    /// header — `identity`, an unknown coding — is not chunked.
+    /// Whether the body is chunked. Any other `Transfer-Encoding` value is not chunked.
     pub fn chunked(&self) -> bool {
         self.header("transfer-encoding")
             .is_some_and(|v| v.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked")))
@@ -101,8 +93,8 @@ impl Head {
 /// A reader that frames HTTP/1.1 messages out of a byte stream and keeps its place.
 pub struct Framed<R> {
     inner: R,
-    /// Bytes read from `inner` that have not been consumed yet. `pos` is how far into them
-    /// this reader has got, so a head can be parsed and its surplus left for the body.
+    /// Bytes read from `inner` not yet consumed. `pos` is how far this reader has got, so a head
+    /// can be parsed and its surplus left for the body.
     buf: Vec<u8>,
     pos: usize,
 }
@@ -112,8 +104,8 @@ impl<R: Read> Framed<R> {
         Self { inner, buf: Vec::new(), pos: 0 }
     }
 
-    /// Read one message head. Fails — never panics, never allocates past
-    /// [`MAX_HEAD_BYTES`] — if the peer closes first or the head is not HTTP.
+    /// Read one message head. Fails, never panics and never allocates past [`MAX_HEAD_BYTES`], if
+    /// the peer closes first or the head is not HTTP.
     pub fn head(&mut self) -> Result<Head> {
         loop {
             if let Some(end) = find_head_end(&self.buf[self.pos..]) {
@@ -136,12 +128,11 @@ impl<R: Read> Framed<R> {
 
     /// Read the body a head describes, at most `max` bytes.
     ///
-    /// * chunked (a response may be) — decoded, trailers consumed;
-    /// * `Content-Length` — read exactly, and an early close is an error;
-    /// * neither — read to the end of the stream, which is what a `Connection: close`
-    ///   responder that omitted the length leaves to do. **Not** for requests: a request
-    ///   with no length must be refused by the caller, because reading it to EOF waits for
-    ///   the client to hang up.
+    /// * chunked: decoded, trailers consumed;
+    /// * `Content-Length`: read exactly, an early close is an error;
+    /// * neither: read to end of stream (a `Connection: close` responder that omitted the length).
+    ///   Not for requests: the caller must refuse a request with no length, since reading to EOF
+    ///   waits for the client to hang up.
     pub fn body(&mut self, head: &Head, max: usize) -> Result<Vec<u8>> {
         if head.chunked() {
             return self.chunked_body(max);
@@ -160,9 +151,8 @@ impl<R: Read> Framed<R> {
         }
     }
 
-    /// Read and discard the rest of the stream, up to `max`. Used by a server that wants
-    /// to drain a rejected request before answering it, so the client sees the response
-    /// rather than a connection reset.
+    /// Read and discard the rest of the stream, up to `max`, so a server can drain a rejected
+    /// request and the client sees the response rather than a connection reset.
     pub fn drain(&mut self, max: usize) -> Result<()> {
         self.rest_of_stream(max).map(|_| ())
     }
@@ -235,8 +225,7 @@ impl<R: Read> Framed<R> {
                 .trim();
             let size = u64::from_str_radix(size_field, 16).context("a chunk size that is not hex")?;
             if size == 0 {
-                // Trailers: header lines until a blank one. Nothing here reads them, but
-                // they have to come off the wire.
+                // Trailers: header lines until a blank one. They are unused but must come off the wire.
                 loop {
                     if self.line()?.is_empty() {
                         return Ok(out);
@@ -258,8 +247,8 @@ impl<R: Read> Framed<R> {
 
     /// Read more from the inner reader. Returns the number of bytes added (0 = EOF).
     fn fill(&mut self) -> Result<usize> {
-        // Reclaim what has already been consumed before growing: a long-lived connection
-        // (the GSI listener sees a handful of requests) must not accumulate.
+        // Reclaim what has been consumed before growing, so a long-lived connection does not
+        // accumulate.
         if self.pos > 0 {
             self.buf.drain(..self.pos);
             self.pos = 0;
@@ -339,8 +328,8 @@ fn parse_start_line(line: &str) -> Result<StartLine> {
     Ok(StartLine::Request { method: first.to_ascii_uppercase(), target: target.to_string() })
 }
 
-/// Write a response with no body — everything either integration answers with. `status`
-/// is written as given; there is no reason phrase, which HTTP/1.1 permits.
+/// Write a response with no body, which is all either integration answers with. `status` is
+/// written as given, with no reason phrase (permitted by HTTP/1.1).
 pub fn write_response(out: &mut impl std::io::Write, status: u16) -> std::io::Result<()> {
     out.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())?;
     out.flush()
@@ -351,8 +340,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// A reader that hands out one byte per call: proves the framing works off a stream
-    /// that arrives in arbitrary pieces, not just off a buffer that holds the whole reply.
+    /// A reader that hands out one byte per call, proving the framing works off a stream arriving
+    /// in arbitrary pieces, not just a buffer holding the whole reply.
     struct OneByteAtATime<'a>(&'a [u8]);
 
     impl Read for OneByteAtATime<'_> {
@@ -401,9 +390,9 @@ mod tests {
 
     #[test]
     fn framing_works_when_the_message_arrives_one_byte_at_a_time() {
-        // The realistic case: headers and body in one segment, delivered in arbitrary
-        // pieces. A reader that lost what it read past the head would return an empty body
-        // here and pass the Cursor tests above.
+        // The realistic case: headers and body in one segment, delivered in arbitrary pieces. A
+        // reader that lost what it read past the head would return an empty body here and still pass
+        // the Cursor tests above.
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"a\":\"hello\"}";
         let mut framed = Framed::new(OneByteAtATime(raw));
         let head = framed.head().expect("a head split over 45 reads");

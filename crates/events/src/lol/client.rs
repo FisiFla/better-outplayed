@@ -1,25 +1,21 @@
-//! The one place in localplay that relaxes any part of TLS verification (spec §7.1).
+//! The one place in localplay that relaxes any part of TLS verification.
 //!
-//! Riot's Live Client Data API is an HTTPS service on `127.0.0.1:2999` whose certificate is
-//! issued by Riot's own "LoL Game Engineering Certificate Authority" and carries no name that
-//! matches an IP literal. So the chain *can* be verified, and is: the client trusts **only**
-//! that pinned root (`riotgames.pem`, published by Riot at
-//! `static.developer.riotgames.com/docs/lol/riotgames.pem`) and none of the platform's roots.
-//! What is relaxed is the host-name match alone, which has nothing to match against. A
-//! process squatting on port 2999 with any other certificate fails the handshake.
+//! Riot's Live Client Data API is HTTPS on `127.0.0.1:2999`, with a certificate issued by
+//! Riot's "LoL Game Engineering Certificate Authority" that carries no name matching an IP
+//! literal. The chain is verified: the client trusts only that pinned root (`riotgames.pem`,
+//! published at `static.developer.riotgames.com/docs/lol/riotgames.pem`) and none of the
+//! platform's roots. Only the host-name match is relaxed, as it has nothing to match. A process
+//! squatting on port 2999 with any other certificate fails the handshake.
 //!
-//! * The relaxation is a private field of [`LoopbackClient`], built here and nowhere else.
-//!   No public API hands out a connector, and none can build this type from a host name or
-//!   a URL.
-//! * The client's destination is an [`Endpoint`], which can only be built for a loopback
-//!   address ([`Endpoint::loopback`] refuses anything else) — so the relaxed connector can
-//!   only ever be pointed at this machine, whatever a caller does with it.
-//! * `tests/no_egress.rs` asserts statically that `danger_accept_invalid_certs` appears
-//!   nowhere in the tree, and that `danger_accept_invalid_hostnames` appears only here.
+//! * The relaxation is a private field of [`LoopbackClient`], built here and nowhere else; no
+//!   public API hands out a connector or builds this type from a host name or URL.
+//! * The destination is an [`Endpoint`], which can only be loopback, so the relaxed connector
+//!   can only be pointed at this machine.
+//! * `tests/no_egress.rs` asserts `danger_accept_invalid_certs` appears nowhere and
+//!   `danger_accept_invalid_hostnames` only here.
 //!
-//! The request is written by hand: `GET <path> HTTP/1.1` with `Host: 127.0.0.1:2999` and
-//! SNI disabled, since the certificate matches no name we could send. Reading the response
-//! is [`crate::wire`]'s job, which is where the bounds and the tests for them live.
+//! The request is written by hand (`GET <path> HTTP/1.1`, `Host: 127.0.0.1:2999`, SNI disabled
+//! since the certificate matches no name we could send); [`crate::wire`] reads the response.
 
 use crate::lol::endpoint::Endpoint;
 use crate::wire::Framed;
@@ -28,21 +24,19 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// Riot's root certificate for the Live Client, which is the only trust anchor this client
-/// has. Pinned in the tree rather than fetched, so nothing is downloaded at runtime.
+/// Riot's root certificate for the Live Client, this client's only trust anchor. Pinned in the
+/// tree so nothing is downloaded at runtime.
 const RIOT_ROOT_PEM: &[u8] = include_bytes!("riotgames.pem");
 
-/// How long to wait for the TCP connection. Loopback either answers at once or not at all,
-/// so a short budget is right: the poller runs once a second and must not be able to fall
-/// behind by waiting a minute for a socket.
+/// How long to wait for the TCP connection. Loopback answers at once or not at all, and the
+/// once-a-second poller must not fall behind waiting on a socket.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long one read or write may take.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The largest response body accepted. `allgamedata` is a few hundred kilobytes for a
-/// ten-player game; this is generous and still bounds what a hostile local process could
-/// make the recorder allocate.
+/// The largest response body accepted. `allgamedata` is a few hundred KB for ten players; this
+/// still bounds what a hostile local process could make the recorder allocate.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// What one poll of the endpoint found.
@@ -50,28 +44,26 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub enum Response {
     /// The endpoint served a body (HTTP 200).
     Body(Vec<u8>),
-    /// The endpoint is up and says there is no game to report (HTTP 404). This is the
-    /// normal answer between games, and it is the signal that a game has ended.
+    /// The endpoint is up and says there is no game to report (HTTP 404): the normal answer
+    /// between games, and the signal that a game has ended.
     NotServing,
 }
 
 /// Why a poll could not produce a payload.
 ///
-/// The variants are separated by what a caller does with them, not by what went wrong
-/// underneath: [`FetchError::is_no_game`] is the "nothing is wrong, there is no game"
-/// answer the poller must not log as an error every second.
+/// Variants are split by what a caller does with them: [`FetchError::is_no_game`] is the
+/// "nothing is wrong" answer the poller must not log as an error every second.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// The connection failed: refused (no game, or the game is not running), reset, or the
-    /// interface went away. The ordinary case when nothing is playing.
+    /// The connection failed (refused, reset, interface gone): the ordinary case when nothing is
+    /// playing.
     #[error("the connection to {0} failed: {1}")]
     Connection(SocketAddr, std::io::Error),
-    /// The socket timed out. Loopback does not do this under normal load; a game that is
-    /// loading its world can.
+    /// The socket timed out. Not expected on loopback under normal load; a game loading its world
+    /// can cause it.
     #[error("the Live Client at {0} did not answer in time")]
     Timeout(SocketAddr),
-    /// The TLS handshake failed — with a self-signed certificate accepted, this means the
-    /// peer is not the Live Client (or is not speaking TLS at all).
+    /// The TLS handshake failed: the peer is not the Live Client, or not speaking TLS.
     #[error("the TLS handshake with {0} failed: {1}")]
     Tls(SocketAddr, String),
     /// The peer answered, but not with HTTP this reader understands.
@@ -83,54 +75,51 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// Whether this is the ordinary "no game is running" answer (spec §7.1: a connection
-    /// refusal or a 404 between games must not be reported as a failure).
+    /// Whether this is the ordinary "no game is running" answer (a refusal or 404 between games
+    /// must not be reported as a failure).
     pub fn is_no_game(&self) -> bool {
         matches!(self, FetchError::Connection(..) | FetchError::Timeout(..))
     }
 }
 
-/// The client that talks to the Live Client Data API — and to nothing else.
+/// The client that talks to the Live Client Data API and nothing else.
 ///
 /// Its address is fixed at construction from an [`Endpoint`], so the relaxed verification
-/// cannot be combined with an arbitrary host: the two are the same object.
+/// cannot be combined with an arbitrary host.
 pub struct LoopbackClient {
     endpoint: Endpoint,
     connector: TlsConnector,
 }
 
 impl LoopbackClient {
-    /// The client for the real endpoint (spec §7.1). This is what production uses.
+    /// The client for the real endpoint, as production uses it.
     pub fn live_client() -> Result<Self, FetchError> {
         Self::for_endpoint(Endpoint::live_client())
     }
 
-    /// The same client for any loopback endpoint — how the tests reach a mock server.
-    ///
-    /// Takes the whole [`Endpoint`] rather than an address, so there is no overload that
-    /// could be given something that is not loopback: the check happened in
-    /// [`Endpoint::loopback`], and this constructor cannot undo it.
+    /// The same client for any loopback endpoint, which is how tests reach a mock server. It takes
+    /// the whole [`Endpoint`], not an address, so the loopback check in [`Endpoint::loopback`]
+    /// cannot be bypassed.
     pub fn for_endpoint(endpoint: Endpoint) -> Result<Self, FetchError> {
         Self::for_endpoint_with_root(endpoint, RIOT_ROOT_PEM)
     }
 
-    /// As [`Self::for_endpoint`], but trusting `root_pem` instead of Riot's root. Exists so
-    /// tests can stand up a mock server under a root of their own; it is still a *pin* (the
-    /// platform roots stay disabled), never a way to skip verification.
+    /// As [`Self::for_endpoint`], trusting `root_pem` instead of Riot's root, so tests can stand
+    /// up a mock under their own root. Still a pin (platform roots stay disabled), never a way to
+    /// skip verification.
     pub fn for_endpoint_with_root(endpoint: Endpoint, root_pem: &[u8]) -> Result<Self, FetchError> {
         debug_assert!(endpoint.is_loopback(), "an Endpoint is loopback by construction");
         let tls_err = |e: &dyn std::fmt::Display| FetchError::Tls(endpoint.addr(), format!("{e}"));
         let root = Certificate::from_pem(root_pem).map_err(|e| tls_err(&e))?;
         let connector = TlsConnector::builder()
-            // Trust the pinned root and nothing else: a certificate any other authority
-            // signed (or a self-signed one) must fail.
+            // Trust the pinned root and nothing else: a certificate signed by any other authority, or
+            // self-signed, must fail.
             .disable_built_in_roots(true)
             .add_root_certificate(root)
-            // The one relaxation left, scoped to a connector stored in this struct and never
-            // handed out: Riot's certificate names no host, and ours is an IP literal.
+            // The one relaxation left, scoped to a connector stored in this struct and never handed out:
+            // Riot's certificate names no host, and ours is an IP literal.
             .danger_accept_invalid_hostnames(true)
-            // No SNI: the Host header is an IP literal, and sending a name would only
-            // involve a resolver in a loopback request.
+            // No SNI: the Host header is an IP literal, and a name would only involve a resolver.
             .use_sni(false)
             .build()
             .map_err(|e| tls_err(&e))?;
@@ -144,18 +133,17 @@ impl LoopbackClient {
 
     /// One `GET`. Returns the body, or [`Response::NotServing`] for a 404.
     ///
-    /// A connection per call, deliberately: the poller asks once a second, a TLS handshake on
-    /// loopback costs a few milliseconds, and holding a connection open to a game that may be
-    /// exiting is a worse trade than paying for the handshake. Nothing here keeps state
-    /// between polls — that is [`crate::lol::derive`]'s job, and it is pure.
+    /// A connection per call, deliberately: the poller asks once a second, a loopback handshake
+    /// costs milliseconds, and holding a connection to a game that may be exiting is worse. State
+    /// between polls lives in [`crate::lol::derive`], which is pure.
     pub fn get(&self) -> Result<Response, FetchError> {
         let addr = self.endpoint.addr();
         let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
             .map_err(|e| self.io_error(e))?;
         stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|e| self.io_error(e))?;
         stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|e| self.io_error(e))?;
-        // The payload is small and the poller is synchronous: waiting for a delayed ACK
-        // would be the slowest part of a one-second poll.
+        // The payload is small and the poller synchronous: a delayed ACK would be the slowest part of
+        // a one-second poll.
         let _ = stream.set_nodelay(true);
 
         let host = self.endpoint.host_header();
@@ -164,13 +152,13 @@ impl LoopbackClient {
             Err(HandshakeError::Failure(e)) => {
                 return Err(FetchError::Tls(addr, format!("{e}")))
             }
-            // A non-blocking handshake would be a bug here: the socket is blocking and
-            // `connect` drives it to completion.
+            // The socket is blocking and `connect` drives the handshake to completion; a non-blocking
+            // handshake would be a bug.
             Err(HandshakeError::WouldBlock(_)) => return Err(FetchError::Timeout(addr)),
         };
 
-        // The request is assembled from the endpoint's own validated path, so the request
-        // line cannot be broken by anything upstream (see `endpoint::is_valid_path`).
+        // Built from the endpoint's validated path, so nothing upstream can break the request line
+        // (see `endpoint::is_valid_path`).
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
              User-Agent: localplay/0.1\r\nConnection: close\r\n\r\n",
@@ -240,8 +228,7 @@ mod tests {
 
     #[test]
     fn the_live_client_constructs_and_is_on_loopback() {
-        // Constructing it does not connect to anything: this test must pass on a machine
-        // with no League client, which is every machine this project is built on.
+        // Constructing it connects to nothing, so this passes on a machine with no League client.
         let client = LoopbackClient::live_client().expect("the relaxed connector builds");
         assert_eq!(client.endpoint().addr().port(), 2999);
         assert!(client.endpoint().is_loopback());
@@ -249,15 +236,10 @@ mod tests {
 
     #[test]
     fn a_closed_loopback_port_is_the_no_game_case_and_not_a_failure() {
-        // Port 1 on loopback: nothing listens there, and this is exactly what polling
-        // between games looks like.
-        //
-        // Which error a closed port produces is the **OS's** decision, and it differs. macOS
-        // refuses the connection immediately — a `Connection` error — while on Windows the
-        // attempt times out instead, measured on the Windows test box. The original assertion
-        // demanded `Connection(..)` and failed there for exactly that reason; the property that
-        // matters is that either outcome is a *connection* result reading as "no game", never a
-        // protocol error, which is what this pins.
+        // Port 1 on loopback: nothing listens, which is what polling between games looks like. The
+        // OS decides which error a closed port gives: macOS refuses immediately (`Connection`), while
+        // on Windows the attempt times out (measured on the Windows test machine). The property pinned
+        // is that either is a connection result reading as "no game", never a protocol error.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let ep = Endpoint::loopback(addr, "/liveclientdata/allgamedata").unwrap();
         let client = LoopbackClient::for_endpoint(ep).unwrap();
@@ -273,8 +255,8 @@ mod tests {
 
     #[test]
     fn an_endpoint_that_only_accepts_and_closes_is_a_protocol_error() {
-        // A socket that accepts and immediately hangs up: the TLS handshake cannot
-        // complete, which must be reported as such (and never as a panic).
+        // A socket that accepts and hangs up: the handshake cannot complete, which must be reported
+        // as such and never as a panic.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
