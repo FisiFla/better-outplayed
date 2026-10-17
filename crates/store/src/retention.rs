@@ -1,83 +1,60 @@
-//! Retention for the two classes of artefact this application keeps: **clips** and
-//! **sessions** (spec §8.1, extended to the session store).
+//! Retention for the two classes of artefact this application keeps: clips and sessions.
 //!
-//! [`crate::cleanup`] is one flat policy over one library: the clips directory, driven by
-//! a single [`crate::cleanup::CleanupPolicy`] and [`crate::cleanup::plan_cleanup`]. That
-//! shape cannot express what Phase 5 needs, because a full-session recording is a
-//! *different class of artefact* — bigger, longer-lived, and managed in units of whole
-//! sessions rather than whole clips. A single `max_total_bytes` over both would mean a
-//! user recording sessions at 100 GB loses every clip they had, or the reverse: whichever
-//! class grew first would evict the other. So this module adds a second policy *beside* the
-//! first, and
+//! [`crate::cleanup`] is one flat policy over the clips directory. A full-session recording is a
+//! different class (bigger, longer-lived, managed in whole sessions), and one shared
+//! `max_total_bytes` would let whichever class grew first evict the other. So this module adds a
+//! second policy beside the first:
 //!
 //! * a session store over its cap never evicts a clip,
 //! * a clips store over its cap never evicts a session,
 //! * both use the same two rules, the same reason flags and the same deletion ordering.
 //!
-//! Nothing in [`crate::cleanup`] changes: the clips class of [`plan_retention`] **is**
-//! [`plan_cleanup`], called with the clips half of the policy and converted into this
-//! module's plan shape, so the two entry points cannot drift into disagreeing about the
-//! same library.
+//! The clips class of [`plan_retention`] is [`plan_cleanup`] called with the clips half of the
+//! policy and converted into this module's plan shape, so the two entry points cannot disagree
+//! about the same library.
 //!
 //! # Deliberate duplication
 //!
-//! Two shapes here parallel their [`crate::cleanup`] counterparts:
+//! * [`RetentionDeletion`] is [`crate::cleanup::PlannedDeletion`] with [`Subject`] in place of a
+//!   bare `id`, so a plan naming sessions and clips says which class an id belongs to.
+//! * [`ClassOutcome`] is [`crate::cleanup::CleanupOutcome`] plus the one field a class that can
+//!   refuse to remove a path needs.
 //!
-//! * [`RetentionDeletion`] is [`crate::cleanup::PlannedDeletion`] with [`Subject`] in place
-//!   of a bare `id` — a plan that names sessions and clips has to say which class an id
-//!   belongs to, or two artefacts could share one.
-//! * [`ClassOutcome`] is [`crate::cleanup::CleanupOutcome`] plus the one field a class that
-//!   can refuse to remove a path needs.
-//!
-//! Both could be fused with their originals by widening the existing types, and that is
-//! exactly what is deferred: this pass is additive, `CleanupOutcome` and `PlannedDeletion`
-//! are part of signatures other crates already build against, and the fusion is a
-//! mechanical refactor for a later pass rather than a change to make while three agents
-//! are editing the workspace. [`crate::cleanup::DeletionReasons`] — the "why" itself — is
-//! **reused verbatim**, so a plan from here and a plan from there explain themselves
-//! identically.
+//! Fusing them with their originals by widening the existing types is deferred: both are part of
+//! signatures other crates build against. [`crate::cleanup::DeletionReasons`] is reused verbatim,
+//! so both plans explain themselves identically.
 
 use crate::cleanup::{plan_cleanup, CleanupPolicy, DeletionReasons};
 use crate::{Clip, Session, Store};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Milliseconds in a day; the age rules' unit conversion.
-///
-/// A private copy of the constant in [`crate::cleanup`], which is private there and would
-/// have to be widened to be shared — a one-line edit to a file this pass must not touch.
-/// The two values are the same length of day or neither is right, so this is noted as a
-/// duplication rather than hidden.
+/// Milliseconds in a day; the age rules' unit conversion. A private copy of the constant in
+/// [`crate::cleanup`], where it is private.
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
-/// Retention for one class of artefact: the two rules of spec §8.1, per class.
+/// Retention for one class of artefact: the age rule and the size cap, per class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionRules {
-    /// Total bytes this class may occupy, its favourites included. An unsatisfiable cap
-    /// is *reported*, never paid for out of the class's other artefacts (see
-    /// [`ClassPlan::over_cap_by_bytes`]).
+    /// Total bytes this class may occupy, favourites included. An unsatisfiable cap is reported,
+    /// never paid for out of the class's other artefacts (see [`ClassPlan::over_cap_by_bytes`]).
     pub max_total_bytes: u64,
-    /// A member of the class older than this many days is deleted, unless it is a
-    /// favourite (or, for a session, still recording). As in
-    /// [`CleanupPolicy::max_age_days`], `0` means "everything older than `now_ms`", and
-    /// the comparison is strictly greater — "older than", not "at least as old as".
+    /// A member of the class older than this many days is deleted, unless it is a favourite (or, for
+    /// a session, still recording). As in [`CleanupPolicy::max_age_days`], `0` means everything older
+    /// than `now_ms`, and the comparison is strictly greater.
     pub max_age_days: u32,
 }
 
-/// Sessions and clips are evicted independently: a session store at 100 GB must not push
-/// clips out, and vice versa.
-///
-/// Two independent rules over two independent libraries — not one cap shared, which could
-/// only ever be satisfied by evicting the class that grew first.
+/// Sessions and clips are evicted independently: a session store at 100 GB must not push clips
+/// out, and vice versa. Two independent rules over two libraries, not one shared cap that only
+/// the class that grew first could satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
     pub clips: RetentionRules,
     pub sessions: RetentionRules,
 }
 
-/// What a planned deletion refers to. Sessions are deleted as units: there is no such
-/// thing as evicting half a session, and a session's segments are not independently
-/// addressable rows.
+/// What a planned deletion refers to. Sessions are deleted as units: a session's segments are not independently addressable rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subject {
     Clip(i64),
@@ -85,14 +62,14 @@ pub enum Subject {
 }
 
 impl Subject {
-    /// The row id, whichever class it is — for logging and for assertions.
+    /// The row id, whichever class it is.
     pub fn id(self) -> i64 {
         match self {
             Subject::Clip(id) | Subject::Session(id) => id,
         }
     }
 
-    /// `"clip"` or `"session"`, for a log line that says which class it is about.
+    /// `"clip"` or `"session"`, for a log line.
     pub fn class(self) -> &'static str {
         match self {
             Subject::Clip(_) => "clip",
@@ -101,14 +78,11 @@ impl Subject {
     }
 }
 
-/// One artefact a plan deletes, with the bytes its row accounts for and **why** it is
-/// going.
+/// One artefact a plan deletes, with the bytes its row accounts for and why it is going.
 ///
-/// The reasons are [`DeletionReasons`], shared with the clips policy: an artefact both
-/// rules select appears once, flagged with both, and the flag is what the log line and the
-/// UI show. A deletion is never anonymous ("something had to go") — `too_old` is a
-/// retention decision and `over_cap` is a size decision, and they are different things to
-/// tell a user.
+/// The reasons are [`DeletionReasons`], shared with the clips policy: an artefact both rules
+/// select appears once, flagged with both. `too_old` is a retention decision and `over_cap` a
+/// size decision, which are different things to tell a user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionDeletion {
     pub subject: Subject,
@@ -121,32 +95,28 @@ pub struct RetentionDeletion {
 pub struct ClassPlan {
     /// Members to delete, oldest first (see [`plan_retention`]), each exactly once.
     pub deletions: Vec<RetentionDeletion>,
-    /// The cap this class was planned against, carried so the executor can check the
-    /// post-condition against the live store rather than against this forecast.
+    /// The cap this class was planned against, carried so the executor checks the post-condition
+    /// against the live store rather than this forecast.
     pub cap_bytes: u64,
     /// Total size of the class if every deletion here succeeds.
     pub bytes_after: u64,
-    /// The part of the overshoot that **no** pass may ever remove: how far the members that
-    /// are immune to eviction — favourites, and sessions that are still recording — exceed
-    /// the cap.
+    /// The part of the overshoot that no pass may ever remove: how far the members immune to
+    /// eviction (favourites, and sessions still recording) exceed the cap.
     ///
-    /// Non-zero means the cap is unsatisfiable under the policy, and the size rule selects
-    /// nothing at all for this class, for the reason spec §8.1 gives: evicting the
-    /// evictable could not reach the cap anyway, and doing it would destroy the material
-    /// the user did not protect. The caller is expected to warn with this number instead.
+    /// Non-zero means the cap is unsatisfiable, and the size rule selects nothing for this class:
+    /// evicting the evictable could not reach the cap and would destroy material the user did not
+    /// protect. The caller warns with this number instead.
     pub over_cap_by_bytes: u64,
 }
 
 impl ClassPlan {
     /// Whether applying this plan brings the class at or under its cap. Equal to
-    /// `bytes_after <= cap_bytes`, for the reason [`crate::cleanup::CleanupPlan::cap_met`]
-    /// gives: while the immune members are within the cap the size rule always reaches it,
-    /// and once they are not, nothing can.
+    /// `bytes_after <= cap_bytes`, for the reason [`crate::cleanup::CleanupPlan::cap_met`] gives.
     pub fn cap_met(&self) -> bool {
         self.over_cap_by_bytes == 0
     }
 
-    /// The ids to delete, in plan order. Handy for assertions and for logging.
+    /// The ids to delete, in plan order.
     pub fn ids(&self) -> Vec<i64> {
         self.deletions.iter().map(|d| d.subject.id()).collect()
     }
@@ -155,19 +125,17 @@ impl ClassPlan {
 /// What one retention pass would do to both classes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionPlan {
-    /// The clips half — **byte-for-byte** what [`plan_cleanup`] would decide for the same
-    /// library under `policy.clips`.
+    /// The clips half: exactly what [`plan_cleanup`] would decide for the same library under `policy.clips`.
     pub clips: ClassPlan,
     /// The sessions half.
     pub sessions: ClassPlan,
 }
 
 impl RetentionPlan {
-    /// Whether applying this plan brings *both* classes at or under their caps.
+    /// Whether applying this plan brings both classes at or under their caps.
     ///
-    /// Per class, not in total: the whole point of two policies is that one class exceeding
-    /// its cap is that class's problem, and reporting a combined figure would hide which
-    /// class is over.
+    /// Per class, not in total: one class exceeding its cap is that class's problem, and a combined
+    /// figure would hide which is over.
     pub fn cap_met(&self) -> bool {
         self.clips.cap_met() && self.sessions.cap_met()
     }
@@ -183,73 +151,57 @@ impl RetentionPlan {
     }
 }
 
-/// Decide what one pass deletes from the clips library and the session store, touching
-/// neither the filesystem nor the database (spec §8.1).
+/// Decide what one pass deletes from the clips library and the session store, touching neither
+/// the filesystem nor the database.
 ///
-/// The rules are the ones the clips policy already implements, applied to each class
-/// independently and with its own cap and age limit:
+/// The rules are the clips policy's, applied to each class independently with its own cap and age limit:
 ///
-/// 1. **Age.** Delete every non-favourite member older than its class's `max_age_days`.
-/// 2. **Size.** Evict non-favourite members least-recently-used first until the class is at
-///    or under its own `max_total_bytes`. If the immune members alone exceed it, the rule
-///    is suspended and the shortfall reported.
-/// 3. Favourites are exempt from *both* rules, in *both* classes.
+/// 1. Age: delete every non-favourite member older than its class's `max_age_days`.
+/// 2. Size: evict non-favourite members least-recently-used first until the class is at or under
+///    its `max_total_bytes`. If the immune members alone exceed it, the rule is suspended and
+///    the shortfall reported.
+/// 3. Favourites are exempt from both rules, in both classes.
 ///
 /// # What "least recently used" means, per class
 ///
-/// Exactly as for clips (see [`plan_cleanup`]'s note, and the same reasoning): a row is
-/// immutable, nothing here ever reads an artefact back, so the ordering is the only instant
-/// in the row that is comparable across runs.
+/// Rows are immutable and nothing reads an artefact back, so the ordering is the one instant
+/// comparable across runs (as for [`plan_cleanup`]).
 ///
-/// * A **clip** is aged and ordered by `clips.created_at` — the wall-clock instant it
-///   entered the library, stamped by [`Store::insert_clip`], never by the caller. The
-///   clips half is [`plan_cleanup`] itself, so this is not a second implementation of it.
-/// * A **session** is aged and ordered by `sessions.started_at`. A session row has no
-///   `created_at`, and the instant that matters for a session is when its footage begins:
-///   a session that started eight days ago and ended yesterday is evicted by a seven-day
-///   limit, because the footage it holds *is* eight days old however recently it stopped
-///   writing. The alternative — aging by `ended_at` — would make a session immortal for as
-///   long as it kept recording, which is the opposite of a retention rule.
+/// * A clip is aged and ordered by `clips.created_at`, stamped by [`Store::insert_clip`]. The
+///   clips half is [`plan_cleanup`] itself, not a second implementation.
+/// * A session is aged and ordered by `sessions.started_at`, when its footage begins: a session
+///   that started eight days ago and ended yesterday is evicted by a seven-day limit. Aging by
+///   `ended_at` would make a session immortal while it kept recording.
 ///
-/// Ties are broken by id in both classes, so a plan is deterministic for a given library
-/// and `now_ms` and never depends on the order a query happened to return rows in.
+/// Ties are broken by id in both classes, so a plan is deterministic for a given library and `now_ms`.
 ///
 /// # A session that is still recording
 ///
-/// A session whose `ended_at` is NULL is in progress, and is **immune to both rules for the
-/// same reason a favourite is, only more strongly**: a favourite is material the user
-/// protected, while a running session's scratch directory is footage that exists nowhere
-/// else yet — deleting it does not evict a copy, it destroys the only one. So:
+/// A session whose `ended_at` is NULL is immune to both rules, more strongly than a favourite: its
+/// scratch directory is footage that exists nowhere else yet, so deleting it destroys the only copy.
 ///
-/// * the age rule does not select it;
-/// * the size rule does not select it;
-/// * its bytes **are** counted towards the cap (they are on disk), and they count in
-///   [`ClassPlan::over_cap_by_bytes`] like a favourite's, so a live recording that alone
-///   exceeds the cap is reported as an unsatisfiable cap rather than paid for out of the
-///   finished sessions beside it.
+/// * the age rule and the size rule do not select it;
+/// * its bytes are counted towards the cap (they are on disk) and in
+///   [`ClassPlan::over_cap_by_bytes`], so a live recording that alone exceeds the cap is
+///   reported as an unsatisfiable cap rather than paid for out of finished sessions.
 ///
-/// The plan is pure: it cannot see the process table, so "still recording" is exactly
-/// `ended_at IS NULL`, and the planner and the executor both read it that way. A session
-/// left running by a crash therefore stays immune until something ends it explicitly —
-/// which is [`Store::end_session`]'s job, deliberately not inferred from a missing process
-/// (see that method's note on the escape hatch).
+/// The plan is pure and cannot see the process table, so "still recording" is exactly
+/// `ended_at IS NULL`, for planner and executor alike. A session left running by a crash stays
+/// immune until [`Store::end_session`] ends it explicitly.
 ///
 /// # Session bytes, and the one number that can lag
 ///
-/// The cap's arithmetic uses `sessions.size_bytes`, which [`Store::end_session`] stamps
-/// when a session finishes and [`Store::set_session_size`] keeps current while it runs.
-/// A recorder that does not call the latter is planning against 0 bytes for its live
-/// session, so the sessions cap cannot see it until the recording stops. That is a
-/// bounded, honest lag rather than a wrong eviction — an in-progress session is never an
-/// eviction candidate — but it is why [`Store::set_session_size`] exists.
+/// The cap uses `sessions.size_bytes`, stamped by [`Store::end_session`] and kept current while
+/// running by [`Store::set_session_size`]. A recorder that does not call the latter plans against
+/// 0 bytes for its live session until it stops: a bounded lag, not a wrong eviction, since a
+/// running session is never a candidate.
 pub fn plan_retention(
     clips: &[Clip],
     sessions: &[Session],
     policy: &RetentionPolicy,
     now_ms: i64,
 ) -> RetentionPlan {
-    // The clips half is the v1 policy, called rather than reimplemented: a policy that
-    // evicts different clips than `plan_cleanup` would is a bug this shape cannot have.
+    // The clips half is called, not reimplemented, so it cannot evict different clips than `plan_cleanup`.
     let flat = plan_cleanup(clips, &clip_rules(policy.clips), now_ms);
     let clips_class = ClassPlan {
         deletions: flat
@@ -272,23 +224,20 @@ pub fn plan_retention(
     }
 }
 
-/// The clips half of a [`RetentionPolicy`] in the shape [`plan_cleanup`] takes. The only
-/// place the two policy types meet.
+/// The clips half of a [`RetentionPolicy`] in the shape [`plan_cleanup`] takes. The only place the two policy types meet.
 fn clip_rules(rules: RetentionRules) -> CleanupPolicy {
     CleanupPolicy {
         max_total_bytes: rules.max_total_bytes,
-        // `CleanupPolicy` counts days as u64; the retention policy uses u32 because a
-        // session store's age limit is a day count, not a duration in milliseconds.
+        // `CleanupPolicy` counts days as u64; the retention policy uses u32 for a day count.
         max_age_days: rules.max_age_days as u64,
     }
 }
 
-/// The sessions class's own planner: the two rules of spec §8.1, over session rows.
+/// The sessions class's planner: the same two rules over session rows.
 ///
-/// The parallel with [`plan_cleanup`] is deliberate and structural — same order, same
-/// marking, same unsatisfiable-cap rule — so the two read the same way and a reader who
-/// knows one knows the other. See [`plan_retention`] for what a session adds: a different
-/// LRU instant, whole-session units, and immunity for a session that is still recording.
+/// Structurally parallel to [`plan_cleanup`] (same order, marking and unsatisfiable-cap rule). See
+/// [`plan_retention`] for what a session adds: a different LRU instant, whole-session units, and
+/// immunity while recording.
 fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> ClassPlan {
     let max_age_ms = (rules.max_age_days as i64).saturating_mul(MS_PER_DAY);
 
@@ -296,12 +245,10 @@ fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> C
     let mut ordered: Vec<&Session> = sessions.iter().collect();
     ordered.sort_by_key(|s| (s.started_at_ms, s.id));
 
-    // One slot per session, in `ordered` order: the same "mark, never push twice" shape the
-    // clips policy uses, which is what keeps a session both rules select in the plan once.
+    // One slot per session, in `ordered` order: "mark, never push twice" keeps a session both rules select in the plan once.
     let mut marked: Vec<Option<DeletionReasons>> = vec![None; ordered.len()];
 
-    // A negative `size_bytes` — a hand-edited row, a writer that overflowed — counts as
-    // zero rather than borrowing from the total, the same clamp `total_bytes` applies.
+    // A negative `size_bytes` (a hand-edited row, an overflowed writer) counts as zero, as `total_bytes` clamps it.
     let bytes = |s: &Session| s.size_bytes.max(0) as u64;
 
     let mut remaining: u64 = sessions.iter().map(bytes).sum();
@@ -364,29 +311,23 @@ fn exempt(session: &Session) -> bool {
 pub struct ClassOutcome {
     /// Rows this pass deleted and committed.
     pub deleted: usize,
-    /// Planned deletions that were refused or failed; each is logged where it happens.
-    /// Counted rather than propagated, because one unreadable row must not abandon the
-    /// rest of a pass.
+    /// Planned deletions that were refused or failed; each is logged where it happens. Counted, not
+    /// propagated, so one unreadable row does not abandon the pass.
     pub failed: usize,
-    /// Bytes this pass actually removed from the disk, measured file by file as they were
-    /// removed — not forecast from the rows. A row that disagrees with its file (a
-    /// truncated write, a re-encode, a hand-edited index) therefore reports what went away.
+    /// Bytes this pass actually removed from the disk, measured file by file as removed, not
+    /// forecast from the rows, so a row that disagrees with its file still reports what went away.
     pub bytes_reclaimed: u64,
-    /// Paths a *deleted* row named whose removal failed: the file is on disk with no row
-    /// naming it, so a later sweep (or the user) has to deal with it.
+    /// Paths a deleted row named whose removal failed: on disk with no row naming them, for a later sweep or the user.
     pub orphaned: Vec<PathBuf>,
-    /// Paths a deleted row named that were already absent from the disk. The end state is
-    /// right — no row, no file — but a row pointing at nothing is worth reporting.
+    /// Paths a deleted row named that were already absent. The end state is right, but a row pointing at nothing is worth reporting.
     pub already_missing: Vec<PathBuf>,
-    /// Paths this pass deliberately refused to remove, because removing them could destroy
-    /// something that is not this class's to destroy — a scratch directory that is a
-    /// symlink, a bare relative name, a filesystem root. Never silently skipped: a refused
+    /// Paths deliberately not removed because removing them could destroy something outside this
+    /// class (a scratch directory that is a symlink, a bare relative name, a filesystem root). The
     /// path stays on disk, the row is already gone, and the caller is told.
     pub refused: Vec<PathBuf>,
     /// Total size of the class after the pass, re-read from the database.
     pub bytes_after: u64,
-    /// Whether the class is at or under the plan's cap **after** the pass, measured rather
-    /// than forecast.
+    /// Whether the class is at or under the plan's cap after the pass, measured rather than forecast.
     pub cap_met: bool,
 }
 
@@ -424,41 +365,33 @@ impl RetentionOutcome {
     }
 }
 
-/// Apply a retention plan: for every deletion, delete the row and commit, then remove what
-/// that committed delete handed back (spec §8.2).
+/// Apply a retention plan: for every deletion, delete the row and commit, then remove what that
+/// committed delete handed back.
 ///
-/// The ordering is the same safety property [`crate::cleanup::execute_cleanup`] carries,
-/// and the clips half is the same sequence of calls: delete the row via
-/// [`Store::delete_clip_returning_path`], which returns a path only when its own `DELETE`
-/// removed a row, then unlink *that* path and nothing else. A file is never removed on a
-/// plan's say-so; it is removed because a committed row named it.
+/// The same safety property as [`crate::cleanup::execute_cleanup`]: delete the row via
+/// [`Store::delete_clip_returning_path`], which returns a path only when its own `DELETE` removed
+/// a row, then unlink that path and nothing else. A file is removed because a committed row named
+/// it, never on a plan's say-so.
 ///
-/// For a session the row delete is [`Store::delete_session_returning_paths`], and the
-/// paths it hands back are two different things:
+/// For a session the row delete is [`Store::delete_session_returning_paths`], returning two things:
 ///
-/// * the **final file**, removed like a clip's file, with a failed or already-missing
-///   removal reported exactly as one is for a clip;
-/// * the **scratch directory**, removed as a tree. That is the most destructive single
-///   operation in this crate, so it is guarded rather than trusted: the path must look
-///   like a directory this application could have created (non-empty, with a final path
-///   component, and a real directory rather than a symlink) before anything inside it is
-///   touched. See [`remove_scratch_dir`]. A refused path is reported in
-///   [`ClassOutcome::refused`] and left exactly as it is.
+/// * the final file, removed like a clip's, with a failed or already-missing removal reported alike;
+/// * the scratch directory, removed as a tree. That is the most destructive operation in this
+///   crate, so it is guarded: the path must look like a directory this application could have
+///   created (non-empty, with a final component, a real directory rather than a symlink) before
+///   anything inside is touched (see [`remove_scratch_dir`]). A refused path is reported in
+///   [`ClassOutcome::refused`] and left as is.
 ///
-/// A session that is still recording cannot reach the removal code at all: its row delete
-/// is refused by the store (see [`Store::delete_session_returning_paths`]), which this
-/// counts as a failed deletion and logs. The planner never selects one, so that path means
-/// a plan built by hand or held across the moment the session started — and both are worth
-/// a warning rather than a crash.
+/// A session still recording cannot reach the removal code: the store refuses its row delete,
+/// which counts as a failed deletion and is logged. The planner never selects one, so that means
+/// a hand-built plan or one held across the moment the session started; both warrant a warning, not a crash.
 ///
-/// Errors are per-row: one failed row is counted in [`ClassOutcome::failed`] and logged
-/// instead of ending the pass. The returned `Err` is reserved for the final re-read of the
-/// store.
+/// Errors are per-row: a failed row is counted in [`ClassOutcome::failed`] and logged instead of
+/// ending the pass. The returned `Err` is reserved for the final re-read of the store.
 pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<RetentionOutcome> {
     let mut outcome = RetentionOutcome::default();
 
-    // Clips first, then sessions: the order the plan lists them in, and the order that
-    // leaves a session's links to its clips already detached by the time the clips go.
+    // Clips first, then sessions: the plan's order, which leaves a session's links to its clips detached by the time the clips go.
     for entry in &plan.clips.deletions {
         let Subject::Clip(id) = entry.subject else {
             tracing::warn!(
@@ -507,9 +440,8 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
                 continue;
             }
             Err(err) => {
-                // The expected reason here is the store refusing a session that is still
-                // recording; any other is a real failure. Either way the session is left
-                // whole, which is the safe direction.
+                // The expected reason is the store refusing a session still recording; any other is a real
+                // failure. Either way the session is left whole, the safe direction.
                 tracing::warn!("retention: session #{id} was not deleted: {err:#}");
                 outcome.sessions.failed += 1;
                 continue;
@@ -533,14 +465,12 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
     Ok(outcome)
 }
 
-/// What one attempt to remove a path did. One type for files and for trees, so the
-/// bookkeeping is written once and every removal reports itself the same way.
+/// What one attempt to remove a path did. One type for files and trees, so bookkeeping is written once.
 ///
-/// Deliberately not `PartialEq`: `Removal::Failed` carries an `io::Error`, which does not
-/// compare, and the failures are reported rather than compared. Tests match on the variant.
+/// Not `PartialEq`: `Removal::Failed` carries an `io::Error`, which does not compare. Tests match on the variant.
 #[derive(Debug)]
 enum Removal {
-    /// Removed. `u64` is what it actually held, measured from the disk first.
+    /// Removed. The `u64` is what it actually held, measured from the disk first.
     Removed(u64),
     /// Not there in the first place.
     Missing,
@@ -549,15 +479,13 @@ enum Removal {
     Failed(std::io::Error),
 }
 
-/// Fold one removal attempt into a class's outcome, and say where it happened.
+/// Fold one removal attempt into a class's outcome.
 ///
-/// Every non-removal lands in one of the three path lists, so an outcome is a complete
-/// account of what a pass could not remove: a path is never dropped because the log line
-/// describing it went to a subscriber nobody is reading.
+/// Every non-removal lands in one of the three path lists, so an outcome is a complete account of
+/// what a pass could not remove, not dependent on a log line nobody reads.
 ///
-/// `planned_bytes` is used only for the debug line that notices a file was smaller or
-/// larger than the row claimed: the bytes counted into `bytes_reclaimed` are the measured
-/// ones, so the total is what the disk lost rather than what the index believed it held.
+/// `planned_bytes` only feeds a debug line noticing a file differed from its row; the bytes
+/// counted into `bytes_reclaimed` are the measured ones.
 fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_bytes: u64) {
     match removal {
         Removal::Removed(actual) => {
@@ -598,10 +526,8 @@ fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_byt
 
 /// Remove one regular file, measuring what actually went away.
 ///
-/// The measurement is taken from the disk before the unlink, not from the row: this is the
-/// number a user is shown, and a row that disagrees with its file would make the row's
-/// number a lie. `NotFound` is reported as such rather than as a silent zero, because a row
-/// pointing at nothing is worth knowing about even when the end state is right.
+/// Measured from the disk before the unlink, not the row, so a row that disagrees with its file
+/// does not make the shown number a lie. `NotFound` is reported as such, not as a silent zero.
 fn unlink(path: &Path) -> Removal {
     if !crate::cleanup::is_absolute_and_clean(path) {
         return Removal::Refused("it is relative or contains `..`, so it names no fixed place");
@@ -611,8 +537,7 @@ fn unlink(path: &Path) -> Removal {
             if meta.is_file() {
                 meta.len()
             } else {
-                // A directory (or a symlink) where a file was expected: `remove_file`
-                // below will refuse it, and there are no bytes of *this* path to count.
+                // A directory (or symlink) where a file was expected: `remove_file` below refuses it, and there are no bytes of this path to count.
                 0
             }
         }
@@ -628,25 +553,20 @@ fn unlink(path: &Path) -> Removal {
 
 /// Remove a session's scratch directory and everything in it, measuring the tree first.
 ///
-/// This is the one place this crate removes something it did not itself write, and the path
-/// comes out of a TEXT column that a bug or a hand-edited index could hold anything in.
-/// `remove_dir_all` given `/`, `.`, `..` or a bare relative name is a catastrophe, so the
-/// path has to look like a directory this application could have created before a single
-/// entry is touched:
+/// The one place this crate removes something it did not write, and the path comes from a TEXT
+/// column a bug or hand-edited index could fill with anything. `remove_dir_all` given `/`, `.`,
+/// `..` or a bare relative name is a catastrophe, so the path must look like a directory this
+/// application could have created before an entry is touched:
 ///
-/// * non-empty and with a final path component, which rules out `.`, `..` and every
-///   filesystem root;
-/// * a real directory, not a symlink — a symlink would send the walk wherever it points,
-///   which is not what the row named — and not a plain file.
+/// * non-empty with a final path component, which rules out `.`, `..` and filesystem roots;
+/// * a real directory, not a symlink (the walk would go wherever it points) and not a plain file.
 ///
-/// Anything else comes back as [`Removal::Refused`] with the reason, and the caller reports
-/// it. A path that is simply gone is [`Removal::Missing`], which is an ordinary end state
-/// for a scratch directory (a session-mode recorder may remove its own scratch directory
-/// once the final file exists) and not a refusal.
+/// Anything else is [`Removal::Refused`] with the reason. A path that is simply gone is
+/// [`Removal::Missing`], an ordinary end state (a session-mode recorder may remove its own
+/// scratch directory once the final file exists), not a refusal.
 ///
-/// The tree is measured before it is removed, and a tree that cannot be measured is *not*
-/// removed: an unreadable directory is a question for a human, and being unable to say what
-/// a removal freed is a good sign it should not happen.
+/// The tree is measured before removal, and a tree that cannot be measured is not removed: an
+/// unreadable directory is a question for a human.
 fn remove_scratch_dir(path: &Path) -> Removal {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Removal::Refused(
@@ -678,10 +598,8 @@ fn remove_scratch_dir(path: &Path) -> Removal {
     }
 }
 
-/// The bytes a directory tree holds: every regular file in it, to any depth.
-///
-/// Symlinks count as zero and are never followed — what a scratch directory holds is what
-/// this application wrote into it, and a symlink is a path to somewhere else, not bytes.
+/// The bytes a directory tree holds: every regular file in it, to any depth. Symlinks count as
+/// zero and are never followed; a symlink is a path elsewhere, not bytes this application wrote.
 fn tree_bytes(path: &Path) -> std::io::Result<u64> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_symlink() {
@@ -712,8 +630,7 @@ mod tests {
         RetentionRules { max_total_bytes, max_age_days }
     }
 
-    /// A policy whose clips half and sessions half can be set independently — the point of
-    /// the whole module, and what every independence test varies.
+    /// A policy whose clips and sessions halves are set independently, which every independence test varies.
     fn policy(clips: RetentionRules, sessions: RetentionRules) -> RetentionPolicy {
         RetentionPolicy { clips, sessions }
     }
@@ -746,17 +663,14 @@ mod tests {
             game: Some("League of Legends".into()),
             mode: SESSION_MODE_SESSION.into(),
             started_at_ms,
-            // These fixtures describe sessions that started against an empty scratch
-            // directory, which is the ordinary case and the one every pre-v3 row means.
+            // These sessions started against an empty scratch directory: the ordinary case and what every pre-v3 row means.
             media_epoch_ms: 0,
             ended_at_ms: Some(started_at_ms + 60_000),
             scratch_dir: format!("/scratch/{id}"),
             final_path: Some(format!("/sessions/{id}.mp4")),
             size_bytes: size_bytes as i64,
-            // A minute of media, matching the minute between `started_at` and `ended_at`
-            // above: these fixtures describe sessions whose encoder kept up, so the media
-            // length and the wall-clock window agree. (That is not generally true — see
-            // `Session::duration_ms` — but it is the case a retention planner sees.)
+            // A minute of media matching the minute between `started_at` and `ended_at`: these sessions'
+            // encoder kept up (not generally true, see `Session::duration_ms`, but the case a planner sees).
             duration_ms: 60_000,
             favourite,
         }
@@ -787,9 +701,7 @@ mod tests {
 
     #[test]
     fn the_clips_half_is_exactly_what_the_flat_policy_would_decide() {
-        // The one property that makes two entry points safe to have: the clips class is
-        // `plan_cleanup` itself, converted, so a retention pass and a cleanup pass cannot
-        // disagree about the same clips library.
+        // The clips class is `plan_cleanup` itself, converted, so a retention pass and a cleanup pass cannot disagree on the same clips.
         let now = 1_000 * DAY;
         let clips = vec![
             clip(1, now - 40 * DAY, 100, false), // over age, and the first eviction candidate
@@ -985,8 +897,7 @@ mod tests {
 
     #[test]
     fn a_session_started_in_the_future_is_never_too_old() {
-        // A clock that stepped backwards between two runs must not make the newest session
-        // look like the oldest — the same guard the clips policy carries.
+        // A clock that stepped backwards between two runs must not make the newest session look the oldest.
         let now = 10 * DAY;
         let sessions = vec![session(1, now + 5 * DAY, 1_000, false)];
 
@@ -998,8 +909,7 @@ mod tests {
 
     // ------------------------------------------------------------ the executor
 
-    /// A store the executor can run against, with the v2 columns — used for the cases where
-    /// the plan is built by hand rather than by `plan_retention`.
+    // A store the executor can run against, for plans built by hand rather than by `plan_retention`.
     fn store() -> Store {
         let store = Store::open_in_memory().expect("an in-memory store");
         store.migrate().expect("migrate");
@@ -1008,8 +918,7 @@ mod tests {
 
     #[test]
     fn the_executor_skips_a_plan_entry_that_is_the_wrong_class() {
-        // Defensive: a plan is `plan_retention`'s to build, and it cannot produce this. An
-        // executor that trusted it would delete a session when asked about a clip.
+        // Defensive: `plan_retention` cannot produce this, but an executor that trusted it would delete a session when asked about a clip.
         let store = store();
         let session_id = store
             .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/keep", 0)
@@ -1039,8 +948,8 @@ mod tests {
 
     #[test]
     fn the_executor_refuses_a_running_session_even_when_a_plan_names_it() {
-        // The planner never selects one. A plan that does — built by hand, or held across
-        // the moment the session started — must still not be a way to lose a recording.
+        // The planner never selects one. A plan that does (hand-built, or held across the moment the
+        // session started) must still not be a way to lose a recording.
         let store = store();
         let running_id = store
             .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000, "/scratch/live", 0)
@@ -1073,8 +982,7 @@ mod tests {
 
     #[test]
     fn a_plan_id_whose_row_is_already_gone_removes_nothing() {
-        // The property the deletion ordering exists for: with no committed row delete,
-        // there is no authority to remove anything.
+        // The property the deletion ordering exists for: with no committed row delete there is no authority to remove anything.
         let store = store();
         let id = store
             .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/absent", 0)
@@ -1108,8 +1016,7 @@ mod tests {
 
     #[test]
     fn a_scratch_directory_with_no_final_component_is_refused() {
-        // These are the paths that make `remove_dir_all` a catastrophe. The guard is the
-        // reason this module can hold a path from a TEXT column at all.
+        // These paths make `remove_dir_all` a catastrophe; the guard is why this module can hold a path from a TEXT column at all.
         for path in ["", ".", "..", "/"] {
             assert!(
                 matches!(
@@ -1180,8 +1087,7 @@ mod tests {
         std::fs::write(scratch.join("seg-1.mkv"), vec![0u8; 400]).expect("segment");
         std::fs::write(scratch.join("nested").join("seg-2.mkv"), vec![0u8; 300]).expect("segment");
 
-        // What is really on the disk, read back file by file: the measurement is checked
-        // against the files the fixture wrote, not against a number the code produced.
+        // What is really on disk, read back file by file: the measurement is checked against the files written, not a number the code produced.
         let seg_1 = std::fs::metadata(scratch.join("seg-1.mkv")).expect("stat").len();
         let seg_2 =
             std::fs::metadata(scratch.join("nested").join("seg-2.mkv")).expect("stat").len();
@@ -1208,8 +1114,7 @@ mod tests {
         assert!(matches!(removed, Removal::Removed(123)), "the bytes it really held: {removed:?}");
         assert!(!file.exists());
 
-        // A directory where a file was expected: `remove_file` refuses it, and the caller
-        // reports an orphan rather than recursively deleting something it never indexed.
+        // A directory where a file was expected: `remove_file` refuses it, and the caller reports an orphan rather than recursively deleting something it never indexed.
         let as_dir = dir.path().join("surprise.mp4");
         std::fs::create_dir_all(&as_dir).expect("create the directory");
         std::fs::write(as_dir.join("inside.bin"), b"still here").expect("write into it");

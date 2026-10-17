@@ -1,8 +1,8 @@
-//! SQLite index of clips and sessions. Schema mirrors spec §5.5.
+//! SQLite index of clips, events and sessions.
 //!
-//! The storage policy (spec §8) is built on top of this: [`cleanup`] decides what may be
-//! deleted from the rows this module hands out, and applies that decision with the
-//! delete-before-unlink ordering the spec requires.
+//! The storage policy is built on top of this: [`cleanup`] decides what may be deleted from the
+//! rows this module hands out and applies that decision row-first, file-second, so no file is
+//! unlinked without a committed delete naming it.
 
 pub mod cleanup;
 pub mod matches;
@@ -12,30 +12,27 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-/// The schema this build writes. Each version adds columns in place, without reading,
-/// copying or losing a row (see [`Store::migrate`]): **v2** the session columns Phase 5
-/// needs, **v3** the media-clock anchor a session's event timeline is measured from, **v4**
-/// the media *length* that timeline is plotted against, **v5** the clip library's own
-/// metadata: a display title, the game, and user tags.
+/// The schema this build writes. Each version adds columns in place without reading, copying or
+/// losing a row (see [`Store::migrate`]): v2 the session columns, v3 the media-clock anchor of a
+/// session's event timeline, v4 the media length that timeline is plotted against, v5 the clip
+/// library's title, game and tags.
 const SCHEMA_VERSION: i32 = 5;
 
-/// The mode of a session the ring buffer opened: the row exists to group the clips and
-/// events of one buffer run, and there is no concatenated session file (spec §5.5).
+/// The mode of a session the ring buffer opened: the row groups the clips and events of one
+/// buffer run, and there is no concatenated session file.
 pub const SESSION_MODE_BUFFER: &str = "buffer";
 
-/// The mode of a session the full-session recorder opened: the scratch segments are
-/// concatenated into one file, which `sessions.final_path` names (spec §5.5).
+/// The mode of a session the full-session recorder opened: the scratch segments are concatenated
+/// into one file, which `sessions.final_path` names.
 pub const SESSION_MODE_SESSION: &str = "session";
 
-/// Every mode [`Store::start_session`] accepts. A closed set, because every reader of
-/// `sessions.mode` switches on it.
+/// Every mode [`Store::start_session`] accepts. Closed, because every reader of `sessions.mode` switches on it.
 const SESSION_MODES: [&str; 2] = [SESSION_MODE_BUFFER, SESSION_MODE_SESSION];
 
-/// The v1 tables, exactly as spec §5.5 defines them.
+/// The v1 tables.
 ///
-/// Created `IF NOT EXISTS` on every upgrade path, so this is both "the schema of a new
-/// database" and "the base a v1 database already has" — one definition, and the v1 → v2
-/// step below is what carries a database from it to the current shape.
+/// Created `IF NOT EXISTS` on every upgrade path, so this is both the schema of a new database
+/// and the base a v1 database already has; the v1 -> v2 step carries it to the current shape.
 const V1_DDL: &str = r#"
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS sessions (
@@ -70,19 +67,14 @@ const V1_DDL: &str = r#"
 
 /// The columns schema v2 adds to `sessions`, and the DDL that adds each.
 ///
-/// Each one is `ADD COLUMN`-able in place: SQLite can add a column with a *constant*
-/// default without rebuilding the table, so no row is read, copied or lost.
+/// Each is `ADD COLUMN`-able in place: SQLite adds a column with a constant default without
+/// rebuilding the table.
 ///
-/// # Why a legacy session's `mode` defaults to `'buffer'`
-///
-/// A `sessions` row that exists before this build was written by the buffer engine or not
-/// at all: the full-session recorder this column exists for has never run in a released
-/// build, and `'session'` would assert a concatenated session file the row demonstrably
-/// does not have (`final_path` is NULL and `size_bytes` is 0, which is a different default
-/// in the same change). So `'buffer'` is the only claim a legacy row supports — it
-/// describes the row's own contents rather than inventing data. Anything else would make
-/// the session store look like it held artefacts it never held, and would charge that
-/// phantom to a retention cap.
+/// A legacy session's `mode` defaults to `'buffer'` because a row from before this build was
+/// written by the buffer engine or not at all (the full-session recorder never ran in a released
+/// build), and `'session'` would assert a concatenated file the row does not have (`final_path`
+/// is NULL, `size_bytes` is 0). `'buffer'` is the only claim a legacy row supports; anything else
+/// would charge a phantom artefact to a retention cap.
 const V2_SESSION_COLUMNS: [(&str, &str); 4] = [
     (
         "mode",
@@ -101,19 +93,13 @@ const V2_SESSION_COLUMNS: [(&str, &str); 4] = [
 
 /// The columns schema v3 adds to `sessions`, and the DDL that adds each.
 ///
-/// One column, and it fixes a real defect rather than tidying one. `events.at` is **media**
-/// time — the ledger's clock, which restarts with the scratch directory — while
-/// `started_at` is the **wall** clock. The session timeline used to be their difference,
-/// which is arithmetic on two unrelated clocks: it is why a session's events plotted
-/// nowhere near the moment they happened. `media_epoch_ms` records the media position the
-/// session began at, so the timeline becomes `at - media_epoch_ms` — one clock, and the
-/// number the scrubber plots.
+/// `events.at` is media time (the ledger's clock, which restarts with the scratch directory)
+/// while `started_at` is wall clock, so their difference is arithmetic on two unrelated clocks
+/// and plots events nowhere near when they happened. `media_epoch_ms` records the media position
+/// the session began at, so the timeline is `at - media_epoch_ms`: one clock.
 ///
-/// A legacy row defaults to 0, and that is honest rather than convenient: those rows were
-/// recorded against the buffer's own ledger, and 0 is the only epoch this build can supply
-/// for them without inventing a measurement it never took. It is the same choice v2 made
-/// for `mode`, and for the same reason — the default describes what the row's own contents
-/// support.
+/// A legacy row defaults to 0, the only epoch this build can supply without inventing a
+/// measurement (the same reasoning as v2's `mode`).
 const V3_SESSION_COLUMNS: [(&str, &str); 1] = [(
     "media_epoch_ms",
     "ALTER TABLE sessions ADD COLUMN media_epoch_ms INTEGER NOT NULL DEFAULT 0",
@@ -121,16 +107,12 @@ const V3_SESSION_COLUMNS: [(&str, &str); 1] = [(
 
 /// The columns schema v4 adds to `sessions`, and the DDL that adds each.
 ///
-/// The media length of a session. `started_at`/`ended_at` are wall clock and `size_bytes` is
-/// a byte count; none of them is the axis a timeline is drawn on, so a review UI had nothing
-/// to scale its scrubber against and could only guess from the last marker's offset. This is
-/// the length of the recorded media itself — the concatenated file's probed duration, which
-/// `end_session` records.
+/// The media length of a session: the concatenated file's probed duration, recorded by
+/// `end_session`. `started_at`/`ended_at` are wall clock and `size_bytes` is a byte count, so a
+/// review UI had nothing to scale its scrubber against.
 ///
-/// A legacy row defaults to 0, and 0 is honest here rather than convenient: those rows were
-/// never concatenated by this build, so no probed duration exists for them. A 0 length means
-/// "unknown", which is what makes a UI disable the scrubber rather than draw an axis of one
-/// pixel per second and pretend.
+/// A legacy row defaults to 0, meaning "unknown" (no probed duration exists for it), which makes
+/// a UI disable the scrubber rather than draw a bogus axis.
 const V4_SESSION_COLUMNS: [(&str, &str); 1] = [(
     "duration_ms",
     "ALTER TABLE sessions ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
@@ -138,19 +120,17 @@ const V4_SESSION_COLUMNS: [(&str, &str); 1] = [(
 
 /// The columns schema v5 adds to `clips`, and the DDL that adds each.
 ///
-/// `title` is a *display* name the user chose; the file on disk is never renamed (a rename
-/// would move the only copy of the footage and invalidate every path the index, the thumbnail
-/// cache and the asset scope hold). NULL means "show the file name", which is what every
-/// legacy row gets. `game` is the game the recording session matched, NULL when nobody
-/// detected one. Both are nullable with no default, so a legacy row claims nothing it
-/// cannot support.
+/// `title` is a display name the user chose; the file on disk is never renamed (that would move
+/// the only copy of the footage and invalidate every path the index, thumbnail cache and asset
+/// scope hold). NULL means "show the file name". `game` is the game the session matched, NULL
+/// when none was detected. Both are nullable with no default, so a legacy row claims nothing.
 const V5_CLIP_COLUMNS: [(&str, &str); 2] = [
     ("title", "ALTER TABLE clips ADD COLUMN title TEXT"),
     ("game", "ALTER TABLE clips ADD COLUMN game TEXT"),
 ];
 
-/// The v5 tag table: one row per (clip, tag). Tags are normalized by [`normalize_tag`]
-/// before they are written, so the primary key makes a tag set a set.
+/// The v5 tag table: one row per (clip, tag). Tags are normalized by [`normalize_tag`] before
+/// they are written, so the primary key makes a tag set a set.
 const V5_TAGS_DDL: &str = r#"
             CREATE TABLE IF NOT EXISTS clip_tags (
                 clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
@@ -167,17 +147,16 @@ pub const MAX_TAGS_PER_CLIP: usize = 20;
 /// Longest display title, in characters.
 pub const MAX_TITLE_CHARS: usize = 120;
 
-/// A tag as it is stored: trimmed, internal whitespace collapsed to single spaces,
-/// lower-cased. `None` for a tag that is empty after that, or longer than
-/// [`MAX_TAG_CHARS`] — refused rather than silently truncated.
+/// A tag as stored: trimmed, internal whitespace collapsed, lower-cased. `None` for a tag that is
+/// empty after that or longer than [`MAX_TAG_CHARS`]: refused, not truncated.
 pub fn normalize_tag(raw: &str) -> Option<String> {
     let tag = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let n = tag.chars().count();
     (n > 0 && n <= MAX_TAG_CHARS && !tag.chars().any(char::is_control)).then_some(tag)
 }
 
-/// A display title as it is stored: trimmed; `None` (clear the title) when empty. Over-long
-/// or control-character titles are an error rather than a silent edit.
+/// A display title as stored: trimmed; `None` (clear the title) when empty. Over-long or
+/// control-character titles are an error rather than a silent edit.
 pub fn normalize_title(raw: &str) -> Result<Option<String>> {
     let title = raw.trim();
     if title.is_empty() {
@@ -205,20 +184,18 @@ pub struct NewClip {
 pub struct Clip {
     pub id: i64,
     pub path: PathBuf,
-    /// The clip's first frame on the encoder's **media** timeline, in ms — the ledger's
-    /// own clock, not the wall clock (see the CLI's `index_clip`). It is not comparable
-    /// across captures: it restarts with the scratch directory.
+    /// The clip's first frame on the encoder's media timeline, in ms: the ledger's clock, not wall
+    /// clock (see the CLI's `index_clip`). Not comparable across captures; it restarts with the scratch directory.
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub size_bytes: u64,
     pub codec: String,
     pub favourite: bool,
-    /// Wall-clock instant this row was written, in ms since the Unix epoch
-    /// (`clips.created_at`, stamped by [`Store::insert_clip`] — never by the caller).
+    /// Wall-clock instant this row was written, in ms since the Unix epoch (`clips.created_at`,
+    /// stamped by [`Store::insert_clip`], never by the caller).
     ///
-    /// This is the only instant in the row that is comparable across runs, so it is the
-    /// one the storage policy ages clips by and orders a library by (see
-    /// [`cleanup::plan_cleanup`]).
+    /// The only instant in the row comparable across runs, so the storage policy ages clips by it and
+    /// orders a library by it (see [`cleanup::plan_cleanup`]).
     pub created_at_ms: i64,
     /// User-chosen display name (schema v5); `None` shows the file name.
     pub title: Option<String>,
@@ -228,26 +205,22 @@ pub struct Clip {
     pub tags: Vec<String>,
 }
 
-/// A row to write into `events` (spec §5.5).
+/// A row to write into `events`.
 ///
-/// `at_ms` is on the **ledger's media timeline**, the same clock `clips.started_at` is on,
-/// and not the wall clock. That is deliberate: the only thing anybody does with an event row
-/// is place it against a clip (spec §9 joins event markers to clips by timestamp), and the
-/// clip's own row is in media time. A wall-clock value here would be a number that cannot be
-/// compared with the row it belongs to.
+/// `at_ms` is on the ledger's media timeline, the same clock `clips.started_at` is on, not wall
+/// clock: events are only ever placed against a clip by timestamp, so a wall-clock value could
+/// not be compared with the row it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEvent {
-    /// Always `None` for now: this engine opens no `sessions` row (see the recorder's
-    /// `index_clip` for why). The column exists for the session recording of Phase 5.
+    /// Always `None` for now: this engine opens no `sessions` row for events (see the recorder's `index_clip`).
     pub session_id: Option<i64>,
     /// `EventKind::as_tag`, e.g. `"kill"` or `"bomb_planted"`.
     pub kind: String,
     pub at_ms: u64,
-    /// Integration-specific detail as one line of JSON (spec §5.5).
+    /// Integration-specific detail as one line of JSON.
     pub payload: Option<String>,
-    /// The clip this event produced, when it produced one. `None` is meaningful: a marker
-    /// (a game or round starting) is recorded without a clip, and so is an event whose
-    /// clip could not be indexed.
+    /// The clip this event produced, when it produced one. `None` is meaningful: a marker (a game or
+    /// round starting) has no clip, and neither does an event whose clip could not be indexed.
     pub clip_id: Option<i64>,
 }
 
@@ -262,100 +235,79 @@ pub struct Event {
     pub clip_id: Option<i64>,
 }
 
-/// A row of `sessions` (spec §5.5): one recording session, and everything the session
-/// manager and the review UI need to show and manage it.
+/// A row of `sessions`: one recording session, with what the session manager and review UI need to show and manage it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub id: i64,
     pub game: Option<String>,
-    /// [`SESSION_MODE_BUFFER`] or [`SESSION_MODE_SESSION`]; a closed set today, stored as
-    /// TEXT so a row written by a newer build is still readable rather than an error.
+    /// [`SESSION_MODE_BUFFER`] or [`SESSION_MODE_SESSION`]; stored as TEXT so a row written by a newer build is readable rather than an error.
     pub mode: String,
-    /// When the session started on the **wall** clock — the instant the retention rules age
-    /// a session by and order the session store with (see [`retention::plan_retention`]),
-    /// and what a UI shows as "recorded at". It is deliberately *not* what the event
-    /// timeline is measured from: `events.at` is media time, and subtracting one from the
-    /// other was arithmetic across two unrelated clocks. That is
-    /// [`Session::media_epoch_ms`]'s job.
+    /// When the session started on the wall clock: what retention ages a session by and the session
+    /// store is ordered by (see [`retention::plan_retention`]), and what a UI shows as "recorded at".
+    /// Not what the event timeline is measured from; that is [`Session::media_epoch_ms`].
     pub started_at_ms: i64,
-    /// The **media** position this session began at, in ms: what
-    /// [`Store::events_for_session`] subtracts from `events.at` to place an event on the
-    /// session timeline. `0` for a session that started against a scratch directory whose
-    /// ledger was empty — the ordinary case — and for every row written before schema v3.
+    /// The media position this session began at, in ms: what [`Store::events_for_session`] subtracts
+    /// from `events.at` to place an event on the session timeline. `0` for a session that started
+    /// against an empty ledger (the ordinary case) and for every row before schema v3.
     ///
-    /// Two clocks, two columns, on purpose. Media time restarts with the scratch directory
-    /// and is the axis a clip's frames are measured on; wall time survives a restart and is
-    /// the axis "how old is this" is measured on. A session that reuses a scratch directory
-    /// inherits a non-zero epoch, so a single column cannot serve both purposes, and
-    /// subtracting the wrong one put every event of such a session in the wrong place.
+    /// Two clocks, two columns. Media time restarts with the scratch directory and is the axis frames
+    /// are measured on; wall time survives a restart and is the axis "how old is this" is measured
+    /// on. A session that reuses a scratch directory inherits a non-zero epoch, so one column cannot
+    /// serve both and subtracting the wrong one misplaces every event.
     pub media_epoch_ms: i64,
-    /// When the recording stopped. **`None` means it is still recording** — the one state
-    /// in the row that is not history, and the one retention must never evict.
+    /// When the recording stopped. `None` means it is still recording: the one state that is not
+    /// history, and the one retention must never evict.
     pub ended_at_ms: Option<i64>,
-    /// The directory the session's segments are written into, and the one the manager
-    /// removes when the session is deleted. `NOT NULL` in the schema, and it is not wrong
-    /// for a buffer-mode session: the ring writes segments into a scratch directory just
-    /// as the session recorder does.
+    /// The directory the session's segments are written into, and the one removed when the session is
+    /// deleted. `NOT NULL`, and correct for a buffer-mode session too: the ring writes into a scratch directory as well.
     pub scratch_dir: String,
-    /// The concatenated session file, once the session has been finalised. `None` until
-    /// [`Store::end_session`] is told about one — a buffer-mode session never has one.
+    /// The concatenated session file, once finalised. `None` until [`Store::end_session`] is told of
+    /// one; a buffer-mode session never has one.
     pub final_path: Option<String>,
-    /// Bytes the session occupies, as recorded when it was finalised. Written by
-    /// [`Store::end_session`] (and, while it is still running, by
-    /// [`Store::set_session_size`]); the retention cap's arithmetic uses this number.
+    /// Bytes the session occupies, as recorded at finalisation by [`Store::end_session`] (and while
+    /// running by [`Store::set_session_size`]); the retention cap's arithmetic uses it.
     pub size_bytes: i64,
-    /// How long the recorded media is, in ms — the concatenated file's probed duration, and
-    /// the axis a review timeline is drawn against. Written by [`Store::end_session`]; `0`
-    /// means unknown, which is the case for a session recovered from a crash (there is no file
-    /// to probe) and for every row written before schema v4.
+    /// How long the recorded media is, in ms: the concatenated file's probed duration, the axis a
+    /// review timeline is drawn against. Written by [`Store::end_session`]; `0` means unknown (a
+    /// session recovered from a crash has no file to probe; so does every row before schema v4).
     ///
-    /// Deliberately **not** derivable from the other columns: `started_at`/`ended_at` are wall
-    /// clock and measure how long the *window* was open, not how much footage it holds — a
-    /// session whose encoder could not keep up is shorter than the wall clock says, and a
-    /// session recovered from a crash has no footage at all to measure.
+    /// Not derivable from the other columns: `started_at`/`ended_at` measure how long the window was
+    /// open, not how much footage it holds.
     pub duration_ms: i64,
-    /// Exempt from both retention rules, exactly as a favourited clip is
-    /// (spec §8.1). [`Store::set_session_favourite`] is the user's only way in.
+    /// Exempt from both retention rules, as a favourited clip is. [`Store::set_session_favourite`] is the user's only way in.
     pub favourite: bool,
 }
 
-/// One row of the session timeline: an event, placed against the session that was
-/// recording when it happened.
+/// One row of the session timeline: an event, placed against the session that was recording when it happened.
 ///
-/// The UI colours these by `kind` and plots them by `offset_ms`, so nothing here is
-/// filtered: a manual hotkey bookmark and a game-derived kill or death are all rows of
-/// the same timeline, and which of them *produced a clip* is [`SessionEvent::clip_id`].
+/// Nothing is filtered: a manual hotkey bookmark and a game-derived kill are rows of the same
+/// timeline, and which of them produced a clip is [`SessionEvent::clip_id`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEvent {
     pub id: i64,
-    /// `events.kind` — the integration's tag (`"kill"`, `"death"`, a hotkey bookmark),
-    /// passed through verbatim. `localplay-store` does not know the vocabulary and must
-    /// not: a tag this build has never heard of is a row that exists, not an error.
+    /// `events.kind`, passed through verbatim. This crate does not know the vocabulary and must not:
+    /// an unfamiliar tag is a row that exists, not an error.
     pub kind: String,
-    /// The event's position on the session timeline: `events.at - sessions.media_epoch_ms`,
-    /// in ms. Derived in SQL, in exactly one place ([`Store::events_for_session`]), so
-    /// the scrubber, a test and the UI cannot disagree about it. `0` is an event at the
-    /// very instant the session started; a **negative** offset is possible and is
-    /// reported rather than clamped — it means a row was written before the session's own
-    /// start instant, which a caller needs to see, not to have rounded to zero.
+    /// The event's position on the session timeline: `events.at - sessions.media_epoch_ms`, in ms.
+    /// Derived in one place ([`Store::events_for_session`]) so the scrubber, a test and the UI cannot
+    /// disagree. A negative offset is possible and reported, not clamped: it means a row was written
+    /// before the session's own start.
     pub offset_ms: i64,
     /// Integration-specific detail as one line of JSON, when there is any.
     pub payload: Option<String>,
-    /// The clip this event produced, when it produced one. `None` for a marker — a
-    /// bookmark that was never clipped, a round boundary, or an event whose clip could
-    /// not be indexed.
+    /// The clip this event produced, when it produced one. `None` for a marker: a bookmark never
+    /// clipped, a round boundary, or an event whose clip could not be indexed.
     pub clip_id: Option<i64>,
 }
 
-/// What a deleted session row leaves for the caller to remove from disk, in the order the
-/// deletion ordering (spec §8.2) implies: the row is already committed gone, and these
-/// are the paths it named.
+/// What a deleted session row leaves for the caller to remove from disk. The row is already
+/// committed gone; these are the paths it named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPaths {
     /// The concatenated session file, when the session had one.
     pub final_path: Option<String>,
-    /// The session's scratch directory — its segments, possibly still growing if the
-    /// session never ended cleanly (see [`Store::delete_session_returning_paths`]).
+    /// The session's scratch directory: its segments, possibly still growing if the session never
+    /// ended cleanly (see [`Store::delete_session_returning_paths`]).
     pub scratch_dir: String,
 }
 
@@ -372,16 +324,13 @@ impl Store {
         Ok(Self { conn: Connection::open(path).with_context(|| format!("opening {}", path.display()))? })
     }
 
-    /// Forward-only migrations. A schema newer than this build is refused rather
-    /// than silently downgraded.
+    /// Forward-only migrations. A schema newer than this build is refused rather than downgraded.
     ///
-    /// Every version is reached through the same path, so a database this build creates
-    /// and a v1 database it upgrades end up with the same shape: the v1 tables are
-    /// created `IF NOT EXISTS` (a no-op on a database that already has them), then each
-    /// step the database has not had yet is applied in order, then the version is
-    /// stamped. `PRAGMA user_version` is written last, so a crash part-way leaves a
-    /// database that is one step behind and is upgraded by the next call — never a
-    /// database claiming a version it does not have.
+    /// Every version is reached the same way, so a new database and an upgraded v1 end up the same
+    /// shape: the v1 tables are created `IF NOT EXISTS`, each step the database has not had is
+    /// applied in order, then the version is stamped. `PRAGMA user_version` is written last, so a
+    /// crash part-way leaves a database one step behind, upgraded by the next call, never one
+    /// claiming a version it lacks.
     pub fn migrate(&self) -> Result<()> {
         let current: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if current > SCHEMA_VERSION {
@@ -412,10 +361,9 @@ impl Store {
         Ok(())
     }
 
-    /// Copy an existing, populated database aside before upgrading it, so a bad migration
-    /// costs a restore rather than the library. The two newest backups are kept. In-memory
-    /// and brand-new databases have nothing to protect and are skipped. A backup that
-    /// cannot be written aborts the migration: nothing has been changed yet.
+    /// Copy an existing, populated database aside before upgrading it, so a bad migration costs a
+    /// restore rather than the library. The two newest backups are kept. In-memory and brand-new
+    /// databases are skipped. A backup that cannot be written aborts the migration before anything changed.
     fn backup_before_migration(&self, current: i32) -> Result<()> {
         let populated: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clips')",
@@ -458,26 +406,24 @@ impl Store {
         Ok(())
     }
 
-    /// v1 → v2: `sessions` gains the columns the session recorder needs.
+    /// v1 -> v2: `sessions` gains the columns the session recorder needs.
     fn upgrade_to_v2(&self) -> Result<()> {
         self.add_session_columns(&V2_SESSION_COLUMNS)
     }
 
-    /// v2 → v3: `sessions` gains the media-clock anchor its event timeline is measured
-    /// from (see [`V3_SESSION_COLUMNS`]).
+    /// v2 -> v3: `sessions` gains the media-clock anchor of its event timeline (see [`V3_SESSION_COLUMNS`]).
     fn upgrade_to_v3(&self) -> Result<()> {
         self.add_session_columns(&V3_SESSION_COLUMNS)
     }
 
-    /// v3 → v4: `sessions` gains the media length that timeline is plotted against (see
-    /// [`V4_SESSION_COLUMNS`]).
+    /// v3 -> v4: `sessions` gains the media length its timeline is plotted against (see [`V4_SESSION_COLUMNS`]).
     fn upgrade_to_v4(&self) -> Result<()> {
         self.add_session_columns(&V4_SESSION_COLUMNS)
     }
 
-    /// v4 → v5: `clips` gains a title and a game, and the tag table appears. The game is
-    /// back-filled from the clip's session where it has one; everything else starts empty.
-    /// One transaction, and every step idempotent, like [`Store::add_session_columns`].
+    /// v4 -> v5: `clips` gains a title and a game, and the tag table appears. The game is back-filled
+    /// from the clip's session where it has one. One transaction, every step idempotent, like
+    /// [`Store::add_session_columns`].
     fn upgrade_to_v5(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for (column, ddl) in &V5_CLIP_COLUMNS {
@@ -496,13 +442,10 @@ impl Store {
 
     /// Add whichever of `columns` the `sessions` table does not already have.
     ///
-    /// Safe to run against a database it has already been applied to, on purpose and twice
-    /// over. The version check in [`Store::migrate`] means it normally is not; and each
-    /// column is checked against `PRAGMA table_info` before it is added, so a database that
-    /// already has one of them — a hand-edited file, an index another build half-upgraded —
-    /// upgrades instead of dying on `duplicate column name`. The whole set is one
-    /// transaction, so an interrupted upgrade leaves the table as it was rather than
-    /// half-widened.
+    /// Idempotent twice over: the version check in [`Store::migrate`] normally skips it, and each
+    /// column is checked against `PRAGMA table_info` first, so a hand-edited or half-upgraded file
+    /// upgrades instead of dying on `duplicate column name`. One transaction, so an interrupted
+    /// upgrade leaves the table as it was.
     fn add_session_columns(&self, columns: &[(&str, &str)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for (column, ddl) in columns {
@@ -570,8 +513,8 @@ impl Store {
         Ok(clips)
     }
 
-    /// Set (or, with an empty/blank `title`, clear) a clip's display title. Returns whether
-    /// a clip with that id exists. The file is never touched (see [`V5_CLIP_COLUMNS`]).
+    /// Set (or, with an empty/blank `title`, clear) a clip's display title. Returns whether the clip
+    /// exists. The file is never touched (see [`V5_CLIP_COLUMNS`]).
     pub fn set_clip_title(&self, id: i64, title: &str) -> Result<bool> {
         let title = normalize_title(title)?;
         let updated =
@@ -587,9 +530,9 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Replace a clip's whole tag set. Tags are normalized ([`normalize_tag`]) and
-    /// de-duplicated; an invalid tag or more than [`MAX_TAGS_PER_CLIP`] is an error and
-    /// leaves the existing set untouched. Returns whether the clip exists.
+    /// Replace a clip's whole tag set. Tags are normalized ([`normalize_tag`]) and de-duplicated; an
+    /// invalid tag or more than [`MAX_TAGS_PER_CLIP`] is an error and leaves the existing set
+    /// untouched. Returns whether the clip exists.
     pub fn set_clip_tags(&self, id: i64, tags: &[String]) -> Result<bool> {
         let mut clean = std::collections::BTreeSet::new();
         for raw in tags {
@@ -621,9 +564,8 @@ impl Store {
 
     /// Write one `events` row and return its id.
     ///
-    /// The foreign key on `clip_id` is enforced (the migration turns `foreign_keys` on for
-    /// this connection), so an event cannot be attached to a clip that does not exist: a
-    /// marker pointing at nothing would be worse than no marker.
+    /// The foreign key on `clip_id` is enforced (the migration turns `foreign_keys` on for this
+    /// connection), so an event cannot point at a clip that does not exist.
     pub fn insert_event(&self, event: &NewEvent) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO events (session_id, kind, at, payload, clip_id)
@@ -639,8 +581,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Every event, oldest first on the media timeline — the order a session timeline
-    /// renders them in.
+    /// Every event, oldest first on the media timeline.
     pub fn list_events(&self) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, kind, at, payload, clip_id FROM events ORDER BY at, id",
@@ -649,8 +590,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// The events attached to one clip, oldest first. This is what a clip's detail pane
-    /// shows beside the footage.
+    /// The events attached to one clip, oldest first, for the clip's detail pane.
     pub fn events_for_clip(&self, clip_id: i64) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, kind, at, payload, clip_id FROM events
@@ -660,12 +600,10 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Mark a clip as a favourite, or clear it. Favourites are exempt from both storage
-    /// rules (spec §8.1), so this is the user's only way to protect a clip from the
-    /// manager.
+    /// Mark a clip as a favourite, or clear it. Favourites are exempt from both storage rules (the
+    /// age rule and the total-bytes cap), so this is the user's only way to protect a clip.
     ///
-    /// Returns whether a row was updated: `false` means no clip with that id exists,
-    /// which the caller may want to report rather than assume.
+    /// Returns whether a row was updated; `false` means no clip with that id exists.
     pub fn set_favourite(&self, id: i64, favourite: bool) -> Result<bool> {
         let updated = self.conn.execute(
             "UPDATE clips SET favourite = ?2 WHERE id = ?1",
@@ -674,9 +612,8 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Total bytes the indexed clips claim — the figure `storage.max_total_bytes` caps
-    /// (spec §8.1). It is what the rows recorded when they were written, not a fresh
-    /// `stat` of the files, so a file changed behind the index's back will disagree.
+    /// Total bytes the indexed clips claim: the figure `storage.max_total_bytes` caps. It is what the
+    /// rows recorded when written, not a fresh `stat`, so a file changed behind the index will disagree.
     pub fn total_bytes(&self) -> Result<u64> {
         let bytes: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM clips",
@@ -686,22 +623,18 @@ impl Store {
         Ok(bytes.max(0) as u64)
     }
 
-    /// Delete the row and return its path so the caller can unlink *afterwards*
-    /// (spec §8.2). Returns `None` if this call did not remove a row.
+    /// Delete the row and return its path so the caller can unlink afterwards (row before file).
+    /// Returns `None` if this call did not remove a row.
     ///
-    /// The path is handed back only when this call's own `DELETE` removed the row — a
-    /// row that disappeared between the read and the delete (another cleanup pass, a
-    /// second instance, a manual `sqlite3` session) yields `None`. That is what makes the
-    /// returned path a path a *committed* delete removed: the caller may unlink it.
+    /// The path comes back only when this call's own `DELETE` removed the row, so a row that vanished
+    /// between the read and the delete (another cleanup pass, a second instance, a manual `sqlite3`)
+    /// yields `None`: the returned path is one a committed delete removed, safe to unlink.
     ///
-    /// **Events that pointed at the clip stay, and lose the link.** `events.clip_id` is a
-    /// foreign key, so deleting a clip an event names would otherwise fail — and the storage
-    /// policy would then be unable to evict exactly the clips a user has clipped most
-    /// (`FOREIGN KEY constraint failed`, on the first clip that has an event). The rows that
-    /// record *what happened* are history, not footage: the manager's business is the clips
-    /// directory, so the clip goes and its events are kept with `clip_id` set to NULL — the
-    /// same state a marker (a game start, a round end) has. Both writes are one transaction,
-    /// so a crash cannot leave events detached from a clip that still exists.
+    /// Events that pointed at the clip stay and lose the link. `events.clip_id` is a foreign key, so
+    /// deleting a clip an event names would otherwise fail with `FOREIGN KEY constraint failed`, and
+    /// the policy could not evict exactly the clips a user clipped most. The events are history, not
+    /// footage, so they are kept with `clip_id` NULL (the state a marker has). Both writes are one
+    /// transaction, so a crash cannot leave events detached from a clip that still exists.
     pub fn delete_clip_returning_path(&self, id: i64) -> Result<Option<String>> {
         let path: Option<String> = self
             .conn
@@ -720,28 +653,21 @@ impl Store {
 
     // ---------------------------------------------------------------- sessions
 
-    /// Open a `sessions` row and return its id (spec §5.5). The session is *running* from
-    /// this moment: `ended_at` is NULL until [`Store::end_session`] is told otherwise, and
-    /// that NULL is what the retention rules read as "still recording" (see
-    /// [`retention::plan_retention`]).
+    /// Open a `sessions` row and return its id. The session is running from this moment: `ended_at`
+    /// is NULL until [`Store::end_session`], and that NULL is what retention reads as "still
+    /// recording" (see [`retention::plan_retention`]).
     ///
-    /// `mode` is which engine opened it — [`SESSION_MODE_BUFFER`] or
-    /// [`SESSION_MODE_SESSION`] — and is **validated**: an unknown mode is refused rather
-    /// than stored, because every reader of the column switches on it and a typo would
-    /// quietly read as "not the mode I know". The set is closed until a third engine
-    /// exists, at which point it is one line here and one arm in the readers.
+    /// `mode` is [`SESSION_MODE_BUFFER`] or [`SESSION_MODE_SESSION`] and is validated: every reader of
+    /// the column switches on it, so a typo would quietly read as an unknown mode. The set is closed
+    /// until a third engine exists.
     ///
-    /// `started_at_ms` is when it started on the **wall** clock and `media_epoch_ms` is
-    /// where it started on the **media** clock — two clocks, both recorded, neither
-    /// derivable from the other. The event timeline is `events.at - media_epoch_ms` (media
-    /// minus media); `started_at` is what ages the session and orders the store. Handing
-    /// the wall clock over as the epoch would put every event of a session that reused a
-    /// scratch directory in the wrong place, which is the defect this parameter closes.
+    /// `started_at_ms` is wall clock and `media_epoch_ms` is the media-clock start; neither is
+    /// derivable from the other. The event timeline is `events.at - media_epoch_ms`, while
+    /// `started_at` ages the session and orders the store. Passing the wall clock as the epoch would
+    /// misplace every event of a session that reused a scratch directory.
     ///
-    /// The store cannot check that the epoch is plausible — it has no access to the
-    /// recorder's ledger — and does not guess: it records what it is handed. `0` is the
-    /// correct value for a session whose scratch directory is empty, which is the ordinary
-    /// case.
+    /// The store has no access to the recorder's ledger, so it records the epoch it is handed without
+    /// checking it. `0` is correct for an empty scratch directory, the ordinary case.
     pub fn start_session(
         &self,
         game: Option<&str>,
@@ -764,38 +690,28 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Finish a session: stamp `ended_at`, record the final file, the bytes the session
-    /// holds, and how long the recorded media is.
+    /// Finish a session: stamp `ended_at`, record the final file, the bytes the session holds, and
+    /// how long the recorded media is.
     ///
-    /// `duration_ms` is the **media** length — the concatenated file's probed duration, which
-    /// is the axis a review timeline is drawn on. `0` means unknown, which is the honest value
-    /// for a session recovered from a crash: the caller ends it with a `final_path` of `None`
-    /// because there is no file to probe. A UI must therefore treat 0 as "no axis" rather than
-    /// as a zero-length recording.
+    /// `duration_ms` is the media length, the axis a review timeline is drawn on. `0` means unknown,
+    /// the honest value for a session recovered from a crash (`final_path` is `None`, no file to
+    /// probe); a UI must treat it as "no axis", not a zero-length recording.
     ///
-    /// # The two states this refuses, and why refusing is the boring answer
+    /// # What this refuses
     ///
-    /// `Result<()>` is the only channel this signature leaves for "what was there". A
-    /// silent `Ok(())` for a session that does not exist, or for one that was already
-    /// finalised, would be indistinguishable from success to the caller — which here means
-    /// a recorder that believes it stamped the session file it just wrote, and a UI that
-    /// believes the row it is showing is the row it just finished. So both come back as an
-    /// `Err` that names the case, and the caller decides what to log:
+    /// A silent `Ok(())` for a missing or already-finalised session would be indistinguishable from
+    /// success, so both are an `Err` that names the case:
     ///
-    /// * no such session — the recorder is about to lose its bookkeeping, worth a warning;
-    /// * already ended — the *first* finalisation wins and the row is not touched, so a
-    ///   retry, a double stop, or a second writer cannot rewrite a finished session's
-    ///   size or file. The `WHERE ... AND ended_at IS NULL` on the update makes that a
-    ///   property of the write rather than of the read: the rowcount is checked, so a
-    ///   session ended by another writer between the read and the write is reported, not
-    ///   silently overwritten.
+    /// * no such session: the recorder is about to lose its bookkeeping, worth a warning;
+    /// * already ended: the first finalisation wins and the row is not touched, so a retry, a double
+    ///   stop or a second writer cannot rewrite a finished session's size or file. The
+    ///   `WHERE ... AND ended_at IS NULL` on the update makes that a property of the write, and the
+    ///   rowcount is checked, so a session ended by another writer between read and write is reported.
     ///
-    /// This is the escape hatch for a session left running by a crash: a session whose
-    /// recording was killed is still `ended_at IS NULL` (see
-    /// [`Store::delete_session_returning_paths`]), and ending it here — with the clock the
-    /// caller believes, a `final_path` of `None`, and the bytes it measured — is how a
-    /// recovery pass makes it evictable again. That the caller must do it explicitly is
-    /// the point: nothing infers "this session is over" from a missing process.
+    /// This is also the escape hatch for a session left running by a crash (still `ended_at IS NULL`,
+    /// see [`Store::delete_session_returning_paths`]): a recovery pass ends it explicitly, with a
+    /// `final_path` of `None` and the bytes it measured, to make it evictable again. Nothing infers
+    /// "this session is over" from a missing process.
     pub fn end_session(
         &self,
         id: i64,
@@ -833,14 +749,11 @@ impl Store {
 
     /// Record how many bytes a running session currently holds.
     ///
-    /// `started_at` is the only instant a session row has, so `size_bytes` is the only
-    /// number the sessions retention cap can count — and [`Store::end_session`] is
-    /// otherwise the only writer of it. Without this call a live recording is invisible to
-    /// the cap: it would be planned against a session store that is missing the bytes the
-    /// recording is currently writing, because `start_session` cannot know them. The
-    /// recorder calls this on the tick it already scans the scratch ring for. `0` is the
-    /// honest value for a session with no bytes on disk yet, and a session that is not
-    /// running is refused — [`Store::end_session`] owns the finished number.
+    /// [`Store::end_session`] is otherwise the only writer of `size_bytes`, so without this a live
+    /// recording is invisible to the sessions cap (`start_session` cannot know the bytes). The
+    /// recorder calls it on the tick it already scans the scratch ring for. `0` is honest for a
+    /// session with nothing on disk yet; a session that is not running is refused, since
+    /// [`Store::end_session`] owns the finished number.
     pub fn set_session_size(&self, id: i64, size_bytes: i64) -> Result<()> {
         let ended: Option<Option<i64>> = self
             .conn
@@ -859,11 +772,10 @@ impl Store {
         Ok(())
     }
 
-    /// Every session, most recently started first — the order the review UI lists them in.
+    /// Every session, most recently started first: the review UI's order.
     ///
-    /// Ordered by `started_at` and then by id, so the order is total and does not depend
-    /// on the order SQLite happens to return rows in. The retention planner sorts the
-    /// other way (oldest first) for itself; this is the library's own order.
+    /// Ordered by `started_at` then id, so the order is total and independent of SQLite's row order.
+    /// The retention planner sorts the other way for itself.
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY started_at DESC, id DESC"
@@ -874,10 +786,8 @@ impl Store {
 
     /// One session, or `None`.
     ///
-    /// A missing id is `Ok(None)` and not an error: the caller asked a question, and "no
-    /// such session" is the answer. An id that has been evicted, one a UI still has in a
-    /// list, and one that never existed are the same state, and a caller that needs to
-    /// report the difference has the id to name either way.
+    /// A missing id is `Ok(None)`, not an error: an evicted id, one a UI still has in a list, and
+    /// one that never existed are the same state.
     pub fn get_session(&self, id: i64) -> Result<Option<Session>> {
         let mut stmt = self
             .conn
@@ -885,20 +795,15 @@ impl Store {
         Ok(stmt.query_row(params![id], read_session).optional()?)
     }
 
-    /// The events recorded against one session, oldest first on the session timeline —
-    /// the order the scrubber plots them in. **Nothing is filtered**: a manual hotkey
-    /// bookmark and a game-derived kill or death are rows of the same timeline, and this
-    /// method does not know the difference between the tags.
+    /// The events recorded against one session, oldest first on the session timeline. Nothing is
+    /// filtered: a manual hotkey bookmark and a game-derived kill are rows of the same timeline.
     ///
-    /// `offset_ms` is derived here and only here:
-    /// `events.at - sessions.media_epoch_ms`, one SQL expression, so the UI, the tests and
-    /// any future consumer cannot disagree about what a position means. Both sides are media
-    /// time — subtracting `started_at` instead was arithmetic across two clocks, which is
-    /// what this used to do and why a session's events plotted in the wrong place.
+    /// `offset_ms` is derived here only: `events.at - sessions.media_epoch_ms`, one SQL expression,
+    /// so the UI, the tests and any consumer agree on what a position means. Both sides are media
+    /// time; subtracting `started_at` would be arithmetic across two clocks.
     ///
-    /// A session that does not exist has no events (an inner join), and so does one whose
-    /// events were detached by its own deletion — in both cases the honest answer is an
-    /// empty timeline rather than an error.
+    /// A session that does not exist has no events (an inner join), and neither does one whose events
+    /// were detached by its own deletion: the answer is an empty timeline, not an error.
     pub fn events_for_session(&self, id: i64) -> Result<Vec<SessionEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.id, e.kind, e.at - s.media_epoch_ms, e.payload, e.clip_id
@@ -919,14 +824,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Mark a session as a favourite, or clear it. Favourites are exempt from both
-    /// retention rules (spec §8.1), so this is the user's only way to protect a session
-    /// from the manager.
+    /// Mark a session as a favourite, or clear it. Favourites are exempt from both retention rules,
+    /// so this is the user's only way to protect a session.
     ///
-    /// A session that does not exist is an `Err`, not a rest: `Result<()>` leaves nowhere
-    /// else to say "this write touched nothing", and a silent success would let a UI
-    /// report a favourite that is not stored. A caller that means "set it if it is still
-    /// there" asks [`Store::get_session`] first.
+    /// A session that does not exist is an `Err`: `Result<()>` has nowhere else to say "this write
+    /// touched nothing", and silent success would let a UI report a favourite that is not stored.
     pub fn set_session_favourite(&self, id: i64, favourite: bool) -> Result<()> {
         let updated = self.conn.execute(
             "UPDATE sessions SET favourite = ?2 WHERE id = ?1",
@@ -938,12 +840,11 @@ impl Store {
         Ok(())
     }
 
-    /// Total bytes the indexed sessions claim, running ones included — the figure the
-    /// sessions retention cap is measured against (see [`retention::RetentionRules`]).
+    /// Total bytes the indexed sessions claim, running ones included: the figure the sessions
+    /// retention cap is measured against (see [`retention::RetentionRules`]).
     ///
-    /// Like [`Store::total_bytes`], this is what the rows recorded, not a fresh walk of
-    /// the scratch directories; the two only differ while a recording is running, and
-    /// [`Store::set_session_size`] is how a recorder keeps them together.
+    /// Like [`Store::total_bytes`], this is what the rows recorded, not a fresh walk of the scratch
+    /// directories; they differ only while recording, which [`Store::set_session_size`] keeps in step.
     pub fn total_session_bytes(&self) -> Result<u64> {
         let bytes: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM sessions",
@@ -953,38 +854,28 @@ impl Store {
         Ok(bytes.max(0) as u64)
     }
 
-    /// Delete the session row and hand back the paths so the caller can remove them
-    /// **afterwards** — the same row-before-file contract as
-    /// [`Store::delete_clip_returning_path`] (spec §8.2). Returns `None` if this call did
-    /// not remove a row.
+    /// Delete the session row and hand back the paths so the caller removes them afterwards: the
+    /// same row-before-file contract as [`Store::delete_clip_returning_path`]. Returns `None` if this
+    /// call did not remove a row.
     ///
-    /// **A session that is still recording is refused.** Every other deletion in this
-    /// crate destroys a copy of something: a clip's footage, a scratch segment the ring
-    /// can regenerate. The scratch directory of a *running* session is the recording —
-    /// deleting it loses footage that exists nowhere else, and no ordering makes that
-    /// safe. So `ended_at IS NULL` is a refusal with the reason in the message, and a
-    /// session orphaned by a crash is made deletable by *ending* it (see
-    /// [`Store::end_session`]) rather than by this method deciding the process is gone.
+    /// A session that is still recording is refused. Every other deletion destroys a copy of something
+    /// regenerable; the scratch directory of a running session is the recording, so deleting it loses
+    /// footage that exists nowhere else, and no ordering makes that safe. A session orphaned by a
+    /// crash is made deletable by ending it (see [`Store::end_session`]), not by this method deciding
+    /// the process is gone.
     ///
-    /// **Both links to it are detached, and nothing else is.** `events.session_id` and
-    /// `clips.session_id` are foreign keys into `sessions`; with enforcement on, deleting
-    /// the session an event or a clip names would fail (`FOREIGN KEY constraint failed`)
-    /// exactly when the manager tried to evict a session the user had clipped from. So
-    /// both are set to NULL in the same transaction as the delete:
+    /// Both links to it are detached, and nothing else is. `events.session_id` and `clips.session_id`
+    /// are foreign keys into `sessions`, so with enforcement on, deleting a session an event or clip
+    /// names would fail (`FOREIGN KEY constraint failed`) exactly when the manager tried to evict a
+    /// session the user had clipped from. Both are set to NULL in the same transaction as the delete:
     ///
-    /// * The **events survive as history** with `session_id` NULL — the same state every
-    ///   event this engine has ever written is already in, and the same treatment
-    ///   [`Store::delete_clip_returning_path`] gives an event whose clip went.
-    /// * The **clips survive as first-class artefacts** with `session_id` NULL: a clip
-    ///   extracted from a session is its own file with its own row, and evicting the
-    ///   session it came from must not take the clip with it. The clip's footage lives in
-    ///   the clips directory, which this method does not name and therefore cannot touch;
-    ///   only the pointer to a row that no longer exists is cleared. `NULL` already means
-    ///   "this clip belongs to no session" in this schema — every row written before
-    ///   Phase 5 has it. (The declarative alternative, `ON DELETE SET NULL` on the two
-    ///   foreign keys, needs a rebuild of `clips` and `events` to add; that is a migration
-    ///   of its own and is deliberately not part of this one. See the `retention` module
-    ///   for the same note.)
+    /// * The events survive as history with `session_id` NULL, as [`Store::delete_clip_returning_path`]
+    ///   treats an event whose clip went.
+    /// * The clips survive as first-class artefacts: a clip extracted from a session is its own file
+    ///   with its own row, and its footage lives in the clips directory, which this method cannot
+    ///   touch. Only the pointer to the vanished row is cleared; NULL already means "belongs to no
+    ///   session". (`ON DELETE SET NULL` on the two foreign keys would need a table rebuild, a
+    ///   migration of its own; see the `retention` module for the same note.)
     pub fn delete_session_returning_paths(&self, id: i64) -> Result<Option<SessionPaths>> {
         let row: Option<(Option<i64>, Option<String>, String)> = self
             .conn
@@ -1013,8 +904,7 @@ impl Store {
     }
 }
 
-/// The `sessions` columns [`read_session`] expects, in order — one definition, so a
-/// query and its reader cannot drift.
+/// The `sessions` columns [`read_session`] expects, in order: one definition, so a query and its reader cannot drift.
 const SESSION_COLUMNS: &str = "id, game, mode, started_at, ended_at, scratch_dir, final_path, \
      size_bytes, favourite, media_epoch_ms, duration_ms";
 
@@ -1036,9 +926,8 @@ fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 
 /// Whether `table` has a column called `column`.
 ///
-/// `PRAGMA table_info` cannot take a bound parameter, so the table name is interpolated —
-/// it is a literal from this file, never caller input. Used by the v1 → v2 step to make
-/// each `ADD COLUMN` idempotent on its own.
+/// `PRAGMA table_info` cannot take a bound parameter, so the table name is interpolated; it is a
+/// literal from this file, never caller input. Makes each `ADD COLUMN` idempotent on its own.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
@@ -1171,8 +1060,8 @@ mod tests {
 
     #[test]
     fn records_the_creation_time_of_a_clip() {
-        // The storage policy's age rule ages against `clips.created_at`, which the store
-        // stamps itself: a caller cannot backdate a clip into (or out of) deletion.
+        // The age rule ages against `clips.created_at`, which the store stamps itself: a caller cannot
+        // backdate a clip into (or out of) deletion.
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
         let before = now_ms();
@@ -1279,8 +1168,7 @@ mod tests {
 
     #[test]
     fn an_event_cannot_point_at_a_clip_that_does_not_exist() {
-        // `events.clip_id` is a foreign key and the migration turns enforcement on, so a
-        // marker cannot be attached to a clip that was never written.
+        // `events.clip_id` is a foreign key with enforcement on, so a marker cannot attach to a clip that was never written.
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
         assert!(
@@ -1309,9 +1197,8 @@ mod tests {
 
     #[test]
     fn deleting_a_clip_releases_its_events_instead_of_failing() {
-        // The interaction that would have made the storage policy unusable the moment an
-        // integration was switched on: `events.clip_id` is a foreign key, so evicting a clip
-        // an event names has to detach the event rather than be refused.
+        // Evicting a clip an event names must detach the event, not be refused, or the storage policy
+        // is unusable once an integration is on (`events.clip_id` is a foreign key).
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
         let clip = s
@@ -1325,8 +1212,7 @@ mod tests {
             .unwrap();
         s.insert_event(&an_event("kill", 1_000, Some(clip))).unwrap();
 
-        // Delete the clip the way the executor does: row first, then the file (there is no
-        // file here, which the executor tolerates).
+        // Delete the clip as the executor does: row first, then the file (none here, which the executor tolerates).
         assert_eq!(s.delete_clip_returning_path(clip).unwrap().as_deref(), Some("/clips/gone.mp4"));
         let events = s.list_events().unwrap();
         assert_eq!(events.len(), 1, "the event row survives the clip it pointed at");
@@ -1336,9 +1222,8 @@ mod tests {
 
     #[test]
     fn delete_before_unlink_ordering_is_exposed_to_the_caller() {
-        // The store must be able to delete the row and hand back the path, so the
-        // caller can unlink afterwards. Spec §8.2: no file is deleted without a
-        // committed row naming it.
+        // The store deletes the row and hands back the path, so the caller unlinks afterwards: no file
+        // is deleted without a committed row naming it.
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
         let id = s.insert_clip(&NewClip {
@@ -1365,9 +1250,8 @@ mod tests {
 
     /// `clips.session_id` for one row.
     ///
-    /// `Clip` does not carry the column — the clip list is the library, not the session
-    /// tree — and the link is written by the session recorder, which owns that decision.
-    /// A test therefore reads the column the way an operator would.
+    /// `Clip` does not carry the column and the session recorder writes the link, so a test reads
+    /// it the way an operator would.
     fn clip_session_id(store: &Store, clip_id: i64) -> Option<i64> {
         store
             .conn
@@ -1407,8 +1291,7 @@ mod tests {
             ended.duration_ms, 118_400,
             "the media length the row carries, which is what a review timeline is drawn on"
         );
-        // Deliberately different from the wall-clock window (120s) in this fixture: the two are
-        // independent facts, and a test that made them equal could not tell them apart.
+        // Deliberately different from the wall-clock window (120s) in this fixture: equal values could not tell the two apart.
         assert_ne!(
             ended.duration_ms,
             ended.ended_at_ms.unwrap() - ended.started_at_ms,
@@ -1500,11 +1383,9 @@ mod tests {
     fn a_session_timeline_is_chronological_with_offsets_from_the_start() {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
-        // Two clocks, deliberately different numbers: the timeline must be measured from the
-        // MEDIA epoch, not the wall start. The old code subtracted `started_at` (wall) from
-        // `events.at` (media) — arithmetic across two clocks, which put every event of a
-        // session that reused a scratch directory in the wrong place. With the two
-        // accidentally equal, as this fixture used to have them, that looked correct.
+        // Two clocks, deliberately different numbers: the timeline is measured from the media epoch, not
+        // the wall start. Subtracting `started_at` from `events.at` mixes two clocks and misplaces every
+        // event of a session that reused a scratch directory, which equal fixture values would hide.
         let session = s
             .start_session(
                 Some("League of Legends"),
@@ -1522,10 +1403,9 @@ mod tests {
             codec: "h264_nvenc".into(),
         }).expect("the clip is indexed");
 
-        // Deliberately inserted out of order, and deliberately of every provenance: a
-        // manual hotkey bookmark, a game-derived kill that produced a clip, a
-        // game-derived death, a marker with no clip, and one event before the session's
-        // own start instant.
+        // Inserted out of order, of every provenance: a manual hotkey bookmark, a game-derived kill that
+        // produced a clip, a game-derived death, a marker with no clip, and one event before the
+        // session's own start.
         for (kind, at, clip_id) in [
             ("kill", 1_030_000u64, Some(clip)),
             ("bookmark", 1_000_000, None),
@@ -1607,8 +1487,8 @@ mod tests {
             "an empty session store holds nothing"
         );
 
-        // A recorder keeps the running total current on the tick it scans its ring; without
-        // this the sessions cap would plan against zero bytes for a live recording.
+        // A recorder keeps the running total current on its scan tick; without this the sessions cap
+        // would plan against zero bytes for a live recording.
         s.set_session_size(id, 3_000).expect("the running size");
         assert_eq!(s.total_session_bytes().expect("the session store's bytes"), 3_000);
 
@@ -1626,10 +1506,9 @@ mod tests {
         let session = running_session(&s);
         s.end_session(session, 1_120_000, Some("/sessions/1.mp4"), 9_000, 0).expect("the session ends");
 
-        // A clip extracted from the session. `insert_clip` takes no session_id — its
-        // signature is frozen for this pass — so the link is written the way the session
-        // recorder writes it, and the foreign key would refuse the delete below if the
-        // store did not detach it.
+        // A clip extracted from the session. `insert_clip` takes no session_id, so the link is written
+        // as the session recorder writes it; the foreign key would refuse the delete below if the store
+        // did not detach it.
         let clip = s.insert_clip(&NewClip {
             path: "/clips/from-session.mp4".into(),
             started_at_ms: 30_000,
@@ -1687,17 +1566,15 @@ mod tests {
         s.migrate().expect("migrate the store");
         let id = running_session(&s);
 
-        // The scratch directory of a running session *is* the recording: there is no second
-        // copy, so no ordering makes deleting it safe.
+        // The scratch directory of a running session is the recording, with no second copy, so no ordering makes deleting it safe.
         let err = s
             .delete_session_returning_paths(id)
             .expect_err("a running session must not be deletable");
         assert!(format!("{err:#}").contains("still recording"), "{err:#}");
         assert!(s.get_session(id).expect("the session").is_some(), "the row is untouched");
 
-        // The escape hatch is explicit: end it — with the clock the caller believes and the
-        // bytes it measured — and it becomes an ordinary deletable session. A session left
-        // running by a crash is the same case, and this is how a recovery pass resolves it.
+        // The escape hatch is explicit: end it and it becomes an ordinary deletable session. A session
+        // left running by a crash is the same case; this is how a recovery pass resolves it.
         s.end_session(id, 1_200_000, None, 0, 0).expect("the session ends");
         let paths = s.delete_session_returning_paths(id).expect("the session is deleted");
         assert_eq!(
@@ -1803,22 +1680,17 @@ mod tests {
             assert!(column_exists(&store.conn, "sessions", column).expect("table_info"), "{column}");
         }
 
-        // The upgraded shape is the shape a new database gets — no drift between a database
-        // this build created and one it upgraded.
+        // The upgraded shape is the shape a new database gets: no drift between created and upgraded databases.
         let fresh = Store::open_in_memory().expect("a fresh store");
         fresh.migrate().expect("migrate");
         assert_eq!(columns(&store, "sessions"), columns(&fresh, "sessions"));
         assert_eq!(columns(&store, "clips"), columns(&fresh, "clips"));
         assert_eq!(columns(&store, "events"), columns(&fresh, "events"));
 
-        // The timeline of the legacy session is readable through the new API. Its epoch is
-        // the migration's default, so the offset is the event's own media position rather
-        // than a difference: this row was written before v3, which means it never recorded an
-        // epoch, and 0 is the only value its contents support. For the ordinary case — a
-        // session against a fresh scratch directory — that IS the session-relative offset.
-        //
-        // (The old code subtracted `started_at`, the wall clock, from a media timestamp:
-        // arithmetic across two clocks, which is the defect the column exists to fix.)
+        // The legacy session's timeline is readable through the new API. Its epoch is the migration's
+        // default (0, the only value its contents support, since it predates v3), so the offset is the
+        // event's own media position, which for a session against a fresh scratch directory is the
+        // session-relative offset.
         let timeline = store.events_for_session(1).expect("the legacy timeline");
         assert_eq!(timeline.len(), 1);
         assert_eq!(
@@ -1836,9 +1708,8 @@ mod tests {
 
     #[test]
     fn the_v1_to_v2_step_is_safe_on_a_database_that_already_has_a_v2_column() {
-        // An upgrade interrupted by a build that added the columns one at a time, or a
-        // hand-edited file: `ADD COLUMN` is not idempotent on its own, so the step checks
-        // each column before adding it.
+        // An upgrade interrupted by a build that added columns one at a time, or a hand-edited file:
+        // `ADD COLUMN` is not idempotent, so the step checks each column first.
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("half-migrated.db");
         {
@@ -1885,9 +1756,8 @@ mod tests {
         let err = store.migrate().expect_err("a newer schema must be refused, never downgraded");
         assert!(format!("{err:#}").contains("newer than this build supports"), "{err:#}");
         assert_eq!(store.schema_version().expect("version"), 99, "the version is not rewritten");
-        // Read through SQL rather than the session API: a refused v99 database has no `mode`
-        // column to read, which is the fail-closed outcome and not a second failure. What
-        // matters is that the row is still there.
+        // Read through SQL: a refused v99 database has no `mode` column to read, which is the
+        // fail-closed outcome. What matters is that the row is still there.
         let rows: i64 = store
             .conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -1899,7 +1769,7 @@ mod tests {
         );
     }
 
-    // -- schema v5: clip title, game, tags -------------------------------------------------
+    // -- schema v5: clip title, game, tags --
 
     fn new_clip(path: &str) -> NewClip {
         NewClip {

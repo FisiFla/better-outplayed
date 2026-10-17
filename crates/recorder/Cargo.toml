@@ -25,8 +25,8 @@ localplay-store   = { path = "../store" }
 [features]
 # Forwards to the encoder's test-only software-encoder path, which is what
 # `dev_software_encoder` (the CLI's `--dev-software-encoder`) needs in a non-test build.
-# Never enabled in a release build: a silent CPU fallback would violate principle 3
-# (spec §3.2), and this feature is opt-in for exactly that reason.
+# Never enabled in a release build: a silent CPU fallback would break the no-CPU-fallback rule,
+# and this feature is opt-in for exactly that reason.
 test-encoders = ["localplay-encoder/test-encoders"]
 
 [dev-dependencies]

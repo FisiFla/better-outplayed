@@ -14,7 +14,7 @@ const AUTO_ORDER: [Vendor; 3] = [Vendor::Nvenc, Vendor::Qsv, Vendor::Amf];
 ///
 /// A vendor is accepted only once it has encoded a frame ([`smoke_test_cached`]). `ffmpeg
 /// -encoders` is what ffmpeg was compiled with and names `h264_amf` on a machine with no AMD
-/// driver (an RTX 3090 + Intel iGPU machine then died mid-capture with "video writer thread has
+/// driver (an NVIDIA + Intel iGPU machine then died mid-capture with "video writer thread has
 /// stopped"). Encoding one frame turns that into a startup failure naming the encoder and reason.
 pub fn select_vendor(bin: &FfmpegBinaries, requested: &str, codec: VideoCodec) -> Result<Vendor> {
     // Resolve the request before touching ffmpeg, so a bad config value fails immediately and independent of hardware.

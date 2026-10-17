@@ -1,20 +1,15 @@
 //! Dual retention against a real database and a real filesystem.
 //!
-//! The rules themselves are exhaustive unit tests in `crates/store/src/retention.rs`,
-//! where the planner is pure. What can only be shown here is what a pass does to the disk
-//! and to the index: which files survive, in which order rows go, and — the point of this
-//! file — **how many bytes a pass actually reclaimed**, measured against files the fixture
-//! really wrote rather than against numbers the code assumed. Every block that reaches a
-//! decision prints the totals it decided on, so a run with `--nocapture` shows the
-//! arithmetic rather than asserting it silently.
+//! The rules are unit-tested in `crates/store/src/retention.rs`. This file shows what a pass does
+//! to the disk and the index: which files survive, in which order rows go, and how many bytes a
+//! pass actually reclaimed, measured against files the fixture wrote rather than numbers the code
+//! assumed. Blocks that reach a decision print their totals (visible with `--nocapture`).
 //!
 //! Two classes, two caps, and the interactions that only exist once sessions are real: a
-//! session's scratch tree and its final file both go when the session does, the clips
-//! extracted from it do not, and a session that is still recording is not a candidate at
-//! all.
+//! session's scratch tree and final file both go with it, the clips extracted from it do not, and
+//! a session still recording is not a candidate.
 //!
-//! Nothing here touches a user profile or the network. Every path lives in a temp directory
-//! under the workspace's `target/`.
+//! Every path lives in a temp directory under the workspace's `target/`.
 
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::retention::{
@@ -35,18 +30,16 @@ fn now_ms() -> i64 {
 
 /// A temp directory under the workspace's `target/`.
 ///
-/// Deliberately not the system temp directory: a test in this crate writes and deletes real
-/// files, and keeping them inside the tree the build already owns means a failed run cannot
-/// leave anything in a user's profile. `CARGO_TARGET_DIR` is honoured when it is set;
-/// otherwise the workspace target directory is `../../target` from this crate.
+/// Not the system temp directory: these tests write and delete real files, and keeping them
+/// inside the tree the build owns means a failed run cannot leave anything in a user's profile.
+/// `CARGO_TARGET_DIR` is honoured when set; otherwise it is `../../target` from this crate.
 fn temp_dir() -> tempfile::TempDir {
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => PathBuf::from(dir),
         None => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("target"),
     };
     std::fs::create_dir_all(&target).expect("create the target directory");
-    // Canonicalised so a reported path in a failure message names the directory the reader
-    // expects (`<workspace>/target/...`) rather than a `../..` walk to it.
+    // Canonicalised so a failure message names `<workspace>/target/...` rather than a `../..` walk.
     let target = std::fs::canonicalize(&target).unwrap_or(target);
     tempfile::Builder::new()
         .prefix("localplay-store-retention-")
@@ -55,7 +48,7 @@ fn temp_dir() -> tempfile::TempDir {
 }
 
 /// The bytes a directory or file really holds, read back from the disk. The test's own
-/// measurement, deliberately not the crate's, so the two have to agree.
+/// measurement, not the crate's, so the two have to agree.
 fn real_bytes(path: &Path) -> u64 {
     let meta = std::fs::symlink_metadata(path).expect("stat");
     if meta.is_file() {
@@ -74,8 +67,7 @@ fn real_bytes(path: &Path) -> u64 {
 struct SessionFiles {
     id: i64,
     scratch_dir: PathBuf,
-    /// `None` for a session with no concatenated file — a running one, and a finished one
-    /// that was never finalised into a single file.
+    /// `None` for a session with no concatenated file: a running one, or a finished one never finalised into a single file.
     final_path: Option<PathBuf>,
     bytes_on_disk: u64,
 }
@@ -109,10 +101,9 @@ impl Fixture {
         Self { _dir: dir, root, db_path, store, sessions: 0 }
     }
 
-    /// Write a session's bytes to disk and index the row the way a session recorder does:
-    /// segments in a scratch directory, and — when the session produced one — a
-    /// concatenated final file. The row's `size_bytes` is set to what is really there, so
-    /// the cap arithmetic and the disk start out agreeing.
+    /// Write a session's bytes to disk and index the row as a session recorder does: segments in a
+    /// scratch directory and, when the session produced one, a concatenated final file. `size_bytes`
+    /// is set to what is really there, so the cap arithmetic and the disk start out agreeing.
     fn add_session(
         &mut self,
         started_at_ms: i64,
@@ -128,9 +119,8 @@ impl Fixture {
         SessionFiles { id, scratch_dir, final_path, bytes_on_disk }
     }
 
-    /// A session that is still recording: no `ended_at`, segments on disk, and the running
-    /// size a recorder keeps current (`Store::set_session_size`) so the sessions cap can see
-    /// the bytes the recording holds.
+    /// A session still recording: no `ended_at`, segments on disk, and the running size a recorder
+    /// keeps current (`Store::set_session_size`) so the sessions cap can see its bytes.
     fn add_running_session(&mut self, started_at_ms: i64, segments: &[usize]) -> SessionFiles {
         let (id, scratch_dir, final_path, bytes_on_disk) =
             self.write_session(started_at_ms, segments, 0);
@@ -199,9 +189,8 @@ impl Fixture {
         self.store.set_session_favourite(id, true).expect("favourite the session");
     }
 
-    /// Age a clip, the way an operator would with `sqlite3`: the application has no API for
-    /// it — `clips.created_at` is stamped by the store, never by the caller. A session needs
-    /// no equivalent, because `sessions.started_at` is an argument of `start_session`.
+    /// Age a clip as an operator would with `sqlite3`: `clips.created_at` is stamped by the store with
+    /// no API to change it. A session needs no equivalent, since `started_at` is an argument of `start_session`.
     fn backdate_clip(&self, id: i64, created_at_ms: i64) {
         let conn = rusqlite::Connection::open(&self.db_path).expect("a second connection");
         conn.execute(
@@ -211,10 +200,9 @@ impl Fixture {
         .expect("backdate the row");
     }
 
-    /// Write a clip the way a session recorder writes one extracted from a session: the file
-    /// and its row, linked to the session it came from. `insert_clip` takes no `session_id`
-    /// (its signature is frozen for this pass), so the link is the one write an operator or
-    /// the recorder does by hand.
+    /// Write a clip as a session recorder writes one extracted from a session: the file and its row,
+    /// linked to the source session. `insert_clip` takes no `session_id`, so the link is the one
+    /// write done by hand.
     fn add_extracted_clip(&self, session_id: i64, name: &str, bytes: usize) -> (i64, PathBuf) {
         let (clip, path) = self.add_clip(name, bytes);
         let conn = rusqlite::Connection::open(&self.db_path).expect("a second connection");
@@ -246,8 +234,8 @@ impl Fixture {
         )
     }
 
-    /// Clip ids, sorted: `list_clips` orders by `started_at`, which a fixture that indexes
-    /// every clip at the same instant cannot break ties with.
+    /// Clip ids, sorted: `list_clips` orders by `started_at`, which a fixture indexing every clip at
+    /// the same instant cannot break ties with.
     fn clip_ids(&self) -> Vec<i64> {
         let mut ids: Vec<i64> =
             self.store.list_clips().expect("clips").iter().map(|c| c.id).collect();
@@ -267,8 +255,7 @@ fn policy(clips: RetentionRules, sessions: RetentionRules) -> RetentionPolicy {
     RetentionPolicy { clips, sessions }
 }
 
-/// A cap nothing reaches and an age nothing exceeds, so the class not under study stays out
-/// of the way.
+/// A cap nothing reaches and an age nothing exceeds, so the class not under study stays out of the way.
 fn generous() -> RetentionRules {
     RetentionRules { max_total_bytes: u64::MAX, max_age_days: 3_650 }
 }
@@ -339,10 +326,9 @@ fn a_capped_session_is_evicted_as_a_unit_with_its_scratch_tree_and_its_final_fil
 
 #[test]
 fn the_bytes_a_pass_reports_are_measured_from_the_disk_not_forecast_from_the_rows() {
-    // A row that disagrees with its files — a truncated write, a re-encode, a hand-edited
-    // index. The plan's arithmetic uses the row (that is all it has); what a pass *reports*
-    // it reclaimed is what the disk actually lost. A pass that reports its own forecast is
-    // how a storage manager lies to a user.
+    // A row that disagrees with its files (a truncated write, a re-encode, a hand-edited index). The
+    // plan's arithmetic uses the row, all it has; what a pass reports reclaiming is what the disk
+    // actually lost. Reporting the forecast is how a storage manager lies to a user.
     let mut fx = Fixture::new();
     let session = fx.add_session(now_ms() - DAY_MS, &[400, 300], 500);
     let conn = rusqlite::Connection::open(&fx.db_path).expect("a second connection");
@@ -466,8 +452,7 @@ fn a_favourite_session_is_immune_to_both_rules_and_its_shortfall_is_reported() {
 
 #[test]
 fn a_favourite_clip_is_immune_to_both_rules_under_the_new_entry_point_too() {
-    // The guarantee the clips policy has always given, checked through the retention entry
-    // point so the two cannot diverge: the clips half *is* `plan_cleanup`.
+    // The clips policy's guarantee, checked through the retention entry point so the two cannot diverge: the clips half is `plan_cleanup`.
     let fx = Fixture::new();
     let (ancient_favourite, ancient_path) = fx.add_clip("ancient-favourite.mp4", 400);
     let (big_favourite, big_path) = fx.add_clip("big-favourite.mp4", 600);
@@ -514,8 +499,7 @@ fn a_session_that_is_still_recording_is_never_evicted_and_its_bytes_are_counted(
     let live = fx.add_running_session(now_ms() - 90 * DAY_MS, &[1_800, 1_200]);
     let finished = fx.add_session(now_ms() - 90 * DAY_MS, &[500], 0);
 
-    // Every rule violated as hard as it can be: a 7 day limit, a 500 byte cap, and the
-    // recording alone is 3_000 bytes.
+    // Every rule violated as hard as it can be: a 7 day limit, a 500 byte cap, and the recording alone is 3_000 bytes.
     let plan = fx.plan(&policy(generous(), rules(500, 7)));
 
     println!(
@@ -553,10 +537,9 @@ fn a_session_that_is_still_recording_is_never_evicted_and_its_bytes_are_counted(
 
 #[test]
 fn a_session_left_running_by_a_crash_is_evicted_once_it_is_ended_explicitly() {
-    // The other half of the in-progress rule: immunity must not be permanent. A session
-    // whose recording was killed is still `ended_at IS NULL`, and the honest way to make it
-    // evictable is to end it — with the clock and the bytes the caller believes — rather
-    // than to infer from a process table that the recording is over.
+    // The other half of the in-progress rule: immunity is not permanent. A session whose recording
+    // was killed is still `ended_at IS NULL`, and the honest way to make it evictable is to end it
+    // with the clock and bytes the caller believes, not to infer from a process table.
     let mut fx = Fixture::new();
     let crashed = fx.add_running_session(now_ms() - 90 * DAY_MS, &[700]);
 
@@ -649,9 +632,8 @@ fn deleting_a_session_leaves_the_clip_extracted_from_it_and_its_events_alone() {
 #[test]
 fn deletions_run_oldest_first_in_both_classes() {
     let mut fx = Fixture::new();
-    // Sessions written in a scrambled order: the plan must follow `started_at`, not the
-    // order the rows were created in. Clips are stamped by the store, so their order is
-    // their insertion order (middle, newest, oldest).
+    // Sessions written in a scrambled order: the plan follows `started_at`, not row creation order.
+    // Clips are stamped by the store, so their order is insertion order (middle, newest, oldest).
     let middle = fx.add_session(now_ms() - 20 * DAY_MS, &[500], 0);
     let newest = fx.add_session(now_ms() - 5 * DAY_MS, &[500], 0);
     let oldest = fx.add_session(now_ms() - 40 * DAY_MS, &[500], 0);
@@ -659,8 +641,7 @@ fn deletions_run_oldest_first_in_both_classes() {
     let (clip_second, path_second) = fx.add_clip("second.mp4", 500);
     let (clip_third, path_third) = fx.add_clip("third.mp4", 500);
 
-    // Both caps hold exactly one artefact of 500 bytes, so each class evicts its two oldest
-    // and keeps its newest — in that order.
+    // Both caps hold exactly one 500 byte artefact, so each class evicts its two oldest and keeps its newest, in that order.
     let plan = fx.plan(&policy(rules(500, 3_650), rules(500, 3_650)));
     println!(
         "retention: 3 sessions and 3 clips of 500 bytes each, caps of 500 -> sessions {:?}, \
@@ -709,11 +690,9 @@ fn deletions_run_oldest_first_in_both_classes() {
 
 #[test]
 fn a_scratch_directory_that_is_a_symlink_is_refused_and_reported_not_followed() {
-    // The one removal in this crate that takes a whole tree, against the adversary it can
-    // actually meet: a `scratch_dir` TEXT value that names something other than the
-    // directory the application created. The row is deleted — it is the row's business —
-    // and the tree it pointed at is left exactly as it is, reported rather than silently
-    // skipped.
+    // The one removal in this crate that takes a whole tree, against the adversary it can actually
+    // meet: a `scratch_dir` TEXT value naming something other than the directory the application
+    // created. The row is deleted; the tree it pointed at is left as is and reported, not skipped.
     let mut fx = Fixture::new();
     let session = fx.add_session(now_ms() - 30 * DAY_MS, &[600], 200);
     let elsewhere = fx.root.join("not-the-scratch-dir");
@@ -794,8 +773,8 @@ fn a_final_file_that_is_already_gone_is_reported_and_the_scratch_tree_still_goes
 
 #[test]
 fn a_final_path_that_cannot_be_unlinked_is_reported_as_an_orphan() {
-    // The other way the filesystem can disagree with the index: something is there, and it
-    // is not a file. A row deleted and a path left behind is recoverable — and is reported.
+    // The other way the filesystem can disagree with the index: something is there that is not a
+    // file. A row deleted and a path left behind is recoverable, and reported.
     let mut fx = Fixture::new();
     let mut session = fx.add_session(now_ms() - 30 * DAY_MS, &[100], 100);
     let in_the_way = fx.root.join("sessions").join("a-directory.mp4");
