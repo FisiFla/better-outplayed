@@ -1,16 +1,12 @@
-//! localplay CLI — the Phase 1 headless replay-buffer PoC.
+//! localplay CLI: the headless replay-buffer front-end.
 //!
-//! Thin by design: logging setup, subcommand dispatch, and nothing else. The pipeline
-//! itself lives in `localplay-recorder` — the engine the desktop shell drives too — and
-//! `localplay_cli` is the driver around it: parse the config, start a `Recorder`, install
-//! the hotkey, clip on a press. It is a library rather than logic in this file so that
-//! integration tests can reach it (`apps/localplay-cli/tests/post_roll.rs` in particular —
-//! the hotkey that reaches this path is Windows-only, so no test could otherwise execute
-//! it), and so that `--self-test-clip-after` can be driven in-process by a test as well.
+//! Thin by design: logging setup, subcommand dispatch, nothing else. The pipeline lives in
+//! `localplay-recorder`, and `localplay_cli` is the driver library around it, so integration
+//! tests can reach it (notably `tests/post_roll.rs`, since the hotkey is Windows-only) and
+//! drive `--self-test-clip-after` in-process.
 //!
-//! `--help` prints the flag list, including the verification-only self-test trigger, and
-//! says there in the help text that it sends no keyboard or mouse input: "does this touch
-//! my input?" is the first question a diagnostic that takes a clip has to answer.
+//! `--help` lists the flags, including the self-test trigger, and states there that it sends no
+//! keyboard or mouse input.
 
 use anyhow::{bail, Result};
 

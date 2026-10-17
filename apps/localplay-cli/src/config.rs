@@ -1,9 +1,8 @@
 //! Root configuration: TOML in the app data directory, never environment variables.
 //!
 //! The `[buffer]`, `[encode]` and `[storage]` sections are the recorder's own types
-//! (`localplay_recorder::config`), because they describe the recording and the desktop
-//! shell parses them too. What stays here is what a headless front-end owns: the hotkey
-//! and the (Phase 4) game-event sources.
+//! (`localplay_recorder::config`), shared with the desktop shell. What stays here is what a
+//! headless front-end owns: the hotkey and the game-event sources.
 
 use anyhow::{bail, Context, Result};
 use localplay_events::process::GamesSection;
@@ -27,27 +26,26 @@ pub struct Config {
     pub mic: MicSection,
     pub hotkeys: HotkeySection,
     pub events: EventsSection,
-    /// `[games]` — the game watcher (Phase 5, spec §7). Defaulted, so a file that does not
-    /// mention it means "watch nothing": `auto_record` is `false` in `GamesSection::default`,
-    /// and with it off the recorder starts no watcher at all.
+    /// `[games]`, the game watcher. Defaulted, so a file that does not mention it means "watch
+    /// nothing": `auto_record` is `false` in `GamesSection::default`, and the recorder then starts
+    /// no watcher.
     #[serde(default)]
     pub games: GamesSection,
 }
 
-/// `[audio]` — the game-audio track.
+/// `[audio]`, the game-audio track.
 ///
-/// `enabled = false` is a **video-only recording**: the engine declares no audio input at all,
-/// so no loopback listener is bound and the container carries no audio stream. It is honoured
-/// rather than warned about, because it is a thing the pipeline can genuinely do.
+/// `enabled = false` is a video-only recording: no audio input, no loopback listener and no
+/// audio stream in the container.
 ///
-/// `source` and `codec` still have exactly one implemented value each (`"loopback"`, `"aac"`)
-/// and anything else is refused in [`Config::validate`]; `bitrate_kbps` reaches ffmpeg's `-b:a`
-/// and is simply unused when `enabled` is false.
+/// `source` and `codec` have one implemented value each (`"loopback"`, `"aac"`); anything else
+/// is refused in [`Config::validate`]. `bitrate_kbps` reaches ffmpeg's `-b:a` and is unused
+/// when `enabled` is false.
 ///
-/// One combination is refused rather than recorded, and refused by the recorder rather than
-/// here: `enabled = false` with a microphone (`[mic] enabled = true`). A container's audio
-/// tracks are named by position — `localplay_media::edit::audio_titles` calls the first
-/// `Game Audio` — so a one-track recording of a voice would be labelled as the game audio.
+/// One combination is refused, by the recorder rather than here: `enabled = false` with a
+/// microphone (`[mic] enabled = true`). Audio tracks are named by position
+/// (`localplay_media::edit::audio_titles` calls the first `Game Audio`), so a one-track
+/// recording of a voice would be labelled as the game audio.
 #[derive(Debug, Deserialize)]
 pub struct AudioSection {
     pub enabled: bool,
@@ -84,7 +82,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        // Fail closed: there is no CPU encoder to fall back to (spec §3.2).
+        // Fail closed: there is no CPU encoder to fall back to.
         match self.encode.vendor.as_str() {
             "auto" | "nvenc" | "qsv" | "amf" => {}
             "software" => bail!(
@@ -93,10 +91,9 @@ impl Config {
             ),
             other => bail!("unknown encode.vendor: {other}"),
         }
-        // 0 disables the listener (config.example.toml documents it): a user who does not
-        // want it should not have to pick a port they will never use. Anything else is a
-        // real port, and the default sits above the ephemeral range so that a temporarily
-        // bound listener elsewhere cannot shadow it at startup.
+        // 0 disables the listener (documented in `config.example.toml`). Anything else is a real port,
+        // and the default sits above the ephemeral range so a temporarily bound listener elsewhere
+        // cannot shadow it at startup.
         if self.events.gsi_port != 0 && !(1024..=65535).contains(&self.events.gsi_port) {
             bail!(
                 "events.gsi_port must be 0 (disabled) or between 1024 and 65535, got {}",
@@ -109,21 +106,19 @@ impl Config {
         if self.buffer.post_seconds == 0 {
             bail!("buffer.post_seconds must be at least 1 second");
         }
-        // The rate the pipeline declares to the encoder (its `-framerate`) and paces capture
-        // to. Zero is not a rate: it makes `1 / fps` meaningless and ffmpeg's `-framerate 0`
-        // an error, and the engine would clamp it to 1 rather than guess. Say so instead.
+        // The rate declared to the encoder (`-framerate`) and capture is paced to. Zero is not a rate:
+        // it makes `1 / fps` meaningless and ffmpeg's `-framerate 0` an error, and the engine would
+        // clamp it to 1 rather than guess. Say so instead.
         if self.encode.fps == 0 {
             bail!(
                 "encode.fps must be at least 1: it is the ceiling on the frame rate the \
                  pipeline paces to (it measures itself against this — see encode.adapt_fps)"
             );
         }
-        // The pipeline records aac over the system loopback and nothing else: ffmpeg's input 1
-        // is a loopback PCM stream and its audio codec is fixed to aac
-        // (`localplay_encoder::ffmpeg`). A config asking for anything else would be recorded
-        // as aac-over-loopback while claiming otherwise — the quiet divergence between what
-        // was asked for and what ran that this project has already paid for — so it is
-        // refused, naming what is implemented.
+        // The pipeline records aac over the system loopback and nothing else (ffmpeg input 1 is a
+        // loopback PCM stream, the audio codec fixed to aac in `localplay_encoder::ffmpeg`). A config
+        // asking for anything else would be recorded as aac-over-loopback while claiming otherwise, so
+        // it is refused, naming what is implemented.
         if self.audio.codec != "aac" {
             bail!(
                 "audio.codec = {:?} is not implemented: this build records the game audio as \
@@ -169,21 +164,20 @@ mod tests {
         assert_eq!(cfg.audio.codec, "aac", "and the implemented codec");
         assert_eq!(cfg.audio.bitrate_kbps, 192, "and the shipped default bitrate");
         assert_eq!(cfg.hotkeys.clip, "Ctrl+F8");
-        // The Phase 5 sections, in the file a fresh install runs: the replay buffer (the
-        // mode every existing configuration already had), no microphone, and nothing
-        // watched — which is the safety posture, not a placeholder.
+        // The sections a fresh install runs with: the replay buffer, no microphone, and nothing
+        // watched, which is the safety posture.
         assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::ReplayBuffer);
         assert!(!cfg.mic.enabled, "the example must not turn the microphone on");
         assert!(!cfg.games.auto_record, "the example must not auto-record");
         assert!(cfg.storage.sessions.max_total_bytes > 0, "the session rules have defaults");
     }
 
-    /// A `config.toml` written before Phase 5 parses — the new sections are all optional —
-    /// and means exactly what it did: buffer mode, no microphone, nothing watched.
+    /// A `config.toml` without the optional newer sections parses and means buffer mode, no
+    /// microphone, nothing watched.
     #[test]
     fn a_pre_phase_5_config_still_parses_and_means_what_it_did() {
-        // The pre-Phase-5 surface, verbatim: the three recording sections, the CLI's own
-        // `[hotkeys]` and `[events]`, and nothing else.
+        // The oldest surface, verbatim: the three recording sections, the CLI's own `[hotkeys]` and
+        // `[events]`, and nothing else.
         let text = "\
 [buffer]
 pre_seconds = 30
@@ -229,8 +223,8 @@ gsi_port = 45671
         );
     }
 
-    /// The mode is settable from the file — that is what makes the CLI's `--mode` an
-    /// *override* rather than the only way in.
+    /// The mode is settable from the file, which is what makes the CLI's `--mode` an override
+    /// rather than the only way in.
     #[test]
     fn the_mode_can_be_set_from_the_file() {
         let text = include_str!("../../../config.example.toml")
@@ -260,10 +254,9 @@ gsi_port = 45671
         );
     }
 
-    /// `audio.codec` and `audio.source` have one implemented value each, and anything else has
-    /// to fail rather than be recorded as the aac-over-loopback the pipeline actually runs —
-    /// a config that says one thing and a file that does another is the class of defect this
-    /// project has already paid for. The messages name what is implemented.
+    /// `audio.codec` and `audio.source` have one implemented value each, and anything else must
+    /// fail rather than be recorded as the aac-over-loopback the pipeline runs. The messages name
+    /// what is implemented.
     #[test]
     fn rejects_an_audio_codec_that_is_not_aac() {
         let text = include_str!("../../../config.example.toml")
@@ -305,8 +298,8 @@ gsi_port = 45671
         assert_eq!(cfg.events.gsi_port, 0);
     }
 
-    /// The frame rate is what the pipeline declares and paces to, so zero has to fail with a
-    /// sentence rather than be silently clamped to 1 by the engine.
+    /// The frame rate is what the pipeline declares and paces to, so zero must fail with a sentence
+    /// rather than be silently clamped to 1 by the engine.
     #[test]
     fn rejects_a_zero_frame_rate() {
         let text = include_str!("../../../config.example.toml").replace("fps = 60", "fps = 0");
@@ -314,9 +307,9 @@ gsi_port = 45671
         assert!(err.to_string().contains("encode.fps"), "got: {err}");
     }
 
-    /// The example enables adaptation, so a fresh install measures what the machine can hold
-    /// (the behaviour issues #1 and #2 need); a file without the key gets it too, and the
-    /// opt-out is honoured. Parsed through the CLI's own reader, which is what runs.
+    /// The example enables adaptation, so a fresh install measures what the machine can hold; a
+    /// file without the key gets it too, and the opt-out is honoured. Parsed through the CLI's own
+    /// reader, which is what runs.
     #[test]
     fn the_example_enables_adaptation_and_the_key_can_turn_it_off() {
         let example = Config::from_toml(include_str!("../../../config.example.toml"))
@@ -328,8 +321,8 @@ gsi_port = 45671
         let off = Config::from_toml(&text).expect("false is a valid setting");
         assert!(!off.encode.adapt_fps);
 
-        // And a file that never mentions the key still adapts: the default lives in the
-        // shared section type, which this reader deserialises.
+        // A file that never mentions the key still adapts: the default lives in the shared section
+        // type, which this reader deserialises.
         let text = include_str!("../../../config.example.toml")
             .lines()
             .filter(|l| !l.trim_start().starts_with("adapt_fps"))
@@ -347,9 +340,8 @@ gsi_port = 45671
 
     #[test]
     fn the_capture_sections_are_the_recorders_own_types() {
-        // The CLI does not re-declare `[buffer]`, `[encode]` or `[storage]`: the desktop
-        // shell parses the same sections into the same types, which is what keeps one
-        // config file meaning one thing to both front-ends.
+        // The CLI does not re-declare `[buffer]`, `[encode]` or `[storage]`: the desktop shell parses
+        // the same sections into the same types, so one config file means one thing to both.
         let cfg = Config::from_toml(include_str!("../../../config.example.toml")).unwrap();
         let buffer: localplay_recorder::BufferSection = cfg.buffer;
         let encode: localplay_recorder::EncodeSection = cfg.encode;

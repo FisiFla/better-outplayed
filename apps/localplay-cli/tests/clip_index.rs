@@ -1,22 +1,16 @@
-//! The hotkey path's post-splice step, end to end on this host: a real clip spliced by
-//! ffmpeg → a real `clips` row in a real index → the storage policy managing that clip.
+//! The hotkey path's post-splice step, end to end: a real clip spliced by ffmpeg, a real
+//! `clips` row in a real index, then the storage policy managing that clip.
 //!
-//! The bug this file exists to prevent is the one the store crate was written for and the
-//! application then never called: clips were written to a directory and never indexed, so
-//! nothing could list them and nothing would ever delete them.
+//! Guards against clips being written to a directory and never indexed, so nothing could list
+//! or delete them.
 //!
-//! Gating and reach: the global hotkey cannot fire off Windows (`localplay_events::hotkey`
-//! installs a real `RegisterHotKey` message loop only there), so the CLI's capture loop
-//! itself cannot be driven from a test on this host. Everything the hotkey *branch* does
-//! after its post-roll wait can be, and is, driven here with the same calls the engine
-//! makes: the in-memory ring's `trigger` to splice, `localplay_recorder::index_clip` to index, and
-//! the policy functions to evict. (Those calls are the recorder crate's rather than this
-//! library's since the pipeline moved there; what this file still pins is that the whole
-//! sequence — splice, index, plan, evict — works over real ffmpeg output.)
+//! The global hotkey cannot fire off Windows, so the CLI's capture loop cannot be driven from a
+//! test here. Everything the hotkey branch does after its post-roll wait is driven with the
+//! engine's own calls: the in-memory ring's `trigger` to splice, `localplay_recorder::index_clip`
+//! to index, and the policy functions to evict.
 //!
-//! Like the rest of this package's tests, it needs ffmpeg on `PATH` with a working
-//! libx264 (see `post_roll.rs` on why the test-encoders feature is guaranteed by the
-//! dev-dependency rather than by a `cfg` gate).
+//! Needs ffmpeg on `PATH` with a working libx264 (see `post_roll.rs` on why the test-encoders
+//! feature is guaranteed by the dev-dependency rather than a `cfg` gate).
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
@@ -45,8 +39,8 @@ fn now_ms() -> i64 {
 #[test]
 fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-    // The buffer keeps its footage in RAM, so a segment directory is only needed because the
-    // test encoder's constructor takes one; nothing is written into it in stream mode.
+    // The buffer keeps its footage in RAM; the segment directory exists only because the test
+    // encoder's constructor takes one, and nothing is written into it in stream mode.
     let segment_dir = tempfile::tempdir().expect("a segment dir");
     let clips = tempfile::tempdir().expect("a clips dir");
 
@@ -78,8 +72,8 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     )
     .expect("start the in-memory ring");
 
-    // The pipeline runs in real time: the encoder's media timeline is the wall clock, so
-    // this covers `need_ms` of footage after roughly `need_ms` of wall clock.
+    // The pipeline runs in real time: the encoder's media timeline is the wall clock, so this
+    // covers `need_ms` of footage after roughly `need_ms` of wall clock.
     capture.start().expect("start the stub capture");
     audio.start().expect("start the stub audio");
     let mut pacer = FramePacer::new(FPS);
@@ -97,19 +91,18 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     )
     .expect("the post-roll must be reachable");
 
-    // Step 5 of spec §6.2, the same call the hotkey branch makes.
+    // The same call the hotkey branch makes.
     let clip = ring.trigger(trigger_ms, "indexed-clip").expect("splice the clip");
     assert!(clip.path.is_file(), "the clip must exist on disk");
     assert_eq!(clip.encoder, "libx264");
 
-    // Step 6, and the code under test: the clip becomes a row.
+    // The code under test: the clip becomes a row.
     let db_dir = tempfile::tempdir().expect("a temp dir for the index");
     let store = Store::open(&db_dir.path().join("localplay.db")).expect("open the clip index");
     store.migrate().expect("migrate the clip index");
 
-    // The window's start on the ring's own clock. An in-memory ring starts at zero every run,
-    // so unlike the file ledger's there is no origin to add: the trigger instant and the
-    // footage are already on the same timeline.
+    // The window's start on the ring's own clock. An in-memory ring starts at zero every run, so
+    // the trigger instant and the footage are already on the same timeline.
     let started_at_ms = trigger_ms.saturating_sub(PRE_MS);
     let id = localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
 
@@ -140,8 +133,8 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
         row.codec
     );
 
-    // Now the storage policy: a zero cap makes every non-favourited clip evictable, and
-    // the clip that was just indexed is the only one there is.
+    // A zero cap makes every non-favourited clip evictable, and the just-indexed clip is the only
+    // one there is.
     let policy = CleanupPolicy { max_total_bytes: 0, max_age_days: 3_650 };
     let plan = plan_cleanup(&store.list_clips().expect("list"), &policy, now_ms());
     assert_eq!(plan.ids(), vec![id], "the policy selects the clip the hotkey produced");
