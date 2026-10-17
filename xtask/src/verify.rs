@@ -1840,7 +1840,7 @@ impl Session {
         Ok(())
     }
 
-    /// Criterion 7: an unusable vendor must fail *at startup*, naming the encoder.
+    /// An unusable vendor must fail *at startup*, naming the encoder.
     fn criterion_seven(&mut self) -> Result<()> {
         let report = self.probe.as_ref().context("no encoder probe")?;
         let Some((vendor, encoder)) = report.unusable_h264_vendor() else {
