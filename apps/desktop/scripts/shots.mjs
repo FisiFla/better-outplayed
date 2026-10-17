@@ -630,6 +630,10 @@ function installMockSource(fixture) {
     async sessionEvents(id) {
       return [...(eventsBySession[id] ?? [])];
     },
+    // No fixture game splits into matches; an empty answer is what an untagged session returns.
+    async sessionMatches() {
+      return [];
+    },
     async setSessionFavourite(id, favourite) {
       const session = sessions.find((s) => s.id === id);
       if (!session) throw { code: 'session_not_found', message: `no session with id ${id} is in the index` };
@@ -1088,33 +1092,25 @@ async function layoutAudit(page) {
         scrollWidth: document.documentElement.scrollWidth,
         scrollHeight: document.documentElement.scrollHeight,
       },
-      sidebar: rect('.sidebar'),
-      main: rect('.main'),
-      mainScroll: scroller('.main'),
-      clipList: scroller('.sidebar ul'),
-      sessionList: (() => {
-        const lists = document.querySelectorAll('.sidebar ul');
-        const el = lists.length > 1 ? lists[1] : null;
-        if (!el) return null;
-        return {
-          clientHeight: el.clientHeight,
-          scrollHeight: el.scrollHeight,
-          clientWidth: el.clientWidth,
-          scrollWidth: el.scrollWidth,
-          scrollsVertically: el.scrollHeight > el.clientHeight + 1,
-          scrollsHorizontally: el.scrollWidth > el.clientWidth + 1,
-        };
-      })(),
-      // `.storage`, not `.panel`: the sidebar's first panel is the recorder (added with
-      // the recording UI), and this audit is about the storage panel's arithmetic.
-      storage: rect('.sidebar .storage'),
-      storageScroll: scroller('.sidebar .storage'),
-      recorder: rect('.sidebar .recorder'),
+      // Every region is addressed by its `data-region` hook, never by a layout class, so a
+      // view can be restyled without this audit (or any state below) noticing. A region is
+      // `null` while its view is not the open one.
+      rail: rect('[data-region=rail]'),
+      view: rect('.view'),
+      viewScroll: scroller('.view'),
+      clipList: scroller('[data-region=clip-grid] ul'),
+      sessionList: scroller('[data-region=session-list] ul'),
+      sessionPage: rect('[data-region=session-page]'),
+      // `.storage`, not `.panel`: the view's root is the storage panel, and this audit is
+      // about its arithmetic.
+      storage: rect('[data-region=storage] .storage'),
+      storageScroll: scroller('[data-region=storage] .storage'),
+      recorder: rect('[data-region=recorder]'),
       timeline: rect('.timeline'),
       track: rect('.track'),
       player: rect('.player'),
-      trimSection: rect('.main .panel.trim'),
-      trimButton: rect('.main .panel.trim button.primary'),
+      trimSection: rect('[data-region=clip-page] .panel.trim'),
+      trimButton: rect('[data-region=clip-page] .panel.trim button.primary'),
     };
   });
 }
@@ -1131,6 +1127,34 @@ const featureName = 'clip-2026-09-23_19-22-04_ace_clutch.webm';
 
 /** Where a fraction of the track lands, in client coordinates. */
 const xAt = (track, fraction) => track.left + track.width * fraction;
+
+/** Rail label → the `data-region` its view carries. */
+const VIEW_REGIONS = {
+  Library: 'library',
+  Sessions: 'sessions',
+  Storage: 'storage',
+  Health: 'health',
+  Settings: 'settings',
+};
+
+/** Open a rail destination the way a user does: click its item, wait for its view. */
+async function showView(page, label) {
+  await page.locator('[data-region=rail]').getByRole('button', { name: label }).click();
+  await page.locator(`[data-region=${VIEW_REGIONS[label]}]`).waitFor({ state: 'visible' });
+}
+
+/** From the library, open the first (newest) clip's page. */
+async function openFirstClip(page) {
+  await showView(page, 'Library');
+  await page.locator('[data-region=clip-grid] button.row').first().click();
+  await page.locator('[data-region=clip-page]').waitFor({ state: 'visible' });
+}
+
+/** The clip page's Back button, to the library. */
+async function backToLibrary(page) {
+  await page.locator('[data-region=clip-page]').getByRole('button', { name: 'Library' }).click();
+  await page.locator('[data-region=library]').waitFor({ state: 'visible' });
+}
 
 const states = [
   {
@@ -1152,15 +1176,19 @@ const states = [
         await page.getByText('No clips are indexed yet').isVisible(),
         'the clip list is empty rather than absent',
       );
+      // The rail is the app's frame: it is there even when every command failed.
+      check(this.name, await page.locator('[data-region=rail]').isVisible(), 'the navigation rail is still rendered');
+      await showView(page, 'Storage');
       check(
         this.name,
-        (await page.locator('.sidebar .storage').count()) === 0,
+        (await page.locator('[data-region=storage] .storage').count()) === 0,
         'no storage panel: `storage_stats` failed too, and the panel is not invented',
       );
+      await showView(page, 'Library');
       // The recorder panel is structural (it is where recording is driven the moment the
       // IPC answers), and with no status it says so rather than showing invented numbers.
-      const recorder = page.locator('.sidebar .recorder');
-      check(this.name, await recorder.isVisible(), 'the recorder panel is still rendered');
+      const recorder = page.locator('[data-region=recorder]');
+      check(this.name, await recorder.isVisible(), 'the recorder bar is still rendered');
       check(
         this.name,
         ((await recorder.locator('.badge').textContent()) ?? '').trim() === 'not recording',
@@ -1175,12 +1203,19 @@ const states = [
     fixture: EMPTY_FIXTURE,
     async verify(page) {
       check(this.name, await page.getByText('No clips are indexed yet').isVisible(), 'the list explains how to record a clip');
-      check(this.name, (await page.getByText('0 indexed').count()) === 2, 'both pane headers count zero');
       check(
         this.name,
-        await page.getByText('Select a clip on the left').isVisible(),
-        'the main pane says what to do instead of showing a blank pane',
+        (await page.locator('[data-region=library]').getByText('0 indexed').count()) === 1,
+        'the library header counts zero',
       );
+      await showView(page, 'Sessions');
+      check(this.name, (await page.getByText('0 indexed').count()) === 1, 'and so does the sessions header');
+      check(
+        this.name,
+        await page.getByText('Select a session to see its markers').isVisible(),
+        'the sessions detail pane says what to do instead of showing a blank pane',
+      );
+      await showView(page, 'Storage');
       // The storage panel is a disclosure: what it shows without being opened is the state
       // itself — the two numbers and the cap's verdict — which is the whole claim for
       // holding the arithmetic back, so it is asserted rather than assumed.
@@ -1195,6 +1230,8 @@ const states = [
         'and the arithmetic is what the disclosure withholds',
       );
       check(this.name, await page.getByText('50 GiB').first().isVisible(), 'the storage panel names the cap');
+      // The default view is the library; the screenshot is of it.
+      await showView(page, 'Library');
     },
   },
   {
@@ -1208,24 +1245,19 @@ const states = [
       check(
         this.name,
         names[0] === featureName,
-        'the newest clip is first and selected',
+        'the newest clip is first',
       );
       check(
         this.name,
-        (await page.locator('.row[aria-current="true"]').count()) === 1,
-        'exactly one row is marked as the selected one',
+        (await page.locator('.row[aria-current="true"]').count()) === 0,
+        'no row is marked as selected: the library is a list, a clip opens on its own page',
       );
-      const pressed = await page.locator('.sidebar .star').evaluateAll((els) =>
+      const pressed = await page.locator('[data-region=clip-grid] .star').evaluateAll((els) =>
         els.map((el) => el.getAttribute('aria-pressed')),
       );
       check(this.name, pressed.filter((p) => p === 'true').length === 2, 'two rows are favourited');
       check(this.name, pressed.filter((p) => p === 'false').length === 4, 'four rows are not');
-      check(
-        this.name,
-        (await page.locator('.main .star').getAttribute('aria-pressed')) === 'true',
-        "the detail header's favourite button agrees with the selected row",
-      );
-      const body = (await page.locator('.sidebar ul').textContent()) ?? '';
+      const body = (await page.locator('[data-region=clip-grid] ul').textContent()) ?? '';
       for (const expected of ['1:11:05.0', '0:00.9', '142 MiB', '2.9 GiB']) {
         check(this.name, body.includes(expected), `the list shows ${expected}`);
       }
@@ -1244,12 +1276,29 @@ const states = [
       const layout = await layoutAudit(page);
       check(
         this.name,
-        layout.storage.bottom <= layout.viewport.height + 0.5,
-        `the storage panel is fully inside the window (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+        layout.document.scrollWidth <= layout.viewport.width,
+        `the library does not overflow horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`,
       );
       if (layout.clipList.scrollsVertically) {
         report(this.name, `the clip list scrolls (${layout.clipList.scrollHeight}px of rows in ${layout.clipList.clientHeight}px)`);
       }
+
+      // Opening the newest clip: its page, and its favourite button agrees with its row.
+      await openFirstClip(page);
+      check(
+        this.name,
+        (await page.locator('[data-region=clip-page] .star').getAttribute('aria-pressed')) === 'true',
+        "the clip page's favourite button agrees with the row it was opened from",
+      );
+      check(
+        this.name,
+        (await page.locator('[data-region=rail]').getByRole('button', { name: 'Library' }).getAttribute('aria-current')) === 'page',
+        'the clip page lights the Library item on the rail',
+      );
+      await backToLibrary(page);
+      check(this.name, (await page.locator('[data-region=clip-grid] .name').count()) === 6, 'Back returns to the full list');
+      // The library at rest is where the heading, count, name and metadata labels live.
+      await auditContrast(page, this.name);
     },
   },
   {
@@ -1259,6 +1308,7 @@ const states = [
     fixture: LIST_FIXTURE,
     async verify(page, context) {
       await waitForThumbnails(page, 6);
+      await openFirstClip(page);
       await waitForMedia(page);
       check(this.name, await page.getByRole('heading', { name: featureName }).isVisible(), 'the detail header names the clip');
       const chips = await page.locator('.facts .chip').allTextContents();
@@ -1338,10 +1388,10 @@ const states = [
       const layout = await layoutAudit(page);
       context.layout = layout;
       check(this.name, layout.document.scrollWidth <= layout.viewport.width, `the window does not overflow horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`);
-      if (layout.mainScroll.scrollsVertically) {
+      if (layout.viewScroll.scrollsVertically) {
         report(
           this.name,
-          `the main pane scrolls: ${layout.mainScroll.scrollHeight}px of content in ${layout.mainScroll.clientHeight}px ` +
+          `the clip page scrolls: ${layout.viewScroll.scrollHeight}px of content in ${layout.viewScroll.clientHeight}px ` +
             `(trim section bottom ${layout.trimSection?.bottom.toFixed(0)}, trim button bottom ${layout.trimButton?.bottom.toFixed(0)})`,
         );
       }
@@ -1499,11 +1549,8 @@ const states = [
         /asked for .*, the file is /.test(text),
         'the notice reports both the asked-for and the written length when they differ',
       );
-      const names = await page.locator('.name').allTextContents();
-      check(this.name, names.length === 7, `the new clip was added to the list (${names.length} rows)`);
-      check(this.name, names[0]?.includes('.trim-') === true, `the new clip is selected (${names[0]})`);
       const heading = (await page.getByRole('heading', { level: 1 }).textContent()) ?? '';
-      check(this.name, heading.includes('.trim-'), `the detail view switched to the new clip (${heading})`);
+      check(this.name, heading.includes('.trim-'), `the clip page switched to the new clip (${heading})`);
       const chips = await page.locator('.facts .chip').allTextContents();
       check(this.name, chips.every((c) => !/^row \d+$/.test(c.trim())), 'no chip names the index row: that was a debugging leftover, not clip metadata');
       const trimmedRange = await timelineGeometry(page);
@@ -1512,6 +1559,12 @@ const states = [
         trimmedRange.handles[0]?.value === 0,
         'the new clip opens with the full range selected',
       );
+      // The list gained the new clip; then back on its page, which is what the shot shows.
+      await backToLibrary(page);
+      const names = await page.locator('.name').allTextContents();
+      check(this.name, names.length === 7, `the new clip was added to the list (${names.length} rows)`);
+      check(this.name, names[0]?.includes('.trim-') === true, `the new clip is the newest row (${names[0]})`);
+      await openFirstClip(page);
     },
   },
   {
@@ -1519,12 +1572,18 @@ const states = [
     title: 'storage panel: the favourites alone exceed the cap',
     group: 'overcap',
     fixture: FAVOURITES_OVER_CAP_FIXTURE,
-    extraShots: [{ name: '07-storage-panel-closeup', selector: '.sidebar .storage' }],
+    extraShots: [{ name: '07-storage-panel-closeup', selector: '[data-region=storage] .storage' }],
     async verify(page) {
       await waitForThumbnails(page, 8);
+      check(
+        this.name,
+        (await page.locator('[data-region=clip-grid] ul li').count()) === 8,
+        'all eight clips are indexed',
+      );
+      await showView(page, 'Storage');
       // The figures and the verdict live behind the storage panel's disclosure — this state
       // is about what is inside it, and about the bar it draws, so it opens it first.
-      await page.locator('.sidebar .storage summary').click();
+      await page.locator('[data-region=storage] .storage summary').click();
       const verdict = page.locator('.panel .verdict.bad');
       check(this.name, (await verdict.count()) === 1, 'exactly one bad verdict is rendered');
       const text = ((await verdict.first().textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -1569,11 +1628,6 @@ const states = [
         !layout.storageScroll.scrollsVertically,
         `the storage panel's own content fits its box (${layout.storageScroll.scrollHeight}px in ${layout.storageScroll.clientHeight}px)`,
       );
-      check(
-        this.name,
-        (await page.locator('.sidebar ul li').count()) === 8,
-        'all eight clips are indexed',
-      );
     },
   },
   {
@@ -1584,13 +1638,14 @@ const states = [
     async verify(page) {
       // The startup warning is one of the three things this state photographs, and it is
       // rendered in the storage panel, so the disclosure is opened before the capture.
-      await page.locator('.sidebar .storage summary').click();
       const banner = page.locator('.banner.error');
       await banner.waitFor({ state: 'visible', timeout: 10_000 });
       const text = ((await banner.textContent()) ?? '').replace(/\s+/g, ' ').trim();
       check(this.name, text.includes('ffmpeg was not found'), `the error banner carries the command error (${JSON.stringify(text.slice(0, 80))})`);
       const placeholders = await page.locator('.thumb.placeholder').count();
       check(this.name, placeholders === 6, `every row falls back to the placeholder (${placeholders} of 6)`);
+      await showView(page, 'Storage');
+      await page.locator('[data-region=storage] .storage summary').click();
       const warnings = page.locator('.verdict.bad');
       check(this.name, (await warnings.count()) === 1, 'the startup warning is rendered in the storage panel');
       check(
@@ -1611,8 +1666,8 @@ const states = [
     group: 'recording',
     fixture: RECORDING_FIXTURE,
     async verify(page) {
-      const panel = page.locator('.sidebar .recorder');
-      check(this.name, await panel.isVisible(), 'the recorder panel is the sidebar\'s first panel');
+      const panel = page.locator('[data-region=recorder]');
+      check(this.name, await panel.isVisible(), 'the recorder bar is on screen');
       check(
         this.name,
         ((await panel.locator('.badge').textContent()) ?? '').trim() === 'REC',
@@ -1666,8 +1721,8 @@ const states = [
       );
       check(
         this.name,
-        layout.storage.bottom <= layout.viewport.height + 0.5,
-        `and the storage panel is still fully visible below it (bottom ${layout.storage.bottom.toFixed(0)})`,
+        layout.view.top >= layout.recorder.bottom - 0.5,
+        `and the active view starts below it (view top ${layout.view.top.toFixed(0)}, bar bottom ${layout.recorder.bottom.toFixed(0)})`,
       );
 
       // The half of the shell that is not a window, in the one place a user can read it:
@@ -1695,6 +1750,9 @@ const states = [
         'and names the config file this process read',
       );
 
+      // The engine counters are a popover: open it so the contrast audit reads real, painted text.
+      await panel.getByRole('button', { name: 'Engine counters' }).click();
+      check(this.name, await panel.locator('.engine-pop').isVisible(), 'the engine counters open from the bar');
       await auditContrast(page, this.name, {
         '.recorder .badge.recording': 'REC badge',
         '.recorder .hotkey': 'hotkey line',
@@ -1714,7 +1772,7 @@ const states = [
       // A real pointer event on the button the panel renders; the mock answers with the
       // clip `clip_now` would return, and the list is refreshed exactly as it is after a
       // real trigger.
-      await page.locator('.sidebar .recorder').getByRole('button', { name: 'Save clip' }).click();
+      await page.locator('[data-region=recorder]').getByRole('button', { name: 'Save clip' }).click();
 
       const notice = page.locator('.banner.notice');
       await notice.waitFor({ state: 'visible', timeout: 10_000 });
@@ -1748,14 +1806,20 @@ const states = [
     title: 'no hotkey: the chord that failed is on screen, and the app still works',
     group: 'nohotkey',
     fixture: NO_HOTKEY_FIXTURE,
-    extraShots: [{ name: '11-hotkey-not-installed-closeup', selector: '.sidebar .recorder' }],
+    extraShots: [{ name: '11-hotkey-not-installed-closeup', selector: '.recorder .engine-pop' }],
     async verify(page) {
       // The whole reason this panel exists in the shape it does. A hotkey that silently does
       // nothing is the worst outcome this feature has, so the failure is an alert above the
       // buttons — not a log line, and not a footnote under the numbers.
-      const panel = page.locator('.sidebar .recorder');
+      const panel = page.locator('[data-region=recorder]');
+      check(
+        this.name,
+        await panel.locator('.hotkey-alert').isVisible(),
+        'the bar itself flags the dead hotkey, without being opened',
+      );
+      await panel.getByRole('button', { name: 'Engine counters' }).click();
       const alert = panel.locator('.hotkey.bad');
-      check(this.name, await alert.isVisible(), 'the hotkey failure is visible in the recorder panel');
+      check(this.name, await alert.isVisible(), 'the hotkey failure is spelled out in the recorder popover');
 
       const text = ((await alert.textContent()) ?? '').replace(/\s+/g, ' ');
       check(this.name, text.includes('Ctrl+F8'), `it names the chord that failed (${JSON.stringify(text.slice(0, 80))})`);
@@ -1795,6 +1859,7 @@ const states = [
       await waitForThumbnails(page, 6);
       await auditContrast(page, this.name, {
         '.recorder .hotkey': 'hotkey alert',
+        '.recorder .hotkey-alert': 'hotkey flag in the bar',
         '.recorder .shell-notes .config': 'config path',
       });
     },
@@ -1806,6 +1871,7 @@ const states = [
     fixture: SESSION_FIXTURE,
     async verify(page) {
       await waitForThumbnails(page, 2);
+      await showView(page, 'Sessions');
       check(
         this.name,
         await page.getByText('No sessions are indexed yet').isHidden(),
@@ -1820,7 +1886,7 @@ const states = [
       // mid-transition (an opacity read during the fade is a fraction, not the verdict).
       await page.waitForFunction(
         () => {
-          const actions = document.querySelector('.sidebar ul li.selected .actions');
+          const actions = document.querySelector('[data-region=session-list] ul li.selected .actions');
           return actions !== null && getComputedStyle(actions).opacity === '1';
         },
         null,
@@ -1828,7 +1894,7 @@ const states = [
       );
       check(
         this.name,
-        await page.locator('.sidebar ul li.selected .actions').first().isVisible(),
+        await page.locator('[data-region=session-list] ul li.selected .actions').first().isVisible(),
         'the selected row reveals its actions once the fade settles',
       );
       check(
@@ -1836,6 +1902,7 @@ const states = [
         await page.getByRole('heading', { name: 'Dota 2' }).isVisible(),
         'selecting the session shows its detail, not a clip',
       );
+      check(this.name, (await page.locator('.banner.error').count()) === 0, 'opening a session reports no error');
       check(
         this.name,
         (await page.locator('.markers tbody tr').count()) === 3,
@@ -1855,14 +1922,20 @@ const states = [
       const layout = await layoutAudit(page);
       check(
         this.name,
-        layout.storage.bottom <= layout.viewport.height + 0.5,
-        `the storage panel is still inside the window with sessions listed (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
+        layout.sessionPage !== null && layout.sessionPage.right <= layout.viewport.width + 0.5,
+        `the session page fits beside the list (right edge ${layout.sessionPage?.right.toFixed(0)} of ${layout.viewport.width})`,
       );
+      check(
+        this.name,
+        layout.document.scrollWidth <= layout.viewport.width,
+        `nothing overflows horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`,
+      );
+      await auditContrast(page, this.name);
     },
   },
   {
     name: '13-long-lists',
-    title: 'long library: thirty clips and ten sessions stay inside the sidebar',
+    title: 'long library: thirty clips and ten sessions stay inside their views',
     group: 'long',
     fixture: LONG_FIXTURE,
     async verify(page) {
@@ -1874,11 +1947,6 @@ const states = [
         layout.document.scrollWidth <= layout.viewport.width,
         `nothing overflows horizontally (${layout.document.scrollWidth} of ${layout.viewport.width})`,
       );
-      check(
-        this.name,
-        layout.storage.bottom <= layout.viewport.height + 0.5,
-        `the storage panel stays reachable (bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
-      );
       if (layout.clipList.scrollsVertically) {
         report(this.name, `the clip list scrolls (${layout.clipList.scrollHeight}px of rows in ${layout.clipList.clientHeight}px)`);
       } else {
@@ -1886,14 +1954,27 @@ const states = [
       }
       check(
         this.name,
-        layout.sessionList !== null && layout.sessionList.clientHeight <= layout.viewport.height * 0.3 + 1,
-        `the session list respects its cap (${layout.sessionList.clientHeight.toFixed(0)}px of ${layout.viewport.height}px)`,
+        layout.view.bottom <= layout.viewport.height + 0.5,
+        `the library ends inside the window (bottom ${layout.view.bottom.toFixed(0)} of ${layout.viewport.height})`,
+      );
+      await showView(page, 'Sessions');
+      const sessions = await layoutAudit(page);
+      check(
+        this.name,
+        (await page.locator('[data-region=session-list] ul li').count()) === 10,
+        'all ten session rows render',
       );
       check(
         this.name,
-        !layout.sessionList.scrollsHorizontally,
+        sessions.sessionList !== null && !sessions.sessionList.scrollsHorizontally,
         'session rows do not scroll sideways',
       );
+      check(
+        this.name,
+        sessions.view.bottom <= sessions.viewport.height + 0.5,
+        `the sessions view ends inside the window (bottom ${sessions.view.bottom.toFixed(0)} of ${sessions.viewport.height})`,
+      );
+      await showView(page, 'Library');
     },
   },
   {
@@ -1909,13 +1990,7 @@ const states = [
         'the recorder says nothing is armed while auto-record is off',
       );
 
-      const layout = await layoutAudit(page);
-      check(
-        this.name,
-        layout.storage.bottom <= layout.viewport.height + 0.5,
-        `the closed settings panel costs almost no space (storage bottom ${layout.storage.bottom.toFixed(0)} of ${layout.viewport.height})`,
-      );
-
+      await showView(page, 'Settings');
       await page.locator('.settings summary').click();
       const panel = page.locator('.settings');
       check(this.name, await panel.getByRole('heading', { name: 'Library' }).isVisible(), 'the library section opens');
@@ -1987,11 +2062,11 @@ const states = [
   },
   {
     name: '15-short-window',
-    title: 'short window: the sidebar scrolls instead of losing storage',
+    title: 'short window (940x600, the minimum): every view scrolls itself, nothing is unreachable',
     group: 'short',
     fixture: LONG_FIXTURE,
     async verify(page) {
-      await page.setViewportSize({ width: 1280, height: 600 });
+      await page.setViewportSize({ width: 940, height: 600 });
       await page.waitForTimeout(150);
       await waitForThumbnails(page, 30);
       const layout = await layoutAudit(page);
@@ -2005,21 +2080,42 @@ const states = [
         (await page.locator('.name').count()) === 30,
         'the clip rows still render in a short window',
       );
-      const sidebar = await page.locator('.sidebar').evaluate((el) => ({
-        scrolls: el.scrollHeight > el.clientHeight + 1,
-        storageBelowFold:
-          (document.querySelector('.sidebar .storage')?.getBoundingClientRect().bottom ?? 0) >
-          window.innerHeight + 0.5,
-      }));
-      if (sidebar.storageBelowFold) {
-        check(this.name, sidebar.scrolls, 'storage below the fold means the sidebar scrolls');
-        await page.locator('.sidebar .storage').scrollIntoViewIfNeeded();
-      }
       check(
         this.name,
-        await page.locator('.sidebar .storage').isVisible(),
-        'the storage panel is reachable without fullscreening',
+        insideViewport(layout.recorder, layout.viewport),
+        `the recorder bar stays on screen (bottom ${layout.recorder.bottom.toFixed(0)} of ${layout.viewport.height})`,
       );
+      check(
+        this.name,
+        insideViewport(layout.rail, layout.viewport),
+        'and so does the rail, with every destination on it',
+      );
+
+      // Every destination is reachable: its content is on screen, or its own view scrolls to
+      // it. (The window never scrolls as a whole: that is the old sidebar's last resort, gone.)
+      for (const [label, selector] of [
+        ['Storage', '[data-region=storage] .storage'],
+        ['Health', '[data-region=health] .health'],
+        ['Settings', '[data-region=settings] .settings'],
+      ]) {
+        await showView(page, label);
+        const target = page.locator(selector);
+        await target.scrollIntoViewIfNeeded();
+        check(this.name, await target.isVisible(), `${label} is reachable in a 600px window`);
+        const after = await layoutAudit(page);
+        check(
+          this.name,
+          after.document.scrollWidth <= after.viewport.width && after.view.bottom <= after.viewport.height + 0.5,
+          `${label} fits the window width and its view ends inside it`,
+        );
+      }
+      await showView(page, 'Sessions');
+      check(
+        this.name,
+        await page.locator('[data-region=session-list] ul li').first().isVisible(),
+        'Sessions lists its rows with the detail pane beside them',
+      );
+      await showView(page, 'Library');
     },
   },
   {
@@ -2027,23 +2123,24 @@ const states = [
     title: 'storage panel: rows whose files are gone are named, not counted',
     group: 'missingfiles',
     fixture: MISSING_FILES_FIXTURE,
-    extraShots: [{ name: '16-storage-missing-closeup', selector: '.sidebar .storage' }],
+    extraShots: [{ name: '16-storage-missing-closeup', selector: '[data-region=storage] .storage' }],
     async verify(page) {
       await waitForThumbnails(page, 2);
-      await page.locator('.sidebar .storage summary').click();
-      const panel = page.locator('.sidebar .storage');
+      // The other half of the contradiction: the clips list must show the same set the
+      // storage panel counts, or the two views are disagreeing again.
+      check(
+        this.name,
+        (await page.locator('[data-region=clip-grid] ul li').count()) === 2,
+        'the clips list shows the two clips the panel will count',
+      );
+      await showView(page, 'Storage');
+      await page.locator('[data-region=storage] .storage summary').click();
+      const panel = page.locator('[data-region=storage] .storage');
       const text = ((await panel.locator('dl').textContent()) ?? '').replace(/\s+/g, ' ').trim();
       report(this.name, `storage figures: ${JSON.stringify(text)}`);
       check(this.name, /Clips on disk\s*2/.test(text), 'the count is the clips that are on disk');
       check(this.name, /Missing files\s*9/.test(text), 'and the rows left out are named');
       check(this.name, text.includes('whose file is gone'), 'with what became of them');
-      // The other half of the contradiction: the clips list must show the same set the
-      // storage panel counted, or the two panels are disagreeing again.
-      check(
-        this.name,
-        (await page.locator('.sidebar ul li').count()) === 2,
-        'the clips list shows the same two clips the panel counted',
-      );
     },
   },
 ];
@@ -2215,7 +2312,7 @@ async function main() {
         await page.goto(`${base}${state.url ?? '/?test-clip-source=1'}`, { waitUntil: 'load' });
         // The window's first paint is whatever the components do on mount; wait for the
         // list's own text so a screenshot cannot be taken mid-render.
-        await page.locator('.sidebar').waitFor({ state: 'visible' });
+        await page.locator('[data-region=rail]').waitFor({ state: 'visible' });
         await page.waitForFunction(() => {
           const images = [...document.images];
           return images.length === 0 || images.every((image) => image.complete);
@@ -2332,8 +2429,8 @@ async function main() {
  * label says "storage warning" — an audit that silently checks the wrong element.
  */
 const CONTRAST_LABELS = {
-  '.sidebar h2': 'pane heading',
-  '.pane-head .muted': 'clip count',
+  '[data-region=library] .view-head h2': 'view heading',
+  '[data-region=library] .view-head .muted': 'clip count',
   '.name': 'clip name',
   '.sub.muted': 'clip metadata',
   '.chip': 'fact chip',
