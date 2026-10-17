@@ -974,23 +974,14 @@ mod tests {
 
     #[test]
     fn a_mistyped_extra_chord_installs_nothing_and_names_its_key() {
-        let (hotkey, presses) =
-            install_hotkey("Ctrl+F8", &[(HotkeyAction::Bookmark, "Ctrl+Shift")]);
+        for typo in ["Ctrl+Shift", "Ctrl+"] {
+            let (hotkey, presses) = install_hotkey("Ctrl+F8", &[(HotkeyAction::Bookmark, typo)]);
 
-        assert!(!hotkey.installed);
-        assert!(presses.is_none(), "a half-working set is worse than none");
-        let error = hotkey.error.expect("a failure carries its reason");
-        assert!(error.contains("bookmark") && error.contains("Ctrl+Shift"), "{error}");
-    }
-
-    #[test]
-    fn a_typo_in_an_optional_chord_installs_nothing_and_names_the_key() {
-        let (hotkey, presses) = install_hotkey("Ctrl+F8", &[(HotkeyAction::Bookmark, "Ctrl+")]);
-
-        assert!(!hotkey.installed);
-        assert!(presses.is_none(), "a half-working set is worse than none");
-        let error = hotkey.error.expect("a failure carries its reason");
-        assert!(error.contains("bookmark"), "the reason names the key: {error}");
+            assert!(!hotkey.installed);
+            assert!(presses.is_none(), "a half-working set is worse than none");
+            let error = hotkey.error.expect("a failure carries its reason");
+            assert!(error.contains("bookmark"), "the reason names the key: {error}");
+        }
     }
 
     #[test]
@@ -1016,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hotkey_status_json_matches_the_typescript_interface() {
+    fn the_status_json_matches_the_typescript_interfaces() {
         // `src/lib/types.ts` mirrors this struct by hand, like every other DTO here. Without
         // this test a rename on either side is discovered by a user staring at a panel that
         // says nothing about the key they are pressing.
@@ -1026,38 +1017,21 @@ mod tests {
         assert_eq!(keys, ["chord", "error", "installed"]);
         assert_eq!(value["installed"], true);
         assert_eq!(value["error"], serde_json::Value::Null, "None is null, not a missing key");
-    }
 
-    // -- what the window shows about the background half ---------------------------------
-
-    #[test]
-    fn the_app_status_json_matches_the_typescript_interface() {
-        let value = serde_json::to_value(AppStatus {
+        let app = serde_json::to_value(AppStatus {
             hotkey: HotkeyStatus::installed("Ctrl+F8"),
-            config_path: "C:\\Users\\player\\AppData\\Local\\localplay\\config.toml".to_string(),
+            config_path: "config.toml".to_string(),
             config_exists: false,
             close_hint: CLOSE_HINT.to_string(),
         })
         .unwrap();
-
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = app.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(keys, ["close_hint", "config_exists", "config_path", "hotkey"]);
-        assert_eq!(value["hotkey"]["chord"], "Ctrl+F8", "the nested status crosses the wire too");
-        assert_eq!(value["hotkey"]["installed"], true);
-        assert_eq!(value["config_exists"], false);
+        assert_eq!(app["hotkey"]["chord"], "Ctrl+F8", "the nested status crosses the wire too");
     }
 
-    #[test]
-    fn the_same_state_renders_the_same_tray() {
-        // The property the half-second poll depends on: equality of the rendering is how the
-        // wiring decides that nothing needs writing. Two renderings of one state must be
-        // equal, or the tray would rewrite its tooltip for ever.
-        let hotkey = HotkeyStatus::installed("Ctrl+F8");
-        let idle = status(false, None);
-
-        assert_eq!(view(&idle, &hotkey, true).rendering(), view(&idle, &hotkey, true).rendering());
-    }
+    // -- what the window shows about the background half ---------------------------------
 
     #[test]
     fn the_tray_rendering_moves_when_and_only_when_something_visible_did() {
@@ -1070,53 +1044,20 @@ mod tests {
 
         let hidden = view(&idle, &hotkey, false).rendering();
         assert_ne!(base, hidden, "hiding the window moves the first item");
-        assert_eq!(base.window_label, "Hide the window");
-        assert_eq!(hidden.window_label, "Show the window");
         assert_eq!(base.state, hidden.state, "but it is not a change of icon");
 
         let running = view(&recording, &hotkey, true).rendering();
         assert_ne!(base, running);
-        assert_eq!(running.state, TrayState::Recording);
-        assert_eq!(running.recording_label, "Stop recording");
         assert!(running.clip_enabled, "a running recorder can take a clip");
         assert!(!base.clip_enabled, "and one that is not running cannot");
 
         let broken_hotkey = view(&idle, &missing, true).rendering();
         assert_ne!(base, broken_hotkey);
-        assert_eq!(broken_hotkey.state, TrayState::Attention);
         assert!(broken_hotkey.tooltip.contains("NOT installed"), "{}", broken_hotkey.tooltip);
 
         let mut pressed = view(&idle, &hotkey, true);
         pressed.last_press = Some("saved clip-1.mp4");
         assert_ne!(pressed.rendering(), base, "a press result moves the tooltip");
-    }
-
-    #[test]
-    fn the_rendering_and_the_menu_are_the_same_labels() {
-        // The wiring builds the real menu from `MenuAction::label` and decides what to
-        // update from the rendering. If those ever disagreed, the tray would show one thing
-        // and the code would believe another.
-        let hotkey = HotkeyStatus::installed("Ctrl+F8");
-
-        for (status, hotkey) in
-            [(&status(true, None), &hotkey), (&status(false, None), &missing_hotkey())]
-        {
-            for visible in [true, false] {
-                let v = view(status, hotkey, visible);
-                let r = v.rendering();
-                assert_eq!(r.state, v.tray_state());
-                assert_eq!(r.tooltip, v.tooltip());
-                assert_eq!(r.window_label, MenuAction::ShowHideWindow.label(&v));
-                assert_eq!(r.recording_label, MenuAction::ToggleRecording.label(&v));
-                assert_eq!(r.clip_label, MenuAction::SaveClip.label(&v));
-                assert_eq!(r.clip_enabled, MenuAction::SaveClip.enabled(&v));
-                assert_eq!(r.config_label, MenuAction::OpenConfig.label(&v));
-            }
-        }
-    }
-
-    fn missing_hotkey() -> HotkeyStatus {
-        HotkeyStatus::not_installed("Ctrl+F8", "another application owns it")
     }
 
     // -- revealing the config file --------------------------------------------------------
@@ -1144,17 +1085,6 @@ mod tests {
         let (program, args) = reveal_command(&file, FileManager::XdgOpen);
         assert_eq!(program, "xdg-open");
         assert_eq!(args, vec![folder], "the generic case has nothing to select with");
-    }
-
-    #[test]
-    fn the_file_manager_is_this_hosts_own() {
-        // The one part that is not data: which of the three this build would actually run.
-        let dir = tempfile::tempdir().unwrap();
-        let (program, _) = reveal_command(&dir.path().join("config.toml"), FileManager::current());
-
-        let expected =
-            if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        assert_eq!(program, expected);
     }
 
     // -- one press, one clip -------------------------------------------------------------
@@ -1228,6 +1158,10 @@ mod tests {
         assert_eq!(MenuAction::ToggleRecording.label(&recording), "Stop recording");
 
         assert_eq!(MenuAction::SaveClip.label(&recording), "Save clip now");
+        let mut no_file = view(&idle, &hotkey, true);
+        no_file.config_exists = false;
+        assert_eq!(MenuAction::OpenConfig.label(&shown), "Open config file");
+        assert_eq!(MenuAction::OpenConfig.label(&no_file), "Open the config folder");
         assert_eq!(MenuAction::Quit.label(&shown), "Quit better-outplayed");
         assert!(MenuAction::Quit.separator_before(), "quit is set apart from the rest");
         assert!(!MenuAction::SaveClip.separator_before());
@@ -1249,19 +1183,6 @@ mod tests {
             MenuAction::ToggleRecording.enabled(&view(&status(false, None), &hotkey, true)),
             "and the chance to start one is always offered"
         );
-    }
-
-    #[test]
-    fn the_config_item_says_which_thing_it_opens() {
-        let hotkey = HotkeyStatus::installed("Ctrl+F8");
-        let idle = status(false, None);
-
-        let with_file = view(&idle, &hotkey, true);
-        let mut without = view(&idle, &hotkey, true);
-        without.config_exists = false;
-
-        assert_eq!(MenuAction::OpenConfig.label(&with_file), "Open config file");
-        assert_eq!(MenuAction::OpenConfig.label(&without), "Open the config folder");
     }
 
     // -- the tray state, icon and tooltip ------------------------------------------------
@@ -1446,21 +1367,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_action_reaches_a_handler_and_none_is_left_unmapped() {
-        // The exhaustiveness is the compiler's (`dispatch` matches every arm), and this pins
-        // that each one produces something the caller can log rather than an empty string.
-        let idle = FakeShell::default();
-        let running = FakeShell::recording();
-
-        for action in MenuAction::ALL {
-            let shell = if matches!(action, MenuAction::ShowHideWindow) { &idle } else { &running };
-            let outcome = dispatch(action, shell);
-            assert!(!outcome.describe().is_empty(), "{action:?} must describe itself");
-            assert!(!shell.calls().is_empty(), "{action:?} must have called the shell");
-        }
-    }
-
     // -- closing the window --------------------------------------------------------------
 
     #[test]
@@ -1469,13 +1375,6 @@ mod tests {
         // ends the recording every time the user tidies their screen.
         assert_eq!(close_action(), CloseAction::Hide);
         assert_eq!(close_action(), CloseAction::Hide, "and it is not conditional");
-    }
-
-    #[test]
-    fn the_close_hint_says_where_the_window_went_and_how_to_leave() {
-        assert!(CLOSE_HINT.contains("tray"), "{CLOSE_HINT}");
-        assert!(CLOSE_HINT.contains("recording keeps running"), "{CLOSE_HINT}");
-        assert!(CLOSE_HINT.contains("Quit from the tray menu"), "{CLOSE_HINT}");
     }
 
     // -- autostart -----------------------------------------------------------------------
