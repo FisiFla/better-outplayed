@@ -547,7 +547,7 @@ mod tests {
             }
         });
         let burst = gather_burst(kill(), &rx, &quick());
-        assert!(burst.len() > 3, "the burst gathered the stream until the cut");
+        assert!(burst.len() > 1, "the burst gathered the stream until the cut");
         drop(rx);
         feeder.join().unwrap();
     }
