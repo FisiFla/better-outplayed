@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn every_surface_counts_the_clips_that_are_actually_there() {
-        // What the box showed: the listing filtered out rows whose files were gone and the
+        // What the Windows test machine showed: the listing filtered out rows whose files were gone and the
         // storage panel did not, so one panel read "No clips are indexed yet" directly
         // above "Indexed clips 12 (0 favourite), In use 1.2 GiB of 50 GiB" — twelve rows
         // whose files had been deleted. That "1.2 GiB in use" was the library's *recorded*

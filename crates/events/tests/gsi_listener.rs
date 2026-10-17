@@ -3,7 +3,7 @@
 //! The listener is started for real — a bound socket, the real request gate, the real token
 //! comparison, the real derivation — and driven by a hand-written HTTP client in this file.
 //! Nothing here is a mock of the listener; the only stand-in is the *game*, because no CS2 or
-//! Dota 2 client was run (see `docs/plans/2026-09-23-localplay-phase-4-integrations.md`).
+//! Dota 2 client was run (the real-client check is still outstanding).
 //!
 //! Every socket is on `127.0.0.1`, and every payload is a canned fixture. The tests assert
 //! four things the spec calls out explicitly:

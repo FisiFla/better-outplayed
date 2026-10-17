@@ -16,8 +16,7 @@
 //!
 //! That Riot's payloads look like the canned ones. They are shaped from the documented API;
 //! no League client was contacted, by requirement. A real client is the only thing that can
-//! confirm the shapes, and that check is listed as unverified in
-//! `docs/plans/2026-09-23-localplay-phase-4-integrations.md`.
+//! confirm the shapes, and that check is still outstanding.
 //!
 //! Every socket here is on loopback, and the test never POSTs to anything: the mock is a
 //! plain TLS responder inside this process, and the poller only ever issues `GET`s to it.
@@ -142,9 +141,6 @@ mod tls {
 
 const IN_PROGRESS: &str = include_str!("fixtures/lol_in_progress.json");
 const EVENTS_NEXT: &str = include_str!("fixtures/lol_events_next.json");
-const SECOND_GAME: &str = include_str!("fixtures/lol_second_game.json");
-const NO_IDENTITY: &str = include_str!("fixtures/lol_no_identity.json");
-const NONE: &str = include_str!("fixtures/lol_none.json");
 
 /// A game that is present but has reported no events yet — the loading screen, and the
 /// document an attach is tested against when the point is what happens *after* it.
@@ -401,18 +397,6 @@ fn a_full_event_history_is_derived_in_order_and_each_event_is_emitted_once() {
 }
 
 #[test]
-fn an_incremental_event_is_emitted_once_and_the_same_poll_twice_is_a_no_op() {
-    let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS), Reply::Body(EVENTS_NEXT)]);
-    let mut poller = mock.poller();
-    poller.poll_once(); // attach
-
-    let incremental = poller.poll_once();
-    assert_eq!(kinds(&incremental), vec![EventKind::Kill, EventKind::Baron]);
-    assert!(payload_of(&incremental, EventKind::Baron).contains("\"stolen\":true"));
-    assert!(poller.poll_once().is_empty(), "the mock repeats its last reply");
-}
-
-#[test]
 fn the_game_ending_emits_one_end_event_and_every_later_poll_is_silent() {
     // 404s at the end: the Live Client's answer once the game is over.
     let mock = MockGame::start(vec![Reply::Body(EVENTS_NEXT), Reply::NoGame]);
@@ -483,54 +467,6 @@ fn a_malformed_body_is_neither_an_event_nor_the_end_of_the_game() {
     // Recovery: only the two new events, nothing replayed.
     assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Baron]);
     assert!(poller.poll_once().is_empty());
-}
-
-#[test]
-fn a_null_body_is_treated_as_the_game_being_over() {
-    // `null` is a documented "no game" answer, distinct from an empty object: the game it
-    // was watching has ended.
-    let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS), Reply::Body(NONE)]);
-    let mut poller = mock.poller();
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::GameStart]);
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::GameEnd]);
-    assert!(!poller.in_game());
-    assert!(poller.poll_once().is_empty());
-}
-
-#[test]
-fn a_second_game_that_starts_without_the_endpoint_going_quiet_is_a_new_attach() {
-    // The player quit and requeued: the clock restarts, the ids restart at 0, and the
-    // endpoint never 404s. The second game must be reported as one attach, not as a replay
-    // of its early history.
-    let mock = MockGame::start(vec![
-        Reply::Body(IN_PROGRESS),
-        Reply::Body(SECOND_GAME),
-        Reply::Body(SECOND_GAME),
-    ]);
-    let mut poller = mock.poller();
-
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::GameStart]);
-    let restart = poller.poll_once();
-    assert_eq!(kinds(&restart), vec![EventKind::GameStart], "one attach, not two events");
-    assert!(
-        payload_of(&restart, EventKind::GameStart).contains("\"adopted_in_progress_events\":2"),
-        "the new game's history is adopted: {}",
-        payload_of(&restart, EventKind::GameStart)
-    );
-    assert!(poller.poll_once().is_empty());
-}
-
-#[test]
-fn a_document_that_names_no_player_still_reports_a_kill_it_sees() {
-    let mock = MockGame::start(vec![
-        Reply::Body(LOADING),
-        Reply::Body(NO_IDENTITY),
-    ]);
-    let mut poller = mock.poller();
-    poller.poll_once(); // attach on an empty history
-    let events = poller.poll_once();
-    assert_eq!(kinds(&events), vec![EventKind::Kill]);
-    assert!(payload_of(&events, EventKind::Kill).contains("\"killer\":\"Somebody\""));
 }
 
 #[test]

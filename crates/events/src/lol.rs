@@ -26,7 +26,7 @@
 //! with kernel-level anti-cheat and the machine it is installed on was not available. The
 //! payload shapes here come from the documented API and are treated as untrusted input —
 //! every field is optional and no payload, however malformed, can panic the parser. What
-//! that leaves unproven is written down in `docs/plans/2026-09-23-localplay-phase-4-integrations.md`.
+//! that leaves unproven is that no real client has been checked against these shapes.
 //!
 //! # The security arrangement, in one place
 //!

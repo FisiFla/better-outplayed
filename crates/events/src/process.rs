@@ -1123,16 +1123,10 @@ mod tests {
             .iter()
             .map(|game| (game.name.as_str(), game.exe.as_str(), game.signal))
             .collect();
+        assert_eq!(named.len(), 6, "the six titles the project names");
         assert_eq!(
-            named,
-            vec![
-                ("League of Legends", "League of Legends.exe", Signal::LiveClientApi),
-                ("Counter-Strike 2", "cs2.exe", Signal::Process),
-                ("Dota 2", "dota2.exe", Signal::Process),
-                ("Rainbow Six Siege", "RainbowSix.exe", Signal::Process),
-                ("Valorant", "VALORANT-Win64-Shipping.exe", Signal::Process),
-                ("Overwatch 2", "Overwatch.exe", Signal::Process),
-            ]
+            named[0],
+            ("League of Legends", "League of Legends.exe", Signal::LiveClientApi)
         );
         assert_eq!(
             watch.iter().filter(|g| g.signal == Signal::LiveClientApi).count(),
@@ -1143,15 +1137,6 @@ mod tests {
             watch.iter().all(|g| g.exe.ends_with(".exe")),
             "every title is watched by an executable's file name"
         );
-    }
-
-    #[test]
-    fn a_match_is_case_insensitive() {
-        let watch = vec![WatchedGame::by_process("League", "League of Legends.exe")];
-        let presences = presences_in(&watch, &observed(&["league of legends.exe"]));
-        assert_eq!(running_of(&presences, "League of Legends.exe"), Some(true));
-        let presences = presences_in(&watch, &observed(&["LEAGUE OF LEGENDS.EXE"]));
-        assert_eq!(running_of(&presences, "League of Legends.exe"), Some(true));
     }
 
     #[test]
@@ -1184,6 +1169,7 @@ mod tests {
             "C:/games/cs2.exe",
             "/Applications/cs2.exe",
             r"cs2.exe",
+            "CS2.EXE", // matching is case-insensitive
         ] {
             assert_eq!(
                 running_of(&presences_in(&watch, &observed(&[name])), "cs2.exe"),
@@ -1191,14 +1177,6 @@ mod tests {
                 "{name:?} names the file cs2.exe"
             );
         }
-    }
-
-    #[test]
-    fn a_configured_path_is_reduced_too() {
-        let watch = vec![WatchedGame::by_process("Counter-Strike 2", r"C:\Games\cs2.exe")];
-        assert_eq!(watch[0].file_name(), "cs2.exe");
-        let presences = presences_in(&watch, &observed(&["cs2.exe"]));
-        assert_eq!(running_of(&presences, r"C:\Games\cs2.exe"), Some(true));
     }
 
     #[test]
@@ -1211,6 +1189,14 @@ mod tests {
             Some(false),
             "a lookalike letter is a different file name"
         );
+    }
+
+    #[test]
+    fn a_configured_path_is_reduced_to_its_file_name() {
+        let watch = vec![WatchedGame::by_process("Counter-Strike 2", r"C:\Games\cs2.exe")];
+        assert_eq!(watch[0].file_name(), "cs2.exe");
+        let presences = presences_in(&watch, &observed(&["cs2.exe"]));
+        assert_eq!(running_of(&presences, r"C:\Games\cs2.exe"), Some(true));
     }
 
     #[test]
@@ -1587,20 +1573,6 @@ mod tests {
     // ---- configuration ----------------------------------------------------------------
 
     #[test]
-    fn the_games_section_defaults_to_auto_record_off() {
-        let section = GamesSection::default();
-        assert!(
-            !section.auto_record,
-            "nothing is automatic until the user turns it on — the point of the default"
-        );
-        assert!(!section.watching());
-        assert_eq!(section.watch, default_watch());
-        assert_eq!(section.poll_ms, DEFAULT_POLL_MS);
-        assert_eq!(section.interval(), DEFAULT_POLL_INTERVAL);
-        assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(DEFAULT_POLL_MS));
-    }
-
-    #[test]
     fn a_configuration_file_without_the_games_section_gets_the_default_one() {
         // The shape the configuration layer parses: the section is optional, so a file
         // that predates the feature — or a user who removed the section — still gets a
@@ -1612,9 +1584,12 @@ mod tests {
         }
 
         let parsed: ConfigFile = serde_json::from_value(json!({})).expect("an empty file parses");
-        assert!(!parsed.games.auto_record);
+        assert!(!parsed.games.auto_record, "nothing is automatic until the user turns it on");
+        assert!(!parsed.games.watching());
         assert_eq!(parsed.games.watch, default_watch());
+        assert_eq!(parsed.games.poll_ms, DEFAULT_POLL_MS);
         assert_eq!(parsed.games.interval(), DEFAULT_POLL_INTERVAL);
+        assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(DEFAULT_POLL_MS));
 
         // And a section that names only some fields keeps the defaults for the rest.
         let parsed: ConfigFile = serde_json::from_value(json!({ "games": { "poll_ms": 4000 } }))

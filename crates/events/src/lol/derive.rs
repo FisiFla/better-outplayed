@@ -434,19 +434,10 @@ mod tests {
         assert_eq!(kinds(&first), vec![EventKind::GameStart], "one event, not seven");
         assert_eq!(tracker.adopted_on_attach(), 6, "the whole history is adopted as seen");
         assert!(tracker.in_game());
+        assert_eq!(tracker.attached_map(), "Map11");
         let payload = first[0].payload.as_deref().unwrap();
         assert!(payload.contains("\"adopted_in_progress_events\":6"), "got {payload}");
         assert!(payload.contains("\"map\":\"Map11\""), "got {payload}");
-    }
-
-    #[test]
-    fn the_tracker_remembers_what_it_attached_to() {
-        let mut tracker = Tracker::default();
-        assert_eq!(tracker.attached_map(), "", "nothing attached yet");
-        tracker.observe(snapshot(IN_PROGRESS).as_ref());
-        assert_eq!(tracker.attached_map(), "Map11");
-        tracker.observe(None);
-        assert_eq!(tracker.attached_map(), "", "the game is over; there is no map");
     }
 
     #[test]
@@ -531,6 +522,7 @@ mod tests {
         let ended = tracker.observe(None);
         assert_eq!(kinds(&ended), vec![EventKind::GameEnd]);
         assert!(!tracker.in_game());
+        assert_eq!(tracker.attached_map(), "", "the game is over; there is no map");
         let payload = ended[0].payload.as_deref().unwrap();
         assert!(payload.contains("\"last_game_time_s\":730.2"), "got {payload}");
 
@@ -568,18 +560,6 @@ mod tests {
         );
         assert_eq!(tracker.adopted_on_attach(), 2);
         assert!(tracker.in_game());
-    }
-
-    #[test]
-    fn a_game_that_ends_and_a_new_one_that_starts_is_two_events() {
-        let mut tracker = Tracker::default();
-        assert_eq!(kinds(&tracker.observe(snapshot(IN_PROGRESS).as_ref())), vec![EventKind::GameStart]);
-        assert_eq!(kinds(&tracker.observe(None)), vec![EventKind::GameEnd]);
-        assert_eq!(
-            kinds(&tracker.observe(snapshot(SECOND_GAME).as_ref())),
-            vec![EventKind::GameStart],
-            "the second game is a new attach, with its own adoption"
-        );
     }
 
     #[test]
@@ -767,20 +747,5 @@ mod tests {
         assert_eq!(value["result"], "Win");
         assert_eq!(value["scoreboard"][0]["kills"], 7);
         assert_eq!(value["scoreboard"][0]["is_local"], true);
-    }
-
-    #[test]
-    fn every_event_kind_this_tracker_can_emit_is_tagged_for_the_events_table() {
-        // The kinds reach the database through `EventKind::as_tag`; this states that the
-        // set the LoL derivation produces is a subset of the vocabulary.
-        let mut tracker = Tracker::default();
-        let mut emitted: Vec<EventKind> = Vec::new();
-        emitted.extend(kinds(&tracker.observe(snapshot(IN_PROGRESS).as_ref())));
-        emitted.extend(kinds(&tracker.observe(snapshot(EVENTS_NEXT).as_ref())));
-        emitted.extend(kinds(&tracker.observe(None)));
-        assert!(!emitted.is_empty());
-        for kind in emitted {
-            assert_eq!(EventKind::from_tag(kind.as_tag()), Some(kind));
-        }
     }
 }

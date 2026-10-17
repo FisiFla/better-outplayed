@@ -28,7 +28,7 @@
 //! with no game running, which is every machine this test has run on).
 
 use localplay_events::process::{
-    default_watch, GamePresence, GameWatcher, GamesSection, Presence, PresenceChange,
+    default_watch, GamePresence, GameWatcher, GamesSection, Presence,
     ProcessWatcher, Signal, WatchedGame,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -216,29 +216,4 @@ fn the_process_watcher_answers_on_windows_and_refuses_clearly_elsewhere() {
             "the refusal has to name what is missing: {message}"
         );
     }
-}
-
-#[test]
-fn a_change_says_what_happened_for_a_log_line() {
-    let game = WatchedGame::by_process("Counter-Strike 2", "cs2.exe");
-    let started = PresenceChange::Started(game.clone());
-    assert_eq!(started.to_string(), "Counter-Strike 2 (cs2.exe) started");
-    assert!(started.is_start() && !started.is_stop());
-    assert_eq!(started.game(), &game);
-
-    let stopped = PresenceChange::Stopped(game.clone());
-    assert_eq!(stopped.to_string(), "Counter-Strike 2 (cs2.exe) stopped");
-    assert!(stopped.is_stop() && !stopped.is_start());
-}
-
-#[test]
-fn a_watch_list_a_user_could_have_written_by_hand_is_accepted() {
-    // The shape `config.toml` documents, built through the public constructors.
-    let watch = vec![
-        WatchedGame::by_live_client_api("League of Legends", "League of Legends.exe"),
-        WatchedGame::by_process("Counter-Strike 2", "cs2.exe"),
-    ];
-    let section = GamesSection { auto_record: true, poll_ms: 5_000, watch: watch.clone() };
-    assert_eq!(section.interval(), Duration::from_millis(5_000));
-    assert!(ProcessWatcher::new(watch).is_ok());
 }

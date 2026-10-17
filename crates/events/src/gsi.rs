@@ -25,7 +25,7 @@
 //! payload (the app id, then the provider name — see [`derive::Game`]). It does not react
 //! to the game exiting: if the process is killed there is no final POST and no event, so a
 //! `GameEnd` is only derived from a payload that says so (`map.phase == "gameover"`, Dota's
-//! `POST_GAME`). That gap is real, is recorded in `docs/plans/2026-09-23-localplay-phase-4-integrations.md`, and
+//! `POST_GAME`). That gap is real, and
 //! is why the League integration's end-of-game signal (the endpoint going quiet) is
 //! different from this one.
 

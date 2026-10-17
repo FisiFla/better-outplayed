@@ -295,8 +295,8 @@ impl MediaInfo {
 /// missing `amfrt64.dll` names itself).
 ///
 /// This exists because `ffmpeg -encoders` cannot answer the question. That list is what
-/// ffmpeg was *compiled* with, not what its runtime can initialise: measured on an RTX 3090
-/// box with no AMD hardware or driver at all, ffmpeg advertised `h264_amf` and then died
+/// ffmpeg was *compiled* with, not what its runtime can initialise: measured on the Windows test machine (an RTX 3090)
+/// with no AMD hardware or driver at all, ffmpeg advertised `h264_amf` and then died
 /// with `DLL amfrt64.dll failed to open` the moment it was asked to open the encoder. The
 /// design spec called for this smoke test alongside the encoder list (§5.2, and §13 lists
 /// the encoder list alone as a risk) and it is the difference between failing at startup
@@ -411,7 +411,7 @@ fn is_ffmpeg_chatter(line: &str) -> bool {
 ///
 /// - **NVENC** rejects anything under 145x145 *at the driver*, with "Frame Dimension less
 ///   than the minimum supported value" (ffmpeg trac #9251: 144x144 fails, 145x145 works). A
-///   64x64 probe would therefore have called a perfectly good RTX 3090 unusable.
+///   64x64 probe would therefore have called a perfectly good NVIDIA GPU unusable.
 /// - **QSV** has a minimum around 128x96.
 /// - **AMF** documents 64x64 for H.264 but 192x128 for HEVC, and one probe size has to
 ///   serve both codecs.
