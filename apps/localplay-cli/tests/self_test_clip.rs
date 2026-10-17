@@ -1,25 +1,22 @@
 //! The self-test trigger (`buffer --self-test-clip-after`), end to end.
 //!
-//! This is the verification-only way to take a clip **without synthesising input**: it
-//! waits until the ring holds a full window, calls the same [`Recorder::clip_now`] the
-//! `Ctrl+F8` hotkey calls (once), logs the trigger and `wrote …` lines the runbook's
-//! criteria already read, and stops. The hotkey itself still needs Windows — what can be
-//! tested off Windows is everything either side of it.
+//! The way to take a clip without synthesising input: it waits until the ring holds a full
+//! window, calls the same [`Recorder::clip_now`] the `Ctrl+F8` hotkey calls (once), logs the
+//! trigger and `wrote ...` lines, and stops. The hotkey itself needs Windows; everything either
+//! side of it is tested here.
 //!
-//! The test drives the real command in-process ([`localplay_cli::run_buffer_with`]), with
-//! the real engine, a real ffmpeg encoder and a real ring buffer, over the synthetic
-//! capture/audio sources. `--dev-software-encoder` (libx264) is what makes that possible
-//! on a host with no GPU encoder; it is reachable here because this package's dev
-//! dependencies enable `test-encoders`, which no shipping build does.
+//! Drives the real command in-process ([`localplay_cli::run_buffer_with`]) with the real engine,
+//! a real ffmpeg encoder and a real ring over the synthetic capture/audio sources.
+//! `--dev-software-encoder` (libx264) makes that possible on a host with no GPU encoder; it is
+//! reachable because this package's dev dependencies enable `test-encoders`, which no shipping
+//! build does.
 //!
-//! Gating: not `#![cfg(feature = "test-encoders")]`, deliberately — the suite's command
-//! line enables that feature on the *encoder* package and a `cfg` gate here would compile
-//! the file away and quietly drop the test (the same trap `post_roll.rs` documents). The
-//! dev-dependency edges in this package's manifest guarantee it instead.
+//! Gating: not `#![cfg(feature = "test-encoders")]`, deliberately: that feature is enabled on
+//! the encoder package, so a `cfg` gate here would quietly drop the test (the trap `post_roll.rs`
+//! documents).
 //!
-//! Nothing in this file (or in the code it tests) sends, simulates or injects a keyboard
-//! or mouse event; the trigger is an in-process call, and the assertion below pins the
-//! log line that says so.
+//! Nothing here sends, simulates or injects a keyboard or mouse event; the trigger is an
+//! in-process call, and an assertion below pins the log line that says so.
 
 use localplay_cli::{BufferOptions, run_buffer_with};
 use localplay_media::{FfmpegBinaries, MediaInfo};
@@ -78,14 +75,13 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         app_dir: app_dir.path().to_path_buf(),
         self_test_clip_after: Some(SELF_TEST_AFTER_S),
         dev_software_encoder: true,
-        // The file decides the mode (its `[recorder] mode`), and the real sources are used:
-        // this test is about the shipping path.
+        // The file decides the mode (its `[recorder] mode`), and the real sources are used: this test
+        // is about the shipping path.
         mode: None,
         stub_sources: false,
     });
-    // A headless CI runner has no audio render endpoint, so the *real* audio source cannot
-    // start there. That is an environment limit, not a defect: skip loudly rather than fake
-    // a device (a fake would prove nothing about the shipping path).
+    // A headless CI runner has no audio render endpoint, so the real audio source cannot start
+    // there. An environment limit, not a defect: skip loudly rather than fake a device.
     if let Err(err) = &result {
         if format!("{err:#}").contains("GetDefaultAudioEndpoint") {
             eprintln!("SKIPPED: no default audio render endpoint on this machine: {err:#}");
@@ -94,8 +90,8 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
     }
     result.expect("the self-test run must succeed");
 
-    // It really waited for the requested hold: the run cannot have finished faster than the
-    // media it had to buffer plus the post-roll.
+    // It really waited for the requested hold: the run cannot finish faster than the media it had
+    // to buffer plus the post-roll.
     let elapsed = started.elapsed();
     assert!(
         elapsed >= Duration::from_secs(SELF_TEST_AFTER_S),
@@ -118,18 +114,15 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
     assert_eq!(clips.len(), 1, "expected exactly one clip, got {clips:?}");
     let clip = &clips[0];
 
-    // The clip is the configured window: pre-roll AND post-roll. The tolerance is wider
-    // than the runbook's ±0.5 s because this run's `segment_time` is 1 s and the splice
-    // cuts on the segment grid — what it must rule out is a clip that is only one side of
-    // the window (≈1 s or ≈2 s) or empty.
+    // The clip is the configured window: pre-roll and post-roll. The tolerance is wider than 0.5 s
+    // because `segment_time` is 1 s and the splice cuts on the segment grid; it must rule out a clip
+    // of only one side of the window (~1 s or ~2 s) or an empty one.
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let info = MediaInfo::probe(&bin, clip).expect("the clip must be a readable media file");
-    // The clip carries BOTH sides of the window, and that is what this must rule out — along
-    // with an empty clip. It deliberately does not demand a tight fit to `WINDOW_MS`: the
-    // post-roll is whatever the encoder writes inside its budget, so a loaded machine
-    // legitimately produces a shorter clip (CI measured 2498ms of video for a 3066ms window in
-    // the encoder suite). The lower bound is the failure this exists to catch — a clip that
-    // stopped at the pre-roll, i.e. one side of the window rather than both.
+    // The clip carries both sides of the window. It does not demand a tight fit to `WINDOW_MS`: the
+    // post-roll is whatever the encoder writes inside its budget, so a loaded machine legitimately
+    // produces a shorter clip (CI measured 2498ms of video for a 3066ms window). The lower bound
+    // catches a clip that stopped at the pre-roll.
     assert!(
         info.duration_ms >= WINDOW_MS * 3 / 4 && info.duration_ms <= WINDOW_MS + 1_500,
         "clip duration {}ms is not the configured window ({WINDOW_MS}ms ± segment grid): a clip \
@@ -143,10 +136,9 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
     assert_eq!(audio.sample_rate, 48_000);
     assert_eq!(audio.channels, 2);
 
-    // The lines the runbook reads, produced by the hotkey's own trigger path: the `hotkey
-    // pressed:` trigger line (media time, wall time, drift) and the `wrote` line. The
-    // self-test line next to them says what triggered it, so a reader cannot mistake it
-    // for a keypress that never happened.
+    // The lines produced by the hotkey's own trigger path: the `hotkey pressed:` line (media time,
+    // wall time, drift) and the `wrote` line. The self-test line beside them says what triggered
+    // it, so it cannot be mistaken for a keypress.
     let log = logs.lock().expect("the log sink is not poisoned").clone();
     assert!(
         log.contains("no keyboard or mouse input is sent, simulated or injected"),
@@ -173,8 +165,8 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         log.contains(&clip.display().to_string()),
         "the wrote line must name the clip that is on disk; log:\n{log}"
     );
-    // The hotkey is unchanged and still installed: the run does not replace the shipping
-    // trigger, it calls the same engine entry point.
+    // The hotkey is unchanged and still installed: the run calls the same engine entry point and
+    // does not replace the shipping trigger.
     assert!(
         log.contains("buffering 2s pre / 1s post at 10fps; press Ctrl+F8 to clip"),
         "the shipping startup line must be unchanged; log:\n{log}"
@@ -183,8 +175,8 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
 
 /// The run's tracing output, for the assertions above.
 ///
-/// Installed once per test process (a global subscriber can only be set once), into a
-/// shared buffer. `debug` because the engine's status line is at that level.
+/// Installed once per test process (a global subscriber can be set once) into a shared buffer;
+/// `debug` because the engine's status line is at that level.
 fn capture_logs() -> Arc<Mutex<String>> {
     static LOGS: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
     LOGS.get_or_init(|| {
