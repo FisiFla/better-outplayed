@@ -122,45 +122,96 @@ code,
 
 /* -- shell layout -------------------------------------------------------------------- */
 
+/* The rail, and everything else: the recorder bar over the active view. */
 .shell {
   display: grid;
-  grid-template-columns: minmax(320px, 380px) 1fr;
+  grid-template-columns: 64px minmax(0, 1fr);
   height: 100%;
 }
 
-.sidebar {
+.content {
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  border-right: 1px solid var(--line);
-  background: var(--panel);
-  /*
-   * Last resort only: at the default height the lists absorb every deficit by
-   * scrolling themselves, so this never engages there (the layout audits pin
-   * that). In a short window the fixed chrome plus the lists' minimums can still
-   * exceed the viewport, and then the sidebar scrolls instead of pushing storage
-   * and settings somewhere unreachable with no way to get to them.
-   */
-  overflow-y: auto;
-}
-
-.main {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
   min-width: 0;
+  min-height: 0;
+}
+
+/*
+ * The active view owns the whole area below the bar and scrolls itself; nothing is ever
+ * pushed below a fold that cannot be reached, so there is no window-level scroll at 940x600.
+ */
+.view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--surface-1);
+}
+
+.view > section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Library: the list takes what is left and scrolls inside itself. */
+.library .grid {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Detail pages and system views read as a page, not a full-bleed pane. */
+.page {
   overflow-y: auto;
 }
 
-.pane-head {
+[data-region='storage'],
+[data-region='health'],
+[data-region='settings'] {
+  max-width: 880px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* Sessions: master list beside the open session. */
+.sessions {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+}
+
+.sessions .master {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.sessions .detail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.view-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 16px 8px;
-  /* Section chrome never squeezes below its content: all deficit lands on the two
-     lists, which scroll, instead of spilling buttons and verdicts over each other. */
+  padding: var(--s-4) var(--s-4) var(--s-2);
   flex: none;
+}
+
+.crumbs {
+  flex: none;
+  padding: var(--s-2) var(--s-3) 0;
 }
 
 /* -- primitives ---------------------------------------------------------------------- */
