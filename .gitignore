@@ -158,3 +158,6 @@ $RECYCLE.BIN/
 *~
 .claude/settings.local.json
 !crates/events/src/lol/riotgames.pem
+
+# svelte-check output
+.svelte-check/
