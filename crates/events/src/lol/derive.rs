@@ -493,7 +493,7 @@ mod tests {
 
         // 3. MinionsSpawning (id 1) and GameStart (id 0) are adopted without a clip.
         let payload = payload_of(&full, EventKind::Kill);
-        assert!(payload.contains("\"killer\":\"FisiFla#EUW\""), "got {payload}");
+        assert!(payload.contains("\"killer\":\"TestPlayer#EUW\""), "got {payload}");
         assert!(payload.contains("\"victim\":\"ZedMain\""), "got {payload}");
 
         // 4. The same document again: nothing.
@@ -611,7 +611,7 @@ mod tests {
         let with_player = |event: &str| -> Vec<EventKind> {
             let body = format!(
                 r#"{{"gameData":{{"gameTime":100.0,"mapName":"Map11"}},
-                     "activePlayer":{{"summonerName":"FisiFla#EUW"}},
+                     "activePlayer":{{"summonerName":"TestPlayer#EUW"}},
                      "events":{{"Events":[{event}]}}}}"#
             );
             let mut tracker = Tracker::default();
@@ -620,7 +620,7 @@ mod tests {
             tracker.observe(
                 crate::lol::payload::parse(
                     br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"},
-                         "activePlayer":{"summonerName":"FisiFla#EUW"}}"#,
+                         "activePlayer":{"summonerName":"TestPlayer#EUW"}}"#,
                 )
                 .unwrap()
                 .as_ref(),
@@ -630,15 +630,15 @@ mod tests {
         };
 
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"FisiFla#EUW","VictimName":"ZedMain"}"#),
+            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"TestPlayer#EUW","VictimName":"ZedMain"}"#),
             vec![EventKind::Kill]
         );
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"FisiFla#EUW"}"#),
+            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"TestPlayer#EUW"}"#),
             vec![EventKind::Death]
         );
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"EnemyTop","Assisters":["FisiFla#EUW"]}"#),
+            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"EnemyTop","Assisters":["TestPlayer#EUW"]}"#),
             vec![EventKind::Assist]
         );
         assert!(
@@ -690,7 +690,7 @@ mod tests {
         // The client has been seen to omit `EventID`. The fallback key is the event's own
         // content, so polling the same document twice is still a no-op.
         let body = br#"{"gameData":{"gameTime":100.0,"mapName":"Map11"},
-                       "activePlayer":{"summonerName":"FisiFla#EUW"},
+                       "activePlayer":{"summonerName":"TestPlayer#EUW"},
                        "events":{"Events":[{"EventName":"DragonKill","EventTime":99.3,"MonsterType":"DRAGON"}]}}"#;
         let document = crate::lol::payload::parse(body).unwrap();
 
@@ -698,7 +698,7 @@ mod tests {
         tracker.observe(
             crate::lol::payload::parse(
                 br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"},
-                     "activePlayer":{"summonerName":"FisiFla#EUW"}}"#,
+                     "activePlayer":{"summonerName":"TestPlayer#EUW"}}"#,
             )
             .unwrap()
             .as_ref(),
@@ -710,7 +710,7 @@ mod tests {
         // event".
         let other = crate::lol::payload::parse(
             br#"{"gameData":{"gameTime":110.0,"mapName":"Map11"},
-                 "activePlayer":{"summonerName":"FisiFla#EUW"},
+                 "activePlayer":{"summonerName":"TestPlayer#EUW"},
                  "events":{"Events":[{"EventName":"DragonKill","EventTime":99.3,"MonsterType":"DRAGON"},
                                      {"EventName":"BaronKill","EventTime":108.9,"MonsterType":"BARON_NASHOR"}]}}"#,
         )
@@ -723,7 +723,7 @@ mod tests {
         // Some builds put the end of the game in the stream. It ends the game; the 404
         // that follows must not end it again.
         let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
-                       "activePlayer":{"summonerName":"FisiFla#EUW"},
+                       "activePlayer":{"summonerName":"TestPlayer#EUW"},
                        "events":{"Events":[{"EventID":40,"EventName":"GameEnd","EventTime":2400.0}]}}"#;
         let document = crate::lol::payload::parse(body).unwrap();
 
@@ -754,8 +754,8 @@ mod tests {
     #[test]
     fn an_in_stream_game_end_carries_the_result_and_the_scoreboard() {
         let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
-                       "activePlayer":{"summonerName":"FisiFla#EUW"},
-                       "allPlayers":[{"summonerName":"FisiFla#EUW","championName":"Ahri","team":"ORDER",
+                       "activePlayer":{"summonerName":"TestPlayer#EUW"},
+                       "allPlayers":[{"summonerName":"TestPlayer#EUW","championName":"Ahri","team":"ORDER",
                                       "scores":{"kills":7,"deaths":2,"assists":9,"creepScore":210,"wardScore":20.0}}],
                        "events":{"Events":[{"EventID":40,"EventName":"GameEnd","EventTime":2400.0,"Result":"Win"}]}}"#;
         let document = crate::lol::payload::parse(body).unwrap();

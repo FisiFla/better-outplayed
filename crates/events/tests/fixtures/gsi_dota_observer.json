@@ -16,7 +16,7 @@
     "game_state": "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS"
   },
   "player": [
-    { "steamid": "76561198000000009", "name": "FisiFla", "kills": 4, "deaths": 2, "assists": 6 },
+    { "steamid": "76561198000000009", "name": "TestPlayer", "kills": 4, "deaths": 2, "assists": 6 },
     { "steamid": "76561198000000010", "name": "SomeoneElse", "kills": 1, "deaths": 1, "assists": 0 }
   ]
 }
