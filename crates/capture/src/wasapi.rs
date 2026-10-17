@@ -21,9 +21,16 @@
 //! There is deliberately no fallback if `Initialize` with that format fails. Capturing the
 //! endpoint's raw format and labelling it 48kHz would desynchronise the audio timeline, so a
 //! refusal is loud and names the requested format.
+//!
+//! # Timing
+//!
+//! Each packet is placed by its device QPC timestamp, not by how many bytes came before it (see
+//! [`AudioTimeline`]): loopback sends nothing while nothing plays, so a byte count alone would
+//! play every later sample early against the video.
 
 #![cfg(windows)]
 
+use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
 use crate::platform::init_com;
 use crate::{
     clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
@@ -38,13 +45,15 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// The format every consumer downstream assumes and the audio engine is asked to deliver, so the
@@ -72,14 +81,9 @@ const MAX_PACKETS_PER_CALL: usize = 16;
 /// WASAPI loopback capture of the default render endpoint, opened as 48kHz stereo s16le with the
 /// engine converting (see the module docs).
 pub struct WasapiLoopback {
-    /// Published format; always `TARGET`, which is what the engine was asked to deliver.
-    format: AudioFormat,
     client: Option<Client>,
-    /// Samples that do not yet add up to a whole 10ms block.
-    pending: Vec<u8>,
-    /// pts of the next block to be published, stamped when its first sample arrived.
-    pending_pts: Duration,
-    last_pts: Duration,
+    /// Places packets by device time and slices the result into 10ms blocks.
+    timeline: AudioTimeline,
     /// Whether this thread's COM apartment was taken by us and must be given back.
     com_owned: bool,
     /// Diagnostic for the reported `AUTOCONVERTPCM`-delivers-silence failure (see
@@ -94,6 +98,9 @@ struct Client {
     /// Whether the endpoint's native format needed the engine's converter (was not already 48kHz
     /// stereo s16), so the capture loop can decide whether silence is worth blaming on conversion.
     converting: bool,
+    /// One instant read on both the QPC and the shared clock, to move packet timestamps across.
+    anchor_hns: u64,
+    anchor: Duration,
 }
 
 // SAFETY: the backend is used from one thread at a time: the one that called `start`, which is
@@ -129,11 +136,8 @@ impl Drop for Client {
 impl WasapiLoopback {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            format: TARGET,
             client: None,
-            pending: Vec::new(),
-            pending_pts: Duration::ZERO,
-            last_pts: Duration::ZERO,
+            timeline: AudioTimeline::new(TARGET, Duration::ZERO),
             com_owned: false,
             // Disarmed until `start` learns whether the endpoint needed conversion.
             silence_watch: ConvertedSilenceWatch::new(false),
@@ -157,9 +161,9 @@ impl AudioBackend for WasapiLoopback {
         self.com_owned = init_com()?;
         match open_client() {
             Ok(client) => {
-                self.pending.clear();
-                self.pending_pts = Duration::ZERO;
-                self.last_pts = Duration::ZERO;
+                // Frame 0 is the moment capture began, so a session that opens on silence still
+                // starts its audio alongside the video.
+                self.timeline.reset(client.anchor);
                 // A fresh session gets a fresh watch, armed only if the endpoint needed the engine's converter.
                 self.silence_watch = ConvertedSilenceWatch::new(client.converting);
                 self.client = Some(client);
@@ -176,42 +180,25 @@ impl AudioBackend for WasapiLoopback {
     /// Returns the next whole 10ms block, or `Ok(None)` when nothing is due within `timeout`. A zero
     /// timeout is a non-blocking "is anything due?" check, how the CLI drains audio without starving video.
     fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-        let Self { client, format, pending, pending_pts, last_pts, silence_watch, .. } = self;
-        let client = client.as_ref().context("WASAPI loopback capture is not started")?;
-        let block_bytes = format.bytes_per_10ms();
-        let block_frames = format.sample_rate as usize / 100;
-        let block_duration =
-            Duration::from_micros(block_frames as u64 * 1_000_000 / format.sample_rate as u64);
+        let Self { client, timeline, silence_watch, .. } = self;
+        let client = client.as_mut().context("WASAPI loopback capture is not started")?;
         let deadline = Instant::now() + timeout;
 
         loop {
-            // Take everything the engine has already handed us.
-            for _ in 0..MAX_PACKETS_PER_CALL {
-                let starting_empty = pending.is_empty();
-                if !pull_packet(client, pending)? {
-                    break;
-                }
-                if starting_empty {
-                    // Stamp the block's first sample on the shared clock now, and let further blocks in the same
-                    // burst follow by exactly one block of samples each. This is when the packet was retrieved,
-                    // not played: loopback hands a buffer over about one device period late, so audio timestamps
-                    // carry up to ~10ms of offset against video. Sample-accurate QPC stamps are deferred.
-                    *pending_pts = clock_base().elapsed().max(*last_pts);
-                }
+            // Take everything the engine has already handed us, then pad any stretch it sent nothing for.
+            if timeline.drain(client, MAX_PACKETS_PER_CALL)? {
+                timeline.fill_to(clock_base().elapsed());
             }
 
-            if pending.len() >= block_bytes {
-                let data: Vec<u8> = pending.drain(..block_bytes).collect();
-                let pts = (*pending_pts).max(*last_pts);
-                *last_pts = pts;
-                *pending_pts = pts + block_duration;
-                let buffer = AudioBuffer { data, frames: block_frames, pts, format: *format };
-
+            if let Some(block) = timeline.next_block() {
+                let buffer = block.buffer;
+                let block_duration =
+                    Duration::from_micros(buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate));
                 // Diagnostic only: if the endpoint was engine-converted and every block so far was pure
                 // silence, this is the reported AUTOCONVERTPCM failure and the user should hear about it
                 // rather than find a silent clip. It latches (one warning per session) and never errors or
-                // stops capture.
-                if silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
+                // stops capture. Padding is skipped: the engine sending nothing says nothing about conversion.
+                if !block.filler && silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
                     tracing::warn!(
                         silent_run_secs = silence_watch.silent_run().as_secs_f64(),
                         capture_secs = silence_watch.elapsed().as_secs_f64(),
@@ -248,7 +235,7 @@ impl AudioBackend for WasapiLoopback {
     fn stop(&mut self) -> Result<()> {
         // Dropping the client stops the stream and closes the event handle.
         self.client = None;
-        self.pending.clear();
+        self.timeline.reset(Duration::ZERO);
         self.release_com();
         Ok(())
     }
@@ -354,6 +341,7 @@ fn open_client() -> Result<Client> {
         unsafe { audio.GetService() }.context("IAudioClient::GetService(IAudioCaptureClient)")?;
     // SAFETY: the stream is fully configured at this point.
     unsafe { audio.Start() }.context("IAudioClient::Start")?;
+    let (anchor_hns, anchor) = qpc_anchor()?;
 
     // The endpoint's native format next to the requested one: `converting=true` plus audible 48kHz
     // stereo audio in the clip shows the engine is converting, without a debugger.
@@ -367,7 +355,25 @@ fn open_client() -> Result<Client> {
         converting = native.needs_conversion(),
         "WASAPI loopback capture started on the default render endpoint"
     );
-    Ok(Client { audio, capture, event, converting: native.needs_conversion() })
+    Ok(Client { audio, capture, event, converting: native.needs_conversion(), anchor_hns, anchor })
+}
+
+/// The QPC in 100ns units and the shared clock, read back to back. `Instant` is QPC-based on
+/// Windows, so the two then differ by a constant and one reading maps every packet timestamp.
+fn qpc_anchor() -> Result<(u64, Duration)> {
+    let mut frequency = 0i64;
+    let mut counter = 0i64;
+    // SAFETY: both are valid out-parameters for the duration of the calls.
+    unsafe {
+        QueryPerformanceFrequency(&mut frequency).context("QueryPerformanceFrequency")?;
+        QueryPerformanceCounter(&mut counter).context("QueryPerformanceCounter")?;
+    }
+    let anchor = clock_base().elapsed();
+    if frequency <= 0 || counter < 0 {
+        bail!("QueryPerformanceCounter returned frequency {frequency}, count {counter}");
+    }
+    let hns = (counter as u128 * 10_000_000 / frequency as u128) as u64;
+    Ok((hns, anchor))
 }
 
 /// Frees the mix-format blob the audio engine hands back.
@@ -461,37 +467,45 @@ pub(crate) fn requested_format() -> WAVEFORMATEX {
     }
 }
 
-/// Pull one packet from the capture client and append it to `out`.
-///
-/// Returns whether a packet was consumed. Callers must not assume `out` grew: a packet can be
-/// empty, or flagged silent (its buffer contents are then undefined; only the frame count matters).
-fn pull_packet(client: &Client, out: &mut Vec<u8>) -> Result<bool> {
-    // SAFETY: the capture client is alive for as long as `client` is.
-    let available = unsafe { client.capture.GetNextPacketSize() }
-        .context("IAudioCaptureClient::GetNextPacketSize")?;
-    if available == 0 {
-        return Ok(false);
+impl PacketSource for Client {
+    /// Pull one packet from the capture client and append it to `out`. A packet can be empty, or
+    /// flagged silent (its buffer contents are then undefined; only the frame count matters).
+    fn pull(&mut self, out: &mut Vec<u8>) -> Result<Option<PacketInfo>> {
+        // SAFETY: the capture client is alive for as long as `self` is.
+        let available = unsafe { self.capture.GetNextPacketSize() }
+            .context("IAudioCaptureClient::GetNextPacketSize")?;
+        if available == 0 {
+            return Ok(None);
+        }
+
+        let mut data: *mut u8 = std::ptr::null_mut();
+        let mut frames: u32 = 0;
+        let mut flags: u32 = 0;
+        let mut qpc_position: u64 = 0;
+        // SAFETY: all four are valid out-parameters; the device position is not needed because the
+        // QPC position already says when the first frame played.
+        unsafe {
+            self.capture
+                .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc_position))
+                .context("IAudioCaptureClient::GetBuffer")?
+        };
+
+        // The buffer must be released however the copy below turns out.
+        let copied = append_packet(data, frames, flags, out);
+        // SAFETY: `frames` is exactly the count `GetBuffer` just reported.
+        let released = unsafe { self.capture.ReleaseBuffer(frames) };
+        copied?;
+        released.context("IAudioCaptureClient::ReleaseBuffer")?;
+
+        let timestamp_ok = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc_position != 0;
+        Ok(Some(PacketInfo {
+            frames: frames as usize,
+            time: timestamp_ok
+                .then(|| qpc_to_shared(qpc_position, self.anchor_hns, self.anchor))
+                .flatten(),
+            discontinuity: flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+        }))
     }
-
-    let mut data: *mut u8 = std::ptr::null_mut();
-    let mut frames: u32 = 0;
-    let mut flags: u32 = 0;
-    // SAFETY: all three are valid out-parameters; the device and QPC positions are not needed
-    // because pts comes from the shared Instant base.
-    unsafe {
-        client
-            .capture
-            .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-            .context("IAudioCaptureClient::GetBuffer")?
-    };
-
-    // The buffer must be released however the copy below turns out.
-    let copied = append_packet(data, frames, flags, out);
-    // SAFETY: `frames` is exactly the count `GetBuffer` just reported.
-    let released = unsafe { client.capture.ReleaseBuffer(frames) };
-    copied?;
-    released.context("IAudioCaptureClient::ReleaseBuffer")?;
-    Ok(true)
 }
 
 /// Append one packet's samples to `out`.
