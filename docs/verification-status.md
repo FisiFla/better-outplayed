@@ -15,7 +15,7 @@ named, so every line below can be re-checked.
 ## The headline, stated plainly
 
 > **The Windows-only surface has now run on Windows.** On 2026-09-24 the whole Rust workspace
-> was built *and its test suite executed* on the box (Windows 11, RTX 3090): every crate's
+> was built *and its test suite executed* on the Windows test machine (Windows 11, NVIDIA RTX-class GPU): every crate's
 > tests, the egress guards, and — in a real desktop session, with the owner's approval — a
 > genuine capture run that wrote a clip. That session is §10. It is the first time the
 > recording engine, the storage policy, the game-presence code, the WGC and WASAPI capture
@@ -25,10 +25,10 @@ named, so every line below can be re-checked.
 >
 > **Correction (2026-10-17).** An earlier version of this paragraph said the desktop **GUI** had
 > "never run". That stopped being true on 2026-09-26: the installer was built, installed and
-> run on the box in Session 1 (`docs/packaging.md` §3.5, pid 23320, up for 30 seconds), and the
-> rebuilt app was run again with its own log file (`docs/HANDOFF.md`: pid 24728, 28 MB), whose
+> run on the Windows test machine in Session 1 (`docs/packaging.md` §3.5, up for 30 seconds), and the
+> rebuilt app was run again with its own log file (28 MB), whose
 > output diagnosed the stale-clip-index fault behind the reported symptoms. So the window
-> *has* been opened on the box. What that does **not** establish: the tray's appearance, the
+> *has* been opened on the Windows test machine. What that does **not** establish: the tray's appearance, the
 > hotkey keypress, hide-on-close, and that the console windows are gone (a human has to watch;
 > the log cannot show a window).
 >
@@ -39,10 +39,10 @@ named, so every line below can be re-checked.
 > §21, §23.)
 >
 > The earlier measurement stands as the state of *that* build, and has since been measured again on
-> later ones: the 2026-09-23 session (RTX 3090, 3840x2160 at 150% scaling, [issue #1]) proved the
+> later ones: the 2026-09-23 session (NVIDIA RTX-class GPU, 3840x2160 at 150% scaling, [issue #1]) proved the
 > capture→encode→ring-buffer→splice path can run, and found that **the pipeline cannot sustain the
 > configured frame rate at 4K and burns ~50% of a CPU core doing it** ([issue #1]). Both of those
-> have since come back as passing, and both measurements are on the box: **§13** for the rate
+> have since come back as passing, and both measurements are on the Windows test machine: **§13** for the rate
 > (`fps=56.9/60`, 8 dropped of 10,525) and **§15** for the core (3.1–4.0% of one core, on a path
 > that stops the captured frame crossing to the CPU at all).
 
@@ -52,7 +52,7 @@ If that paragraph surprises you, it is doing its job. The rest of this file is t
 (`07b90fc`) on the Windows box. It runs the criteria it can automate in one bounded
 session and writes `target\verify\report.md` — every check with its threshold, its
 measured value and the raw output behind it — marking anything it could not perform as
-*not performed*, with the reason. From an SSH session, use
+*not performed*, with the reason. From a remote shell, use
 `scripts/verify-in-interactive-session.ps1`, because a capture session needs a desktop.
 **The harness first ran on Windows on 2026-10-15** (§21, §23; before that it had only been
 exercised on the development host against the synthetic backends), and its own report is still
@@ -123,7 +123,7 @@ The per-item tables remain the source of truth; this is a summary of them.
 
 ## 1. The Windows capture runs and the retained ring
 
-Environment: **RTX 3090, Intel i7-13700K, 3840x2160 primary display at 150% DPI scaling**,
+Environment: **an NVIDIA RTX-class GPU, a 13th-gen Intel desktop CPU, 3840x2160 primary display at 150% DPI scaling**,
 configured `encode.fps = 30`, `Ctrl+F8` hotkey, H.264. The measurements below are recorded
 in [issue #1] and [issue #2]; the harness's own argument list is quoted in issue #2.
 
@@ -132,7 +132,7 @@ Command used to check the source of every row: `gh issue view 1` / `gh issue vie
 | Claim | Level | Evidence / number |
 |---|---|---|
 | WGC capture starts and delivers frames at the monitor's native **3840x2160** | Verified on Windows hardware | issue #1 measurement table, "Capture resolution — 3840x2160, real content — PASS" |
-| The encoder child runs with **`h264_nvenc`** | Verified on Windows hardware | issue #2, the encoder's actual argument list: `-c:v h264_nvenc -b:v 20000k -g 30 …`; also issue #1 (RTX 3090 → NVENC) |
+| The encoder child runs with **`h264_nvenc`** | Verified on Windows hardware | issue #2, the encoder's actual argument list: `-c:v h264_nvenc -b:v 20000k -g 30 …`; also issue #1 (NVIDIA GPU → NVENC) |
 | Audio is transported to the encoder over **loopback TCP** and muxed as **48 kHz stereo AAC** | Verified on Windows hardware | issue #2 arg list: `-f s16le -ar 48000 -ac 2 -i tcp://127.0.0.1:51234 … -c:a aac -b:a 192k` |
 | The ring buffer writes segments | Verified on Windows hardware | issue #1: `frames=1814 segments=57 bytes=37795772 span=57000ms dropped=1183 …`; issue #2: segments every ~1.25 s |
 | A `Ctrl+F8` clip is produced and its **duration matches the target** | Verified on Windows hardware | issue #2: "a clip of **13,091 ms** was produced against a **13,000 ms** target, written **137 ms** after the post-roll elapsed" |
@@ -141,7 +141,7 @@ Command used to check the source of every row: `gh issue view 1` / `gh issue vie
 | The clip's **video codec is H.264** and **audio is AAC 48 kHz stereo** | Verified on Windows hardware | follows from criteria 4/5/8 passing (issue #1) + the fixed pipeline format; and the audio is confirmed **non-silent** by measurement — the retained clip probed `mean_volume = -31.7 dB, max_volume = -11.3 dB` (a silent track would sit near -91 dB) — see the read-only note below. |
 | The scratch-**cap** eviction ran and held | Verified on Windows hardware | a **15,000,000-byte** cap with a ledger `total_bytes = 14880356` (≤ cap) and 24 segments on disk, `seg-000063.mp4` … `seg-000086.mp4` — 63 segments evicted, oldest-first. Re-derived read-only from the retained ring, not from a committed log (see below). |
 
-### Re-derived read-only from files still on the box
+### Re-derived read-only from files still on the Windows test machine
 
 When this repository was inspected there was no committed log carrying these numbers; the
 fresh values below come from **read-only analysis of the scratch ring and one clip still
@@ -169,22 +169,22 @@ understated the state and has since been corrected.
 | Cannot sustain the configured frame rate at 4K | Verified on Windows hardware | **~24 fps** sustained against **30 fps** configured — issue #1 |
 | Frames dropped by the encoder | Verified on Windows hardware | **~45% of delivered frames**; the debug line reads `dropped=1183` of ~3000 delivered — issue #1 |
 | CPU cost | Verified on Windows hardware | **50.8% of one core** against a **< 5%** target — issue #1 (criterion 6 **FAIL** on this path; **met since on the zero-copy path, §15**) |
-| The media timeline does not track real time | Verified on Windows hardware — the measurement is unresolved there; **the mechanism is now measured on the dev host and fixed** | the divergence on the box is real, and two informal measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring). Both measured the *write* position, which is what `span_ms` is; the mechanism is the frame-rate conversion (see below), and the fix takes the dev host's ratio from 0.660× to 0.987×. **The box's own number is still unmeasured** |
+| The media timeline does not track real time | Verified on Windows hardware — the measurement is unresolved there; **the mechanism is now measured on the dev host and fixed** | the divergence on the Windows test machine is real, and two informal measurements disagree on direction: **≈0.81x** (media slower; segments written every ~1.25 s of wall clock — issue #2) versus **≈1.11x** (media faster; segment mtimes average **~899 ms** apart on the retained ring). Both measured the *write* position, which is what `span_ms` is; the mechanism is the frame-rate conversion (see below), and the fix takes the dev host's ratio from 0.660× to 0.987×. **The Windows test machine's own number is still unmeasured** |
 | RSS (the one criterion-6 half that passed) | Verified on Windows hardware | 235 MB, peak 267 MB against a < 400 MB target — issue #1 |
 
-The box's two figures are **both readings of the write position** (`span_ms` is
+The Windows test machine's two figures are **both readings of the write position** (`span_ms` is
 `completed segments × segment_time`), which is why they can disagree between runs and why
 neither settles the mechanism on its own: what they measure is how fast ffmpeg's muxer got
 through a grid that required `R` frames a second — slower when the encoder was short, and
 apparently faster in a run whose scratch cap had evicted segments and shifted the ledger's
 origin. The earlier confident **0.81x** figure stays **withdrawn** (issue #2's correction
-comment), and the *rerun that will settle the box's number* is prescribed below. On the dev
+comment), and the *rerun that will settle the Windows test machine's number* is prescribed below. On the dev
 host the same reading is now 0.987× rather than 0.660× after the timeline fix, because the
 grid that made it a throughput measurement is gone.
 
 **How to measure it properly — do not infer it from file mtimes.** mtimes measure *writes*,
 not the media they carry, so a cadence read off mtimes is not the media-vs-real-time ratio.
-On the box, take the periodic debug line and compare its `span=` field against wall-clock
+On the Windows test machine, take the periodic debug line and compare its `span=` field against wall-clock
 time across a sustained run, and its `fps=` field against the configured rate. The ratio that
 matters is media-time (`span`) per wall-clock second, read from the log on a run long enough
 (minutes) to average out segment jitter.
@@ -210,7 +210,7 @@ twice on the way, so read this as the final account:
   fed frame and reading its media timestamp back out of the encoded segments (49 distinct
   frames, 1085 output frames, media span 8001 ms against an arrival span of 9027 ms — slope
   0.94 against *write* times, the small deficit being ffmpeg's own read lag, not a warp). So
-  the box's original complaint was about the ring's clock and the *staleness* it implies
+  the Windows test machine's original complaint was about the ring's clock and the *staleness* it implies
   (footage at the trigger was seconds old), not about time-compressed pictures.
 
 **The fix, and the A/B that justifies it.** `-fps_mode passthrough` on the video output
@@ -279,15 +279,15 @@ the probe's number is *more* optimistic. It remains as what it always should hav
 diagnostic that reports the sustainable rate and a pacing aid that keeps capture from paying
 for frames the encoder will drop.
 
-`gh issue list --state all` then showed both issues **OPEN**, and both still needed the box. Both
+`gh issue list --state all` then showed both issues **OPEN**, and both still needed the Windows test machine. Both
 have since had their readings taken and both are now **closed** — #1 and #2 — leaving #3 open:
 
-- issue #1 (throughput): **closed.** The box produced what it asked for and more: `fps=56.9/60`
+- issue #1 (throughput): **closed.** The Windows test machine produced what it asked for and more: `fps=56.9/60`
   with 8 dropped of 10,525 (§13), and criterion 6's CPU number, which the zero-copy path then met
   at 3.1–4.0% of one core with `capture_copy=0.6–0.7%` (§15).
 - issue #2 (the timeline): **closed.** The *direction and magnitude* question above was answered by
   mechanism and by the local A/B (the ring's clock was the write position and it ran at 0.66×; it is
-  now ~0.99×), and the fix is in the shipping argument list. **The box's own number has since been
+  now ~0.99×), and the fix is in the shipping argument list. **The Windows test machine's own number has since been
   taken** — §13's `media=180266ms wall=180372ms` over 180 s, a drift of 0.06% — which is what
   settles it, and which also shows passthrough leaves the machine able to encode the frames it
   actually captures.
@@ -308,11 +308,11 @@ Source checked with `git log --oneline` and by reading each module's own doc com
 | **The silence detector** for a converted-but-silent endpoint (`2a63949`) | Type-checked only | it only fires on the path above, which has never run; `crates/capture/src/lib.rs` says the failure mode is "external and **unverified at runtime**" |
 | **Encoder child** (`crates/encoder/src/ffmpeg.rs`, ffmpeg sidecar) — H.264 via hardware encoder | Verified on Windows hardware | `h264_nvenc` in issue #2's arg list; criteria 4/5 passed |
 | **Audio over loopback TCP** (`47cd974`) | Verified on Windows hardware | `tcp://127.0.0.1:51234` in issue #2's arg list |
-| **Hardware-encoder selection + smoke test** (`6e63977`, `xtask probe`) | Verified on Windows hardware | the `advertised, FAILS` case was observed on the box (see §1) |
+| **Hardware-encoder selection + smoke test** (`6e63977`, `xtask probe`) | Verified on Windows hardware | the `advertised, FAILS` case was observed on the Windows test machine (see §1) |
 | **`Frame` move instead of clone on submit** (`f6a5a0e`) | Type-checked only | `f6a5a0e` message: "not measured here — there is no Windows host to measure it on" |
 | **Ring buffer, segment ledger and cap eviction** (`crates/replay`) | Verified on Windows hardware | segments written; criterion 2 passed (issue #1), and the retained ring now records the cap (**15 MB**) and oldest-first eviction (§1) |
 | **Clip splicing** (`crates/replay`, `crates/media`) — lossless `-c copy` remux | Verified on Windows hardware | the 13,091 ms clip; criteria 4 and 5 passed (issues #1, #2) |
-| **The media-time trigger** (`55f1541`) | Verified on Windows hardware | fixed and confirmed on the box (issue #2: "Verified on hardware") |
+| **The media-time trigger** (`55f1541`) | Verified on Windows hardware | fixed and confirmed on the Windows test machine (issue #2: "Verified on hardware") |
 | **The self-test trigger** — the same media-time trigger, reached without synthesising input (`d8ec96b`) | Verified on the dev host (the trigger), not on Windows | `apps/localplay-cli/tests/self_test_clip.rs::the_self_test_trigger_writes_a_clip_through_the_hotkey_path` drives the whole command in-process over real ffmpeg: it waited for the ring to hold the configured window, called `Recorder::clip_now()` once, and wrote a real clip (8,053 ms for an 8,000 ms window, `encoder=libx264`). What still needs Windows is not the trigger but the keypress that reaches the *same* call |
 
 ### Tests that cover the non-Windows half of this path
@@ -343,7 +343,7 @@ executes a Windows API.
 | Desktop **recording wiring** — Start/Stop/Save clip over the engine (`ce81aef`, `bf87be0`) | Verified on the dev host (headless) | frontend `vitest` (`apps/desktop/src/lib/recording.test.ts` etc.), shell Rust tests, and headless render screenshots (`2f0be65`). **No GUI window is opened.** |
 | Desktop **background half** — the tray menu and its state-dependent labels, the tooltip and icon state, the menu-action → shell-call mapping, the close-to-hide rule, the `[app]` defaults and the autostart decision table | Verified on the dev host | `apps/desktop/src-tauri/src/background.rs` unit tests (pure functions over plain data), `config.rs` tests for the new `[hotkeys]`/`[app]` reader, `apps/desktop/src/lib/recording.test.ts` for the two display rules, and the headless screenshot state `11-hotkey-not-installed`. **The tray, the window hide and the keypress themselves are not covered by any of this** — see §9. |
 | The hotkey **trigger path** in the GUI — one press, one clip, through `RecorderHost::clip_now` | Verified on the dev host (headless) | `apps/desktop/src-tauri/src/commands.rs::one_hotkey_press_writes_exactly_one_clip_through_the_recorder` drives a **real** recording (stub capture source, libx264, a real ring, a real splice, a real index row) and asserts exactly one clip file, one index row and one count in the engine. The press is an in-process call — no input is synthesised. |
-| **Hotkey registration failure is reported** (`225a1fe` in `crates/events`) | **Verified on Windows hardware** (2026-09-24, §10) | `RegisterHotKey` genuinely failed on the box — `This operation requires an interactive window station. (0x800705B3)`, over SSH — and the error returned to the caller **named the chord**: "the chord Ctrl+F8 could not be registered (RegisterHotKey failed: …)". The previous claim was that this "has never run"; it has, and the branch that was expected to be unreachable in practice turns out to be the one an SSH session always takes. A `#[cfg(windows)]` test now asserts the failure names the chord. The parse-failure and "no global hotkey on this platform" branches remain unit-tested (`background::install_hotkey`). |
+| **Hotkey registration failure is reported** (`225a1fe` in `crates/events`) | **Verified on Windows hardware** (2026-09-24, §10) | `RegisterHotKey` genuinely failed on the Windows test machine — `This operation requires an interactive window station. (0x800705B3)`, from a remote shell — and the error returned to the caller **named the chord**: "the chord Ctrl+F8 could not be registered (RegisterHotKey failed: …)". The previous claim was that this "has never run"; it has, and the branch that was expected to be unreachable in practice turns out to be the one a remote-shell session always takes. A `#[cfg(windows)]` test now asserts the failure names the chord. The parse-failure and "no global hotkey on this platform" branches remain unit-tested (`background::install_hotkey`). |
 | **Sidecar pipeline** (`07b9d83`) — fetch + SHA-256 verify + allowlisted extract | Verified on the dev host | `xtask/src/sidecars.rs` unit tests (zip-slip rejected, symlink rejected, mismatch refused, allowlist honoured) |
 | **Phase 4 — LoL Live Client poller** (`3ae0a01`) | Verified on the dev host (mocks only) | `crates/events/tests/lol_mock.rs` drives a real TLS server on loopback; see §5 |
 | **Phase 4 — CS2/Dota 2 GSI listener** (`32774ff`) | Verified on the dev host (mocks only) | `crates/events/tests/gsi_listener.rs` over real loopback sockets |
@@ -390,12 +390,12 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | A hotkey registration failure is returned rather than swallowed (`crates/events`) | `225a1fe` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `07b90fc` | Verified on the dev host only, and only in the sense that it runs and reports honestly there: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has never run on Windows**, which is the only place it is meant to matter |
 | The pipeline **paces capture to a rate it can actually keep**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate`. **This is a pacing aid and a diagnostic, not the timeline guarantee** (see the two rows below, and §1) | `e051b60`, `411c32e` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, its numbers do not transfer to NVENC (hardware, content-blind), and the probe measures the encode path only — on this host it reported 62 fps where the pipeline achieved 8 |
-| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the box against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **failed on Windows**, and it turned out to be a real loss of audio rather than a test artefact: the encoder's own queue was too short to ride out a momentary stall in ffmpeg and discarded 760 ms of a 3 s feed (§10.4). |
+| The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the Windows test machine against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **failed on Windows**, and it turned out to be a real loss of audio rather than a test artefact: the encoder's own queue was too short to ride out a momentary stall in ffmpeg and discarded 760 ms of a 3 s feed (§10.4). |
 | A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`localplay_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
 
 The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
 dev host (stub capture, `--dev-software-encoder`, so the encoder is libx264 at the stub's
-1280x720 — **these numbers are this host's and say nothing about the box's**):
+1280x720 — **these numbers are this host's and say nothing about the Windows test machine's**):
 
 ```text
 # encode.fps = 30, measured far above it: nothing is reduced
@@ -436,7 +436,7 @@ What a green run does **not** prove — quoted from the workflow's own header:
 
 - **No Windows runtime verification.** "Not one line of the WASAPI or WGC backends is
   *executed* here; they are only compiled. A green run says nothing about how the app
-  behaves on a real machine." (§10 is where they were executed — by hand, on the box.)
+  behaves on a real machine." (§10 is where they were executed — by hand, on the Windows test machine.)
 - **No GUI window.** "No window is opened, the screen is never captured and no input is
   synthesised."
 - **`localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell are not
@@ -481,8 +481,8 @@ $ gh run view 35904179918 --log-failed
 
 ## 7. Known limitations — do not mistake these for bugs, or for working features
 
-- ~~**The box's own media/wall ratio has never been measured with the fix in place.**~~
-  **Measured on the box, 2026-09-25 (§13):** `media=180266ms wall=180372ms`, a drift of
+- ~~**The Windows test machine's own media/wall ratio has never been measured with the fix in place.**~~
+  **Measured on the Windows test machine, 2026-09-25 (§13):** `media=180266ms wall=180372ms`, a drift of
   106 ms over 180 seconds. The media clock is the wall clock to 0.06%, so `pre_seconds`
   means real seconds. The mechanism (`-fps_mode passthrough`) was already in the tree; this
   was the one reading that was outstanding.
@@ -491,7 +491,7 @@ $ gh run view 35904179918 --log-failed
   segment boundary can step the concatenated timeline back by ≤ ~50 ms. All three are
   measured in §1; before the fix the clip was exactly nominal and its footage was seconds
   stale.
-- ~~**Criteria 1 and 6 fail on 4K hardware.**~~ **Re-measured on the box, 2026-09-25 (§13),
+- ~~**Criteria 1 and 6 fail on 4K hardware.**~~ **Re-measured on the Windows test machine, 2026-09-25 (§13),
   and they now part company.** Criterion 1 **passes**: the pipeline sustains **`fps=56.9/60`**
   at 3840x2160 with `h264_nvenc` and drops 8 frames of 10,525 — against ~24 fps at 30 with 45%
   dropped when the issue was filed. Criterion 6 **failed on this path** — **88.9% of one core**
@@ -534,8 +534,7 @@ $ gh run view 35904179918 --log-failed
   (runbook "Known gaps").
 - **The Phase 4 integrations have never been run against a game.** No League client and no
   CS2/Dota 2 client was ever contacted; the payloads are canned fixtures and the servers are
-  mocks in the test process (see `docs/plans/2026-09-23-localplay-phase-4-integrations.md`
-  §5 for the full, itemised list of what that leaves unproven).
+  mocks in the test process; the module docs of `crates/events` list what that leaves unproven.
 - **The desktop shell has never been a background application in practice.** The tray icon,
   its menu, the icon/tooltip state changes, the close-to-hide behaviour, the notification-like
   hint and the `Ctrl+F8` keypress are all **unobserved**: no window has been opened, no
@@ -573,7 +572,7 @@ $ gh run view 35904179918 --log-failed
   `Config::validate`, which names what *is* implemented rather than recording something else.
   `bitrate_kbps` still reaches ffmpeg's `-b:a` — 192 kbps for a front-end that carries no value
   (the desktop shell, which does not parse `[audio]`) — and is unused when `enabled = false`.
-  **It is measured**: §17 below carries the box run — one `h264` stream, and no audio stream at
+  **It is measured**: §17 below carries the Windows test machine run — one `h264` stream, and no audio stream at
   all.
 
 ---
@@ -626,7 +625,7 @@ observation; the Phase 1 runbook
 > writes `target\verify\report.md`: the probe, a bounded buffer run with the CPU/RSS
 > window, the media-vs-real-time ratio from `span=`, the cap and eviction, the clip taken
 > through the CLI's own `--self-test-clip-after` trigger (**no synthetic input anywhere**),
-> the ffprobe of that clip, and criterion 7's fail-loud path. Run it from an SSH session
+> the ffprobe of that clip, and criterion 7's fail-loud path. Run it from a remote shell
 > with `scripts/verify-in-interactive-session.ps1`, which puts it in the logged-on user's
 > desktop session through a one-shot scheduled task and cleans up afterwards.
 >
@@ -642,7 +641,7 @@ observation; the Phase 1 runbook
 > hand at least once, because a report's green cell is not the same thing as a person
 > having watched the clip and heard the audio.
 
-1. **`cargo xtask probe`** — confirms which hardware encoders this box can actually open.
+1. **`cargo xtask probe`** — confirms which hardware encoders this machine can actually open.
    Cheap, no capture. Confirms the encoder half of the path.
 2. **`cargo run --release -p localplay-cli -- buffer`** on the 4K display for ~40 s, then
    read the debug line. Look for: **`skipped=` non-zero** (the readback skip, `dd921b3`)
@@ -668,7 +667,7 @@ observation; the Phase 1 runbook
    current build.
 7. **Set the Windows default playback device to 44.1 kHz or 96 kHz and record a clip** —
    exercises the WASAPI autoconversion (`0848fc7`) and the silence detector (`2a63949`).
-   **Half done** (§10.2): the autoconversion *has* now run — the box's default render endpoint
+   **Half done** (§10.2): the autoconversion *has* now run — the Windows test machine's default render endpoint
    reported `native_sample_format=F32` and the backend logged `converting=true`, and the clip
    that came out had audio in it. What has still never run anywhere is the **detector
    firing**: that needs an endpoint that converts *and* is silent, which a live machine does
@@ -702,13 +701,13 @@ observation; the Phase 1 runbook
 ## 10. The 2026-09-24 Windows session — the suite, run on Windows
 
 The first time this project's tests were **executed** on Windows rather than type-checked for
-it. Method: `git archive HEAD | tar -xz` on the box (`C:\Users\player\localplay`; the box has
+it. Method: `git archive HEAD | tar -xz` on the Windows test machine (in a scratch directory; it has
 no `git`), then `cargo test`. The toolchain is cargo/rustc 1.98.1 and the *system* ffmpeg
 9.0.2 — the same ffmpeg version as the dev host, which matters for reading §10.4 below.
 
 ### 10.1 What ran, and what it proved
 
-`cargo test --workspace --features localplay-encoder/test-encoders --no-fail-fast`, in an SSH
+`cargo test --workspace --features localplay-encoder/test-encoders --no-fail-fast`, in a remote-shell
 session (session 0, no desktop):
 
 | Crate | Result |
@@ -752,7 +751,7 @@ buffer session #1 closed: 9 segment(s), 7114374 bytes in the scratch ring, no se
 Read that against the ledger above. It moves, in one run: **WGC capture** on a real display,
 **WASAPI loopback** including the engine-side sample-rate conversion (`converting=true`),
 **hardware-encoder selection in the shipping build** (`h264_nvenc` chosen by `vendor = "auto"`
-on the box's own GPU — six `type-checked only` rows in §1 turn on this alone), the **microphone
+on the Windows test machine's own GPU — six `type-checked only` rows in §1 turn on this alone), the **microphone
 track surviving the lossless concat** (two audio streams in the clip — the defect §10.3 fixed,
 now confirmed on hardware), and the **bookmark event** a manual clip records, linked to its
 session.
@@ -794,7 +793,7 @@ streams agree:
 the two timelines must agree to within the muxer's granularity: video 2934ms, audio 2023ms
 ```
 
-Per segment, from the sibling test on the same box:
+Per segment, from the sibling test on the same machine:
 
 ```
 seg-000000.mp4: video 1000ms, audio 896ms
@@ -804,7 +803,7 @@ seg-000003.mp4: video   67ms, audio   0ms
 ```
 
 The audio stopped about 1.5s into a 3s feed while 3010ms was *fed*. Two things were known, and
-both ruled out the obvious answers: the box's ffmpeg is 9.0.2, the same version as the dev host,
+both ruled out the obvious answers: the Windows test machine's ffmpeg is 9.0.2, the same version as the dev host,
 so it was not an ffmpeg difference; and **the real capture run in §10.2 measured `video 7000ms
 audio 6997ms`**, 3ms apart, so it was not general to the Windows product. The assertion was
 **left failing rather than widened**, which was right — it was guarding a real property, and the
@@ -832,7 +831,7 @@ seconds, ~576 KB**, with the comment above it saying why — the video queue is 
 cannot bend (33.2 MB each), the audio queue is a rounding error beside it, and the microphone's
 queue is sized the same way because it carries the same payload to the same child.
 
-Verified on the box at `e4d4098` plus this one constant, unmodified test, three consecutive runs,
+Verified on the Windows test machine at `e4d4098` plus this one constant, unmodified test, three consecutive runs,
 `test result: ok. 3 passed; 0 failed` each time:
 
 ```
@@ -857,8 +856,8 @@ on purpose. **The bound did not move. What was fixed was the behaviour it bounds
 The list is shorter than it was, and every remaining item needs something a script cannot
 supply:
 
-* **The desktop GUI.** No window was opened on the box *in this session*. (Superseded: the app
-  was run on the box on 2026-09-26, see the correction in the headline; the tray, the keypress
+* **The desktop GUI.** No window was opened on the Windows test machine *in this session*. (Superseded: the app
+  was run on the Windows test machine on 2026-09-26, see the correction in the headline; the tray, the keypress
   and hide-on-close remain unobserved, and §8 stands for those.)
 * **`cargo xtask verify`** (`07b90fc`): never run on Windows *as of this session* (it first ran on 2026-10-15, §21). §10 is not a substitute — it ran
   the *tests*, not the acceptance harness, and the harness's own report is still the thing to
@@ -866,7 +865,7 @@ supply:
 * **A real game.** Both Phase 4 integrations remain unrun against one.
 * **The silence detector *firing*** (`2a63949`): the converted-loopback path executed in §10.2
   (`converting=true`), but the detector did not trip — a live microphone was connected.
-* **The pinned sidecar** (`binaries/ffmpeg.exe`): §10.2 used the box's *system* ffmpeg.
+* **The pinned sidecar** (`binaries/ffmpeg.exe`): §10.2 used the Windows test machine's *system* ffmpeg.
 * **A synthesised keypress.** Never, by policy: input synthesis is exactly what must not happen
   on a machine running an anti-cheat, and a test is not a reason to make an exception. The
   hotkey's *failure* path is now verified (§10.3); its *success* path needs a human at the
@@ -876,7 +875,7 @@ supply:
 
 `localplay-cli` **exits** when the clip hotkey cannot be registered — deliberate, and the
 comment explains why (a buffer run whose chord does nothing is not worth starting). The
-2026-09-24 session showed what that means in practice: **the CLI cannot run at all over SSH,
+2026-09-24 session showed what that means in practice: **the CLI cannot run at all from a remote shell,
 as a service, or on a headless box**, and neither can `--mode session`, which records
 continuously and needs no hotkey. Kept as designed, by the owner's decision; recorded here
 because "the CLI refuses to start headlessly" is the kind of thing that belongs in a ledger
@@ -893,7 +892,7 @@ test modules:
 | `crates/encoder/src/mft.rs:1149` | the test called `probe_hardware_encoders()`, a function that had grown a `VideoCodec` parameter | `3f2fe49` *Make the hardware path codec-aware, so HEVC can take it* |
 | `crates/encoder/src/ffmpeg.rs:1890,1895` | `a_dead_writer_reports_ffmpegs_exit_status_and_stderr` used `std::os::unix::fs::PermissionsExt` and a `#!/bin/sh` stub with no `#[cfg(unix)]` gate | `6e63977` *smoke-test hardware encoders so an advertised-but-unusable one fails loudly* |
 
-Neither was visible from anywhere that runs. The box's Windows sessions since then named a test
+Neither was visible from anywhere that runs. The Windows test machine's Windows sessions since then named a test
 file (`--test timeline`), which builds only that target; and this repository's own Windows gate
 is a `cargo check` of the *libraries*, which never compiles `#[cfg(test)]` code:
 
@@ -923,7 +922,7 @@ cross-check list now compiles with its tests, and the encoder's library-only che
 only its pre-existing unused-import warning. `localplay-media` and `localplay-events` already
 gated their own unix-only test code properly, so the encoder was the whole of it.
 
-On the box the whole crate is green and has run there for the first time since 2026-09-25:
+On the Windows test machine the whole crate is green and has run there for the first time since 2026-09-25:
 `30 + 3 + 2 + 3 + 3 passed, 0 failed`, exit 0. That includes `mft.rs`'s own test, which is the
 one this defect silenced — and it is the test that asks the machine what hardware encoders it
 has, so its answer is worth recording: **ten MFTs**, of which the **NVIDIA H.264 and HEVC
@@ -1036,8 +1035,8 @@ rather than a guessed length.
 
 ### It runs on Windows (2026-09-25)
 
-The tree was shipped to the box as an archive — it has no `git` — and extracted to a **fresh
-directory** (`C:\Users\player\localplay-ram`), so nothing of the owner's was overwritten, then
+The tree was shipped to the Windows test machine as an archive — it has no `git` — and extracted to a **fresh
+directory** (a separate scratch location), so nothing of the owner's was overwritten, then
 built and tested there natively (`cargo 1.98.1`, host `x86_64-pc-windows-msvc`). League was not
 running at the time and nothing captured, displayed or injected anything: `cargo test` is CPU
 only.
@@ -1082,11 +1081,11 @@ instead of a window. The test is unchanged, deliberately: it passes because the 
 asserts is now the ordering there is. Reproduced on the dev host by widening the window on
 purpose — 600 extra expired sessions for the retention pass to evict — and polling every 200µs:
 `game: Some("Dota 2")` alongside `running: false` before the change, `None` at that same instant
-after it. Not re-run on Windows; the box is where the window was first seen, and this is the
+after it. Not re-run on Windows; the Windows test machine is where the window was first seen, and this is the
 dev-host diagnosis of it.
 
 What is **not** claimed: nothing here exercises NVENC, AMF or QSV — the tests run the software
-encoder, as they do on the dev host. The hardware-encoder selection was verified on this box in
+encoder, as they do on the dev host. The hardware-encoder selection was verified on this machine in
 §10, before this change, and this change does not touch it. A real capture run into a RAM buffer
 on Windows is still unperformed; what ran is the test suite with stub sources.
 
@@ -1140,10 +1139,10 @@ is the real difference between a session and a rolling buffer, and it is better 
 
 ---
 
-## 13. The 4K soak on the box (2026-09-25) — the measurement issues #1 and #2 were waiting for
+## 13. The 4K soak on the Windows test machine (2026-09-25) — the measurement issues #1 and #2 were waiting for
 
-Issue #2's own closing comment says the one thing that would close it is "the box's own ratio, taken
-with the fix in place" and that no number from the box had been taken. Issue #1 says the same about
+Issue #2's own closing comment says the one thing that would close it is "the Windows test machine's own ratio, taken
+with the fix in place" and that no number from the Windows test machine had been taken. Issue #1 says the same about
 `dropped=` / `fps=` / `configured=`. Both were taken in a single run.
 
 ### How it was run, so it can be repeated
@@ -1198,7 +1197,7 @@ WGC frame pool is created at the capture item's size, so it is not a configurati
 the measurement that makes it moot rather than merely unexercised.
 
 **Not measured: 1080p**, and the reason is worth recording rather than glossing. Issue #1 asks for it
-"to separate '4K is hard' from 'the pipeline is slow'", and on this box it cannot be had by
+"to separate '4K is hard' from 'the pipeline is slow'", and on this machine it cannot be had by
 configuration: only the primary monitor is captured, that monitor is 4K, and the pool size follows
 it. Taken from session 0 the display list reports a 1024x768 virtual device, so the real geometry is
 only visible inside the interactive session. A 1080p measurement needs either the display resolution
@@ -1264,9 +1263,8 @@ what came back: see §15**, where the copy falls to 0.7% of the loop and the cor
 
 §14 bounded what removing the readback could buy and could not test it, because the path did not
 exist. It exists now, it is in the tree, and it is the **default wherever a hardware encoder is
-present**. This is the measurement §14 asked for. It was taken on the same box, against the same
-4K/60 soak and the same example config, by the work recorded in
-`docs/plans/2026-09-25-localplay-tier-2-zero-copy.md` and `docs/plans/2026-09-25-localplay-hevc.md`.
+present**. This is the measurement §14 asked for. It was taken on the same machine, against the same
+4K/60 soak and the same example config, by the zero-copy and HEVC work recorded in §15.
 
 What it is: the WGC texture goes to NVIDIA's H.264 Media Foundation encoder unchanged (`ARGB32`,
 no colour conversion), the encoder's own thread turns it into an H.264 elementary stream, and
@@ -1275,7 +1273,7 @@ which is the entire point — §14 measured that crossing as 97% of the loop. `e
 an `Option<bool>`: unset means *use the hardware path when the hardware is there*, `true` means
 *require it and refuse to start without it*, `false` turns it off.
 
-### The numbers, same box, same soak
+### The numbers, same machine, same soak
 
 | | shipping path | hybrid, inline | hybrid, threaded |
 |---|---|---|---|
@@ -1319,13 +1317,13 @@ EXITED after 36.2s
 zero-copy: captured textures go straight to the hardware encoder, and ffmpeg copies the H.264
   instead of encoding it (chosen by default, because a hardware encoder is present)
 the hardware encoder is open on its own thread encoder=NVIDIA H.264 Encoder MFT format=ARGB32
-  size=(3840, 2160) adapter=NVIDIA GeForce RTX 3090
+  size=(3840, 2160) adapter=NVIDIA GeForce (discrete)
 CLIENT_EXIT=0
 ```
 
 The device on a null adapter is whichever adapter DXGI calls the default, and on a machine with an
-integrated GPU that is not safe to assume — so it was read rather than assumed: adapter 0 is the RTX
-3090 (the Intel UHD is present and is not it, and the QSV MFTs report `d3d11=false` and cannot take
+integrated GPU that is not safe to assume — so it was read rather than assumed: adapter 0 is the NVIDIA
+GPU (the Intel UHD is present and is not it, and the QSV MFTs report `d3d11=false` and cannot take
 the device at all). `MftEncoder::open_for_texture` takes the device *from the captured texture*, so
 the encoder and capture cannot disagree about which GPU they are on.
 
@@ -1345,7 +1343,7 @@ Three ways to wait for ever were on that path at once, and the shutdown took whi
    deadline, and a status that arrives only because of that kill is reported as such.
 
 Those three were fixed and the story still was not over, because the same mistake was one line
-further up. The MFT's **per-frame** handover was a blocking `send` too, and that is the one the box
+further up. The MFT's **per-frame** handover was a blocking `send` too, and that is the one the Windows test machine
 keeps hitting: five of six zero-copy runs on a later soak, two of eight after that, and two of four
 in a probe built to ask. Every one of them was *after* the clip was written and indexed, so the
 recording was never at risk — only the exit was, which is why it read as a soak that would not end
@@ -1408,7 +1406,7 @@ than discovered later:
   instead, and an MFT offers that whether or not it accepted the caller's. The refusal is now a row
   of its own, carrying the call's error, and its available output types are enumerated anyway — the
   input side is not asked, because an async MFT will not talk about its inputs until an output type
-  has been accepted. Measured on the box, old code against new, same build, same throwaway caller, at
+  has been accepted. Measured on the Windows test machine, old code against new, same build, same throwaway caller, at
   a size every encoder has to refuse (`probe_available_types(Hevc, (16384, 16384))`): the old report
   names the eight Intel MFTs (which cannot be activated at all) and **both NVIDIA encoders are simply
   absent from it**; the new one names them, their refusals — `Invalid type. (0xC00D36BD)` for H.264,
@@ -1458,7 +1456,7 @@ than discovered later:
 - **`capture_wait=` is not a back-pressure signal.** It reads 61.1% while the inline encoder
   throttled the pump to 35 fps and 61.3% while a threaded encoder kept up at 59.6 — the same number
   for opposite situations. Most of it is a correctly paced 60 Hz capture idling between frames.
-- **AV1 is not reachable on this hardware.** The 3090 does H.264 and HEVC through NVENC; AV1 is
+- **AV1 is not reachable on this hardware.** The NVIDIA GPU does H.264 and HEVC through NVENC; AV1 is
   40-series and later.
 - **1080p is still unmeasured**, for the reason §1 already gives: the pool follows the capture item,
   only the primary 4K monitor is captured, and no configuration reaches a smaller size.
@@ -1494,7 +1492,7 @@ runs of that test, plain and with sixteen competing processes:
 The **video stream is the window**: 3000ms, or 3100ms when the window's edge falls inside a
 slightly longer fragment. The container carries the audio track's per-fragment padding and the
 muxer's stitched timestamps on top of it, and that surplus is small and steady on a real feed:
-the box's clip in §1 and §10.2 is **13,091ms against a 13,000ms target — 91ms over thirteen
+the Windows test machine's clip in §1 and §10.2 is **13,091ms against a 13,000ms target — 91ms over thirteen
 segments**, about 7ms each, comfortably inside criterion 4's ±0.5s. The test's own clips come
 out ~190ms over three fragments instead, which is a property of the synthetic stub feed or of
 how the synthetic audio is muxed; the two feeds were not isolated against each other, so treat
@@ -1558,7 +1556,7 @@ to be found in the file. `bitrate_kbps` still reaches ffmpeg's `-b:a` and is sim
 `enabled` is false.
 
 **Evidence.** The argument list, the listeners and the backends are the code's half of this; the
-file's half is a run of the released CLI on the box at `92e5a70`, against the shipped example with
+file's half is a run of the released CLI on the Windows test machine at `92e5a70`, against the shipped example with
 `[audio] enabled = false` (the key the run set is `enabled = false`, at line 134 of the
 configuration the CLI actually read). Its own `--self-test-clip-after` ended the run after 45 s
 with exit code 0, and:
@@ -1591,7 +1589,7 @@ with `[encode] zero_copy = true` and nothing else different between them.
 | the clip's `avg_frame_rate` | 59.3 fps | 58.6 fps |
 | frames that never reached the encoder | 3 | 10 |
 
-**The rate gap does not reproduce.** In one session on this box, HEVC holds the same frame rate
+**The rate gap does not reproduce.** In one session on this machine, HEVC holds the same frame rate
 as H.264 — 59.0 against 58.8, both inside the spread §15 already published. What does reproduce
 is a smaller and more specific difference: HEVC sheds about three times as many frames at the
 handover (10 against 3, out of ~3000), and both codecs report the same warning — "its queue is
@@ -1629,7 +1627,7 @@ The encoder answers yes, and the file does not move:
 Both calls return `Ok` — the debug log carries `the encoder accepted rate control mode (CBR) = 0`
 and `the encoder accepted mean bitrate (bit/s) = 20000000`, twice per run (the warm-up output
 type and the real one) — and the third row set `CODECAPI_AVEncCommonMaxBitRate` as well as the
-mean, which moved the file by half a percent. So on this stack (Windows 11, RTX 3090, the NVENC
+mean, which moved the file by half a percent. So on this stack (Windows 11, NVIDIA RTX-class GPU, the NVENC
 H.264 MFT) the property is advertised, accepted and ignored, and the order of the calls against
 `SetOutputType` is not the reason, because moving them earlier changed nothing.
 
@@ -1643,7 +1641,7 @@ driver-side preset. None was measured, and each would be another experiment for 
 of a clip's `ffprobe` output can already see is not being held.
 
 **Follow-up (P11, unmeasured).** Two changes aimed at §19, both argument/property level and neither
-run on the 3090: the ffmpeg path (`video_output_args`, used for every non-zero-copy hardware encoder)
+run on the NVIDIA GPU: the ffmpeg path (`video_output_args`, used for every non-zero-copy hardware encoder)
 now sends `-rc cbr` (NVENC/AMF) plus `-maxrate` and `-bufsize` equal to the target, where it used to
 send only `-b:v`; and `pin_bitrate` for the MFT path now also sets `CODECAPI_AVEncCommonMaxBitRate`,
 `CODECAPI_AVEncCommonBufferSize` (one second) and `CODECAPI_AVLowLatencyMode`, the untried items
@@ -1692,7 +1690,7 @@ re-running it until it passes.
 §7 and §9 have carried the same caveat since 2026-09-25: the harness's Windows half — the
 `GetProcessTimes` + `K32GetProcessMemoryInfo` sampler, `scripts/verify-in-interactive-session.ps1`,
 and everything it says about a *real* capture path — was **compiled and never run**. It ran on
-2026-10-15, on the box, in Session 1, against the released CLI at the tip:
+2026-10-15, on the Windows test machine, in Session 1, against the released CLI at the tip:
 
 ```
 xtask.exe verify --seconds 60 --report … --cli target\release\localplay-cli.exe
@@ -1770,5 +1768,5 @@ drop is real and is now disclosed in the `dropped` row's measured text rather th
 `eviction` is **still unproven** — the ring peaked at 10.5 of 16.8 MB, so nothing was evicted —
 and needs a run with a lower cap or a longer `--seconds`.
 
-Result at `13063a2` on the box (RTX 3090, 3840x2160/30fps, `h264_nvenc`): **28 passed, 0 failed,
+Result at `13063a2` on the Windows test machine (NVIDIA RTX-class GPU, 3840x2160/30fps, `h264_nvenc`): **28 passed, 0 failed,
 2 not performed** (`silence_detector`, `eviction`).

@@ -6,7 +6,7 @@ Tick every box on the release candidate; attach the filled copy to the GitHub Re
 - [ ] CI: macOS tests, Windows tests, supply-chain (cargo-deny, npm audit, gitleaks, API guard)
 - [ ] Installer builds; contains `binaries\ffmpeg.exe` / `ffprobe.exe` (LGPL build, no `--enable-gpl`)
 
-## Windows hardware (human, interactive session — see HANDOFF for the Vanguard rules)
+## Windows hardware (human, interactive session — see `docs/anti-cheat.md` for the Vanguard operating rules)
 - [ ] `cargo xtask verify` report attached; first row `capture_started` is real 3840x2160 (or native) capture
 - [ ] Install from the NSIS artifact; first run; tray icon; hide-on-close
 - [ ] Clip hotkey pressed by a person -> clip appears, plays, scrubs, trims, deletes
