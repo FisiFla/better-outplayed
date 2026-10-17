@@ -1,11 +1,7 @@
-//! The clip index: opening it, inserting a clip that was just spliced, and applying the
-//! storage policy to it.
+//! The clip index: opening it, inserting a just-spliced clip, and applying the storage policy.
 //!
-//! Everything here is synchronous bookkeeping over a [`Store`] and costs the capture path
-//! nothing: the index is opened once at startup, written once per clip, and swept every
-//! [`crate::CLEANUP_INTERVAL`]. It lives beside the engine rather than inside it because
-//! it is the one part of the trigger path that can be tested without ffmpeg, a scratch
-//! directory or a capture backend.
+//! Synchronous bookkeeping over a [`Store`], costing the capture path nothing; it sits beside the
+//! engine because it is the one part of the trigger path testable without ffmpeg or a backend.
 
 use crate::config::StorageSection;
 use anyhow::{Context, Result};
@@ -17,8 +13,7 @@ use localplay_store::retention::{
 use localplay_store::{NewClip, NewEvent, Store};
 use std::path::{Path, PathBuf};
 
-/// Wall-clock now, in ms since the Unix epoch — the clock `clips.created_at` is on, and
-/// so the clock the storage policy's age rule is evaluated against.
+/// Wall-clock now, in ms since the Unix epoch: the clock `clips.created_at` and the storage age rule use.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -26,8 +21,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Wall-clock now, in whole seconds since the Unix epoch — the clock a clip file's name
-/// is stamped from (`clip-<ts>.mp4`).
+/// Wall-clock now in whole seconds since the Unix epoch; stamps clip file names (`clip-<ts>.mp4`).
 pub fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -35,13 +29,10 @@ pub fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Open the clip index in the app data directory and bring its schema up to date
-/// (spec §5.5).
+/// Open the clip index in the app data directory and bring its schema up to date.
 ///
-/// A failure here is fatal, deliberately. An index that cannot be opened is an index that
-/// records nothing, and a clip that is never recorded can neither be listed nor ever
-/// cleaned up — the growing, unmanaged clips directory the storage policy exists to
-/// prevent. Stopping with the path in the log is diagnosable; carrying on is not.
+/// A failure is fatal on purpose: an index that cannot be opened records nothing, and unrecorded
+/// clips are never cleaned up. Stopping with the path in the log is diagnosable; carrying on is not.
 pub fn open_clip_index(db_path: &Path) -> Result<Store> {
     if let Some(dir) = db_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -58,25 +49,18 @@ pub fn open_clip_index(db_path: &Path) -> Result<Store> {
     Ok(store)
 }
 
-/// Insert the `clips` row for a clip that has just been spliced (spec §6.2 step 6).
+/// Insert the `clips` row for a clip that has just been spliced.
 ///
-/// * `started_at_ms` is the clip's first frame on the ring's **ledger timeline** (media
-///   time), not a wall-clock instant: it is the only position the splice knows, and it is
-///   the timeline the segment numbering — and therefore the footage — is measured on. The
-///   wall-clock instant of the record is `created_at`, stamped by the store.
-/// * The codec is `clip.encoder`, the encoder that actually produced the file
-///   (`h264_nvenc`, `libx264`, …), because that is the name criterion 5 checks the file
-///   against; the config's abstract `h264` would name neither.
-/// * `session_id` is left NULL. The schema allows it, and this engine does not open a
-///   `sessions` row: a recording session has no clean shutdown that stamps `ended_at` on
-///   one, so a session row could never be finished. NULL is the honest value; a made-up id
-///   would point at a session that does not exist.
+/// * `started_at_ms` is the clip's first frame on the ring's ledger timeline (media time), the
+///   timeline the footage is measured on; the wall-clock instant is `created_at`, stamped by the store.
+/// * The codec is `clip.encoder`, the encoder that produced the file (`h264_nvenc`, `libx264`, ...),
+///   not the config's abstract `h264`.
+/// * `session_id` is left NULL: this function has no session context, and a made-up id would
+///   point at a session that does not exist.
 ///
-/// A failed insert is reported at ERROR and returns `None` — it is *not* fatal. The clip
-/// file exists and the user asked for it; losing it to a bookkeeping failure would be far
-/// worse than an index that is missing an entry (spec §8.2 is about never losing a file,
-/// not about perfect bookkeeping). The consequence is named in the log: an unindexed clip
-/// is invisible to the list and to the storage policy.
+/// A failed insert is logged at ERROR and returns `None`; it is not fatal. The file exists and the
+/// user asked for it, so losing it to bookkeeping would be worse than a missing entry. An unindexed
+/// clip is invisible to the list and the storage policy.
 pub fn index_clip(store: &Store, clip: &ClipMetadata, started_at_ms: u64) -> Option<i64> {
     let new = NewClip {
         path: clip.path.clone(),
@@ -108,20 +92,14 @@ pub fn index_clip(store: &Store, clip: &ClipMetadata, started_at_ms: u64) -> Opt
     }
 }
 
-/// The `events.kind` a manual clip records: the user pressed the hotkey, and the timeline
-/// should show the moment they chose.
+/// The `events.kind` a manual clip records, so the timeline shows the moment the user chose.
 ///
-/// A manual clip used to record nothing but the clip, so a session's timeline carried the
-/// game's kills and none of the user's own marks — the scrubber had nothing to plot for the
-/// moments that mattered most. The tag is the same vocabulary the scrubber colours by
-/// (`localplay-store` passes it through verbatim), and it is deliberately not a
-/// [`GameEvent`]: nothing produced it but a keypress.
+/// The tag is the vocabulary the scrubber colours by (`localplay-store` passes it through
+/// verbatim) and is deliberately not a [`GameEvent`]: only a keypress produced it.
 pub const BOOKMARK_KIND: &str = "bookmark";
 
-/// Record the `events` row for a manual clip and return its id.
-///
-/// `payload` is `None`: a bookmark has no source to describe, and inventing one would make
-/// the timeline claim a provenance it does not have.
+/// Record the `events` row for a manual clip and return its id. `payload` is `None`: a bookmark
+/// has no source to describe.
 pub fn index_bookmark(
     store: &Store,
     at_ms: u64,
@@ -139,25 +117,18 @@ pub fn index_bookmark(
     Ok(id)
 }
 
-/// Insert the `events` row for a derived game event (spec §5.5), linked to the clip it
-/// produced when it produced one.
+/// Insert the `events` row for a derived game event, linked to its clip when it produced one.
 ///
-/// * `at_ms` is the event's position on the **ledger's media timeline** — the same clock
-///   `clips.started_at` and a session's `media_epoch_ms` are on, so a session timeline can
-///   place a marker against a clip without converting anything. For a clip's own event this
-///   is the *trigger* instant, which is `buffer.pre_seconds` into the clip, because that is
-///   the moment the event happened; the window merely starts earlier.
-/// * `clip_id` is `None` for a marker (a game or round boundary, recorded but not clipped —
-///   see `EventKind::is_highlight`) and for an event whose clip could not be indexed. The
-///   column is nullable for exactly those cases.
-/// * `session_id` is the session that was recording. It was left NULL here for as long as
-///   "this engine opens no `sessions` row" was true, which stopped being true in Phase 5 —
-///   so NULL now means an event detached from its session, which is what deletion does to
-///   it, and not "there was no session".
+/// * `at_ms` is the event's position on the ledger's media timeline, the clock of
+///   `clips.started_at` and a session's `media_epoch_ms`. For a clip's own event it is the trigger
+///   instant (`buffer.pre_seconds` into the clip), because that is when the event happened.
+/// * `clip_id` is `None` for a marker (recorded but not clipped, see `EventKind::is_highlight`) and
+///   for an event whose clip could not be indexed.
+/// * `session_id` is the recording session; NULL means an event detached from its session (what
+///   deletion does to it).
 ///
-/// Returns the new row's id, or the error: the callers differ on what a failure means. A
-/// clip that has already been written must not be lost to a bookkeeping failure, while a
-/// marker is the *only* thing the caller asked for, so failing it is worth reporting.
+/// Returns the new row's id or the error: a written clip must not be lost to a bookkeeping failure,
+/// but a marker is the only thing the caller asked for, so failing it is worth reporting.
 pub fn index_event(
     store: &Store,
     event: &GameEvent,
@@ -188,34 +159,26 @@ pub fn index_event(
     Ok(id)
 }
 
-/// Bookkeeping across storage-policy passes, so a condition that lasts the whole session
-/// is stated when it appears (or when its size changes) rather than once per pass.
+/// Bookkeeping across storage-policy passes, so a lasting condition is stated when it appears or
+/// its size changes rather than once per pass.
 ///
-/// One field per cap: clips and sessions are planned independently (spec §8.1), so each can
-/// be unsatisfiable on its own, and a single field would let one class's recovery hide the
-/// other's shortfall. Both are public because they are the observable "why did nothing get
-/// deleted" of a pass, and a test asserts on them.
+/// One field per cap: clips and sessions are planned independently, so each can be unsatisfiable
+/// on its own. Public because they are the observable "why was nothing deleted", asserted by tests.
 #[derive(Default, Debug)]
 pub struct CleanupReport {
-    /// The shortfall reported by the last pass whose clips cap could not be met; `None`
-    /// while that cap is met, so a recurrence warns again.
+    /// The shortfall of the last pass whose clips cap could not be met; `None` while it is met, so a recurrence warns again.
     pub last_clips_shortfall: Option<u64>,
     /// The same for the sessions cap.
     pub last_sessions_shortfall: Option<u64>,
 }
 
-/// Apply the storage policy once (spec §8.1): plan against the index, execute the plan, and
-/// report what happened.
+/// Apply the storage policy once: plan against the index, execute the plan, report.
 ///
-/// The decision is [`plan_retention`]'s — one plan over **both** libraries, clips and
-/// sessions, each with its own cap and age limit — and the deletion ordering is
-/// [`execute_retention`]'s; this function supplies the policy from the config and the clock,
-/// and decides what is worth a log line. It is silent when there is nothing to do, because it
-/// runs at startup and then every [`crate::CLEANUP_INTERVAL`], and an idle pass is not news.
-///
-/// The returned [`RetentionOutcome`] is what the pass measured after executing the plan
-/// (bytes reclaimed file by file, per class): returned rather than only logged so a caller
-/// — and a test — can see the numbers instead of reconstructing them from log lines.
+/// One plan over both libraries (clips and sessions, each with its own cap and age limit) comes from
+/// [`plan_retention`] and deletion ordering from [`execute_retention`]; this supplies the policy from
+/// the config and the clock. Silent when idle, since it runs at startup and every
+/// [`crate::CLEANUP_INTERVAL`]. The returned [`RetentionOutcome`] holds what the pass measured, so
+/// callers and tests need not reconstruct it from log lines.
 pub fn cleanup_pass(
     store: &Store,
     storage: &StorageSection,
@@ -224,9 +187,7 @@ pub fn cleanup_pass(
     let policy = RetentionPolicy {
         clips: RetentionRules {
             max_total_bytes: storage.max_total_bytes,
-            // The retention rules count days as `u32`; the config keeps them as `u64` (it
-            // always has). A day count above `u32::MAX` is not a policy, it is "never",
-            // and clamping says so rather than wrapping to a small number.
+            // Days are `u32` in the retention rules and `u64` in the config; above `u32::MAX` means "never", so clamp rather than wrap.
             max_age_days: storage.max_age_days.min(u64::from(u32::MAX)) as u32,
         },
         sessions: RetentionRules {
@@ -282,10 +243,8 @@ pub fn cleanup_pass(
     }
     let leftovers: Vec<&PathBuf> = outcome.leftovers().collect();
     if !leftovers.is_empty() {
-        // The row is gone (the delete committed) and the path is still there. Every entry is
-        // one of: a removal that failed, a path deliberately refused (a symlinked or
-        // suspicious session directory), or a file that was already missing. Named, because
-        // "the library is within its cap" would otherwise be a statement about rows only.
+        // The row is gone but the path remains: a failed removal, a refused path (a symlinked or suspicious
+        // session directory) or an already-missing file. Named, since "within cap" would otherwise be about rows only.
         tracing::warn!(
             "storage policy: {} path(s) named by deleted rows are still on disk: {}",
             leftovers.len(),
@@ -298,11 +257,8 @@ pub fn cleanup_pass(
         );
     }
 
-    // A cap that the immune members alone exceed is not merely "not met this pass" — no
-    // pass can meet it: favourites and a *running* session are exempt (spec §8.1), so the
-    // shortfall is what the user has to act on. Worth a warning, but only when it appears or
-    // changes: the condition is permanent, and repeating it verbatim every pass would bury
-    // everything else in the log.
+    // A cap that immune members alone exceed (favourites, a running session) can never be met, so the
+    // shortfall is what the user must act on. Warn only when it appears or changes.
     report_clips_shortfall(report, policy.clips.max_total_bytes, &plan, &outcome);
     report_sessions_shortfall(report, policy.sessions.max_total_bytes, &plan, &outcome);
     outcome
@@ -330,9 +286,8 @@ fn report_clips_shortfall(
     }
 }
 
-/// The sessions cap's unsatisfiable case — the same condition, but its two causes are both
-/// "nothing here may be deleted": a favourited session, and a session that is still
-/// recording (its scratch directory is footage that exists nowhere else).
+/// The sessions cap's unsatisfiable case: a favourited session, or one still recording (its scratch
+/// directory exists nowhere else), both of which may not be deleted.
 fn report_sessions_shortfall(
     report: &mut CleanupReport,
     cap: u64,
@@ -372,15 +327,9 @@ mod tests {
         (dir, store)
     }
 
-    /// The schema version this build's store writes, **read from the store itself**.
-    ///
-    /// `localplay-store` keeps its `SCHEMA_VERSION` private, so there is no exported
-    /// constant to assert against — and a bare `2` here is exactly what broke when the
-    /// store bumped 1 → 2: this crate's assertion failed on a store that was working
-    /// perfectly. A fresh in-memory database is migrated by the same code path a file
-    /// database is, so its `user_version` *is* the store's constant. A future bump
-    /// therefore cannot break these assertions, while a database that failed to migrate
-    /// still can.
+    /// The schema version this build's store writes, read from the store itself: `localplay-store`'s
+    /// `SCHEMA_VERSION` is private, and a hard-coded number broke when the store bumped it. A fresh
+    /// in-memory database migrates through the same path as a file one.
     fn store_schema_version() -> i32 {
         let fresh = Store::open_in_memory().expect("an in-memory store");
         fresh.migrate().expect("migrating a fresh store");
@@ -404,15 +353,12 @@ mod tests {
         index_clip(&store, &metadata(path, 500), 1_000).expect("the clip is indexed");
         drop(store);
 
-        // A second start must adopt the same index — migration is forward-only and
-        // idempotent — rather than start a fresh one over the top of it.
+        // A second start adopts the same index (migration is forward-only and idempotent).
         let reopened = open_clip_index(&db).expect("reopen the index");
         assert_eq!(reopened.schema_version().unwrap(), store_schema_version());
         assert_eq!(reopened.list_clips().unwrap().len(), 1, "the clip survived the restart");
 
-        // The capability the version gate exists for, asserted rather than assumed: the
-        // session columns a Phase 5 engine writes into are present, so a session row can be
-        // opened and closed on this index.
+        // The session columns the version gate exists for are present, so a session row can be opened and closed.
         let session = reopened
             .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch", 0)
             .expect("the index carries the session columns");
@@ -464,8 +410,7 @@ mod tests {
         let meta = metadata(path.clone(), 500);
 
         assert!(index_clip(&store, &meta, 1).is_some());
-        // `clips.path` is UNIQUE, so indexing the same file twice fails — the index write
-        // is the one thing that can fail after the clip exists.
+        // `clips.path` is UNIQUE, so a duplicate insert fails; the index write is the one thing that can fail after the clip exists.
         assert_eq!(index_clip(&store, &meta, 2), None, "a duplicate insert fails");
         assert!(
             path.is_file(),
@@ -484,7 +429,7 @@ mod tests {
         let kill = localplay_events::GameEvent::new(
             localplay_events::Source::Lol,
             localplay_events::EventKind::Kill,
-            // One line of JSON, which is what the payload column holds.
+            // One line of JSON, as the payload column holds.
             serde_json::json!({ "source": "lol", "killer": "Ahri" }),
         );
         let id = index_event(&store, &kill, 34_000, Some(clip_id), None).expect("the reason is written");
@@ -513,8 +458,7 @@ mod tests {
 
     #[test]
     fn an_event_for_a_clip_that_does_not_exist_is_reported_rather_than_written() {
-        // The foreign key is the store's; all this checks is that the failure comes back as
-        // an error for the caller to decide about instead of being silently dropped.
+        // The foreign key is the store's; this checks the failure comes back as an error rather than being dropped.
         let (_dir, store) = index_dir();
         let event = localplay_events::GameEvent::bare(
             localplay_events::Source::Lol,
@@ -570,17 +514,14 @@ mod tests {
         assert!(outcome.sessions.deleted == 0 && outcome.sessions.bytes_reclaimed == 0);
         assert!(outcome.clips.cap_met, "the clips cap is met after the pass");
 
-        // A second pass has nothing to do, and must leave the survivor alone: this is the
-        // pass that runs every `CLEANUP_INTERVAL` in the capture loop, so it has to be a
-        // no-op once the library fits.
+        // A second pass must leave the survivor alone: this pass runs every `CLEANUP_INTERVAL`, so it must be a no-op once the library fits.
         let outcome = cleanup_pass(&store, &storage, &mut report);
         assert_eq!(store.list_clips().unwrap().len(), 1);
         assert!(survivor.is_file(), "an idle pass deletes nothing");
         assert_eq!(outcome.deleted(), 0);
     }
 
-    /// The two libraries are evicted **independently** — a full session store must not
-    /// push clips out, and vice versa — and a favourite survives in each of them.
+    /// The two libraries are evicted independently, and a favourite survives in each.
     #[test]
     fn retention_evicts_clips_and_sessions_independently_with_favourites_immune() {
         let (dir, store) = index_dir();
@@ -644,11 +585,8 @@ mod tests {
         assert!(outcome.cap_met(), "both caps are met after the pass");
     }
 
-    /// A cap that nothing may satisfy is reported, per class, and nothing is deleted to try.
-    ///
-    /// Both causes are real: a favourited session (immune by choice) and a session that is
-    /// **still recording** (immune because its scratch directory is footage that exists
-    /// nowhere else yet).
+    /// A cap nothing may satisfy is reported per class and nothing is deleted to try. Both causes are
+    /// real: a favourited session, and a session still recording.
     #[test]
     fn an_unsatisfiable_cap_is_reported_for_each_class() {
         let (dir, store) = index_dir();
@@ -684,14 +622,12 @@ mod tests {
         assert!(scratch.is_dir(), "and the live session's footage is not touched");
         assert!(store.get_session(running).unwrap().unwrap().ended_at_ms.is_none());
 
-        // The report is remembered: a second identical pass does not change it (it is the
-        // same shortfall), and once the immunity is gone the next pass evicts both classes.
+        // The report is remembered (an identical pass does not change it); once the immunity is gone the next pass evicts both classes.
         let outcome = cleanup_pass(&store, &storage, &mut report);
         assert_eq!(outcome.deleted(), 0, "still nothing to do: {outcome:?}");
         assert_eq!(report.last_sessions_shortfall, Some(1_900));
 
-        // The recording ends (with the bytes its directory holds) and the clip is
-        // un-favourited: now the same policy has something it may delete.
+        // The recording ends and the clip is un-favourited, so the policy now has something it may delete.
         store.end_session(running, 9_000, None, 2_000, 0).unwrap();
         store.set_favourite(clip_id, false).unwrap();
         let outcome = cleanup_pass(&store, &storage, &mut report);

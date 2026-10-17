@@ -1,26 +1,12 @@
 //! Full-session recording: the per-session segment directory, its ledger, the lossless
-//! concatenation at stop, and the recovery of a session a crash left behind (Phase 5).
+//! concatenation at stop, and recovery of a session a crash left behind.
 //!
-//! # Why this is not the replay ring
-//!
-//! The two modes look alike — a directory of `seg-%06d.mp4` files written by one ffmpeg
-//! segment muxer — and they are deliberately *not* the same object, because the one thing
-//! that defines the ring is the one thing a full session must not have: eviction.
-//! The file-backed ring this was paired with indexed new segments **and** evicted the oldest to
-//! stay under a size cap. A four-hour session has no oldest segment to spare,
-//! so [`SessionRing`] scans the same directory names with the same
-//! [`localplay_replay::scanner`] functions and never evicts anything.
-//!
-//! That bypass is *structural*, not a huge cap: `evict_to_cap` is not called on this
-//! ledger at all — it is not called on this one. The file-backed ring had no "scan without
-//! evicting" entry point, which is why the scan lives here as its own small function rather
-//! than as a parameter; see `finalise` for the other place that limit shows.
-//! The re-expression is deliberately small: the scan, the sequence reservation and the
-//! clip window are [`localplay_replay`]'s public pieces
-//! ([`SegmentLedger`], [`scanner`], [`window`], [`ClipSplicer`]); nothing here re-implements
-//! a concatenation.
-//!
-//! # The on-disk shape
+//! [`SessionRing`] is deliberately not a replay ring: a four-hour session has no oldest segment to
+//! spare, so it scans the same directory names with the same [`localplay_replay::scanner`]
+//! functions and never evicts. The bypass is structural (there is no cap to pass), and the scan,
+//! sequence reservation and clip window are [`localplay_replay`]'s public pieces
+//! ([`SegmentLedger`], [`scanner`], [`window`], [`ClipSplicer`]); nothing here re-implements a
+//! concatenation.
 //!
 //! ```text
 //! <app data dir>/sessions/
@@ -31,10 +17,8 @@
 //! └── session-1758612345.mp4         <- written at stop, `-c copy`, segments then removed
 //! ```
 //!
-//! There is no ledger file: a session's segments are enumerated from the directory itself
-//! (they are named `seg-%06d.mp4` in sequence order), which is also what makes recovery
-//! possible after a crash — nothing has to have been persisted for the footage to be
-//! findable, and nothing is orphaned by a write that never happened.
+//! There is no ledger file: segments are enumerated from the directory (`seg-%06d.mp4`, in
+//! sequence order), which is what makes a crashed session recoverable from the file names alone.
 
 use crate::index::now_ms;
 use anyhow::{bail, Context, Result};
@@ -46,14 +30,13 @@ use localplay_replay::splice::{ClipMetadata, ClipSplicer};
 use localplay_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
 
-/// How many whole-session concatenations were attempted before giving up on a name.
+/// Attempts at claiming a unique session directory name before giving up.
 const MAX_SESSION_DIR_ATTEMPTS: u32 = 100;
 
-/// A session's segments, indexed and **never evicted**.
+/// A session's segments, indexed and never evicted.
 ///
-/// The removed file-backed ring's cap-free twin: same directory convention,
-/// same "a segment is only trusted once a strictly later one exists" scan rule, same
-/// timeline arithmetic — and no eviction, by construction (there is no cap here to pass).
+/// The replay ring's cap-free twin: same directory convention, same "a segment is only trusted once
+/// a strictly later one exists" scan rule, same timeline arithmetic, no eviction.
 pub struct SessionRing {
     bin: FfmpegBinaries,
     dir: PathBuf,
@@ -61,32 +44,26 @@ pub struct SessionRing {
     ledger: SegmentLedger,
     highest_known: Option<u64>,
     segment_ms: u64,
-    /// Offset of this run's first segment on the ledger timeline — `reserve_number() *
-    /// segment_ms`, exactly as the ring's is, so the clip path's arithmetic is the same in
-    /// both modes.
+    /// Offset of this run's first segment on the ledger timeline (`reserve_number() * segment_ms`),
+    /// so the clip path's arithmetic matches the ring's.
     origin_ms: u64,
-    /// Name of the encoder in use, recorded on every clip (spec §11 criterion 5).
+    /// Name of the encoder in use, recorded on every clip.
     encoder: String,
     /// Media time kept before a trigger (the engine's `buffer.pre_seconds`).
     pre_ms: u64,
     /// Media time kept after a trigger (the engine's `buffer.post_seconds`).
     post_ms: u64,
-    /// Whether the encoder that writes this session's segments has a microphone input. It
-    /// decides how a **clip** is spliced out of the session: with a second audio track the
-    /// splicer's `-c copy` concat would drop it, so the map-preserving concat is used
-    /// instead (`finalise` has the measurement; the same `-map 0` argument, one window).
+    /// Whether the encoder has a microphone input. With a second audio track the splicer's plain
+    /// `-c copy` concat would drop it, so clips use the map-preserving concat (`-map 0`; see `finalise`).
     microphone: bool,
 }
 
 impl SessionRing {
-    /// Open the session's segment directory, creating it if the encoder is about to write
-    /// into it. Nothing is scanned yet — [`SessionRing::adopt_existing`] is that step, and
-    /// the caller runs it before the encoder is spawned (the segment number ffmpeg is told
-    /// depends on it).
+    /// Open the session's segment directory, creating it if the encoder is about to write into it.
+    /// Nothing is scanned yet: the caller runs [`SessionRing::adopt_existing`] before the encoder is
+    /// spawned, because the segment number ffmpeg is told depends on it.
     ///
-    /// The `BufferConfig` carries the segment length and the trigger window, exactly as it
-    /// does for the replay ring — the two modes resolve a clip the same way, and taking the
-    /// same configuration type is what keeps that true.
+    /// Takes the same `BufferConfig` as the replay ring so both modes resolve a clip the same way.
     pub fn open(
         bin: &FfmpegBinaries,
         dir: &Path,
@@ -113,9 +90,8 @@ impl SessionRing {
         })
     }
 
-    /// Index what is already in the directory (a session directory is fresh, so this is
-    /// normally nothing — but a caller that restarts into an adopted directory gets the
-    /// ring's own answer rather than an overwrite).
+    /// Index what is already in the directory (normally nothing; a restart into an adopted directory
+    /// gets the ring's answer rather than an overwrite).
     pub fn adopt_existing(&mut self) -> Result<usize> {
         let before = self.ledger.len();
         self.scan()?;
@@ -124,11 +100,9 @@ impl SessionRing {
 
     /// Index every segment in the directory, including the newest file.
     ///
-    /// [`SessionRing::scan`] deliberately does not trust the newest segment — ffmpeg
-    /// appends to it, so it may be half-written. That rule is right while a recording is
-    /// running and wrong at shutdown, when the encoder has been flushed and the child has
-    /// exited: at that point the newest file is complete, and dropping it would lose the
-    /// last `segment_time` of every session.
+    /// [`SessionRing::scan`] does not trust the newest segment while ffmpeg appends to it. At shutdown
+    /// the encoder has exited and that file is complete; dropping it would lose the last
+    /// `segment_time` of every session.
     pub fn scan_all(&mut self) -> Result<()> {
         for segment in segments_on_disk(&self.dir, self.segment_ms)? {
             let seq = segment.seq;
@@ -138,8 +112,7 @@ impl SessionRing {
         Ok(())
     }
 
-    /// Index newly completed segments. **No eviction happens here** — that is the whole
-    /// difference from a file ring's `scan_once` (see the module docs).
+    /// Index newly completed segments. No eviction happens here.
     pub fn scan(&mut self) -> Result<()> {
         let observed = observed_seqs(&self.dir)?;
         for seq in newly_complete(&observed, self.highest_known) {
@@ -157,9 +130,8 @@ impl SessionRing {
         Ok(())
     }
 
-    /// Reserve the sequence number the encoder must start writing at — the same rule the
-    /// ring uses ([`next_segment_number`]), so a session directory that already holds
-    /// segments cannot be overwritten.
+    /// Reserve the sequence number the encoder must start at (the ring's rule, [`next_segment_number`]),
+    /// so a directory that already holds segments cannot be overwritten.
     pub fn reserve_number(&mut self) -> Result<u64> {
         let names = observed_names(&self.dir)?;
         let number = next_segment_number(&self.ledger.seqs(), &names);
@@ -167,13 +139,12 @@ impl SessionRing {
         Ok(number)
     }
 
-    /// The ledger's position, in ms, of this run's zero (see the field's doc).
+    /// The ledger position, in ms, of this run's zero.
     pub fn origin_ms(&self) -> u64 {
         self.origin_ms
     }
 
-    /// This run's recorded media time, in ms — the same quantity
-    /// a file ring's `stats().span_ms` is, measured from the same zero.
+    /// This run's recorded media time, in ms (the same quantity as a ring's `stats().span_ms`).
     pub fn span_ms(&self) -> u64 {
         self.ledger.span_ms().saturating_sub(self.origin_ms)
     }
@@ -196,19 +167,13 @@ impl SessionRing {
         &self.dir
     }
 
-    /// The ffmpeg binaries this session's splices run with (the caller's own, cloned at
-    /// [`SessionRing::open`]).
+    /// The ffmpeg binaries this session's splices run with.
     pub fn bin(&self) -> &FfmpegBinaries {
         &self.bin
     }
 
-    /// Extract a clip around `trigger_ms` from the session's own footage.
-    ///
-    /// The ring's trigger, restated (see the module docs on why): resolve the window on
-    /// the ledger, splice via [`ClipSplicer::splice`] and warn about a truncated pre-roll
-    /// exactly as the ring does. Taking a clip during a full session is the point of having
-    /// both modes, and it is the *same* splice the ring mode uses — only the window it is
-    /// given comes from this ledger.
+    /// Extract a clip around `trigger_ms` from the session's own footage: the ring's trigger, using the
+    /// same [`ClipSplicer::splice`] with a window from this ledger and the same truncated-pre-roll warning.
     pub fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
         self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
     }
@@ -223,8 +188,7 @@ impl SessionRing {
     ) -> Result<ClipMetadata> {
         let win = window::resolve(
             &self.ledger,
-            // `trigger_ms` is run-relative; the ledger's timeline is absolute — the same
-            // conversion the ring's trigger makes.
+            // `trigger_ms` is run-relative; the ledger's timeline is absolute.
             self.origin_ms + trigger_ms,
             pre_ms,
             post_ms,
@@ -239,9 +203,7 @@ impl SessionRing {
         }
         let out = self.clips_dir.join(format!("{stem}.mp4"));
         if self.microphone {
-            // A clip cut out of a session that carries a microphone track must keep it: the
-            // session file does (see `finalise`), and a clip that silently lost the voice
-            // track would be the one artefact of a recording that is missing it.
+            // A clip from a session with a microphone must keep that track, like the session file (see `finalise`).
             finalise(&self.bin, &out, &win.segments, &self.encoder, true)
         } else {
             ClipSplicer::splice(&self.bin, &win, &out, &self.encoder)
@@ -249,8 +211,7 @@ impl SessionRing {
     }
 }
 
-/// The pump's view of a session's segments: the same two facts the ring answers, with no
-/// eviction behind the scan (see the module docs).
+/// The pump's view of a session's segments, with no eviction behind the scan.
 impl crate::pump::MediaRing for SessionRing {
     fn scan(&mut self) -> Result<()> {
         SessionRing::scan(self)
@@ -261,7 +222,7 @@ impl crate::pump::MediaRing for SessionRing {
     }
 }
 
-/// The microphone's own safety net (see `finalise`).
+/// Segment file names in `dir`; used by the microphone safety net (see `finalise`).
 fn observed_names(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -270,18 +231,15 @@ fn observed_names(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The sequence numbers of the segments in `dir` (everything else in the directory — a
-/// concat list, a stray file — is not a segment).
+/// The sequence numbers of the segments in `dir` (concat lists and stray files are not segments).
 fn observed_seqs(dir: &Path) -> Result<Vec<u64>> {
     Ok(observed_names(dir)?.iter().filter_map(|n| scanner::segment_seq(n)).collect())
 }
 
-/// Every segment file in `dir`, in sequence order, with the sizes they actually have.
+/// Every segment file in `dir`, in sequence order, with their actual sizes.
 ///
-/// The ledger is built from the *directory*, not from a saved index: a crash leaves
-/// segments on disk and nothing else, so the footage has to be findable from the file
-/// names alone. A zero-byte file is skipped — ffmpeg creates the next segment's file
-/// before writing into it, and an empty file is not a second of footage.
+/// Built from the directory, not a saved index, so footage is findable after a crash. Zero-byte
+/// files are skipped: ffmpeg creates the next segment's file before writing into it.
 pub fn segments_on_disk(dir: &Path, segment_ms: u64) -> Result<Vec<Segment>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -306,18 +264,15 @@ pub fn segments_on_disk(dir: &Path, segment_ms: u64) -> Result<Vec<Segment>> {
     Ok(segments)
 }
 
-/// A directory name for a new session: `session-<unix seconds>`, or with `-2`, `-3`, … when
-/// a run already started in that second.
+/// A directory name for a new session: `session-<unix seconds>`, with `-2`, `-3`, ... when a run
+/// already started in that second.
 ///
-/// The name is *attempted by creation* (`create_dir`, which fails rather than overwriting),
-/// so two processes starting in the same second cannot share a segment directory — the
-/// one failure that would mix two recordings' segments into one session file.
+/// The name is claimed by creation (`create_dir` fails rather than overwriting), so two processes
+/// cannot mix their segments into one session file.
 pub fn create_session_dir(sessions_dir: &Path, started_at_ms: i64) -> Result<PathBuf> {
     std::fs::create_dir_all(sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    // The same instant the session row's `started_at` carries and `session_file_path` names
-    // the file from, so a session's directory and its file read as one session in a file
-    // browser rather than as two that merely started close together.
+    // The same instant as the row's `started_at` and `session_file_path`, so directory and file read as one session.
     let stamp = started_at_ms.div_euclid(1_000) as u64;
     for attempt in 1..=MAX_SESSION_DIR_ATTEMPTS {
         let name = if attempt == 1 {
@@ -341,12 +296,10 @@ pub fn create_session_dir(sessions_dir: &Path, started_at_ms: i64) -> Result<Pat
     )
 }
 
-/// The concatenated file a session with this start instant writes:
-/// `sessions/session-<unix seconds>.mp4`.
+/// The concatenated file a session with this start instant writes: `sessions/session-<unix seconds>.mp4`.
 ///
-/// Derived from the session's own start instant — not from "now" — so a retry (recovery of
-/// a session a crash left unfinalised) writes the same path it would have written the first
-/// time, rather than a second file beside a partial one.
+/// Derived from the session's own start instant, not "now", so a recovery retry writes the same path
+/// rather than a second file beside a partial one.
 pub fn session_file_path(sessions_dir: &Path, started_at_ms: i64) -> PathBuf {
     let seconds = started_at_ms.div_euclid(1_000);
     sessions_dir.join(format!("session-{seconds}.mp4"))
@@ -354,24 +307,14 @@ pub fn session_file_path(sessions_dir: &Path, started_at_ms: i64) -> PathBuf {
 
 /// Concatenate a finished session's segments into one file.
 ///
-/// `segments` must be in sequence order and complete; the caller flushes the encoder first
-/// and takes the list from [`segments_on_disk`] (or [`SessionRing::scan_all`]).
+/// `segments` must be in sequence order and complete; the caller flushes the encoder first and
+/// takes the list from [`segments_on_disk`] (or [`SessionRing::scan_all`]).
 ///
-/// # Sharing the lossless path with the splicer
-///
-/// This uses the same three steps `ClipSplicer::splice` does — `check_concat_layout`,
-/// `write_concat_list`, `concat_lossless_sized` — rather than keeping a private copy. It
-/// used to have its own concat, for two measured reasons that no longer exist: the splicer
-/// passed no `-map`, so ffmpeg's default stream selection kept one audio stream and dropped
-/// the microphone track from every microphone-enabled *clip*; and it bounded the copy with a
-/// clip-sized 60s, which is the wrong budget for a 20GB session and fails only after doing
-/// the work, on every recovery attempt. Both now live in `localplay_media::edit`, where one
-/// implementation serves both callers; a private copy here would be a second place for them
-/// to drift apart.
-///
-/// What this adds over `splice` is what a *session* needs and a clip does not: a partial
-/// output is deleted rather than left occupying the space its own retry needs, and a session
-/// that recorded a microphone has its audio-stream count verified afterwards.
+/// Shares the splicer's lossless path (`check_concat_layout`, `write_concat_list`,
+/// `concat_lossless_sized` in `localplay_media::edit`) so a fix to `-map 0` (microphone tracks)
+/// or to the size-scaled timeout lands in both callers. What this adds for a session: a partial
+/// output is deleted rather than left occupying the space its retry needs, and a session with a
+/// microphone has its audio-stream count verified afterwards.
 pub fn finalise(
     bin: &FfmpegBinaries,
     out: &Path,
@@ -384,10 +327,9 @@ pub fn finalise(
     }
     let files: Vec<PathBuf> = segments.iter().map(|s| s.file.clone()).collect();
 
-    // Refused before anything is written: a segment whose layout differs from the first
-    // would make `-map 0` silently drop or truncate a track. The layout is also what tells the
-    // concat how many audio tracks to re-name: a `-c copy` carries no per-stream metadata, so
-    // the names the encoder wrote are gone by this point.
+    // Refused before anything is written: a segment whose layout differs from the first would make
+    // `-map 0` silently drop or truncate a track. The layout also says how many audio tracks to
+    // re-name, since a `-c copy` concat loses the encoder's per-stream names.
     let layout = edit::check_concat_layout(bin, &files)?;
 
     let list = out.with_extension("concat.txt");
@@ -396,8 +338,7 @@ pub fn finalise(
     let concat = edit::concat_lossless_sized(bin, &list, out, total_bytes, layout.audio_count());
     let _ = std::fs::remove_file(&list);
     if let Err(e) = concat {
-        // The partial file is worse than useless: it occupies the space the retry needs and
-        // it is not a session. Removing it is the only thing that gets that space back.
+        // A partial file is not a session and occupies the space the retry needs.
         let _ = std::fs::remove_file(out);
         return Err(e).with_context(|| {
             format!(
@@ -417,9 +358,8 @@ pub fn finalise(
             out.display()
         );
     }
-    // The microphone's own safety net. `-map 0` is what keeps the second audio track, and a
-    // session file that lost it looks exactly like one that never had it — the track is
-    // simply absent. Counting the audio streams is the only way to say so out loud.
+    // The microphone safety net: `-map 0` keeps the second track, and a file that lost it looks like
+    // one that never had it, so count the audio streams.
     if multitrack {
         match audio_stream_count(bin, out) {
             Some(count) if count < 2 => tracing::warn!(
@@ -450,9 +390,8 @@ pub fn finalise(
 
 /// How many audio streams `path` carries, or `None` when ffprobe cannot say.
 ///
-/// A deliberate second probe: [`MediaInfo`] reports the *first* video and the *first* audio
-/// stream, which is exactly the shape that cannot distinguish "the microphone survived" from
-/// "it did not". Used only for a session that recorded a microphone.
+/// A second probe because [`MediaInfo`] reports only the first video and first audio stream and
+/// cannot tell whether the microphone survived.
 fn audio_stream_count(bin: &FfmpegBinaries, path: &Path) -> Option<usize> {
     let output = localplay_media::sidecar_command(&bin.ffprobe)
         .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
@@ -475,16 +414,14 @@ fn audio_stream_count(bin: &FfmpegBinaries, path: &Path) -> Option<usize> {
 pub struct Recovery {
     /// Sessions that were concatenated and closed by this pass.
     pub recovered: Vec<i64>,
-    /// Sessions whose segments could not be concatenated (the row is left running, so the
-    /// next start tries again).
+    /// Sessions whose segments could not be concatenated (row left running; the next start retries).
     pub unfinalised: Vec<i64>,
     /// Rows for a recording that left nothing on disk, closed with no file.
     pub closed_empty: Vec<i64>,
     /// Directories under the sessions area that no session row names.
     pub orphan_dirs: Vec<PathBuf>,
-    /// Session directories that still hold segments although their session is finished (a
-    /// crash between the concatenation and the directory's removal). Left in place: the
-    /// retention pass removes them with the row that names them.
+    /// Session directories still holding segments although their session is finished (a crash between
+    /// concatenation and removal). Left in place; retention removes them with the row.
     pub leftover_dirs: Vec<PathBuf>,
 }
 
@@ -499,28 +436,22 @@ impl Recovery {
     }
 }
 
-/// Find what a previous run left behind, finish it, and say what was found (Phase 5).
+/// Find what a previous run left behind, finish it, and report it.
 ///
-/// A crash — a power cut, a killed process, a panic in a driver — leaves three things: a
-/// `sessions` row with `ended_at IS NULL`, a directory of segments under the sessions area,
-/// and no session file. This pass runs at every start, before this run creates anything, and
-/// it is the answer to "does the next start orphan gigabytes?" — it does not:
+/// A crash leaves a `sessions` row with `ended_at IS NULL`, a directory of segments and no session
+/// file. This pass runs at every start, before this run creates anything:
 ///
-/// * a session row with segments on disk is **concatenated** into the file it would have
-///   written (`session_file_path`, from its own start instant) and closed with the real
-///   size; the segments are then removed. If the concatenation fails — a full disk is the
-///   interesting case — the row is **left running** and the segments are kept, so the next
-///   start tries again once there is room (a running session is never an eviction
-///   candidate, so retention cannot delete the only copy of the footage meanwhile);
-/// * a row whose session wrote no segments at all (a crash between the row and the first
-///   segment, or a start that failed after opening the row) is closed with no file;
-/// * a buffer-mode row left running is closed with the size it had — its scratch directory
-///   is shared with the ring, which is the ring's to manage, so nothing on disk is touched;
-/// * a directory no row names is **reported**, never deleted: without a row there is no
-///   proof the footage is this application's to remove, and a report is reversible.
+/// * a row with segments on disk is concatenated into the file it would have written and closed
+///   with the real size; segments are then removed. If concatenation fails (a full disk), the row is
+///   left running and the segments kept so the next start retries, and retention (which never evicts
+///   a running session) cannot delete the only copy;
+/// * a row that wrote no segments is closed with no file;
+/// * a buffer-mode row left running is closed with its size; its scratch directory belongs to the
+///   ring, so nothing on disk is touched;
+/// * a directory no row names is reported, never deleted: without a row there is no proof it is
+///   this application's to remove.
 ///
-/// `encoder` is a label only (see [`ClipMetadata::encoder`]): the encoder that wrote the
-/// segments lived in a previous process and is not knowable from the files.
+/// `encoder` is a label only: the encoder that wrote the segments lived in a previous process.
 pub fn recover_sessions(
     store: &Store,
     sessions_dir: &Path,
@@ -542,9 +473,7 @@ pub fn recover_sessions(
         if row.mode == SESSION_MODE_SESSION {
             recover_session_row(store, row, sessions_dir, bin, segment_ms, encoder, &mut report);
         } else if row.ended_at_ms.is_none() {
-            // A buffer-mode session (or a mode a newer build wrote): its footage belongs to
-            // the ring, which manages the scratch directory by itself. All this pass owes it
-            // is an end stamp, so the retention rules can see it as history.
+            // A buffer-mode row (or a mode a newer build wrote): the ring owns its footage; just stamp the end so retention sees it as history.
             match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
                 Ok(()) => {
                     tracing::info!(
@@ -564,7 +493,7 @@ pub fn recover_sessions(
         }
     }
 
-    // Directories under the sessions area that no row names. Reported, never removed.
+    // Directories no row names: reported, never removed.
     if let Ok(entries) = std::fs::read_dir(sessions_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -627,7 +556,7 @@ fn recover_session_row(
                 }
                 Err(err) => tracing::warn!("could not close session #{}: {err:#}", row.id),
             }
-            // An empty directory is this application's own and costs nothing to remove.
+            // An empty directory is ours and costs nothing to remove.
             if dir.is_dir() {
                 if let Err(err) = std::fs::remove_dir(&dir) {
                     tracing::debug!("could not remove the empty {}: {err}", dir.display());
@@ -638,10 +567,8 @@ fn recover_session_row(
     }
 
     if !running && row.final_path.is_some() {
-        // A finished session whose segments are still there: a crash between the
-        // concatenation and the directory's removal. The final file exists and the row
-        // names it, so the segments are a duplicate — reported, not deleted (the retention
-        // pass removes them, with the row, when it evicts the session).
+        // A finished session whose segments remain (crash between concatenation and removal): the final
+        // file exists and the row names it, so these are a duplicate. Reported; retention removes them with the row.
         tracing::warn!(
             "session #{} is finished ({}) but its segment directory {} still holds {} \
              segment(s); the retention pass removes them with the session",
@@ -656,9 +583,8 @@ fn recover_session_row(
 
     let out = session_file_path(sessions_dir, row.started_at_ms);
     let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
-    // `true` asks for the audio-stream count (and its warning): a recovered session may well
-    // have had a microphone — the row does not say, and the encoder that knew is gone — and a
-    // silently absent voice track is exactly what that check exists to catch.
+    // `true` asks for the audio-stream count: the row does not say whether a recovered session had a
+    // microphone, and a silently absent voice track is what the check catches.
     match finalise(bin, &out, &segments, encoder, true) {
         Ok(meta) => {
             let path = meta.path.display().to_string();
@@ -667,8 +593,7 @@ fn recover_session_row(
                 now_ms(),
                 Some(&path),
                 meta.size_bytes as i64,
-                // The probed length of the file just concatenated: a recovered session has a
-                // real media length, and the timeline needs it as much as a normal one does.
+                // The probed length of the concatenated file, which the timeline needs.
                 meta.duration_ms as i64,
             ) {
                 Ok(()) => {
@@ -728,13 +653,9 @@ pub fn remove_session_dir(dir: &Path) -> u64 {
     }
 }
 
-/// Write two one-second segments into `dir` with a real ffmpeg — 1 video plus `audio` audio
-/// streams, the shape the encoder's segment muxer produces.
-///
-/// **Test-only**, and shared on purpose: it is what lets a test build a directory that looks
-/// exactly like a session that was recorded — for the session module's own unit tests and
-/// for the engine's crash-recovery test, which needs a session on disk that no live
-/// recording can leave behind (a clean stop removes it).
+/// Write two one-second segments into `dir` with a real ffmpeg (1 video plus `audio` audio streams,
+/// like the encoder's segment muxer). Test-only and shared so the engine's crash-recovery test can
+/// build a session on disk that no live recording leaves behind (a clean stop removes it).
 #[cfg(test)]
 pub(crate) fn layout_test_segments(dir: &Path, audio: usize) -> Result<Vec<Segment>> {
     let bin = FfmpegBinaries::discover(None)
@@ -773,13 +694,12 @@ mod tests {
     use super::*;
     use localplay_store::SESSION_MODE_BUFFER;
 
-    /// The ffmpeg on `PATH`, discovered the way the engine discovers it.
+    /// The ffmpeg on `PATH`.
     fn bin() -> FfmpegBinaries {
         FfmpegBinaries::discover(None).expect("ffmpeg on PATH")
     }
 
-    /// The ring configuration the session's tests open with: the same shape the engine
-    /// passes (`BufferConfig`), with the segment length and window these tests use.
+    /// The ring configuration the tests open with: the engine's `BufferConfig` shape with these tests' segment length and window.
     fn session_cfg(clips_dir: &Path) -> localplay_replay::buffer::BufferConfig {
         localplay_replay::buffer::BufferConfig {
             pre_ms: 2_000,
@@ -794,9 +714,7 @@ mod tests {
         layout_test_segments(dir, audio).expect("laying out test segments")
     }
 
-    /// A temp directory **under `target/`**, so a test run leaves its leftovers inside the
-    /// build directory and never in the user's temp or home (the recorder's own convention:
-    /// `LOCALPLAY_TEST_CLIPS_DIR` also puts a run's recording under `target/`).
+    /// A temp directory under `target/`, so a test run never leaves leftovers in the user's temp or home.
     fn temp_dir(what: &str) -> tempfile::TempDir {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-session-tests");
         std::fs::create_dir_all(&base).expect("creating the test scratch root");
@@ -819,17 +737,12 @@ mod tests {
             .expect("opening a session row")
     }
 
-    /// Both lossless concatenation paths keep **every** audio stream.
+    /// Both lossless concatenation paths keep every audio stream.
     ///
-    /// This is the regression test for a measured data-loss bug.
-    /// [`localplay_media::edit::concat_lossless`] passed no `-map`, so ffmpeg applied its
-    /// default stream selection and kept one audio stream: a clip cut from a session that
-    /// was recorded with a microphone came out with the voice track missing — exit status 0,
-    /// nothing logged, a file the user believes is whole.
-    ///
-    /// The splicer and `finalise` now share one `-map 0` invocation, so both must keep both
-    /// tracks. If a future ffmpeg changed its default selection, or someone dropped the
-    /// `-map`, the two halves of this test would disagree and point at which path regressed.
+    /// Regression test: `concat_lossless` once passed no `-map`, so ffmpeg kept one audio stream and a
+    /// clip from a session recorded with a microphone silently lost the voice track. The splicer and
+    /// `finalise` now share one `-map 0` invocation; the two halves below would disagree and show which
+    /// path regressed.
     #[test]
     fn every_lossless_concat_path_keeps_a_second_audio_track() {
         let dir = temp_dir("session-");
@@ -863,9 +776,7 @@ mod tests {
         assert_eq!(meta2.size_bytes, std::fs::metadata(&out).unwrap().len());
         assert!(meta.size_bytes > 0);
 
-        // The clip must also be as long as the segments it was built from, not merely carry
-        // the right number of streams: a concat that kept both audio streams but truncated
-        // one would pass the count above.
+        // The clip must also be as long as its segments: a concat that kept both audio streams but truncated one would pass the count.
         let spliced_info = MediaInfo::probe(&bin(), &spliced).expect("probing the clip");
         assert!(
             spliced_info.duration_ms >= 1_900,
@@ -874,8 +785,7 @@ mod tests {
         );
     }
 
-    /// Without a microphone, `finalise` goes through the same `-c copy` machinery and the
-    /// file has exactly the streams the segments had.
+    /// Without a microphone, `finalise` keeps exactly the streams the segments had.
     #[test]
     fn a_single_track_session_concatenates_to_one_video_and_one_audio_stream() {
         let dir = temp_dir("session-");
@@ -891,14 +801,13 @@ mod tests {
         assert_eq!(audio_stream_count(&bin(), &out), Some(1));
         assert!(meta.duration_ms >= 1_900, "{}ms for two 1s segments", meta.duration_ms);
 
-        // And a finalise with nothing to concatenate is an error, not an empty file.
+        // A finalise with nothing to concatenate is an error, not an empty file.
         let err = finalise(&bin(), &dir.path().join("empty.mp4"), &[], "libx264", false)
             .expect_err("no segments is not a session");
         assert!(err.to_string().contains("no segments"), "{err}");
     }
 
-    /// The live scan does not trust the newest segment (ffmpeg is still appending to it);
-    /// the shutdown scan takes every file, because by then the child has exited.
+    /// The live scan skips the newest segment (ffmpeg is appending); the shutdown scan takes every file.
     #[test]
     fn the_newest_segment_is_taken_at_shutdown_and_not_before_it() {
         let dir = temp_dir("session-");
@@ -931,8 +840,7 @@ mod tests {
         );
     }
 
-    /// A session directory that already holds segments cannot be written over: the encoder
-    /// is told to continue the numbering (the same rule the replay ring follows).
+    /// A directory that already holds segments is not written over: the encoder continues the numbering.
     #[test]
     fn a_session_directory_that_already_holds_segments_continues_the_numbering() {
         let dir = temp_dir("session-");
@@ -956,9 +864,8 @@ mod tests {
         );
     }
 
-    /// A crash leaves a running row and a directory of segments; the next start concatenates
-    /// them into the file the session would have written, closes the row, removes the
-    /// segments — and reports it.
+    /// After a crash the next start concatenates the segments into the session file, closes the row,
+    /// removes the segments and reports it.
     #[test]
     fn a_crashed_session_is_recovered_into_one_file_and_closed() {
         let dir = temp_dir("session-");
@@ -993,18 +900,15 @@ mod tests {
         assert!(store.get_session(id).unwrap().unwrap().final_path.is_some());
     }
 
-    /// When the concatenation cannot be done (a full disk is the real case; corrupt
-    /// segments stand in for it), nothing is lost and the next start tries again: every
-    /// segment is kept, and the row is left **running**, which is what keeps the retention
-    /// rules from evicting footage that has no session file.
+    /// When concatenation fails (corrupt segments stand in for a full disk), every segment is kept and
+    /// the row stays running, so retention cannot evict footage that has no session file.
     #[test]
     fn a_recovery_that_cannot_concatenate_keeps_the_segments_and_leaves_the_row_running() {
         let dir = temp_dir("session-");
         let sessions_dir = dir.path().join("sessions");
         let session_dir = sessions_dir.join("session-1700000000");
         std::fs::create_dir_all(&session_dir).unwrap();
-        // Not a media file at all: ffmpeg will refuse it, which is the failure path a full
-        // disk takes as well (a write that cannot complete).
+        // Not a media file: ffmpeg refuses it, as it would a write that cannot complete.
         std::fs::write(session_dir.join("seg-000000.mp4"), b"this is not an mp4").unwrap();
         let store = store();
         let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
@@ -1026,17 +930,15 @@ mod tests {
         );
     }
 
-    /// A row for a recording that wrote nothing is closed; a buffer-mode row left running by
-    /// a crash is closed without touching its scratch directory (the ring owns that); and a
-    /// directory no row names is reported rather than deleted.
+    /// A row for a recording that wrote nothing is closed; a buffer-mode row left running is closed
+    /// without touching its scratch directory; a directory no row names is reported, not deleted.
     #[test]
     fn recovery_closes_empty_rows_and_reports_directories_it_cannot_own() {
         let dir = temp_dir("session-");
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
-        // A session row whose directory is empty (a crash between the row and the first
-        // segment), and a buffer row whose scratch directory the ring manages.
+        // An empty session directory (crash before the first segment) and a buffer row whose scratch directory the ring manages.
         let empty_dir = sessions_dir.join("session-1");
         std::fs::create_dir_all(&empty_dir).unwrap();
         let scratch = dir.path().join("scratch");
@@ -1068,9 +970,7 @@ mod tests {
         assert!(orphan.is_dir(), "an unnamed directory is reported, never deleted");
     }
 
-    /// A finished session whose segments are still there (a crash between the concatenation
-    /// and the directory's removal) is reported and left alone: the file exists and the row
-    /// names it, so the segments are a duplicate the retention pass removes with the row.
+    /// A finished session whose segments remain is reported and left alone; retention removes the duplicate with the row.
     #[test]
     fn a_finished_session_with_leftover_segments_is_reported_not_deleted() {
         let dir = temp_dir("session-");
@@ -1093,8 +993,7 @@ mod tests {
         assert!(report.orphan_dirs.is_empty(), "the row names it, so it is not an orphan");
     }
 
-    /// Two recordings starting in the same second get different directories: the name is
-    /// claimed by creating it, so nothing can mix two sessions' segments into one file.
+    /// Two recordings starting in the same second get different directories (the name is claimed by creating it).
     #[test]
     fn a_session_directory_is_created_and_never_shared() {
         let dir = temp_dir("session-");

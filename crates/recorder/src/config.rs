@@ -1,24 +1,17 @@
-//! The configuration surface of the recorder: the three `config.toml` sections that
-//! describe a recording.
+//! The recorder's `config.toml` sections: `[recorder]`, `[mic]`, `[buffer]`, `[capture]`,
+//! `[encode]`, `[storage]`.
 //!
-//! These are the *recording* settings, so they live with the thing they configure rather
-//! than with either front-end. The CLI keeps `[hotkeys]` and `[events]` (a driver's
-//! business, and no business of the engine's) and the desktop shell keeps its own view of
-//! `[storage]` for the review pane; both parse the sections below for the recorder.
-//!
-//! The field names, the types and the defaults are `config.example.toml`'s (spec §10):
-//! paths are `String` because an empty one means "the default under the application data
-//! directory", which is a rule the recorder applies when it resolves them
-//! ([`crate::RecorderConfig`]).
+//! They live with the engine they configure; the CLI keeps `[hotkeys]` and `[events]` and the
+//! desktop shell its own `[storage]` view. Names, types and defaults follow `config.example.toml`.
+//! Paths are `String` because an empty one means "the default under the application data
+//! directory", which [`crate::RecorderConfig`] applies when resolving them.
 
 use serde::Deserialize;
 
-/// `[recorder]` — which recording this run is (spec §6, Phase 5).
+/// `[recorder]`: which recording this run is.
 ///
-/// Its own section rather than a key on `[buffer]` or `[storage]`: the mode is not a
-/// property of the ring or of the storage policy, it is what the engine is asked to do,
-/// and the two modes read every other setting differently (the scratch cap applies to one
-/// and not the other, and only one of them produces a session file).
+/// Its own section because the mode is what the engine is asked to do, not a property of the ring
+/// or the storage policy: the scratch cap applies to one mode only, and only one produces a session file.
 ///
 /// ```toml
 /// [recorder]
@@ -33,21 +26,18 @@ pub struct RecorderSection {
 
 /// What the engine records.
 ///
-/// * [`RecordingMode::ReplayBuffer`] — a bounded ring holding the last few minutes of play, a
-///   hotkey (or a game event) splices a clip out of it, and everything older than
-///   `buffer.ram_cap_bytes` is dropped. Nothing else survives the run, and — because the ring is
-///   memory — nothing was written until a clip was asked for (§12 of the verification ledger).
-/// * [`RecordingMode::FullSession`] — the whole session is written to disk: segments go
-///   into a per-session directory under the sessions area, **the scratch cap is not
-///   applied to them** (a full session is not a ring: evicting the oldest segment of a
-///   four-hour recording would delete footage the user asked for), and stopping the
-///   recording losslessly concatenates them into one `session-<timestamp>.mp4`.
+/// * [`RecordingMode::ReplayBuffer`]: a bounded RAM ring of the last few minutes; a hotkey or game
+///   event splices a clip out of it, older footage is dropped at `buffer.ram_cap_bytes`, and
+///   nothing is written until a clip is asked for.
+/// * [`RecordingMode::FullSession`]: segments go into a per-session directory that the scratch cap
+///   does not apply to (evicting the oldest segment of a long recording would delete footage the
+///   user asked for); stopping losslessly concatenates them into one `session-<timestamp>.mp4`.
 ///
-/// The strings are the ones `sessions.mode` stores ([`RecordingMode::store_mode`]), and
-/// a test pins the two spellings together so a rename cannot silently split them.
+/// The strings are those `sessions.mode` stores ([`RecordingMode::store_mode`]); a test pins the
+/// spellings together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub enum RecordingMode {
-    /// The rolling replay buffer. The default, and the only mode before Phase 5.
+    /// The rolling replay buffer (the default).
     #[default]
     #[serde(rename = "buffer", alias = "replay_buffer", alias = "replaybuffer")]
     ReplayBuffer,
@@ -57,8 +47,7 @@ pub enum RecordingMode {
 }
 
 impl RecordingMode {
-    /// The `config.toml` spelling (`[recorder] mode`), which is also the string
-    /// [`RecordingMode::store_mode`] maps onto.
+    /// The `config.toml` spelling (`[recorder] mode`), also the string [`RecordingMode::store_mode`] maps onto.
     pub fn as_str(self) -> &'static str {
         match self {
             RecordingMode::ReplayBuffer => "buffer",
@@ -66,8 +55,7 @@ impl RecordingMode {
         }
     }
 
-    /// The `sessions.mode` value this mode opens its row with (spec §5.5). The store owns
-    /// the vocabulary; this is the mapping, in one place.
+    /// The `sessions.mode` value this mode opens its row with; the store owns the vocabulary.
     pub fn store_mode(self) -> &'static str {
         match self {
             RecordingMode::ReplayBuffer => localplay_store::SESSION_MODE_BUFFER,
@@ -75,8 +63,7 @@ impl RecordingMode {
         }
     }
 
-    /// Whether this mode writes a session file and keeps its segments free of the scratch
-    /// cap. Named rather than compared, so the intent is readable at the call sites.
+    /// Whether this mode writes a session file and keeps its segments free of the scratch cap.
     pub fn is_full_session(self) -> bool {
         matches!(self, RecordingMode::FullSession)
     }
@@ -104,21 +91,16 @@ impl std::str::FromStr for RecordingMode {
     }
 }
 
-/// `[mic]` — the optional microphone track (spec §5.1, Phase 5).
+/// `[mic]`: the optional microphone track, off by default.
 ///
-/// **Off by default, and that is the whole posture of the feature.** A microphone is not
-/// part of the game's own audio, a machine may have no capture endpoint at all, and a
-/// recording that silently gained a track nobody asked for is a surprise with a legal
-/// flavour on a voice-chat-enabled box. The user opts in by writing `enabled = true`.
+/// Opt-in because a microphone is not the game's audio, a machine may have no capture endpoint, and
+/// a silently added voice track is a privacy surprise. When on, the engine sets `mic_audio` on the
+/// encode config (a second audio input, two output tracks) and feeds it from the microphone backend.
+/// If it cannot (no endpoint, or no backend on this platform) the recording fails at start rather
+/// than carrying a silent track (see `Recorder::start`).
 ///
-/// When it *is* on, the engine sets `mic_audio` on the encode configuration (so ffmpeg
-/// gets a second audio input and the output carries two audio tracks) and feeds that input
-/// from the microphone backend. When it cannot — no capture endpoint, or a platform with
-/// no microphone backend — the recording **fails at start** rather than producing video
-/// with a silent microphone track (see `Recorder::start`).
-///
-/// Device choice is deliberately not configurable: the Windows backend opens the default
-/// **communications** capture endpoint, which is the device the user actually talks into.
+/// Device choice is not configurable: Windows opens the default communications capture endpoint,
+/// the device the user talks into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(default)]
 pub struct MicSection {
@@ -126,34 +108,27 @@ pub struct MicSection {
     pub enabled: bool,
 }
 
-/// `[buffer]` — the ring's window, its segment length and its scratch budget.
+/// `[buffer]`: the ring's window, segment length and budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BufferSection {
     /// Media time kept before a trigger.
     pub pre_seconds: u64,
     /// Media time kept after a trigger.
     pub post_seconds: u64,
-    /// Length of one scratch segment. Also the keyframe interval, which is what makes a
-    /// clip a lossless concatenation of whole segments (spec §6.3).
+    /// Length of one scratch segment, also the keyframe interval, so a clip is a lossless
+    /// concatenation of whole segments.
     pub segment_time: u64,
     /// Empty means `<app data dir>/scratch`.
     pub scratch_dir: String,
-    /// Bytes of **RAM** the in-memory replay ring may occupy. Default 256 MiB.
+    /// Bytes of RAM the in-memory replay ring may occupy. Default 256 MiB.
     ///
-    /// This is the cap that matters for a replay buffer: unclipped footage lives in RAM rather
-    /// than on the SSD (see `localplay_replay::MemoryRingBuffer`), so this number is what keeps
-    /// the application from being killed by the operating system. Sized as a fraction of a
-    /// typical machine rather than all of it — the encoder, the capture backends and the
-    /// application all need room, and a ring that has evicted something is still a ring.
-    ///
-    /// Defaulted rather than required, so a `config.toml` written before this key existed still
-    /// parses: a config file belongs to its user, and a key this build added is not their error
-    /// (the same reasoning as `[mic]` and `[games]`).
+    /// Unclipped footage lives in RAM (see `localplay_replay::MemoryRingBuffer`), so this keeps the OS
+    /// from killing the application. It is a fraction of a typical machine because the encoder and
+    /// capture backends need room too. Defaulted so an older `config.toml` still parses.
     #[serde(default = "default_ram_cap_bytes")]
     pub ram_cap_bytes: u64,
-    /// The longest pre-roll a single clip may ask for, in seconds; `0` (the default) means
-    /// "no more than `pre_seconds`". It sizes the ring, so a long-clip hotkey can reach back
-    /// further than the everyday clip does. A request above it is clamped, never an error.
+    /// The longest pre-roll a single clip may ask for, in seconds; `0` means `pre_seconds`. It sizes
+    /// the ring so a long-clip hotkey can reach further back. Larger requests are clamped, not errors.
     #[serde(default)]
     pub max_pre_seconds: u64,
     /// The longest post-roll a single clip may ask for, in seconds; `0` means `post_seconds`.
@@ -178,19 +153,17 @@ fn default_ram_cap_bytes() -> u64 {
     256 * 1024 * 1024
 }
 
-/// `[capture]` — what is recorded: a monitor, or one window.
+/// `[capture]`: what is recorded, a monitor or one window.
 ///
-/// Both keys are optional and default to the primary monitor, so a `config.toml` written
-/// before this section existed records what it always did. Choosing is the capture crate's
+/// Both keys are optional and default to the primary monitor. Choosing is the capture crate's
 /// ([`localplay_capture::target`]); only Windows Graphics Capture honours it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(default)]
 pub struct CaptureSection {
-    /// Monitor index; 0 is the primary monitor. An index with no monitor behind it refuses
-    /// to start rather than recording another display.
+    /// Monitor index; 0 is the primary. An index with no monitor refuses to start rather than record another display.
     pub monitor: usize,
-    /// A window title (case-insensitive; exact beats substring) to capture instead of a
-    /// monitor. Empty captures the monitor. No match refuses to start.
+    /// A window title (case-insensitive; exact beats substring) to capture instead of a monitor.
+    /// Empty captures the monitor; no match refuses to start.
     pub window: String,
 }
 
@@ -203,72 +176,49 @@ impl CaptureSection {
 /// `[encode]` — what the encoder is asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EncodeSection {
-    /// `"auto"`, `"nvenc"`, `"qsv"` or `"amf"`. Resolved by a smoke test (spec §5.2).
+    /// `"auto"`, `"nvenc"`, `"qsv"` or `"amf"`, resolved by a smoke test.
     pub vendor: String,
     /// `"h264"` or `"hevc"`.
     pub codec: String,
     pub bitrate_kbps: u32,
-    /// The frame rate asked for. It is the *ceiling* on the rate the pipeline runs at: what
-    /// the machine can actually sustain is measured at startup (see `adapt_fps`) and the
-    /// lower of the two is used for both the pacer and the encoder child.
+    /// The frame rate asked for: a ceiling. The sustainable rate is measured at startup (see
+    /// `adapt_fps`) and the lower of the two drives both the pacer and the encoder child.
     pub fps: u32,
-    /// Hand captured frames to the hardware encoder **as GPU textures**, so their pixels never
-    /// reach this process's memory (default `false`).
+    /// Hand captured frames to the hardware encoder as GPU textures so pixels never reach this
+    /// process's memory (default: unset).
     ///
-    /// What it removes, measured on the 4K box: the capture backend copies 33.2 MB out of VRAM per
-    /// frame for ffmpeg to read back in, and that copy is ~97% of what the pipeline does (`capture=`
-    /// on the periodic line). With this on, a hardware encoder MFT takes the texture directly and
-    /// ffmpeg is told to copy the H.264 that comes out — a few hundred kilobytes a second across the
-    /// pipe instead of gigabytes.
+    /// This removes the per-frame VRAM readback (33.2 MB at 4K), which dominated the pipeline: a
+    /// hardware encoder MFT takes the texture directly and ffmpeg copies the H.264 that comes out.
     ///
-    /// **Unset means "use it when the hardware can".** That is the default, and it is resolved
-    /// against the machine: a detected hardware encoder and Windows gets the hardware path, and
-    /// anything else gets the ordinary one with a line saying so. A default that refused to start
-    /// would be a recorder that does not record on the machine it was copied to — and it would take
-    /// the test suite with it, which runs nowhere near this hardware.
+    /// * Unset: use it when the hardware can (a detected hardware encoder on Windows), otherwise the
+    ///   ordinary path with a log line. Refusing to start by default would break the recorder on any
+    ///   other machine and the test suite.
+    /// * `true`: the hardware path is required; a run that cannot have it is refused at startup with
+    ///   the reason rather than silently downgraded. This is why it is an `Option`, not a `bool`.
+    /// * `false`: off everywhere.
     ///
-    /// `true` is the strict form and means what it says: the hardware path is *required*, and a run
-    /// that cannot have it is refused at startup with the reason rather than silently downgraded.
-    /// That distinction is why this is an `Option` rather than a `bool` — a key that was set on
-    /// purpose deserves a different answer from one that was never mentioned.
-    ///
-    /// `false` turns it off everywhere.
-    ///
-    /// It needs a hardware encoder — a software one has no MFT to hand a texture to — and the
-    /// texture handover is Media Foundation's, so the path is Windows-only. Measured on the box it
-    /// was built for: 4.0% of one core against 88.9% on the readback path, 59.6 fps of 60 against
-    /// 55.5, no dropped frames against 8. See
-    /// `docs/plans/2026-09-25-localplay-tier-2-zero-copy.md`.
+    /// Needs a hardware encoder (a software one has no MFT to take a texture) and is Windows-only.
     #[serde(default)]
     pub zero_copy: Option<bool>,
-    /// Measure the sustainable encode rate at startup and record at the lower of that and
-    /// `fps` (default `true`).
+    /// Measure the sustainable encode rate at startup and record at the lower of that and `fps`
+    /// (default `true`).
     ///
-    /// This is a **pacing** decision, not the timeline's guarantee. It exists so the capture
-    /// does not pay for frames the encoder will throw away: on Windows every captured frame
-    /// costs a GPU-to-CPU readback (33 MB at 4K) whether or not it is ever encoded, so a rate
-    /// the machine cannot hold is wasted work and a choppier picture — on the measured 4K box
-    /// a configured 30fps sustained ~24fps with ~45% of frames dropped (issue #1).
+    /// A pacing decision, not the timeline guarantee: on Windows every captured frame costs a
+    /// GPU-to-CPU readback (33 MB at 4K) whether or not it is encoded, so a rate the machine cannot
+    /// hold is wasted work and a choppier picture. The media timeline tracks real time regardless,
+    /// because frames carry their arrival timestamps (`localplay_encoder::ffmpeg`). With
+    /// `adapt_fps = false` the unencodable frames are still dropped (the picture holds them) and the
+    /// status line's drop counter says how many.
     ///
-    /// What makes the *media timeline* track real time is independent of throughput and of
-    /// this setting: frames carry their arrival timestamps and the encoder no longer resamples
-    /// them onto a declared grid (`localplay_encoder::ffmpeg`), so a `pre_seconds` window is
-    /// that many real seconds on a machine of any speed. With `adapt_fps = false` the frames
-    /// the machine cannot encode are still dropped — the picture holds them — but the clock
-    /// stays honest, and the drop counter in the status line says how many.
-    ///
-    /// The probe costs about 1.5s of startup. Set it to `false` to skip that and declare `fps`
-    /// exactly as configured. A measurement at or above `fps` changes nothing either way.
+    /// The probe costs about 1.5s of startup; `false` skips it and declares `fps` exactly.
     #[serde(default = "adapt_fps_default")]
     pub adapt_fps: bool,
-    /// `"1920x1080"`, or empty for the capture backend's native size (spec §10).
+    /// `"1920x1080"`, or empty for the capture backend's native size.
     pub output_size: String,
 }
 
-/// `encode.adapt_fps` when the file does not mention it: on, because not paying a readback
-/// for frames the encoder will drop is the better default, and a rate the machine cannot hold
-/// is worth warning about before recording rather than after. A `config.toml` written before
-/// this key existed keeps working and gets the measured behaviour.
+/// `encode.adapt_fps` when the file does not mention it: on, since skipping readbacks for frames
+/// the encoder would drop is the better default and an unholdable rate deserves a warning up front.
 fn adapt_fps_default() -> bool {
     true
 }
@@ -311,12 +261,8 @@ output_size = \"\"
         assert!(section.adapt_fps, "config.example.toml must enable adaptation");
     }
 
-    /// A `[buffer]` section written before `ram_cap_bytes` existed must still parse.
-    ///
-    /// The key is `#[serde(default)]` for exactly this reason — a config file belongs to its user,
-    /// and a key a later build added is not their error — and a default no test ever takes is a
-    /// claim rather than a behaviour. Every other key in the section is required, so `ram_cap_bytes`
-    /// is the one this section cannot be missing.
+    /// A `[buffer]` section written before `ram_cap_bytes` existed must still parse; it is the one key
+    /// the section can be missing, and an untaken default is a claim rather than a behaviour.
     #[test]
     fn a_config_without_the_ram_cap_parses_and_gets_the_default() {
         #[derive(Debug, Deserialize)]
@@ -335,24 +281,20 @@ output_size = \"\"
         );
     }
 
-    /// A `config.toml` written before this key existed gets adaptation, not silence: the
-    /// default is the point of the key, and the alternative is a user who upgrades and keeps
-    /// the behaviour the ledger measured as broken.
+    /// A `config.toml` without `adapt_fps` gets adaptation, not silence.
     #[test]
     fn a_config_that_does_not_mention_the_key_enables_adaptation() {
         assert!(encode_section(MINIMAL).adapt_fps);
     }
 
-    /// The opt-out is honoured, and it is the only way to declare a rate the machine may not
-    /// hold (the escape hatch documented in `config.example.toml` and the spec).
+    /// The opt-out is honoured; it is the only way to declare a rate the machine may not hold.
     #[test]
     fn the_key_can_turn_adaptation_off() {
         let text = MINIMAL.replace("fps = 30", "fps = 30\nadapt_fps = false");
         assert!(!encode_section(&text).adapt_fps);
     }
 
-    /// A typo is a parse error rather than a silent default: `adapt_fps = "yes"` must not
-    /// leave a user believing they turned something on or off.
+    /// A typo is a parse error rather than a silent default: `adapt_fps = "yes"` must not leave a user misled.
     #[test]
     fn a_non_boolean_value_is_a_parse_error() {
         let text = MINIMAL.replace("fps = 30", "fps = 30\nadapt_fps = \"yes\"");
@@ -363,8 +305,7 @@ output_size = \"\"
         );
     }
 
-    /// The mode is a setting of the engine, so it parses from `[recorder]` — and absent, it
-    /// is the replay buffer, i.e. the behaviour every existing configuration already has.
+    /// The mode parses from `[recorder]`; absent, it is the replay buffer.
     #[test]
     fn the_recording_mode_parses_and_defaults_to_the_replay_buffer() {
         let absent: RecorderFile = toml::from_str("buffer_thing = 1\n").expect("no [recorder]");
@@ -380,8 +321,7 @@ output_size = \"\"
         assert!(session.recorder.mode.is_full_session());
     }
 
-    /// A mode this build does not know is a parse error naming the key — the alternative is
-    /// recording the *other* mode while the file says otherwise.
+    /// An unknown mode is a parse error naming the key, not a silent fallback to the other mode.
     #[test]
     fn an_unknown_mode_is_refused() {
         let err = toml::from_str::<RecorderFile>("[recorder]\nmode = \"everything\"\n")
@@ -389,9 +329,7 @@ output_size = \"\"
         assert!(err.to_string().contains("mode"), "the error names the key: {err}");
     }
 
-    /// The spelling `config.toml` uses and the value `sessions.mode` stores are one fact:
-    /// the config's `"session"` must be the store's `SESSION_MODE_SESSION`, or a row would
-    /// say one thing and the config another.
+    /// The config's `"session"` must be the store's `SESSION_MODE_SESSION`, or a row and the config would disagree.
     #[test]
     fn the_mode_spellings_match_the_stores_vocabulary() {
         for mode in [RecordingMode::ReplayBuffer, RecordingMode::FullSession] {
@@ -419,8 +357,7 @@ output_size = \"\"
         assert!(on.mic.enabled);
     }
 
-    /// The session rules are additive: a `[storage]` table written before Phase 5 parses,
-    /// keeps its own values, and gets the documented default for the session store.
+    /// An older `[storage]` table still parses, keeps its values and gets the default session rules.
     #[test]
     fn the_session_storage_rules_are_optional_and_separate() {
         #[derive(Debug, Deserialize)]
@@ -448,10 +385,8 @@ output_size = \"\"
     }
 }
 
-/// `[storage]` — the clips directory and the policy applied to it (spec §8.1).
-///
-/// Phase 5 added [`StorageSection::sessions`], additively: a file written before it existed
-/// still parses, and every field above means exactly what it always did.
+/// `[storage]`: the clips directory and the policy applied to it. [`StorageSection::sessions`] is additive,
+/// so older files still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StorageSection {
     /// Empty means `<app data dir>/clips`.
@@ -461,38 +396,32 @@ pub struct StorageSection {
     pub max_total_bytes: u64,
     /// A non-favourited clip older than this many days is deleted.
     pub max_age_days: u64,
-    /// `[storage.sessions]` — the same two rules, for the session store (Phase 5).
-    /// Optional: a configuration that does not mention it gets
+    /// `[storage.sessions]`: the same two rules for the session store. Optional; absent gets
     /// [`SessionStorageRules::default`].
     #[serde(default)]
     pub sessions: SessionStorageRules,
 }
 
-/// `[storage.sessions]` — the session store's own rules (spec §8.1).
+/// `[storage.sessions]`: the session store's own rules.
 ///
-/// The field names are the clips rules' field names on purpose: sessions and clips are
-/// evicted independently, by the *same* two rules with their own numbers, and a reader who
-/// knows one table knows the other ([`crate::index::cleanup_pass`] applies both).
+/// Field names mirror the clips rules because sessions and clips are evicted independently by the
+/// same two rules with their own numbers ([`crate::index::cleanup_pass`] applies both).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SessionStorageRules {
     /// Empty means `<app data dir>/sessions`.
     pub sessions_dir: String,
-    /// Total bytes the session store may occupy, favourites and *running* sessions
-    /// included. A session that is still recording is never an eviction candidate — its
-    /// bytes are counted, and a live recording that alone exceeds the cap is reported as
-    /// an unsatisfiable cap rather than paid for out of the finished sessions beside it.
+    /// Total bytes the session store may occupy, favourites and running sessions included. A running
+    /// session is never an eviction candidate; a live recording that alone exceeds the cap is reported
+    /// as an unsatisfiable cap rather than paid for out of finished sessions.
     pub max_total_bytes: u64,
-    /// A non-favourited session that *started* longer ago than this many days is deleted.
+    /// A non-favourited session that started longer ago than this many days is deleted.
     pub max_age_days: u64,
 }
 
 impl Default for SessionStorageRules {
-    /// 200 GiB and a week. The cap is generous because a session is one file the user
-    /// deliberately recorded end to end (a 4K session is ~9 GB an hour at the example
-    /// bitrate), and the age limit is the clips limit: a session is not more precious than
-    /// a clip. Both are meant to be raised by a user who records a lot, not to be the
-    /// thing that decides how much they can keep.
+    /// 200 GiB and a week. Generous because a session is one file the user recorded deliberately end
+    /// to end; users who record a lot should raise it.
     fn default() -> Self {
         Self { sessions_dir: String::new(), max_total_bytes: 214_748_364_800, max_age_days: 7 }
     }
