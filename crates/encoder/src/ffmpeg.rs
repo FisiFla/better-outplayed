@@ -602,7 +602,7 @@ impl FfmpegEncoder {
         // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream)
-            .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, video_tx.clone()));
+            .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, cfg.fps, video_tx.clone()));
         let video_writer = std::thread::Builder::new()
             .name("ffmpeg-video-in".into())
             .spawn(move || pump(video_rx, video_in))
