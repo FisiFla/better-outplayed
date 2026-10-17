@@ -28,7 +28,7 @@ impl SegmentWindow {
         self.segments.iter().map(|s| s.seq).collect()
     }
 
-    /// Nominal duration, accurate to within one segment (spec §6.3).
+    /// Nominal duration, accurate to within one segment.
     pub fn duration_ms(&self) -> u64 {
         self.segments.iter().map(|s| s.duration_ms).sum()
     }
