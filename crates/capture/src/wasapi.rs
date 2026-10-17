@@ -606,7 +606,7 @@ fn start_stream(
 
 /// The QPC in 100ns units and the shared clock, read back to back. `Instant` is QPC-based on
 /// Windows, so the two then differ by a constant and one reading maps every packet timestamp.
-fn qpc_anchor() -> Result<(u64, Duration)> {
+pub(crate) fn qpc_anchor() -> Result<(u64, Duration)> {
     let mut frequency = 0i64;
     let mut counter = 0i64;
     // SAFETY: both are valid out-parameters for the duration of the calls.
