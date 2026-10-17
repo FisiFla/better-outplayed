@@ -1,8 +1,8 @@
-//! The encoder probe: which hardware encoders this machine has, and — the part that
-//! matters — which of them can actually encode a frame.
+//! The encoder probe: which hardware encoders this machine has and, the part that matters,
+//! which of them can actually encode a frame.
 //!
-//! Shared by `xtask probe` (prints it) and `xtask verify` (embeds it in the report and uses
-//! it to pick a vendor that must fail, for criterion 7).
+//! Shared by `xtask probe` (prints it) and `xtask verify` (embeds it in the report and picks a
+//! vendor that must fail).
 
 use anyhow::{Context, Result};
 use localplay_media::FfmpegBinaries;
@@ -29,7 +29,7 @@ pub enum State {
 }
 
 impl State {
-    /// The one-line form the runbook reads.
+    /// The one-line form used in the report.
     pub fn describe(&self) -> String {
         match self {
             State::Works => "advertised, WORKS".to_string(),
@@ -54,12 +54,10 @@ impl ProbeReport {
             .any(|(name, state)| name == encoder && *state == State::Works)
     }
 
-    /// A vendor whose H.264 encoder this machine *cannot* use, for criterion 7.
+    /// A vendor whose H.264 encoder this machine cannot use, to test the unusable-vendor failure.
     ///
-    /// Prefers an `advertised, FAILS` vendor — the case that used to slip through, because
-    /// the encoder list was the only check — and falls back to `not advertised`. `None`
-    /// when every vendor works here, which is a legitimate machine state: the check is then
-    /// reported as not performed rather than faked.
+    /// Prefers an `advertised, FAILS` vendor, then `not advertised`. `None` when every vendor
+    /// works here, a legitimate state: the check is then reported as not performed, not faked.
     pub fn unusable_h264_vendor(&self) -> Option<(&'static str, &'static str)> {
         let unusable = VENDORS.iter().filter(|(_, encoder)| !self.works(encoder));
         let advertised_fails = unusable
@@ -104,12 +102,11 @@ pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
 
     let mut rows = Vec::with_capacity(CANDIDATES.len());
     for name in CANDIDATES {
-        // Two questions, and only the second one is the answer. `-encoders` says the build
-        // carries the encoder; the smoke test says *this machine* can run it, which is
-        // what a `vendor` value in the config depends on. A vendor can advertise an
-        // encoder it cannot initialise — measured on a box with no AMD hardware, ffmpeg
-        // listed h264_amf and died with `DLL amfrt64.dll failed to open` when asked to use
-        // it — so a row that says only "listed" is not enough to trust.
+        // Two questions, and only the second is the answer. `-encoders` says the build carries the
+        // encoder; the smoke test says this machine can run it, which is what a config `vendor`
+        // depends on. A vendor can advertise an encoder it cannot initialise (on a machine with no AMD
+        // hardware, ffmpeg listed h264_amf and died with `DLL amfrt64.dll failed to open`), so "listed"
+        // is not enough to trust.
         let state = if !text.lines().any(|l| l.contains(name)) {
             State::NotAdvertised
         } else {

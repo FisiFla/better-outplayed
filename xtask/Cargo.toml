@@ -29,9 +29,8 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # `xtask verify` samples the running CLI's CPU time and working set with the same two
-# Win32 calls the runbook's PowerShell recipe reads (`GetProcessTimes`,
-# `K32GetProcessMemoryInfo`). Target-specific, so a non-Windows development host never
-# builds it — and it is the same `windows-sys` the capture backend already pulls in.
+# Win32 calls (`GetProcessTimes`, `K32GetProcessMemoryInfo`). Target-specific, so a
+# non-Windows development host never builds it; it is the same `windows-sys` the capture backend already pulls in.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
