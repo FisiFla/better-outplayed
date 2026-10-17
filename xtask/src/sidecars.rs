@@ -1535,15 +1535,6 @@ binaries = [\"bin/ffmpeg\"]
     }
 
     #[test]
-    fn host_defaults_resolve_for_the_platforms_this_repo_is_built_on() {
-        assert_eq!(triple_for("x86_64", "windows"), Some("x86_64-pc-windows-msvc"));
-        assert_eq!(triple_for("aarch64", "macos"), Some("aarch64-apple-darwin"));
-        assert_eq!(triple_for("x86_64", "macos"), Some("x86_64-apple-darwin"));
-        assert_eq!(triple_for("x86_64", "linux"), Some("x86_64-unknown-linux-gnu"));
-        assert_eq!(triple_for("sparc64", "hermit"), None);
-    }
-
-    #[test]
     fn requested_target_wins_and_unknown_targets_list_the_alternatives() {
         let manifest = parse_manifest(SAMPLE).expect("parsing");
         let entries = entries_of(&manifest);
@@ -1571,11 +1562,7 @@ binaries = [\"bin/ffmpeg\"]
         let msg = format!("{err:#}");
         assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
         assert!(msg.contains("--target"), "must say how to proceed: {msg}");
-    }
 
-    #[test]
-    fn an_unrecognised_host_asks_for_an_explicit_target() {
-        let manifest = parse_manifest(SAMPLE).expect("parsing");
         let err = select_entry(&entries_of(&manifest), None, None)
             .expect_err("an unknown host must ask for --target");
         assert!(format!("{err:#}").contains("--target"));

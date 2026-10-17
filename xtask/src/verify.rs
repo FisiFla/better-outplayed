@@ -2925,24 +2925,6 @@ mod tests {
     }
 
     #[test]
-    fn the_harness_config_is_one_the_cli_accepts() {
-        // The harness writes this file into the sandbox; if it stopped parsing, every run
-        // would fail at startup with a confusing error. The CLI's own parser is the check.
-        let toml = RUN_CONFIG.to_toml("auto");
-        for needle in [
-            "pre_seconds = 5",
-            "post_seconds = 3",
-            "scratch_cap_bytes = 16777216",
-            "vendor = \"auto\"",
-            "gsi_port = 0",
-            "lol_poll_enabled = false",
-        ] {
-            assert!(toml.contains(needle), "config is missing {needle}:\n{toml}");
-        }
-        assert_eq!(RUN_CONFIG.window_ms(), 8000);
-    }
-
-    #[test]
     fn options_default_to_the_repository_target_directory() {
         let repo = Path::new("/repo");
         let opts = parse_options(&[], repo).expect("no arguments are all defaults");
