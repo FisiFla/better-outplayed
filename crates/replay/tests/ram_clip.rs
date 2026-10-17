@@ -16,67 +16,36 @@ use localplay_media::{edit::audio_titles, FfmpegBinaries, MediaInfo};
 use localplay_replay::splice::ClipSplicer;
 use localplay_replay::MemoryRingBuffer;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Record `seconds` of stub capture into a ring, and hold the stream's bytes.
+/// Build a ring from `seconds` of synthetic footage, and return it with the (empty) scratch
+/// directory the tests assert stays that way.
 ///
-/// Returns the ring and the directory that must stay empty: the two things this test is about.
+/// The stream is the shape the live encoder produces (`empty_moov+frag_keyframe+default_base_moof`,
+/// a keyframe a second, H.264 + AAC) but is made **offline**: ffmpeg renders it faster than real
+/// time from lavfi sources. The earlier version fed a real-time stub capture through the real
+/// encoder, so how much footage the ring held, and whether the encoder's bounded shutdown killed
+/// it under load (SIGKILL), depended on the host's speed (`docs/verification-status.md` §20, §22).
+/// Nothing here depends on wall time, so the span and the fragments are exact. The real-time
+/// capture -> encoder -> ring path keeps its own test below.
 fn ring_of_stub_capture(seconds: u64) -> (MemoryRingBuffer, tempfile::TempDir) {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let dir = tempfile::tempdir().expect("a temp dir");
-    let mut cfg = EncodeConfig::for_tests_software(
-        VideoCodec::H264,
-        64,
-        48,
-        30,
-        dir.path().to_path_buf(),
-        1_000,
-    );
-    cfg.output = EncodeOutput::FragmentedStream;
-
-    let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
-    let stream = enc.take_output_stream().expect("the stream mode exposes its pipe");
-
-    // Read on another thread: ffmpeg blocks when its stdout fills, which stops it draining
-    // stdin and would hang this test rather than fail it.
-    let done = Arc::new(AtomicBool::new(false));
-    let finished = Arc::clone(&done);
-    let reader = std::thread::spawn(move || {
-        let mut stream = stream;
-        let mut bytes = Vec::new();
-        while !finished.load(Ordering::Relaxed) {
-            let mut chunk = [0u8; 32 * 1024];
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                Err(_) => break,
-            }
-        }
-        bytes
-    });
-
-    let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 30 });
-    let mut audio = StubAudio::new(AudioFormat::default());
-    video.start().expect("start the capture stub");
-    audio.start().expect("start the audio stub");
-
-    let until = Instant::now() + Duration::from_secs(seconds);
-    while Instant::now() < until {
-        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
-            enc.submit_video(frame).expect("submit video");
-        }
-        while let Some(block) = audio.next_buffer(Duration::ZERO).expect("next audio block") {
-            enc.submit_audio(block).expect("submit audio");
-        }
-    }
-    enc.finish().expect("flush the encoder");
-    done.store(true, Ordering::Relaxed);
-    let bytes = reader.join().expect("the reader thread");
+    let out = std::process::Command::new(&bin.ffmpeg)
+        .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30"])
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
+        .args(["-t", &seconds.to_string()])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "30"])
+        .args(["-force_key_frames", "expr:gte(t,n_forced*1)"])
+        .args(["-c:a", "aac", "-f", "mp4"])
+        .args(["-movflags", "empty_moov+frag_keyframe+default_base_moof", "pipe:1"])
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
 
     let mut ring = MemoryRingBuffer::new(256 * 1024 * 1024, 120_000);
-    ring.push(&bytes).expect("the ring ingests the stream");
+    ring.push(&out.stdout).expect("the ring ingests the stream");
     (ring, dir)
 }
 
@@ -305,25 +274,14 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
 /// assertion is that the ring then covers the whole request. The recorder's half of the
 /// invariant — that it really waits — is the recorder's own test's business.
 ///
-/// # The front is the ring's, not an assumed `0`
-///
-/// The fixture is a real-time capture, so how much footage the ring holds — and, in particular,
-/// where its *earliest* held fragment starts — is a function of what the encoder managed to
-/// deliver, not of the wall time the feeding loop ran for. A window measured back from `span`
-/// alone therefore rests on an assumption the ring never promised: that its front is `0`. When
-/// it is not, the request starts before the footage the ring can actually cut from and comes
-/// back `truncated_front` — which is exactly how this test failed once on a CI run whose commit
-/// changed only documentation (§20 of `docs/verification-status.md`). The window below is
-/// therefore built against the front the ring reports through `segments()`, the same
-/// closed-fragment set `window` itself selects from, rather than against an assumed zero.
+/// The window is still built against the front the ring reports through `segments()` (the same
+/// closed-fragment set `window` selects from) rather than an assumed `0`.
 #[test]
 fn a_window_inside_the_held_footage_covers_the_whole_request() {
     const PRE: u64 = 2_000;
     const POST: u64 = 1_000;
-    // 8s rather than the 6s the first version asked for: the assertion below needs the ring to
-    // hold PRE + POST = 3s of footage measured from whatever front it reports, and this fixture
-    // is a real-time capture whose yield depends on the host. The extra seconds are margin so a
-    // loaded runner still holds comfortably more than the one window the test needs.
+    // The footage is synthetic and exact (no capture timing), so 8s is simply comfortably more
+    // than the PRE + POST = 3s the window needs.
     let (ring, _dir) = ring_of_stub_capture(8);
 
     let span = ring.span_ms();
