@@ -70,6 +70,11 @@ impl<O: SourceOpener> RecoveringSource<O> {
         self.stream.as_ref().map(|(s, _)| s)
     }
 
+    #[cfg(test)]
+    pub fn opener(&self) -> &O {
+        &self.opener
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -81,11 +86,6 @@ impl<O: SourceOpener> RecoveringSource<O> {
     /// Take what the stream has, reopen it if it is lost or no longer wanted, and pad up to `now`
     /// when nothing is flowing. Only an error that is not a lost endpoint comes back.
     pub fn poll(&mut self, now: Duration) -> Result<()> {
-        if self.stream.is_some() && now >= self.next_switch_check {
-            self.next_switch_check = now + SWITCH_CHECK_INTERVAL;
-            self.check_switch();
-        }
-
         if let Some((stream, key)) = self.stream.as_mut() {
             match self.timeline.drain(stream, MAX_PACKETS_PER_POLL) {
                 Ok(true) => self.timeline.fill_to(now),
@@ -97,6 +97,11 @@ impl<O: SourceOpener> RecoveringSource<O> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        if self.stream.is_some() && now >= self.next_switch_check {
+            self.next_switch_check = now + SWITCH_CHECK_INTERVAL;
+            self.check_switch();
         }
 
         if self.stream.is_none() {

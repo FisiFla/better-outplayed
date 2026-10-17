@@ -165,6 +165,9 @@ pub struct CaptureSection {
     /// A window title (case-insensitive; exact beats substring) to capture instead of a monitor.
     /// Empty captures the monitor; no match refuses to start.
     pub window: String,
+    /// `"app"`: only the running watched game (the whole output while none runs); `"system"`:
+    /// everything the default output plays.
+    pub game_audio: localplay_capture::GameAudioSource,
 }
 
 impl CaptureSection {

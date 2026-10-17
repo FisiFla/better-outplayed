@@ -86,7 +86,7 @@ pub use pump::{
 };
 
 use anyhow::{bail, Context, Result};
-use localplay_capture::platform::{default_audio_backend, default_video_backend};
+use localplay_capture::platform::{default_video_backend, game_audio_backend};
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::wasapi_mic::{StubMicrophone, MICROPHONE_FORMAT};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
@@ -946,7 +946,8 @@ impl Prepared {
                  video-only recording, or leave `[audio] enabled = true`."
             );
         }
-        let (mut capture, mut audio) = build_sources(cfg.sources, &cfg.capture, cfg.encode.fps, game_audio)?;
+        let (mut capture, mut audio) =
+            build_sources(cfg.sources, &cfg.capture, &self.opts.games.watch, cfg.encode.fps, game_audio)?;
         let native = capture.native_size();
 
         let mut encode_cfg = build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
@@ -2199,6 +2200,7 @@ impl RecorderConfig {
 fn build_sources(
     sources: Sources,
     capture_section: &CaptureSection,
+    watch: &[localplay_events::process::WatchedGame],
     fps: u32,
     game_audio: bool,
 ) -> Result<(Box<dyn CaptureBackend>, Option<Box<dyn AudioBackend>>)> {
@@ -2208,7 +2210,15 @@ fn build_sources(
             let stub = StubConfig { width: STUB_CAPTURE_SIZE.0, height: STUB_CAPTURE_SIZE.1, fps };
             let capture = default_video_backend(stub, &capture_section.target())?;
             let audio: Option<Box<dyn AudioBackend>> = if game_audio {
-                Some(default_audio_backend(AudioFormat::default())?)
+                // The same snapshot the game watcher takes, so the audio follows the game it detects.
+                let watch = watch.to_vec();
+                let find_game = Box::new(move || {
+                    localplay_events::process::running_game_pid(&watch).unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "could not look for the game process");
+                        None
+                    })
+                });
+                Some(game_audio_backend(AudioFormat::default(), capture_section.game_audio, find_game)?)
             } else {
                 None
             };

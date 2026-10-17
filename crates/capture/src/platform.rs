@@ -12,7 +12,7 @@
 
 use crate::stub::StubConfig;
 use crate::target::CaptureTarget;
-use crate::{AudioBackend, AudioFormat, CaptureBackend};
+use crate::{AudioBackend, AudioFormat, CaptureBackend, GameAudioSource, GameFinder};
 use anyhow::Result;
 
 /// The video backend for this platform.
@@ -63,6 +63,32 @@ pub fn default_audio_backend(format: AudioFormat) -> Result<Box<dyn AudioBackend
     }
     #[cfg(not(windows))]
     {
+        Ok(Box::new(crate::stub::StubAudio::new(format)))
+    }
+}
+
+/// The game-audio backend: like [`default_audio_backend`], but under [`GameAudioSource::App`] it
+/// captures only the process `find_game` reports, where Windows supports that.
+pub fn game_audio_backend(
+    format: AudioFormat,
+    source: GameAudioSource,
+    find_game: GameFinder,
+) -> Result<Box<dyn AudioBackend>> {
+    #[cfg(windows)]
+    {
+        if format != AudioFormat::default() {
+            tracing::warn!(
+                "audio was requested as {:?} but the Windows loopback backend only \
+                 produces {:?}",
+                format,
+                AudioFormat::default()
+            );
+        }
+        Ok(Box::new(crate::wasapi::WasapiLoopback::with_source(source, Some(find_game))?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, find_game);
         Ok(Box::new(crate::stub::StubAudio::new(format)))
     }
 }

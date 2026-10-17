@@ -47,7 +47,7 @@
 //!
 //! # Unverified on Windows
 //!
-//! [`image_names`] is type-checked against `x86_64-pc-windows-msvc` but its syscalls are
+//! [`processes`] is type-checked against `x86_64-pc-windows-msvc` but its syscalls are
 //! unproven here. It is kept to four calls (`CreateToolhelp32Snapshot`, `Process32FirstW`,
 //! `Process32NextW`, `CloseHandle`) so the unproven part is small, and everything that decides
 //! anything ([`presences_in`]) is pure and tested everywhere. If a protected process's image
@@ -182,6 +182,30 @@ pub fn presences_in(watched: &[WatchedGame], observed: &[String]) -> Vec<Presenc
         .collect()
 }
 
+/// The process id of the first title in `watched` (list order) found among `observed`
+/// `(image name, pid)` pairs.
+pub fn pid_in(watched: &[WatchedGame], observed: &[(String, u32)]) -> Option<u32> {
+    watched.iter().find_map(|game| {
+        observed.iter().find(|(name, _)| image_name_matches(&game.exe, name)).map(|&(_, pid)| pid)
+    })
+}
+
+/// The process id of a running watched title, from the same snapshot [`ProcessWatcher`] takes.
+///
+/// For per-application audio capture, which hands the id to the audio service. The id is only
+/// read out of the snapshot: the process is never opened.
+pub fn running_game_pid(watched: &[WatchedGame]) -> Result<Option<u32>> {
+    #[cfg(windows)]
+    {
+        Ok(pid_in(watched, &processes()?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = watched;
+        bail!("finding a game's process needs the Windows process-list snapshot")
+    }
+}
+
 /// Whether an observed image name is the file `configured` names. Exactly:
 ///
 /// * both sides are reduced to a file name first, so a snapshot reporting a full path and a
@@ -212,7 +236,7 @@ fn file_name(name: &str) -> &str {
 /// The process-name watcher: compare a snapshot of image names against the configured list.
 ///
 /// The thin half of detection: the comparison is [`presences_in`]; what remains is one
-/// snapshot call, one walk and one handle close, in [`image_names`].
+/// snapshot call, one walk and one handle close, in [`processes`].
 ///
 /// One poll is one `CreateToolhelp32Snapshot` plus a walk of a few hundred entries, copying
 /// each image name into a vector dropped before `poll` returns. Nothing about a process is
@@ -243,7 +267,7 @@ impl GamePresence for ProcessWatcher {
     fn poll(&mut self) -> Result<Vec<Presence>> {
         #[cfg(windows)]
         {
-            let observed = image_names()?;
+            let observed: Vec<String> = processes()?.into_iter().map(|(name, _)| name).collect();
             Ok(presences_in(&self.watched, &observed))
         }
         #[cfg(not(windows))]
@@ -259,7 +283,7 @@ impl GamePresence for ProcessWatcher {
     }
 }
 
-/// One snapshot of every process's image name: the only Windows code in this module.
+/// One snapshot of every process's image name and id: the only Windows code in this module.
 ///
 /// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` is Task Manager's enumeration: the kernel
 /// returns a copy of the process list as `PROCESSENTRY32W` records and this copies the image
@@ -268,7 +292,7 @@ impl GamePresence for ProcessWatcher {
 /// is the snapshot's own, closed before return. Kept to four calls because this half cannot
 /// be tested on the development machine.
 #[cfg(windows)]
-fn image_names() -> Result<Vec<String>> {
+fn processes() -> Result<Vec<(String, u32)>> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -311,7 +335,7 @@ fn image_names() -> Result<Vec<String>> {
             Some(len) => String::from_utf16_lossy(&entry.szExeFile[..len]),
             None => String::from_utf16_lossy(&entry.szExeFile),
         };
-        names.push(name);
+        names.push((name, entry.th32ProcessID));
         // A failure here is the documented end of the list, how a `Process32*` walk always ends.
         if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
             break;
@@ -1008,6 +1032,21 @@ mod tests {
             .iter()
             .find(|presence| presence.game.exe.eq_ignore_ascii_case(exe))
             .map(|presence| presence.running)
+    }
+
+    #[test]
+    fn the_pid_is_the_first_watched_title_that_is_running() {
+        let watch = default_watch();
+        let running = |list: &[(&str, u32)]| -> Vec<(String, u32)> {
+            list.iter().map(|&(name, pid)| (name.to_string(), pid)).collect()
+        };
+        assert_eq!(pid_in(&watch, &running(&[("explorer.exe", 4), ("CS2.EXE", 77)])), Some(77));
+        // Watch-list order decides, not snapshot order: League is listed before cs2.
+        assert_eq!(
+            pid_in(&watch, &running(&[("cs2.exe", 77), ("League of Legends.exe", 12)])),
+            Some(12)
+        );
+        assert_eq!(pid_in(&watch, &running(&[("notcs2.exe", 5)])), None);
     }
 
     #[test]
