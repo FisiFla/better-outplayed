@@ -9,9 +9,16 @@
    * are), while fps, output size, mic and auto-record are baked in per recorder start.
    * The panel says which is which instead of pretending everything is live.
    */
-  import type { GsiGame, GsiTarget, RecordingStatus, SettingsDto, SettingsUpdate } from '../types';
+  import type {
+    AudioDevices,
+    GsiGame,
+    GsiTarget,
+    RecordingStatus,
+    SettingsDto,
+    SettingsUpdate,
+  } from '../types';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { QUALITY_OPTIONS, captureUpdate, monitorIndex } from '../settings';
+  import { QUALITY_OPTIONS, captureUpdate, deviceOptions, monitorIndex } from '../settings';
 
   interface Props {
     /** `null` until the first read answers; the panel is hidden meanwhile. */
@@ -21,6 +28,10 @@
     /** A command is in flight; the apply buttons are held while it is. */
     busy?: boolean;
     onApply: (update: SettingsUpdate) => void;
+    /** The active microphones and outputs; empty lists leave only "Windows default". */
+    audioDevices?: AudioDevices;
+    /** Re-read the device list, so a device plugged in after launch shows up. */
+    onRefreshAudioDevices?: () => void;
     /** CS2 / Dota 2 as Steam has them; empty until the first detection answers. */
     gsiTargets?: GsiTarget[];
     /** Write that game's Game State Integration cfg into its detected folder. */
@@ -32,6 +43,8 @@
     recording = null,
     busy = false,
     onApply,
+    audioDevices = { inputs: [], outputs: [] },
+    onRefreshAudioDevices = () => {},
     gsiTargets = [],
     onInstallGsi = () => {},
   }: Props = $props();
@@ -52,6 +65,8 @@
   let quality = $state('balanced');
   let monitorText = $state('0');
   let windowTitle = $state('');
+  let micDevice = $state('');
+  let outputDevice = $state('');
 
   $effect(() => {
     if (settings === null) return;
@@ -63,7 +78,12 @@
     quality = settings.quality;
     monitorText = String(settings.capture_monitor);
     windowTitle = settings.capture_window;
+    micDevice = settings.mic_device;
+    outputDevice = settings.output_device;
   });
+
+  const micOptions = $derived(deviceOptions(audioDevices.inputs, micDevice));
+  const outputOptions = $derived(deviceOptions(audioDevices.outputs, outputDevice));
 
   const fps = $derived(/^\d+$/.test(fpsText.trim()) ? Number(fpsText.trim()) : null);
   const fpsValid = $derived(fps !== null && fps >= 1 && fps <= 240);
@@ -98,7 +118,13 @@
       fps,
       output_size: outputSize,
       mic_enabled: micEnabled,
-      ...captureUpdate(settings, { quality, monitor, window: windowTitle }),
+      ...captureUpdate(settings, {
+        quality,
+        monitor,
+        window: windowTitle,
+        micDevice,
+        outputDevice,
+      }),
     });
   }
 
@@ -271,8 +297,41 @@
           onchange={(event) => (micEnabled = event.currentTarget.checked)}
           disabled={busy}
         />
-        <span>Microphone track {#if isDefault('mic.enabled')}<span class="muted">(default)</span>{/if}</span>
+        <span>Record microphone {#if isDefault('mic.enabled')}<span class="muted">(default)</span>{/if}</span>
       </label>
+      <div class="row">
+        <label class="field">
+          <span>Microphone device {#if isDefault('mic.device')}<span class="muted">(default)</span>{/if}</span>
+          <select
+            value={micDevice}
+            onchange={(event) => (micDevice = event.currentTarget.value)}
+            onfocus={onRefreshAudioDevices}
+            disabled={busy || !micEnabled}
+          >
+            {#each micOptions as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="field">
+          <span>Desktop audio device {#if isDefault('capture.output_device')}<span class="muted">(default)</span>{/if}</span>
+          <select
+            value={outputDevice}
+            onchange={(event) => (outputDevice = event.currentTarget.value)}
+            onfocus={onRefreshAudioDevices}
+            disabled={busy}
+          >
+            {#each outputOptions as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </label>
+      </div>
+      <p class="muted footnote">
+        Desktop audio is the output whose sound is recorded when the whole desktop is captured. A
+        game's own audio is captured from the game itself, whichever device it plays on. A chosen
+        device that is unplugged at start refuses the recording.
+      </p>
       {#if recordingNow}
         <p class="muted footnote">Takes effect on the next recording.</p>
       {/if}

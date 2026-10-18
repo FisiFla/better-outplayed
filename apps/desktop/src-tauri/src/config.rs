@@ -352,6 +352,10 @@ pub enum SettingEdit {
     OutputSize(String),
     /// `[mic] enabled`.
     MicEnabled(bool),
+    /// `[mic] device`: a capture endpoint id. Empty is the Windows default microphone.
+    MicDevice(String),
+    /// `[capture] output_device`: an output endpoint id. Empty is the Windows default output.
+    OutputDevice(String),
     /// `[games] auto_record`.
     AutoRecord(bool),
     /// A quality preset ([`QUALITY_PRESETS`]), written as `[encode] bitrate_kbps`.
@@ -385,6 +389,8 @@ impl SettingEdit {
             SettingEdit::Fps(_) => "encode.fps",
             SettingEdit::OutputSize(_) => "encode.output_size",
             SettingEdit::MicEnabled(_) => "mic.enabled",
+            SettingEdit::MicDevice(_) => "mic.device",
+            SettingEdit::OutputDevice(_) => "capture.output_device",
             SettingEdit::AutoRecord(_) => "games.auto_record",
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
@@ -408,6 +414,10 @@ pub struct EffectiveSettings {
     pub fps: u32,
     pub output_size: String,
     pub mic_enabled: bool,
+    /// `[mic] device`; empty is the Windows default microphone.
+    pub mic_device: String,
+    /// `[capture] output_device`; empty is the Windows default output.
+    pub output_device: String,
     pub auto_record: bool,
     /// `[encode] bitrate_kbps`; [`quality_for_bitrate`] names it.
     pub bitrate_kbps: u32,
@@ -432,7 +442,8 @@ fn mistyped(key: &'static str) -> CommandError {
             "the config file's [{section}] {key} is not a {what}, so it cannot be used",
             section = key.split('.').next().unwrap_or("config"),
             what = match key {
-                "storage.clips_dir" | "encode.output_size" | "capture.window" => "string",
+                "storage.clips_dir" | "encode.output_size" | "capture.window" | "mic.device"
+                | "capture.output_device" => "string",
                 "encode.fps" | "encode.bitrate_kbps" | "capture.monitor" => "integer",
                 "mic.enabled" | "games.auto_record" => "true/false value",
                 "games.watch" => "list of [[games.watch]] tables",
@@ -617,6 +628,16 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
             )
         }),
         SettingEdit::CaptureMonitor(_) => Ok(()),
+        SettingEdit::MicDevice(id) | SettingEdit::OutputDevice(id) => {
+            if id.contains(['\n', '\r']) {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!("{} is a single-line device id", edit.key()),
+                ))
+            } else {
+                Ok(())
+            }
+        }
         SettingEdit::CaptureWindow(title) => {
             if title.contains(['\n', '\r']) {
                 Err(CommandError::new(
@@ -768,6 +789,24 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             String::new()
         }
     };
+    let mic_device = match get_str(&doc, "mic", "device", "mic.device")? {
+        Some(id) => id,
+        None => {
+            if config_exists {
+                defaulted.push("mic.device");
+            }
+            String::new()
+        }
+    };
+    let output_device = match get_str(&doc, "capture", "output_device", "capture.output_device")? {
+        Some(id) => id,
+        None => {
+            if config_exists {
+                defaulted.push("capture.output_device");
+            }
+            String::new()
+        }
+    };
     let watch_titles = read_watch_titles(&doc)?;
 
     Ok(EffectiveSettings {
@@ -775,6 +814,8 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         fps,
         output_size,
         mic_enabled,
+        mic_device,
+        output_device,
         auto_record,
         bitrate_kbps,
         capture_monitor,
@@ -868,6 +909,8 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::Fps(_) => ("encode", "fps", "encode"),
             SettingEdit::OutputSize(_) => ("encode", "output_size", "encode"),
             SettingEdit::MicEnabled(_) => ("mic", "enabled", "mic"),
+            SettingEdit::MicDevice(_) => ("mic", "device", "mic"),
+            SettingEdit::OutputDevice(_) => ("capture", "output_device", "capture"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
             SettingEdit::CaptureMonitor(_) => ("capture", "monitor", "capture"),
@@ -892,6 +935,7 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::Fps(fps) => toml_edit::value(*fps as i64),
             SettingEdit::OutputSize(size) => toml_edit::value(size.clone()),
             SettingEdit::MicEnabled(enabled) => toml_edit::value(*enabled),
+            SettingEdit::MicDevice(id) | SettingEdit::OutputDevice(id) => toml_edit::value(id.clone()),
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
             // Validated above, so the preset exists; the fallback is the balanced rate.
             SettingEdit::Quality(name) => {
@@ -1177,8 +1221,8 @@ mod tests {
             "# a comment the writer must keep\n\
              [storage]\nclips_dir = \"D:\\\\clips\"\n\n\
              [encode]\nfps = 30\nbitrate_kbps = 8000\noutput_size = \"1280x720\"\n\n\
-             [capture]\nmonitor = 0\nwindow = \"\"\n\n\
-             [mic]\nenabled = true\n\n\
+             [capture]\nmonitor = 0\nwindow = \"\"\noutput_device = \"\"\n\n\
+             [mic]\nenabled = true\ndevice = \"\"\n\n\
              [games]\nauto_record = true\n\
              [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n",
         )
@@ -1279,6 +1323,31 @@ mod tests {
         assert_eq!((rec.capture.monitor, rec.capture.window.as_str()), (1, "League"));
         let default = RecordingConfig::example().unwrap();
         assert!(default.capture.target().is_default(), "the example records the primary monitor");
+    }
+
+    #[test]
+    fn the_chosen_audio_devices_are_written_and_read_by_both_parsers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_settings(
+            &path,
+            &[
+                SettingEdit::MicDevice("{0.0.1.00000000}.{mic}".into()),
+                SettingEdit::OutputDevice("{0.0.0.00000000}.{speakers}".into()),
+            ],
+        )
+        .unwrap();
+        let settings = read_effective_settings(&path).unwrap();
+        assert_eq!(settings.mic_device, "{0.0.1.00000000}.{mic}");
+        assert_eq!(settings.output_device, "{0.0.0.00000000}.{speakers}");
+        let rec = RecordingConfig::load(&path).unwrap();
+        assert_eq!(rec.capture.output_device, "{0.0.0.00000000}.{speakers}");
+        let engine = EngineOptionsConfig::load(&path).unwrap();
+        assert_eq!(engine.mic.device, "{0.0.1.00000000}.{mic}");
+
+        // Empty goes back to the Windows default.
+        write_settings(&path, &[SettingEdit::MicDevice(String::new())]).unwrap();
+        assert_eq!(read_effective_settings(&path).unwrap().mic_device, "");
     }
 
     #[test]

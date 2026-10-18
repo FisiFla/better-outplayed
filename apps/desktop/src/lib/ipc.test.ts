@@ -102,6 +102,7 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.updateSettings({ fps: 30 }))).toBe('update_settings');
     expect(await wireName(() => tauriIpc.health())).toBe('health');
     expect(await wireName(() => tauriIpc.gsiTargets())).toBe('gsi_targets');
+    expect(await wireName(() => tauriIpc.listAudioDevices())).toBe('list_audio_devices');
     expect(await wireName(() => tauriIpc.installGsiCfg('dota2'))).toBe('install_gsi_cfg');
   });
 
@@ -138,6 +139,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.updateSettings({ fps: 30 })),
       await wireName(() => tauriIpc.health()),
       await wireName(() => tauriIpc.gsiTargets()),
+      await wireName(() => tauriIpc.listAudioDevices()),
       await wireName(() => tauriIpc.installGsiCfg('cs2')),
       await wireName(() => tauriIpc.logFromFrontend('info', 'a message', 'a detail')),
     ];

@@ -230,6 +230,22 @@ export interface RecordingStatus {
   mic_enabled: boolean;
 }
 
+/** One active audio endpoint, as `list_audio_devices` returns it. */
+export interface AudioDevice {
+  /** The WASAPI endpoint id, what the config stores. */
+  id: string;
+  /** The name Windows shows for it. */
+  name: string;
+  /** Whether it is the current Windows default for its kind. */
+  is_default: boolean;
+}
+
+/** The microphones and outputs a person can choose between; both empty off Windows. */
+export interface AudioDevices {
+  inputs: AudioDevice[];
+  outputs: AudioDevice[];
+}
+
 /** The settings the window shows, as `get_settings` returns them. */
 export interface SettingsDto {
   /** `[storage] clips_dir`, verbatim — empty means the default. */
@@ -242,6 +258,10 @@ export interface SettingsDto {
   output_size: string;
   /** `[mic] enabled`. */
   mic_enabled: boolean;
+  /** `[mic] device` — a capture endpoint id; empty is the Windows default microphone. */
+  mic_device: string;
+  /** `[capture] output_device` — an output endpoint id; empty is the Windows default output. */
+  output_device: string;
   /** `[games] auto_record`. */
   auto_record: boolean;
   /** `[encode] bitrate_kbps`. */
@@ -268,6 +288,8 @@ export interface SettingsUpdate {
   fps?: number;
   output_size?: string;
   mic_enabled?: boolean;
+  mic_device?: string;
+  output_device?: string;
   auto_record?: boolean;
   /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
   quality?: string;

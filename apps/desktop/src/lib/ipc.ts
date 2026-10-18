@@ -30,6 +30,7 @@ import type {
   ErrorCode,
   GsiGame,
   GsiInstallOutcome,
+  AudioDevices,
   GsiTarget,
   Health,
   MatchDto,
@@ -125,6 +126,8 @@ export interface ClipSource {
   health(): Promise<Health>;
   /** Which of CS2 / Dota 2 Steam has installed, and whether the cfg is already there. */
   gsiTargets(): Promise<GsiTarget[]>;
+  /** The active microphones and outputs, for the settings pickers. */
+  listAudioDevices(): Promise<AudioDevices>;
   /**
    * Write the Game State Integration cfg into that game's detected folder. Only the game is
    * sent: the backend finds and validates the directory itself.
@@ -204,6 +207,7 @@ export const tauriIpc: ClipSource = {
     invoke<UpdateSettingsOutcome>('update_settings', { update }),
   health: () => invoke<Health>('health'),
   gsiTargets: () => invoke<GsiTarget[]>('gsi_targets'),
+  listAudioDevices: () => invoke<AudioDevices>('list_audio_devices'),
   installGsiCfg: (game) => invoke<GsiInstallOutcome>('install_gsi_cfg', { game }),
   logFromFrontend: (level, message, detail) =>
     invoke<void>('log_from_frontend', { level, message, detail }),

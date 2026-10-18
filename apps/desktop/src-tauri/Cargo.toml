@@ -13,6 +13,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# Lists the audio endpoints for the settings pickers.
+localplay-capture = { path = "../../../crates/capture" }
 serde = { version = "1", features = ["derive"] }
 # Parses the League/GSI event payloads for the match scoreboard; tests also assert the exact
 # JSON keys the TypeScript interfaces mirror.
@@ -60,7 +62,6 @@ tempfile = "3"
 # which are test-only entry points in the crates below — see the notes in their manifests.
 # Dev-dependencies are not built for `cargo build`, so the shipping binary still has
 # neither.
-localplay-capture = { path = "../../../crates/capture" }
 localplay-recorder = { path = "../../../crates/recorder", features = ["test-encoders"] }
 localplay-encoder = { path = "../../../crates/encoder", features = ["test-encoders"] }
 

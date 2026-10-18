@@ -6,7 +6,7 @@
  * (`restart_reason` names the keys); this only decides the saved-vs-nothing part.
  */
 
-import type { SettingsDto, SettingsUpdate, UpdateSettingsOutcome } from './types';
+import type { AudioDevice, SettingsDto, SettingsUpdate, UpdateSettingsOutcome } from './types';
 
 export function describeSettingsUpdate(outcome: UpdateSettingsOutcome): string {
   const saved =
@@ -35,11 +35,41 @@ export function monitorIndex(text: string): number | null {
  */
 export function captureUpdate(
   saved: SettingsDto,
-  draft: { quality: string; monitor: number; window: string },
+  draft: {
+    quality: string;
+    monitor: number;
+    window: string;
+    micDevice: string;
+    outputDevice: string;
+  },
 ): SettingsUpdate {
   const update: SettingsUpdate = {};
   if (draft.quality !== saved.quality && draft.quality !== 'custom') update.quality = draft.quality;
   if (draft.monitor !== saved.capture_monitor) update.capture_monitor = draft.monitor;
   if (draft.window.trim() !== saved.capture_window) update.capture_window = draft.window.trim();
+  if (draft.micDevice !== saved.mic_device) update.mic_device = draft.micDevice;
+  if (draft.outputDevice !== saved.output_device) update.output_device = draft.outputDevice;
   return update;
+}
+
+/**
+ * The options for a device picker: the Windows default first, then each active device. A saved
+ * device that is no longer listed (unplugged) stays selectable as itself, so the panel shows what
+ * the file says and an untouched Apply does not rewrite it to the default.
+ */
+export function deviceOptions(
+  devices: AudioDevice[],
+  selected: string,
+): { value: string; label: string }[] {
+  const options = [{ value: '', label: 'Windows default' }];
+  for (const device of devices) {
+    options.push({
+      value: device.id,
+      label: device.is_default ? `${device.name} (current default)` : device.name,
+    });
+  }
+  if (selected !== '' && !devices.some((device) => device.id === selected)) {
+    options.push({ value: selected, label: 'Saved device (not connected)' });
+  }
+  return options;
 }

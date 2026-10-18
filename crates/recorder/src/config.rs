@@ -99,13 +99,16 @@ impl std::str::FromStr for RecordingMode {
 /// If it cannot (no endpoint, or no backend on this platform) the recording fails at start rather
 /// than carrying a silent track (see `Recorder::start`).
 ///
-/// Device choice is not configurable: Windows opens the default communications capture endpoint,
-/// the device the user talks into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+/// Which device is recorded is `device`: a WASAPI endpoint id from the settings picker, or empty
+/// for the default communications capture endpoint (the device the user talks into). A chosen
+/// device that is missing at start refuses the recording rather than recording another one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(default)]
 pub struct MicSection {
     /// Record a microphone track alongside the game audio. Default `false`.
     pub enabled: bool,
+    /// The capture endpoint id to record; empty is the default communications microphone.
+    pub device: String,
 }
 
 /// `[buffer]`: the ring's window, segment length and budgets.
@@ -168,6 +171,10 @@ pub struct CaptureSection {
     /// `"app"`: only the running watched game (the whole output while none runs); `"system"`:
     /// everything the default output plays.
     pub game_audio: localplay_capture::GameAudioSource,
+    /// The output endpoint id whose audio is recorded when the whole output is captured (`"system"`,
+    /// or `"app"` with no game running). Empty is the Windows default output. A game's own process
+    /// audio follows the game whatever device it plays on, so this does not apply to it.
+    pub output_device: String,
 }
 
 impl CaptureSection {
