@@ -29,12 +29,13 @@ use std::time::Duration;
 /// rcgen through its `SigningKey` trait.
 mod tls {
     use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
+        KeyUsagePurpose, PublicKeyData, SanType, SerialNumber, SignatureAlgorithm,
+        SigningKey as RcgenSigningKey, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
+    };
     use rsa::pkcs1::EncodeRsaPublicKey;
     use rsa::pkcs8::EncodePrivateKey;
-    use rcgen::{
-        BasicConstraints, CertificateParams, SerialNumber, DistinguishedName, DnType, IsCa, Issuer, KeyUsagePurpose,
-        PublicKeyData, SanType, SignatureAlgorithm, SigningKey as RcgenSigningKey, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
-    };
 
     struct Key {
         sk: SigningKey,
@@ -44,7 +45,11 @@ mod tls {
     impl Key {
         fn new() -> Self {
             let sk = SigningKey::random(&mut rand_core::OsRng);
-            let public = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+            let public = sk
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec();
             Self { sk, public }
         }
     }
@@ -112,7 +117,13 @@ mod tls {
         CHAIN.get_or_init(|| {
             let (ca_params, ca_key, ca_cert) = ca("localplay test CA");
             let rsa = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("an RSA key");
-            let public = RsaPublic(rsa.to_public_key().to_pkcs1_der().expect("PKCS#1").as_bytes().to_vec());
+            let public = RsaPublic(
+                rsa.to_public_key()
+                    .to_pkcs1_der()
+                    .expect("PKCS#1")
+                    .as_bytes()
+                    .to_vec(),
+            );
 
             let mut leaf_params = CertificateParams::default();
             leaf_params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
@@ -121,12 +132,18 @@ mod tls {
             leaf_params.distinguished_name = dn;
             leaf_params.serial_number = Some(SerialNumber::from(2u64));
             let issuer = Issuer::from_params(&ca_params, &ca_key);
-            let leaf = leaf_params.signed_by(&public, &issuer).expect("a leaf signed by the test CA");
+            let leaf = leaf_params
+                .signed_by(&public, &issuer)
+                .expect("a leaf signed by the test CA");
 
             Chain {
                 root_pem: ca_cert.pem().into_bytes(),
                 leaf_pem: leaf.pem().into_bytes(),
-                leaf_key_pem: rsa.to_pkcs8_pem(Default::default()).expect("PKCS#8").as_bytes().to_vec(),
+                leaf_key_pem: rsa
+                    .to_pkcs8_pem(Default::default())
+                    .expect("PKCS#8")
+                    .as_bytes()
+                    .to_vec(),
             }
         })
     }
@@ -167,7 +184,9 @@ impl MockGame {
             .expect("the generated certificate loads");
         let acceptor = TlsAcceptor::new(identity).expect("a TLS acceptor");
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral loopback port");
-        listener.set_nonblocking(true).expect("a non-blocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
         let addr = listener.local_addr().expect("the port the OS assigned");
 
         let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -194,7 +213,13 @@ impl MockGame {
                 .expect("the mock thread starts")
         };
 
-        Self { addr, root_pem: chain.root_pem.clone(), requests, stop, thread: Some(thread) }
+        Self {
+            addr,
+            root_pem: chain.root_pem.clone(),
+            requests,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -203,7 +228,10 @@ impl MockGame {
 
     fn poller(&self) -> LolPoller {
         LolPoller::with_root(
-            LolConfig { endpoint: self.endpoint(), interval: Duration::from_millis(20) },
+            LolConfig {
+                endpoint: self.endpoint(),
+                interval: Duration::from_millis(20),
+            },
             &self.root_pem,
         )
         .expect("a client for the mock")
@@ -250,7 +278,10 @@ fn serve_one(
     };
     let request = String::from_utf8_lossy(&buf[..read]).to_string();
     if let Some(line) = request.lines().next() {
-        requests.lock().expect("the request log").push(line.to_string());
+        requests
+            .lock()
+            .expect("the request log")
+            .push(line.to_string());
     }
 
     let reply = {
@@ -299,7 +330,9 @@ fn the_client_trusts_only_its_pinned_root() {
     let addr = mock.addr;
 
     // 1. A stock client — platform roots — must refuse the throwaway CA.
-    let strict = TlsConnector::builder().build().expect("a default connector");
+    let strict = TlsConnector::builder()
+        .build()
+        .expect("a default connector");
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("loopback connects");
     assert!(
         strict.connect("127.0.0.1", tcp).is_err(),
@@ -312,19 +345,30 @@ fn the_client_trusts_only_its_pinned_root() {
         .expect("pinned to Riot's root")
         .get()
         .expect_err("a certificate Riot's CA did not sign must be refused");
-    assert!(matches!(err, localplay_events::lol::FetchError::Tls(..)), "{err}");
+    assert!(
+        matches!(err, localplay_events::lol::FetchError::Tls(..)),
+        "{err}"
+    );
     let other = tls::unrelated_root();
-    let err = localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
-        .expect("pinned to an unrelated root")
-        .get()
-        .expect_err("an unrelated root must be refused too");
-    assert!(matches!(err, localplay_events::lol::FetchError::Tls(..)), "{err}");
+    let err =
+        localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
+            .expect("pinned to an unrelated root")
+            .get()
+            .expect_err("an unrelated root must be refused too");
+    assert!(
+        matches!(err, localplay_events::lol::FetchError::Tls(..)),
+        "{err}"
+    );
 
     // 3. Pinned to the signing CA, the client gets the game document (the host-name mismatch on an
     //    IP literal is the only relaxation).
     let mut poller = mock.poller();
     let events = poller.poll_once();
-    assert_eq!(kinds(&events), vec![EventKind::GameStart], "the attach, through real TLS");
+    assert_eq!(
+        kinds(&events),
+        vec![EventKind::GameStart],
+        "the attach, through real TLS"
+    );
     assert!(poller.in_game());
 }
 
@@ -383,7 +427,10 @@ fn a_full_event_history_is_derived_in_order_and_each_event_is_emitted_once() {
     assert!(payload_of(&history, EventKind::Dragon).contains("\"monster\":\"DRAGON\""));
 
     // Two more events arrive later, one at a time.
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Baron]);
+    assert_eq!(
+        kinds(&poller.poll_once()),
+        vec![EventKind::Kill, EventKind::Baron]
+    );
     assert!(poller.poll_once().is_empty(), "the same document, again");
 }
 
@@ -402,7 +449,10 @@ fn the_game_ending_emits_one_end_event_and_every_later_poll_is_silent() {
         "the record says how long the game ran"
     );
     for poll in 1..=3 {
-        assert!(poller.poll_once().is_empty(), "poll {poll} after the game ended");
+        assert!(
+            poller.poll_once().is_empty(),
+            "poll {poll} after the game ended"
+        );
     }
 }
 
@@ -422,7 +472,10 @@ fn a_connection_that_is_refused_is_the_no_game_case() {
     .expect("a client for a closed port");
 
     for _ in 0..3 {
-        assert!(poller.poll_once().is_empty(), "a refused connection is not an event");
+        assert!(
+            poller.poll_once().is_empty(),
+            "a refused connection is not an event"
+        );
     }
     assert!(!poller.in_game());
 }
@@ -450,12 +503,24 @@ fn a_malformed_body_is_neither_an_event_nor_the_end_of_the_game() {
         kinds(&poller.poll_once()),
         vec![EventKind::Kill, EventKind::Death, EventKind::Dragon]
     );
-    assert!(poller.poll_once().is_empty(), "a body localplay cannot read is not an event");
-    assert!(poller.poll_once().is_empty(), "and it is not reported again");
-    assert!(poller.in_game(), "one unreadable response is not the end of a game");
+    assert!(
+        poller.poll_once().is_empty(),
+        "a body localplay cannot read is not an event"
+    );
+    assert!(
+        poller.poll_once().is_empty(),
+        "and it is not reported again"
+    );
+    assert!(
+        poller.in_game(),
+        "one unreadable response is not the end of a game"
+    );
 
     // Recovery: only the two new events, nothing replayed.
-    assert_eq!(kinds(&poller.poll_once()), vec![EventKind::Kill, EventKind::Baron]);
+    assert_eq!(
+        kinds(&poller.poll_once()),
+        vec![EventKind::Kill, EventKind::Baron]
+    );
     assert!(poller.poll_once().is_empty());
 }
 
@@ -464,8 +529,8 @@ fn the_poller_only_ever_asks_for_loopback() {
     // The one constructor that accepts an address refuses anything else, so a configuration
     // mistake cannot turn the poller into an outbound HTTP client.
     let non_loopback: SocketAddr = "192.168.1.10:2999".parse().unwrap();
-    let err = Endpoint::loopback(non_loopback, "/liveclientdata/allgamedata")
-        .expect_err("not loopback");
+    let err =
+        Endpoint::loopback(non_loopback, "/liveclientdata/allgamedata").expect_err("not loopback");
     assert!(err.to_string().contains("loopback"), "got: {err}");
 
     // The endpoint a poller was built with is the one it dialled, and it is loopback.
@@ -475,8 +540,11 @@ fn the_poller_only_ever_asks_for_loopback() {
     assert_eq!(poller.endpoint().addr(), mock.addr);
 
     // And a response type is what the client reports for a 404 rather than an error.
-    let client = localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &mock.root_pem)
-        .expect("a pinned client for the mock");
+    let client = localplay_events::lol::LoopbackClient::for_endpoint_with_root(
+        mock.endpoint(),
+        &mock.root_pem,
+    )
+    .expect("a pinned client for the mock");
     assert_eq!(
         client.get().expect("the mock answers"),
         Response::NotServing,

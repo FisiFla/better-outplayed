@@ -56,7 +56,10 @@ pub struct GameClipSection {
 
 impl GameClipSection {
     pub fn window(self) -> ClipWindow {
-        ClipWindow { pre_seconds: self.pre_seconds, post_seconds: self.post_seconds }
+        ClipWindow {
+            pre_seconds: self.pre_seconds,
+            post_seconds: self.post_seconds,
+        }
     }
 }
 
@@ -181,7 +184,9 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
                 Some(handle)
             }
             Err(err) => {
-                tracing::warn!("events.lol_poll_enabled is set but polling could not start: {err:#}");
+                tracing::warn!(
+                    "events.lol_poll_enabled is set but polling could not start: {err:#}"
+                );
                 reports.push(SourceReport {
                     source: "League of Legends",
                     state: SourceState::Failed,
@@ -230,7 +235,12 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
         }
     };
 
-    EventSources { events: events_rx, _lol: lol, _gsi: gsi, reports }
+    EventSources {
+        events: events_rx,
+        _lol: lol,
+        _gsi: gsi,
+        reports,
+    }
 }
 
 /// Bring up the GSI listener and write out the file the user has to install.
@@ -245,15 +255,18 @@ fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Re
 
     // One file per game in its own directory: the games subscribe different data blocks but the file name is the same.
     let dirs = [
-        ("cs2", gsi::integration_cfg(port, &token), "Counter-Strike 2 / CS:GO"),
+        (
+            "cs2",
+            gsi::integration_cfg(port, &token),
+            "Counter-Strike 2 / CS:GO",
+        ),
         ("dota2", gsi::integration_cfg_dota(port, &token), "Dota 2"),
     ];
     for (game, text, name) in dirs {
         let dir = app_dir.join("gsi").join(game);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("gamestate_integration_localplay.cfg");
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         tracing::info!(
             "{name}: copy {} into the game's cfg directory and restart the game",
             path.display()
@@ -301,7 +314,6 @@ pub fn act_on_event_in(
     }
 }
 
-
 /// How long a burst of highlights may grow before it becomes one clip.
 ///
 /// A pentakill is five kills in ten seconds; one clip over the settled burst replaces five
@@ -321,7 +333,10 @@ impl Coalesce {
     pub fn for_pre_roll(pre_seconds: u64) -> Self {
         let max = Duration::from_millis(pre_seconds.saturating_mul(600));
         let quiet = (max / 3).clamp(Duration::from_secs(1), Duration::from_secs(6));
-        Self { quiet, max: max.max(quiet) }
+        Self {
+            quiet,
+            max: max.max(quiet),
+        }
     }
 }
 
@@ -409,7 +424,11 @@ impl EventDriver {
             .name("localplay-events".into())
             .spawn(move || drive(&recorder, sources, &flag, &policy, &on_clip))
             .context("spawning the game-event thread")?;
-        Ok(Self { reports, stop, thread: Some(thread) })
+        Ok(Self {
+            reports,
+            stop,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -463,12 +482,18 @@ mod tests {
     use super::*;
 
     fn kill() -> GameEvent {
-        GameEvent::bare(localplay_events::Source::Lol, localplay_events::EventKind::Kill)
+        GameEvent::bare(
+            localplay_events::Source::Lol,
+            localplay_events::EventKind::Kill,
+        )
     }
 
     fn quick() -> Policy {
         Policy {
-            coalesce: Coalesce { quiet: Duration::from_millis(60), max: Duration::from_millis(400) },
+            coalesce: Coalesce {
+                quiet: Duration::from_millis(60),
+                max: Duration::from_millis(400),
+            },
             muted: Vec::new(),
             lol: ClipWindow::default(),
             gsi: ClipWindow::default(),
@@ -477,23 +502,38 @@ mod tests {
 
     #[test]
     fn a_muted_highlight_does_not_take_a_clip_and_an_unknown_tag_is_an_error() {
-        let events = EventsSection { mute_clips: vec!["objective".into()], ..EventsSection::default() };
+        let events = EventsSection {
+            mute_clips: vec!["objective".into()],
+            ..EventsSection::default()
+        };
         let policy = Policy::new(&events, 30).unwrap();
         let objective = GameEvent::bare(localplay_events::Source::Lol, EventKind::Objective);
         assert!(!policy.clips(&objective), "muted");
         assert!(policy.clips(&kill()), "an unmuted highlight still clips");
-        let bad = EventsSection { mute_clips: vec!["kil".into()], ..EventsSection::default() };
+        let bad = EventsSection {
+            mute_clips: vec!["kil".into()],
+            ..EventsSection::default()
+        };
         assert!(bad.muted_kinds().unwrap_err().to_string().contains("kil"));
     }
 
     #[test]
     fn muting_objective_mutes_every_sub_kind_and_a_sub_kind_mutes_only_itself() {
-        let all = EventsSection { mute_clips: vec!["objective".into()], ..EventsSection::default() };
+        let all = EventsSection {
+            mute_clips: vec!["objective".into()],
+            ..EventsSection::default()
+        };
         let policy = Policy::new(&all, 30).unwrap();
         for kind in EventKind::ALL.into_iter().filter(|k| k.is_objective()) {
-            assert!(!policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind)), "{kind}");
+            assert!(
+                !policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind)),
+                "{kind}"
+            );
         }
-        let some = EventsSection { mute_clips: vec!["turret".into()], ..EventsSection::default() };
+        let some = EventsSection {
+            mute_clips: vec!["turret".into()],
+            ..EventsSection::default()
+        };
         let policy = Policy::new(&some, 30).unwrap();
         let clips = |kind| policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind));
         assert!(!clips(EventKind::Turret));
@@ -507,12 +547,21 @@ mod tests {
         )
         .unwrap();
         let policy = Policy::new(&events, 30).unwrap();
-        assert_eq!(policy.window_for(localplay_events::Source::Lol), ClipWindow::new(25, 8));
+        assert_eq!(
+            policy.window_for(localplay_events::Source::Lol),
+            ClipWindow::new(25, 8)
+        );
         assert_eq!(
             policy.window_for(localplay_events::Source::Gsi),
-            ClipWindow { pre_seconds: Some(6), post_seconds: None }
+            ClipWindow {
+                pre_seconds: Some(6),
+                post_seconds: None
+            }
         );
-        assert_eq!(policy.window_for(localplay_events::Source::Manual), ClipWindow::default());
+        assert_eq!(
+            policy.window_for(localplay_events::Source::Manual),
+            ClipWindow::default()
+        );
     }
 
     #[test]
@@ -522,7 +571,11 @@ mod tests {
             tx.send(kill()).unwrap();
         }
         let burst = gather_burst(kill(), &rx, &quick());
-        assert_eq!(burst.len(), 5, "the first plus the four that were already waiting");
+        assert_eq!(
+            burst.len(),
+            5,
+            "the first plus the four that were already waiting"
+        );
     }
 
     #[test]
@@ -547,7 +600,10 @@ mod tests {
             }
         });
         let burst = gather_burst(kill(), &rx, &quick());
-        assert!(burst.len() > 1, "the burst gathered the stream until the cut");
+        assert!(
+            burst.len() > 1,
+            "the burst gathered the stream until the cut"
+        );
         drop(rx);
         feeder.join().unwrap();
     }

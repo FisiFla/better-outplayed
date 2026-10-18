@@ -118,7 +118,11 @@ pub(crate) mod windows_impl {
             let device = unsafe { collection.Item(i) }.context("IMMDeviceCollection::Item")?;
             let id = id_of(&device)?;
             let name = name_of(&device).unwrap_or_else(|_| id.clone());
-            out.push(AudioDevice { is_default: default_id.as_deref() == Some(id.as_str()), id, name });
+            out.push(AudioDevice {
+                is_default: default_id.as_deref() == Some(id.as_str()),
+                id,
+                name,
+            });
         }
         Ok(out)
     }
@@ -136,8 +140,12 @@ pub(crate) mod windows_impl {
     fn name_of(device: &IMMDevice) -> Result<String> {
         // SAFETY: the device is alive; the property store and value are released on drop.
         unsafe {
-            let store = device.OpenPropertyStore(STGM_READ).context("IMMDevice::OpenPropertyStore")?;
-            let value = store.GetValue(&PKEY_Device_FriendlyName).context("IPropertyStore::GetValue")?;
+            let store = device
+                .OpenPropertyStore(STGM_READ)
+                .context("IMMDevice::OpenPropertyStore")?;
+            let value = store
+                .GetValue(&PKEY_Device_FriendlyName)
+                .context("IPropertyStore::GetValue")?;
             Ok(value.to_string())
         }
     }

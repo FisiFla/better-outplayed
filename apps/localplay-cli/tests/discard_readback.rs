@@ -29,9 +29,9 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::{pump_once_counted, FramePacer, PumpCounts};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::{pump_once_counted, FramePacer, PumpCounts};
 use std::time::{Duration, Instant};
 
 /// What the synthetic source offers: four times the pacer's target. A source rate-matched to
@@ -70,8 +70,11 @@ impl Fixture {
             scratch.path().to_path_buf(),
             SEGMENT_MS,
         );
-        let mut capture =
-            StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: SOURCE_FPS });
+        let mut capture = StubCapture::new(StubConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            fps: SOURCE_FPS,
+        });
         let mut audio = StubAudio::new(AudioFormat::default());
         let encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn encoder");
         capture.start().expect("start the capture stub");
@@ -86,8 +89,13 @@ impl Fixture {
     }
 
     fn pump(&mut self) -> PumpCounts {
-        pump_once_counted(&mut self.pacer, &mut self.capture, Some(&mut self.audio), &mut self.encoder)
-            .expect("a pump iteration must not fail")
+        pump_once_counted(
+            &mut self.pacer,
+            &mut self.capture,
+            Some(&mut self.audio),
+            &mut self.encoder,
+        )
+        .expect("a pump iteration must not fail")
     }
 }
 
@@ -103,9 +111,15 @@ fn a_frame_the_pacer_is_not_due_for_is_never_materialised() {
 
     // Spend the first slot, exactly as the pump does once a frame exists.
     let t0 = Instant::now();
-    assert!(fx.pacer.is_due(t0), "sanity: the first slot is due immediately");
+    assert!(
+        fx.pacer.is_due(t0),
+        "sanity: the first slot is due immediately"
+    );
     fx.pacer.commit(t0);
-    assert!(!fx.pacer.is_due(t0), "and it is spent: the next one is an interval away");
+    assert!(
+        !fx.pacer.is_due(t0),
+        "and it is spent: the next one is an interval away"
+    );
 
     // 120fps source: its first frame is due the moment capture starts, before this test began. It
     // is waiting, and the pump must not take it.
@@ -119,7 +133,10 @@ fn a_frame_the_pacer_is_not_due_for_is_never_materialised() {
         fx.capture.frames_discarded()
     );
 
-    assert_eq!(counts.submitted, 0, "the pacer is not due, so nothing may be submitted");
+    assert_eq!(
+        counts.submitted, 0,
+        "the pacer is not due, so nothing may be submitted"
+    );
     assert_eq!(
         fx.capture.frames_read_back(),
         0,

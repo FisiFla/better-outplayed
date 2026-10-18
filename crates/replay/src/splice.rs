@@ -50,13 +50,8 @@ impl ClipSplicer {
         let list = out.with_extension("concat.txt");
         let total_bytes = edit::write_concat_list(&files, &list)?;
         // The list is removed whether the copy succeeded or not.
-        let concat = edit::concat_lossless_sized(
-            bin,
-            &list,
-            out,
-            total_bytes,
-            layout.audio_count(),
-        );
+        let concat =
+            edit::concat_lossless_sized(bin, &list, out, total_bytes, layout.audio_count());
         let _ = std::fs::remove_file(&list);
         concat?;
 

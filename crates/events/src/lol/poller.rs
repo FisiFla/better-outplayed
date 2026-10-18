@@ -43,7 +43,10 @@ pub struct LolConfig {
 impl LolConfig {
     /// The real configuration: Riot's endpoint, polled once a second.
     pub fn live_client() -> Self {
-        Self { endpoint: Endpoint::live_client(), interval: POLL_INTERVAL }
+        Self {
+            endpoint: Endpoint::live_client(),
+            interval: POLL_INTERVAL,
+        }
     }
 }
 
@@ -101,7 +104,9 @@ impl LolPoller {
         let document = match self.client.get() {
             Ok(Response::Body(body)) => {
                 if let Some(condition) = self.quiet.recovered() {
-                    tracing::info!("the League Live Client is answering normally again ({condition})");
+                    tracing::info!(
+                        "the League Live Client is answering normally again ({condition})"
+                    );
                 }
                 match crate::lol::payload::parse(&body) {
                     Ok(snapshot) => snapshot,
@@ -130,7 +135,9 @@ impl LolPoller {
             }
             Err(err) => {
                 if self.quiet.note(Condition::Unreadable(format!("{err}"))) {
-                    tracing::warn!("the League Live Client could not be read ({err}); still watching");
+                    tracing::warn!(
+                        "the League Live Client could not be read ({err}); still watching"
+                    );
                 }
                 return Vec::new();
             }
@@ -208,7 +215,10 @@ pub fn spawn(config: LolConfig, sink: EventSink) -> anyhow::Result<LolHandle> {
     let endpoint = poller.endpoint().clone();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    tracing::info!("polling the League Live Client at {} once a second", endpoint.url());
+    tracing::info!(
+        "polling the League Live Client at {} once a second",
+        endpoint.url()
+    );
 
     let thread = std::thread::Builder::new()
         .name("localplay-lol".to_string())
@@ -229,7 +239,11 @@ pub fn spawn(config: LolConfig, sink: EventSink) -> anyhow::Result<LolHandle> {
         })
         .map_err(|e| anyhow::anyhow!("spawning the League poller thread: {e}"))?;
 
-    Ok(LolHandle { stop, thread: Some(thread), endpoint })
+    Ok(LolHandle {
+        stop,
+        thread: Some(thread),
+        endpoint,
+    })
 }
 
 /// Sleep until `deadline`, waking early — within [`STOP_SLICE`] — when asked to stop.
@@ -303,9 +317,15 @@ mod tests {
     #[test]
     fn a_condition_that_lasts_is_reported_once() {
         let mut quiet = Quiet::default();
-        assert!(quiet.note(Condition::NoGame("refused".into())), "the first is news");
+        assert!(
+            quiet.note(Condition::NoGame("refused".into())),
+            "the first is news"
+        );
         for _ in 0..10 {
-            assert!(!quiet.note(Condition::NoGame("refused".into())), "and the rest are not");
+            assert!(
+                !quiet.note(Condition::NoGame("refused".into())),
+                "and the rest are not"
+            );
         }
         assert_eq!(quiet.recovered(), Some(Condition::NoGame("refused".into())));
         assert_eq!(quiet.recovered(), None, "a recovery is reported once");
@@ -325,9 +345,16 @@ mod tests {
     #[test]
     fn the_production_configuration_is_the_endpoint_the_spec_names() {
         let config = LolConfig::live_client();
-        assert_eq!(config.endpoint.url(), "https://127.0.0.1:2999/liveclientdata/allgamedata");
+        assert_eq!(
+            config.endpoint.url(),
+            "https://127.0.0.1:2999/liveclientdata/allgamedata"
+        );
         assert_eq!(config.interval, POLL_INTERVAL);
-        assert_eq!(LolConfig::default(), config, "the default is the production one");
+        assert_eq!(
+            LolConfig::default(),
+            config,
+            "the default is the production one"
+        );
     }
 
     #[test]
@@ -349,12 +376,15 @@ mod tests {
         // error, and must not invent a GameEnd for a game never seen.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let endpoint = Endpoint::loopback(addr, "/liveclientdata/allgamedata").unwrap();
-        let mut poller = LolPoller::new(LolConfig { endpoint, interval: POLL_INTERVAL }).unwrap();
+        let mut poller = LolPoller::new(LolConfig {
+            endpoint,
+            interval: POLL_INTERVAL,
+        })
+        .unwrap();
         for _ in 0..3 {
             assert!(poller.poll_once().is_empty());
         }
         assert!(!poller.in_game());
         assert!(EventKind::GameEnd.is_highlight());
     }
-
 }

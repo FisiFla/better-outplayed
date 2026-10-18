@@ -111,12 +111,20 @@ pub struct WatchedGame {
 impl WatchedGame {
     /// A title recognised by its executable's file name.
     pub fn by_process(name: impl Into<String>, exe: impl Into<String>) -> Self {
-        Self { name: name.into(), exe: exe.into(), signal: Signal::Process }
+        Self {
+            name: name.into(),
+            exe: exe.into(),
+            signal: Signal::Process,
+        }
     }
 
     /// A Riot title recognised by the Live Client Data API it publishes.
     pub fn by_live_client_api(name: impl Into<String>, exe: impl Into<String>) -> Self {
-        Self { name: name.into(), exe: exe.into(), signal: Signal::LiveClientApi }
+        Self {
+            name: name.into(),
+            exe: exe.into(),
+            signal: Signal::LiveClientApi,
+        }
     }
 
     /// The file name this title is compared by: the `exe` with any path removed and surrounding
@@ -177,7 +185,9 @@ pub fn presences_in(watched: &[WatchedGame], observed: &[String]) -> Vec<Presenc
         .iter()
         .map(|game| Presence {
             game: game.clone(),
-            running: observed.iter().any(|name| image_name_matches(&game.exe, name)),
+            running: observed
+                .iter()
+                .any(|name| image_name_matches(&game.exe, name)),
         })
         .collect()
 }
@@ -186,7 +196,10 @@ pub fn presences_in(watched: &[WatchedGame], observed: &[String]) -> Vec<Presenc
 /// `(image name, pid)` pairs.
 pub fn pid_in(watched: &[WatchedGame], observed: &[(String, u32)]) -> Option<u32> {
     watched.iter().find_map(|game| {
-        observed.iter().find(|(name, _)| image_name_matches(&game.exe, name)).map(|&(_, pid)| pid)
+        observed
+            .iter()
+            .find(|(name, _)| image_name_matches(&game.exe, name))
+            .map(|&(_, pid)| pid)
     })
 }
 
@@ -399,7 +412,10 @@ impl LiveClientPresence {
             .filter(|game| game.signal == Signal::LiveClientApi)
             .cloned()
             .collect();
-        Ok(Self { client: LoopbackClient::for_endpoint(endpoint)?, watching })
+        Ok(Self {
+            client: LoopbackClient::for_endpoint(endpoint)?,
+            watching,
+        })
     }
 
     /// The endpoint this detector reads.
@@ -459,8 +475,9 @@ impl CompositePresence {
     /// Watch `watched`, each title by the signal it names.
     pub fn new(watched: Vec<WatchedGame>) -> Result<Self> {
         validate_watch_list(&watched)?;
-        let (by_process, by_api): (Vec<WatchedGame>, Vec<WatchedGame>) =
-            watched.into_iter().partition(|game| game.signal == Signal::Process);
+        let (by_process, by_api): (Vec<WatchedGame>, Vec<WatchedGame>) = watched
+            .into_iter()
+            .partition(|game| game.signal == Signal::Process);
 
         let live = if by_api.is_empty() {
             None
@@ -513,12 +530,15 @@ impl GamePresence for CompositePresence {
         let mut snapshot = Vec::new();
         if let Some(process) = &mut self.process {
             snapshot.extend(
-                process.poll().map_err(|err| anyhow!("reading the process list: {err}"))?,
+                process
+                    .poll()
+                    .map_err(|err| anyhow!("reading the process list: {err}"))?,
             );
         }
         if let Some(live) = &mut self.live {
             snapshot.extend(
-                live.poll().map_err(|err| anyhow!("polling the League Live Client: {err}"))?,
+                live.poll()
+                    .map_err(|err| anyhow!("polling the League Live Client: {err}"))?,
             );
         }
         Ok(snapshot)
@@ -557,7 +577,11 @@ impl PresenceChange {
 
 impl fmt::Display for PresenceChange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let verb = if self.is_start() { "started" } else { "stopped" };
+        let verb = if self.is_start() {
+            "started"
+        } else {
+            "stopped"
+        };
         write!(f, "{} {verb}", self.game())
     }
 }
@@ -610,7 +634,10 @@ impl PresenceTracker {
         let mut tracked: Vec<Tracked> = Vec::with_capacity(watched.len());
         for game in watched {
             let duplicate = tracked.iter().any(|other| {
-                other.game.file_name().eq_ignore_ascii_case(game.file_name())
+                other
+                    .game
+                    .file_name()
+                    .eq_ignore_ascii_case(game.file_name())
             });
             if duplicate {
                 continue;
@@ -622,7 +649,10 @@ impl PresenceTracker {
                 runs: 0,
             });
         }
-        Self { confirmations: confirmations.max(1), tracked }
+        Self {
+            confirmations: confirmations.max(1),
+            tracked,
+        }
     }
 
     /// Fold one poll in, and answer what changed.
@@ -632,7 +662,10 @@ impl PresenceTracker {
             let Some(running) = snapshot
                 .iter()
                 .find(|presence| {
-                    presence.game.file_name().eq_ignore_ascii_case(tracked.game.file_name())
+                    presence
+                        .game
+                        .file_name()
+                        .eq_ignore_ascii_case(tracked.game.file_name())
                 })
                 .map(|presence| presence.running)
             else {
@@ -688,7 +721,10 @@ impl PresenceTracker {
     pub fn is_running(&self, exe: &str) -> bool {
         self.tracked.iter().any(|tracked| {
             tracked.believed == Some(true)
-                && tracked.game.file_name().eq_ignore_ascii_case(file_name(exe))
+                && tracked
+                    .game
+                    .file_name()
+                    .eq_ignore_ascii_case(file_name(exe))
         })
     }
 
@@ -718,7 +754,11 @@ impl GameWatcher {
     /// here, so no configuration value can turn the watcher into a tight loop over the process list.
     pub fn new(games: Vec<WatchedGame>, interval: Duration) -> Result<Self> {
         let detector = CompositePresence::new(games.clone())?;
-        Ok(Self::with_detector(Box::new(detector), &games, clamp_interval(interval)))
+        Ok(Self::with_detector(
+            Box::new(detector),
+            &games,
+            clamp_interval(interval),
+        ))
     }
 
     /// The same loop around any [`GamePresence`], for tests and front-ends with a source of their
@@ -853,7 +893,10 @@ pub fn spawn(watcher: GameWatcher, sink: PresenceSink) -> Result<WatchHandle> {
         })
         .map_err(|e| anyhow!("spawning the game watcher thread: {e}"))?;
 
-    Ok(WatchHandle { stop, thread: Some(thread) })
+    Ok(WatchHandle {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 /// Sleep until `deadline`, waking early — within [`STOP_SLICE`] — when asked to stop.
@@ -1038,12 +1081,20 @@ mod tests {
     fn the_pid_is_the_first_watched_title_that_is_running() {
         let watch = default_watch();
         let running = |list: &[(&str, u32)]| -> Vec<(String, u32)> {
-            list.iter().map(|&(name, pid)| (name.to_string(), pid)).collect()
+            list.iter()
+                .map(|&(name, pid)| (name.to_string(), pid))
+                .collect()
         };
-        assert_eq!(pid_in(&watch, &running(&[("explorer.exe", 4), ("CS2.EXE", 77)])), Some(77));
+        assert_eq!(
+            pid_in(&watch, &running(&[("explorer.exe", 4), ("CS2.EXE", 77)])),
+            Some(77)
+        );
         // Watch-list order decides, not snapshot order: League is listed before cs2.
         assert_eq!(
-            pid_in(&watch, &running(&[("cs2.exe", 77), ("League of Legends.exe", 12)])),
+            pid_in(
+                &watch,
+                &running(&[("cs2.exe", 77), ("League of Legends.exe", 12)])
+            ),
             Some(12)
         );
         assert_eq!(pid_in(&watch, &running(&[("notcs2.exe", 5)])), None);
@@ -1059,10 +1110,17 @@ mod tests {
         assert_eq!(named.len(), 6, "the six titles the project names");
         assert_eq!(
             named[0],
-            ("League of Legends", "League of Legends.exe", Signal::LiveClientApi)
+            (
+                "League of Legends",
+                "League of Legends.exe",
+                Signal::LiveClientApi
+            )
         );
         assert_eq!(
-            watch.iter().filter(|g| g.signal == Signal::LiveClientApi).count(),
+            watch
+                .iter()
+                .filter(|g| g.signal == Signal::LiveClientApi)
+                .count(),
             1,
             "Riot publishes the Live Client Data API for one title on this list, not for all"
         );
@@ -1077,16 +1135,20 @@ mod tests {
         // The false positive that would start a recording nobody asked for.
         let watch = vec![WatchedGame::by_process("Counter-Strike 2", "cs2.exe")];
         for name in [
-            "notcs2.exe",       // a superset of the name
-            "cs2.exe.bak",      // not the same file
-            "mycs2.exe",        // a different file that happens to end the same way
-            "cs2",              // the same stem without the extension
-            "xc s2.exe",        // a space where a character is
-            "cs2.exe ",         // trailing space, trimmed away — matches, see below
+            "notcs2.exe",  // a superset of the name
+            "cs2.exe.bak", // not the same file
+            "mycs2.exe",   // a different file that happens to end the same way
+            "cs2",         // the same stem without the extension
+            "xc s2.exe",   // a space where a character is
+            "cs2.exe ",    // trailing space, trimmed away — matches, see below
         ] {
             let matches = running_of(&presences_in(&watch, &observed(&[name])), "cs2.exe");
             if name == "cs2.exe " {
-                assert_eq!(matches, Some(true), "{name:?} is the same file name once trimmed");
+                assert_eq!(
+                    matches,
+                    Some(true),
+                    "{name:?} is the same file name once trimmed"
+                );
             } else {
                 assert_eq!(matches, Some(false), "{name:?} must not match cs2.exe");
             }
@@ -1118,7 +1180,10 @@ mod tests {
         // fold would call these equal.
         let watch = vec![WatchedGame::by_process("Counter-Strike 2", "cs2.exe")];
         assert_eq!(
-            running_of(&presences_in(&watch, &observed(&["\u{421}S2.EXE"])), "cs2.exe"),
+            running_of(
+                &presences_in(&watch, &observed(&["\u{421}S2.EXE"])),
+                "cs2.exe"
+            ),
             Some(false),
             "a lookalike letter is a different file name"
         );
@@ -1126,7 +1191,10 @@ mod tests {
 
     #[test]
     fn a_configured_path_is_reduced_to_its_file_name() {
-        let watch = vec![WatchedGame::by_process("Counter-Strike 2", r"C:\Games\cs2.exe")];
+        let watch = vec![WatchedGame::by_process(
+            "Counter-Strike 2",
+            r"C:\Games\cs2.exe",
+        )];
         assert_eq!(watch[0].file_name(), "cs2.exe");
         let presences = presences_in(&watch, &observed(&["cs2.exe"]));
         assert_eq!(running_of(&presences, r"C:\Games\cs2.exe"), Some(true));
@@ -1149,14 +1217,26 @@ mod tests {
         let watch = default_watch();
         let presences = presences_in(
             &watch,
-            &observed(&["explorer.exe", "cs2.exe", "VALORANT-Win64-Shipping.exe", "cs2.exe"]),
+            &observed(&[
+                "explorer.exe",
+                "cs2.exe",
+                "VALORANT-Win64-Shipping.exe",
+                "cs2.exe",
+            ]),
         );
         assert_eq!(running_of(&presences, "cs2.exe"), Some(true));
-        assert_eq!(running_of(&presences, "VALORANT-Win64-Shipping.exe"), Some(true));
+        assert_eq!(
+            running_of(&presences, "VALORANT-Win64-Shipping.exe"),
+            Some(true)
+        );
         assert_eq!(running_of(&presences, "dota2.exe"), Some(false));
         assert_eq!(running_of(&presences, "Overwatch.exe"), Some(false));
         assert_eq!(running_of(&presences, "League of Legends.exe"), Some(false));
-        assert_eq!(presences.len(), watch.len(), "a duplicate in the snapshot is still one answer");
+        assert_eq!(
+            presences.len(),
+            watch.len(),
+            "a duplicate in the snapshot is still one answer"
+        );
     }
 
     #[test]
@@ -1193,7 +1273,10 @@ mod tests {
         let changes = tracker.observe(&poll_of(&watch, &["cs2.exe"]));
         assert_eq!(changes, vec![PresenceChange::Started(watch[1].clone())]);
         assert_eq!(tracker.running().len(), 1);
-        assert!(tracker.is_running("CS2.EXE"), "and the answer is the believed state");
+        assert!(
+            tracker.is_running("CS2.EXE"),
+            "and the answer is the believed state"
+        );
     }
 
     #[test]
@@ -1218,7 +1301,10 @@ mod tests {
 
         // Nothing running, then a start: believed on the second agreeing poll.
         assert!(tracker.observe(&poll_of(&watch, &[])).is_empty());
-        assert!(tracker.observe(&poll_of(&watch, &["cs2.exe"])).is_empty(), "one poll is not enough");
+        assert!(
+            tracker.observe(&poll_of(&watch, &["cs2.exe"])).is_empty(),
+            "one poll is not enough"
+        );
         assert_eq!(
             tracker.observe(&poll_of(&watch, &["cs2.exe"])),
             vec![PresenceChange::Started(watch[1].clone())]
@@ -1230,13 +1316,19 @@ mod tests {
         }
 
         // And the stop is reported once, never twice.
-        assert!(tracker.observe(&poll_of(&watch, &[])).is_empty(), "one poll is not enough to stop");
+        assert!(
+            tracker.observe(&poll_of(&watch, &[])).is_empty(),
+            "one poll is not enough to stop"
+        );
         assert_eq!(
             tracker.observe(&poll_of(&watch, &[])),
             vec![PresenceChange::Stopped(watch[1].clone())]
         );
         for _ in 0..5 {
-            assert!(tracker.observe(&poll_of(&watch, &[])).is_empty(), "a stop is reported once");
+            assert!(
+                tracker.observe(&poll_of(&watch, &[])).is_empty(),
+                "a stop is reported once"
+            );
         }
         assert!(tracker.running().is_empty());
     }
@@ -1251,10 +1343,17 @@ mod tests {
 
         let mut changes = 0;
         for poll in 0..40 {
-            let snapshot = if poll % 2 == 0 { &["cs2.exe"][..] } else { &[][..] };
+            let snapshot = if poll % 2 == 0 {
+                &["cs2.exe"][..]
+            } else {
+                &[][..]
+            };
             changes += tracker.observe(&poll_of(&watch, snapshot)).len();
         }
-        assert_eq!(changes, 0, "an alternating snapshot believes nothing and reports nothing");
+        assert_eq!(
+            changes, 0,
+            "an alternating snapshot believes nothing and reports nothing"
+        );
         assert!(tracker.running().is_empty());
     }
 
@@ -1318,7 +1417,11 @@ mod tests {
         assert_eq!(tracker.watched(), 1, "an exe names one game");
 
         let mut tracker = PresenceTracker::with_confirmations(std::slice::from_ref(&repeat), 0);
-        assert_eq!(tracker.confirmations(), 1, "a debounce of zero would believe nothing");
+        assert_eq!(
+            tracker.confirmations(),
+            1,
+            "a debounce of zero would believe nothing"
+        );
         let watch = vec![WatchedGame::by_process("Counter-Strike 2", "cs2.exe")];
         assert_eq!(
             tracker.observe(&poll_of(&watch, &["cs2.exe"])),
@@ -1335,7 +1438,10 @@ mod tests {
         let original = WatchedGame::by_process("Counter-Strike 2", "cs2.exe");
         let mut tracker = PresenceTracker::new(std::slice::from_ref(&original));
         let renamed = WatchedGame::by_process("CS2", "cs2.exe");
-        let snapshot = vec![Presence { game: renamed, running: true }];
+        let snapshot = vec![Presence {
+            game: renamed,
+            running: true,
+        }];
         assert_eq!(
             tracker.observe(&snapshot),
             vec![PresenceChange::Started(original)],
@@ -1355,7 +1461,9 @@ mod tests {
     impl Scripted {
         /// Boxed, which is why this is not called `new`: the loop wants a trait object.
         fn boxed(answers: Vec<Result<Vec<Presence>>>) -> Box<dyn GamePresence> {
-            Box::new(Self { answers: answers.into() })
+            Box::new(Self {
+                answers: answers.into(),
+            })
         }
     }
 
@@ -1389,7 +1497,10 @@ mod tests {
         );
         // Three failed polls: no change, and the state the last good poll found survives.
         for _ in 0..3 {
-            assert!(watcher.poll_once().is_empty(), "a failed poll is not a stop");
+            assert!(
+                watcher.poll_once().is_empty(),
+                "a failed poll is not a stop"
+            );
             assert_eq!(watcher.running().len(), 1);
         }
         // And the recovery is a return to the steady state, not a second start.
@@ -1400,10 +1511,7 @@ mod tests {
     #[test]
     fn the_watcher_drives_the_detector_once_per_poll() {
         let watch = default_watch();
-        let detector = Scripted::boxed(vec![
-            Ok(poll_of(&watch, &[])),
-            Ok(poll_of(&watch, &[])),
-        ]);
+        let detector = Scripted::boxed(vec![Ok(poll_of(&watch, &[])), Ok(poll_of(&watch, &[]))]);
         let mut watcher = GameWatcher::with_detector(detector, &watch, Duration::from_millis(10));
         assert!(watcher.poll_once().is_empty());
         assert!(watcher.poll_once().is_empty());
@@ -1414,14 +1522,26 @@ mod tests {
     #[test]
     fn a_repeating_condition_is_reported_once() {
         let mut quiet = RunQuiet::default();
-        assert!(quiet.note("the snapshot failed".into()), "the first is news");
+        assert!(
+            quiet.note("the snapshot failed".into()),
+            "the first is news"
+        );
         for _ in 0..10 {
-            assert!(!quiet.note("the snapshot failed".into()), "and the rest are not");
+            assert!(
+                !quiet.note("the snapshot failed".into()),
+                "and the rest are not"
+            );
         }
-        assert!(quiet.note("something else failed".into()), "a change is news again");
+        assert!(
+            quiet.note("something else failed".into()),
+            "a change is news again"
+        );
         assert_eq!(quiet.recovered(), Some("something else failed".into()));
         assert_eq!(quiet.recovered(), None, "a recovery is reported once");
-        assert!(quiet.note("the snapshot failed".into()), "and it can be reported again later");
+        assert!(
+            quiet.note("the snapshot failed".into()),
+            "and it can be reported again later"
+        );
     }
 
     // ---- the live client source -------------------------------------------------------
@@ -1432,7 +1552,10 @@ mod tests {
         assert_eq!(source.watching().len(), 1);
         assert_eq!(source.watching()[0].name, "League of Legends");
         assert_eq!(source.endpoint().addr().port(), 2999);
-        assert!(source.endpoint().is_loopback(), "the address is loopback by construction");
+        assert!(
+            source.endpoint().is_loopback(),
+            "the address is loopback by construction"
+        );
     }
 
     #[test]
@@ -1446,8 +1569,14 @@ mod tests {
         let mut source =
             LiveClientPresence::for_endpoint(&watch, endpoint).expect("a client for a mock");
 
-        let presences = source.poll().expect("a refused loopback connection is 'no game'");
-        assert_eq!(presences.len(), 1, "one answer per title the source speaks for");
+        let presences = source
+            .poll()
+            .expect("a refused loopback connection is 'no game'");
+        assert_eq!(
+            presences.len(),
+            1,
+            "one answer per title the source speaks for"
+        );
         assert!(!presences[0].running);
         assert_eq!(presences[0].game.signal, Signal::LiveClientApi);
     }
@@ -1478,9 +1607,18 @@ mod tests {
         assert_eq!(live.watching().len(), 1);
 
         if cfg!(windows) {
-            let process = composite.process().expect("Windows has the process-list snapshot");
-            assert_eq!(process.watched().len(), 5, "everything else is watched by name");
-            assert!(process.watched().iter().all(|g| g.signal == Signal::Process));
+            let process = composite
+                .process()
+                .expect("Windows has the process-list snapshot");
+            assert_eq!(
+                process.watched().len(),
+                5,
+                "everything else is watched by name"
+            );
+            assert!(process
+                .watched()
+                .iter()
+                .all(|g| g.signal == Signal::Process));
         } else {
             assert!(
                 composite.process().is_none(),
@@ -1515,12 +1653,18 @@ mod tests {
         }
 
         let parsed: ConfigFile = serde_json::from_value(json!({})).expect("an empty file parses");
-        assert!(!parsed.games.auto_record, "nothing is automatic until the user turns it on");
+        assert!(
+            !parsed.games.auto_record,
+            "nothing is automatic until the user turns it on"
+        );
         assert!(!parsed.games.watching());
         assert_eq!(parsed.games.watch, default_watch());
         assert_eq!(parsed.games.poll_ms, DEFAULT_POLL_MS);
         assert_eq!(parsed.games.interval(), DEFAULT_POLL_INTERVAL);
-        assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(DEFAULT_POLL_MS));
+        assert_eq!(
+            DEFAULT_POLL_INTERVAL,
+            Duration::from_millis(DEFAULT_POLL_MS)
+        );
 
         // And a section that names only some fields keeps the defaults for the rest.
         let parsed: ConfigFile = serde_json::from_value(json!({ "games": { "poll_ms": 4000 } }))
@@ -1574,7 +1718,10 @@ mod tests {
             "exe": "mystery.exe",
             "signal": "mindreading",
         }));
-        assert!(unknown.is_err(), "an unknown signal must not be silently accepted");
+        assert!(
+            unknown.is_err(),
+            "an unknown signal must not be silently accepted"
+        );
     }
 
     #[test]
@@ -1589,11 +1736,17 @@ mod tests {
             (60_000, MAX_POLL_INTERVAL),
             (u64::MAX, MAX_POLL_INTERVAL),
         ] {
-            let section = GamesSection { poll_ms, ..GamesSection::default() };
+            let section = GamesSection {
+                poll_ms,
+                ..GamesSection::default()
+            };
             assert_eq!(section.interval(), expected, "poll_ms = {poll_ms}");
         }
         assert_eq!(clamp_interval(Duration::ZERO), MIN_POLL_INTERVAL);
-        assert_eq!(clamp_interval(Duration::from_secs(3_600)), MAX_POLL_INTERVAL);
+        assert_eq!(
+            clamp_interval(Duration::from_secs(3_600)),
+            MAX_POLL_INTERVAL
+        );
 
         // The production constructor is behind the same floor, so no path into the watcher can
         // produce a tight loop over the process list.
@@ -1611,8 +1764,14 @@ mod tests {
     fn a_watch_list_that_cannot_mean_what_it_says_is_refused() {
         let nameless = vec![WatchedGame::by_process("Mystery", "   ")];
         let err = ProcessWatcher::new(nameless.clone()).expect_err("no file name to watch for");
-        assert!(err.to_string().contains("Mystery"), "the error names the title: {err}");
-        assert!(ProcessWatcher::new(Vec::new()).is_ok(), "an empty list is empty, not wrong");
+        assert!(
+            err.to_string().contains("Mystery"),
+            "the error names the title: {err}"
+        );
+        assert!(
+            ProcessWatcher::new(Vec::new()).is_ok(),
+            "an empty list is empty, not wrong"
+        );
 
         let duplicate = vec![
             WatchedGame::by_process("Counter-Strike 2", "cs2.exe"),
@@ -1660,14 +1819,16 @@ mod tests {
     fn a_watcher_whose_receiver_is_dropped_ends_by_itself() {
         let watch = default_watch();
         let detector = Scripted::boxed(
-            (0..8).map(|_| Ok(poll_of(&watch, &["dota2.exe"]))).collect(),
+            (0..8)
+                .map(|_| Ok(poll_of(&watch, &["dota2.exe"])))
+                .collect(),
         );
         let watcher = GameWatcher::with_detector(detector, &watch, Duration::from_millis(5));
         let (sink, changes) = std::sync::mpsc::channel();
         let handle = spawn(watcher, sink).expect("a watcher thread");
         drop(changes); // the driver is gone
-        // Dropping the handle joins the thread; had the thread not noticed the closed sink this would
-        // hang. The assertion is that it returns.
+                       // Dropping the handle joins the thread; had the thread not noticed the closed sink this would
+                       // hang. The assertion is that it returns.
         handle.stop();
     }
 }

@@ -185,7 +185,9 @@ fn parse_options(args: &[String], repo: &Path) -> Result<Options> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let value = |flag: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String> {
-            it.next().cloned().with_context(|| format!("{flag} needs a value"))
+            it.next()
+                .cloned()
+                .with_context(|| format!("{flag} needs a value"))
         };
         match arg.as_str() {
             "--report" => opts.report = PathBuf::from(value("--report", &mut it)?),
@@ -290,16 +292,53 @@ impl Session {
         });
     }
 
-    fn pass(&mut self, id: &'static str, what: &'static str, criterion: &'static str, expected: impl Into<String>, measured: impl Into<String>) {
+    fn pass(
+        &mut self,
+        id: &'static str,
+        what: &'static str,
+        criterion: &'static str,
+        expected: impl Into<String>,
+        measured: impl Into<String>,
+    ) {
         self.push(id, what, criterion, expected, measured, Outcome::Pass);
     }
 
-    fn fail(&mut self, id: &'static str, what: &'static str, criterion: &'static str, expected: impl Into<String>, measured: impl Into<String>, reason: impl Into<String>) {
-        self.push(id, what, criterion, expected, measured, Outcome::Fail(reason.into()));
+    fn fail(
+        &mut self,
+        id: &'static str,
+        what: &'static str,
+        criterion: &'static str,
+        expected: impl Into<String>,
+        measured: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.push(
+            id,
+            what,
+            criterion,
+            expected,
+            measured,
+            Outcome::Fail(reason.into()),
+        );
     }
 
-    fn not_performed(&mut self, id: &'static str, what: &'static str, criterion: &'static str, expected: impl Into<String>, measured: impl Into<String>, reason: impl Into<String>) {
-        self.push(id, what, criterion, expected, measured, Outcome::NotPerformed(reason.into()));
+    fn not_performed(
+        &mut self,
+        id: &'static str,
+        what: &'static str,
+        criterion: &'static str,
+        expected: impl Into<String>,
+        measured: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.push(
+            id,
+            what,
+            criterion,
+            expected,
+            measured,
+            Outcome::NotPerformed(reason.into()),
+        );
     }
 
     /// A check that needs the real capture path and a hardware encoder.
@@ -325,12 +364,26 @@ impl Session {
             let reason = "this run used the synthetic capture source and/or the development \
                           software encoder, so the check says nothing about the real capture \
                           + hardware-encoder path; the measured value is reported anyway";
-            self.push(id, what, criterion, expected, measured, Outcome::NotPerformed(reason.to_string()));
+            self.push(
+                id,
+                what,
+                criterion,
+                expected,
+                measured,
+                Outcome::NotPerformed(reason.to_string()),
+            );
         }
     }
 
     fn record_step_error(&mut self, step: &'static str, err: anyhow::Error) {
-        self.fail(step, step, "—", "the step completes", "the step failed", format!("{err:#}"));
+        self.fail(
+            step,
+            step,
+            "—",
+            "the step completes",
+            "the step failed",
+            format!("{err:#}"),
+        );
     }
 }
 
@@ -368,7 +421,11 @@ struct RunOutput {
 
 impl RunOutput {
     fn stdout_text(&self) -> String {
-        self.stdout.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+        self.stdout
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn find(&self, needle: &str) -> Option<&LogLine> {
@@ -406,7 +463,11 @@ pub fn verify_command(args: &[String]) -> Result<()> {
     session.execute();
     let (path, failed) = session.write_report()?;
     if failed > 0 {
-        bail!("{failed} check(s) failed; the report is {}\n{}", path.display(), session.console_summary());
+        bail!(
+            "{failed} check(s) failed; the report is {}\n{}",
+            path.display(),
+            session.console_summary()
+        );
     }
     println!("{}", session.console_summary());
     Ok(())
@@ -414,8 +475,16 @@ pub fn verify_command(args: &[String]) -> Result<()> {
 
 impl Session {
     fn console_summary(&self) -> String {
-        let passed = self.checks.iter().filter(|c| matches!(c.outcome, Outcome::Pass)).count();
-        let failed = self.checks.iter().filter(|c| matches!(c.outcome, Outcome::Fail(_))).count();
+        let passed = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.outcome, Outcome::Pass))
+            .count();
+        let failed = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.outcome, Outcome::Fail(_)))
+            .count();
         let skipped = self
             .checks
             .iter()
@@ -513,22 +582,34 @@ impl Session {
                     versions.push((label, format!("failed: {}", out.status)));
                 }
                 Err(err) => {
-                    text.push_str(&format!("$ {program} {}\n[not found: {err}]\n\n", args.join(" ")));
+                    text.push_str(&format!(
+                        "$ {program} {}\n[not found: {err}]\n\n",
+                        args.join(" ")
+                    ));
                     versions.push((label, format!("not found: {err}")));
                 }
             }
         }
-        let toolchain_ok = versions.iter().all(|(_, v)| !v.starts_with("failed") && !v.starts_with("not found"));
+        let toolchain_ok = versions
+            .iter()
+            .all(|(_, v)| !v.starts_with("failed") && !v.starts_with("not found"));
         self.push(
             "toolchain",
             "Rust toolchain present and reporting a version",
             "prerequisite",
             "`rustc -vV` and `cargo --version` both answer",
-            versions.iter().map(|(l, v)| format!("{l}: {}", v.lines().next().unwrap_or(""))).collect::<Vec<_>>().join("; "),
+            versions
+                .iter()
+                .map(|(l, v)| format!("{l}: {}", v.lines().next().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("; "),
             if toolchain_ok {
                 Outcome::Pass
             } else {
-                Outcome::Fail("a toolchain that cannot report its version cannot have built this harness".into())
+                Outcome::Fail(
+                    "a toolchain that cannot report its version cannot have built this harness"
+                        .into(),
+                )
             },
         );
 
@@ -620,7 +701,10 @@ impl Session {
                 ),
             );
             if !exists {
-                bail!("--no-build was given and {} does not exist", target.display());
+                bail!(
+                    "--no-build was given and {} does not exist",
+                    target.display()
+                );
             }
             self.cli = Some(target);
             return Ok(());
@@ -644,7 +728,10 @@ impl Session {
             .filter(|l| !l.trim().is_empty())
             .collect();
         let tail = tail[tail.len().saturating_sub(20)..].join("\n");
-        self.note("Build", format!("$ {command}\n{tail}\n\nbinary: {}", target.display()));
+        self.note(
+            "Build",
+            format!("$ {command}\n{tail}\n\nbinary: {}", target.display()),
+        );
         if !out.status.success() || !target.is_file() {
             self.fail(
                 "build",
@@ -759,7 +846,11 @@ impl Session {
             format!(
                 "exit code: {:?}{}\nwall clock: {:.1}s\n\n```text\n{}\n```",
                 run.exit_code,
-                if run.timed_out { " (TIMED OUT and killed)" } else { "" },
+                if run.timed_out {
+                    " (TIMED OUT and killed)"
+                } else {
+                    ""
+                },
                 run.wall.as_secs_f64(),
                 run.raw()
             ),
@@ -791,7 +882,11 @@ impl Session {
                 "the buffer run exited cleanly",
                 "prerequisite",
                 "exit code 0",
-                if run.timed_out { "killed after the timeout".to_string() } else { "no exit code".to_string() },
+                if run.timed_out {
+                    "killed after the timeout".to_string()
+                } else {
+                    "no exit code".to_string()
+                },
                 "see the run's raw output",
             );
         }
@@ -826,7 +921,10 @@ impl Session {
                         "`WGC capture started on the primary monitor …` and a `capture geometry` line",
                         format!("{} | {}", g.text.trim(), w.text.trim()),
                     );
-                    self.note("Capture geometry", format!("{}\n{}", w.text.trim(), g.text.trim()));
+                    self.note(
+                        "Capture geometry",
+                        format!("{}\n{}", w.text.trim(), g.text.trim()),
+                    );
                 }
                 _ => self.fail(
                     "capture_started",
@@ -836,7 +934,9 @@ impl Session {
                     format!(
                         "geometry: {}, WGC: {}",
                         geometry.map(|l| l.text.trim()).unwrap_or("missing"),
-                        run.find("WGC capture started").map(|l| l.text.trim()).unwrap_or("missing")
+                        run.find("WGC capture started")
+                            .map(|l| l.text.trim())
+                            .unwrap_or("missing")
                     ),
                     "the Windows capture backend did not start; a stub geometry would mean the \
                      stub ran, which is a defect on Windows",
@@ -848,7 +948,9 @@ impl Session {
                 "the real capture backend started and reported its geometry",
                 "criterion 1",
                 "`WGC capture started on the primary monitor …`",
-                geometry.map(|l| l.text.trim().to_string()).unwrap_or_else(|| "no geometry line".into()),
+                geometry
+                    .map(|l| l.text.trim().to_string())
+                    .unwrap_or_else(|| "no geometry line".into()),
                 "this is not a Windows run: the synthetic stub backend is what captured",
             );
         }
@@ -876,7 +978,10 @@ impl Session {
             );
             self.note(
                 "Status line — last sample",
-                format!("```\n{measured}\n```\n{} samples parsed from `frames=` lines.", parsed.len()),
+                format!(
+                    "```\n{measured}\n```\n{} samples parsed from `frames=` lines.",
+                    parsed.len()
+                ),
             );
             if last.frames > 0 && last.segments > 0 {
                 self.pass(
@@ -904,7 +1009,11 @@ impl Session {
             let floor = declared_fps * 0.9;
             // Steady state = after the first segment landed (encoder spawned and warm). The final sample is
             // taken during shutdown and reads ~0, so the verdict is the median of the steady samples.
-            let steady: Vec<&Status> = parsed.iter().map(|(_, s)| s).filter(|s| s.segments >= 1).collect();
+            let steady: Vec<&Status> = parsed
+                .iter()
+                .map(|(_, s)| s)
+                .filter(|s| s.segments >= 1)
+                .collect();
             let steady_fps = {
                 let mut v: Vec<f64> = steady.iter().map(|s| s.fps).collect();
                 v.sort_by(|a, b| a.total_cmp(b));
@@ -1040,7 +1149,9 @@ impl Session {
             // only a real soak shows. Frame-rate conversion is off (`-fps_mode passthrough`), so frames
             // carry arrival timestamps and the ratio is ~1.0 by construction whatever the delivered rate
             // (the `frame_rate`/`configured_rate_reached` checks cover that separately).
-            if let (Some((Some(t0), first)), Some((Some(t1), last))) = (parsed.first(), parsed.last()) {
+            if let (Some((Some(t0), first)), Some((Some(t1), last))) =
+                (parsed.first(), parsed.last())
+            {
                 let wall_ms = t1.saturating_sub(*t0) as f64;
                 let span_ms = last.span_ms.saturating_sub(first.span_ms) as f64;
                 if wall_ms >= 5_000.0 {
@@ -1114,7 +1225,9 @@ impl Session {
                     &measured,
                     violated
                         .map(|l| l.text.trim().to_string())
-                        .unwrap_or_else(|| "bytes= exceeded the cap while the process kept running".into()),
+                        .unwrap_or_else(|| {
+                            "bytes= exceeded the cap while the process kept running".into()
+                        }),
                 );
             }
 
@@ -1306,11 +1419,14 @@ impl Session {
         let note = |_s: &Session| -> String {
             // Samples relative to the trigger, so "steady state" is explicit: the window ends at the
             // trigger, whose post-roll wait is a different workload.
-            let mut text = String::from(
-                "| t (s) | CPU time (s) | RSS (MB) |\n|---|---|---|\n",
-            );
+            let mut text = String::from("| t (s) | CPU time (s) | RSS (MB) |\n|---|---|---|\n");
             for s in &run.samples {
-                text.push_str(&format!("| {:.1} | {:.3} | {:.1} |\n", s.t_s, s.cpu_s, s.rss_bytes as f64 / (1024.0 * 1024.0)));
+                text.push_str(&format!(
+                    "| {:.1} | {:.3} | {:.1} |\n",
+                    s.t_s,
+                    s.cpu_s,
+                    s.rss_bytes as f64 / (1024.0 * 1024.0)
+                ));
             }
             if run.samples.is_empty() {
                 text.push_str("| — | — | — |\n");
@@ -1363,7 +1479,10 @@ impl Session {
                 "steady-state CPU under 5% of one core",
                 "criterion 6",
                 "CPU < 5% of ONE core",
-                format!("only {} samples fell inside the steady-state window", window.len()),
+                format!(
+                    "only {} samples fell inside the steady-state window",
+                    window.len()
+                ),
                 "the window is the first quarter of the run up to the trigger and needs at \
                  least three 2s samples: raise --seconds",
             );
@@ -1372,16 +1491,27 @@ impl Session {
                 "steady-state RSS under 400 MB",
                 "criterion 6",
                 "RSS < 400 MB",
-                format!("only {} samples fell inside the steady-state window", window.len()),
+                format!(
+                    "only {} samples fell inside the steady-state window",
+                    window.len()
+                ),
                 "the window is the first quarter of the run up to the trigger and needs at \
                  least three 2s samples: raise --seconds",
             );
             return;
         }
-        let first = window.first().expect("the window has at least three samples");
-        let last = window.last().expect("the window has at least three samples");
+        let first = window
+            .first()
+            .expect("the window has at least three samples");
+        let last = window
+            .last()
+            .expect("the window has at least three samples");
         let dt = last.t_s - first.t_s;
-        let cpu_percent = if dt > 0.0 { (last.cpu_s - first.cpu_s) / dt * 100.0 } else { f64::NAN };
+        let cpu_percent = if dt > 0.0 {
+            (last.cpu_s - first.cpu_s) / dt * 100.0
+        } else {
+            f64::NAN
+        };
         let rss_bytes = window.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
         let rss_mb = rss_bytes as f64 / (1024.0 * 1024.0);
         let window_desc = format!(
@@ -1430,7 +1560,10 @@ impl Session {
         // Taken out of `self` rather than borrowed, so checks can be recorded while the run's data is
         // still being read. Nothing after this step needs either value.
         let run = self.run.take().context("no buffer run")?;
-        let app_data = self.app_data.take().context("no application data directory")?;
+        let app_data = self
+            .app_data
+            .take()
+            .context("no application data directory")?;
         let clips_dir = app_data.join("localplay").join("clips");
 
         let Some(clip) = newest_clip(&clips_dir)? else {
@@ -1456,7 +1589,9 @@ impl Session {
             .stdout
             .iter()
             .find_map(|l| parse_wrote(&l.text).map(|w| (l.at_ms, w)));
-        let self_test_line = run.find("self-test: the ring holds").map(|l| l.text.trim().to_string());
+        let self_test_line = run
+            .find("self-test: the ring holds")
+            .map(|l| l.text.trim().to_string());
 
         if let Some((at_ms, trigger_line)) = trigger {
             self.note(
@@ -1529,7 +1664,10 @@ impl Session {
                 "the self-test trigger wrote a clip",
                 "criterion 3",
                 "a `wrote …` line and the file on disk",
-                format!("clip found at {} but no complete trigger/wrote pair in the log", clip.display()),
+                format!(
+                    "clip found at {} but no complete trigger/wrote pair in the log",
+                    clip.display()
+                ),
                 "see the run's raw output",
             ),
         }
@@ -1537,11 +1675,15 @@ impl Session {
         // --- ffprobe ------------------------------------------------------------------
         let info = MediaInfo::probe(&bin, &clip).context("ffprobe on the clip")?;
         let stream_counts = ffprobe_stream_counts(&bin, &clip)?;
-        let ffprobe_json = ffprobe_json(&bin, &clip).unwrap_or_else(|e| format!("(ffprobe failed: {e:#})"));
+        let ffprobe_json =
+            ffprobe_json(&bin, &clip).unwrap_or_else(|e| format!("(ffprobe failed: {e:#})"));
         let levels = volumedetect(&bin, &clip)?;
         let frame = frame_stats(&bin, &clip)?;
 
-        let mut probe_text = format!("$ ffprobe -v error -show_streams -show_format -of json {}\n{ffprobe_json}\n", clip.display());
+        let mut probe_text = format!(
+            "$ ffprobe -v error -show_streams -show_format -of json {}\n{ffprobe_json}\n",
+            clip.display()
+        );
         probe_text.push_str(&format!(
             "\n$ ffmpeg -i {} -af volumedetect -f null -\nmean_volume={} dB, max_volume={} dB (digital silence is about -91 dB)\n",
             clip.display(),
@@ -1581,9 +1723,19 @@ impl Session {
         }
 
         // Exactly one video and one audio stream, with the expected codecs.
-        let videos = stream_counts.iter().filter(|t| t.as_str() == "video").count();
-        let audios = stream_counts.iter().filter(|t| t.as_str() == "audio").count();
-        let video_codec = info.video.as_ref().map(|v| v.codec.clone()).unwrap_or_else(|| "none".into());
+        let videos = stream_counts
+            .iter()
+            .filter(|t| t.as_str() == "video")
+            .count();
+        let audios = stream_counts
+            .iter()
+            .filter(|t| t.as_str() == "audio")
+            .count();
+        let video_codec = info
+            .video
+            .as_ref()
+            .map(|v| v.codec.clone())
+            .unwrap_or_else(|| "none".into());
         let resolution = info
             .video
             .as_ref()
@@ -1618,7 +1770,11 @@ impl Session {
         }
 
         // Stream copy: the clip's codec family is the encoder's, and the splice was quick.
-        let expected_family = if video_codec.starts_with("hevc") { "hevc" } else { "h264" };
+        let expected_family = if video_codec.starts_with("hevc") {
+            "hevc"
+        } else {
+            "h264"
+        };
         match &wrote {
             Some((at_ms, wrote)) => {
                 // The encoder's *family*, not its name: `h264_nvenc` and `libx264` are both H.264, and ffprobe
@@ -1629,7 +1785,9 @@ impl Session {
                 let measured = format!(
                     "clip video codec={video_codec}, logged encoder={}, extraction took {}{}",
                     wrote.encoder,
-                    splice_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "?".into()),
+                    splice_ms
+                        .map(|m| format!("{m}ms"))
+                        .unwrap_or_else(|| "?".into()),
                     splice_ms
                         .map(|_| format!(" against a clip of {}ms of media", info.duration_ms))
                         .unwrap_or_default()
@@ -1680,7 +1838,9 @@ impl Session {
 
         // The hardware-encoder half of the codec check (shipping path only).
         if let Some((_, wrote)) = &wrote {
-            let is_hardware = ["nvenc", "qsv", "amf"].iter().any(|v| wrote.encoder.ends_with(v));
+            let is_hardware = ["nvenc", "qsv", "amf"]
+                .iter()
+                .any(|v| wrote.encoder.ends_with(v));
             self.hardware_check(
                 "clip_hardware_encoder",
                 "the clip was produced by a hardware encoder (no CPU fallback)",
@@ -1703,7 +1863,12 @@ impl Session {
         let drift_line = run.stdout.iter().find_map(|l| parse_drift_line(&l.text));
         let probed_drift = info.av_drift();
         let drift_context = probed_drift
-            .map(|d| format!("ffprobe: video {}ms, audio {}ms, drift {}ms", d.video_ms, d.audio_ms, d.delta_ms))
+            .map(|d| {
+                format!(
+                    "ffprobe: video {}ms, audio {}ms, drift {}ms",
+                    d.video_ms, d.audio_ms, d.delta_ms
+                )
+            })
             .unwrap_or_else(|| "ffprobe reported no per-stream durations".to_string());
         match drift_line {
             Some((video_ms, audio_ms, drift_ms)) => {
@@ -1753,7 +1918,10 @@ impl Session {
         // Audio level, proving the track is not silent.
         match &levels {
             Some(l) => {
-                let measured = format!("mean_volume={:.1} dB, max_volume={:.1} dB", l.mean_db, l.max_db);
+                let measured = format!(
+                    "mean_volume={:.1} dB, max_volume={:.1} dB",
+                    l.mean_db, l.max_db
+                );
                 self.note("Audio level", format!("{measured}\n\nThe report's volumedetect output above carries ffmpeg's own text."));
                 if self.hardware_path {
                     if l.max_db > -80.0 {
@@ -1884,8 +2052,7 @@ impl Session {
         let measured = format!(
             "exit code {:?}; names `{encoder}`: {named}; repeats the reason: {reason}; started \
              capturing: {}",
-            run.exit_code,
-            !no_capture
+            run.exit_code, !no_capture
         );
         if non_zero && named && reason && no_capture {
             self.pass(
@@ -1922,12 +2089,20 @@ impl Session {
     }
 
     /// Spawn the CLI, read every line it writes, sample its resource use, and wait.
-    fn run_cli(&self, app_data_base: &Path, args: &[String], budget: Duration) -> Result<RunOutput> {
+    fn run_cli(
+        &self,
+        app_data_base: &Path,
+        args: &[String],
+        budget: Duration,
+    ) -> Result<RunOutput> {
         let cli = self.cli.clone().context("no CLI binary to run")?;
         let command = format!(
             "{} {}",
             cli.display(),
-            args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+            args.iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         std::fs::create_dir_all(app_data_base)
             .with_context(|| format!("creating {}", app_data_base.display()))?;
@@ -1956,7 +2131,10 @@ impl Session {
         loop {
             while let Ok((stream, text)) = rx.recv_timeout(Duration::from_millis(20)) {
                 match stream {
-                    Stream::Stdout => stdout.push(LogLine { at_ms: parse_epoch_ms(&text), text }),
+                    Stream::Stdout => stdout.push(LogLine {
+                        at_ms: parse_epoch_ms(&text),
+                        text,
+                    }),
                     Stream::Stderr => {
                         stderr.push_str(&text);
                         stderr.push('\n');
@@ -1977,7 +2155,11 @@ impl Session {
             let now = Instant::now();
             if now >= next_sample {
                 if let Some((cpu_s, rss_bytes)) = sample_process(&child) {
-                    samples.push(Sample { t_s: now.duration_since(started).as_secs_f64(), cpu_s, rss_bytes });
+                    samples.push(Sample {
+                        t_s: now.duration_since(started).as_secs_f64(),
+                        cpu_s,
+                        rss_bytes,
+                    });
                 }
                 next_sample = now + SAMPLE_INTERVAL;
             }
@@ -1991,7 +2173,10 @@ impl Session {
         // The readers stop when the pipes close; take whatever is still buffered.
         while let Ok((stream, text)) = rx.recv_timeout(Duration::from_millis(500)) {
             match stream {
-                Stream::Stdout => stdout.push(LogLine { at_ms: parse_epoch_ms(&text), text }),
+                Stream::Stdout => stdout.push(LogLine {
+                    at_ms: parse_epoch_ms(&text),
+                    text,
+                }),
                 Stream::Stderr => {
                     stderr.push_str(&text);
                     stderr.push('\n');
@@ -2012,14 +2197,26 @@ impl Session {
 
     /// Write the report, and report how many checks failed.
     fn write_report(&mut self) -> Result<(PathBuf, usize)> {
-        let passed = self.checks.iter().filter(|c| matches!(c.outcome, Outcome::Pass)).count();
-        let failed = self.checks.iter().filter(|c| matches!(c.outcome, Outcome::Fail(_))).count();
+        let passed = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.outcome, Outcome::Pass))
+            .count();
+        let failed = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.outcome, Outcome::Fail(_)))
+            .count();
         let not_performed = self
             .checks
             .iter()
             .filter(|c| matches!(c.outcome, Outcome::NotPerformed(_)))
             .count();
-        let verdict = if failed == 0 { "PASS (on this machine, this run)" } else { "FAIL" };
+        let verdict = if failed == 0 {
+            "PASS (on this machine, this run)"
+        } else {
+            "FAIL"
+        };
 
         let mut md = String::new();
         md.push_str("# localplay verification report\n\n");
@@ -2048,7 +2245,9 @@ impl Session {
         );
 
         md.push_str("\n## Checks\n\n");
-        md.push_str("| # | Check | Criterion | Expected | Measured | Result |\n|---|---|---|---|---|---|\n");
+        md.push_str(
+            "| # | Check | Criterion | Expected | Measured | Result |\n|---|---|---|---|---|---|\n",
+        );
         for (i, c) in self.checks.iter().enumerate() {
             let result = match &c.outcome {
                 Outcome::Pass => "PASS".to_string(),
@@ -2103,7 +2302,9 @@ impl Session {
         if self.opts.no_build {
             invocation.push_str(" --no-build");
         }
-        md.push_str(&format!("\n## How to reproduce\n\n```console\n$ {invocation}\n```\n"));
+        md.push_str(&format!(
+            "\n## How to reproduce\n\n```console\n$ {invocation}\n```\n"
+        ));
         md.push_str(&format!(
             "\nRun it in this checkout's root, in an **interactive desktop session** (an SSH \
              session has no desktop, which the capture backend needs — \
@@ -2111,7 +2312,11 @@ impl Session {
              command lines and the config the run used are in the sections above; the sandbox \
              this run wrote into is `{}`{}.\n",
             self.opts.work_dir.display(),
-            if self.opts.clean_work { " (removed afterwards: `--clean-work`)" } else { "" }
+            if self.opts.clean_work {
+                " (removed afterwards: `--clean-work`)"
+            } else {
+                ""
+            }
         ));
 
         let report = self.opts.report.clone();
@@ -2123,7 +2328,10 @@ impl Session {
 
         if self.opts.clean_work {
             match std::fs::remove_dir_all(&self.opts.work_dir) {
-                Ok(()) => self.note("Cleanup", format!("removed {}", self.opts.work_dir.display())),
+                Ok(()) => self.note(
+                    "Cleanup",
+                    format!("removed {}", self.opts.work_dir.display()),
+                ),
                 Err(err) => eprintln!(
                     "xtask: could not remove {}: {err}",
                     self.opts.work_dir.display()
@@ -2236,7 +2444,12 @@ fn parse_wrote(line: &str) -> Option<Wrote> {
     let duration_ms = parts.next()?.trim().strip_suffix("ms")?.parse().ok()?;
     let size_bytes = parts.next()?.trim().strip_suffix(" bytes")?.parse().ok()?;
     let encoder = parts.next()?.trim().strip_prefix("encoder=")?.to_string();
-    Some(Wrote { path: path.trim().to_string(), duration_ms, size_bytes, encoder })
+    Some(Wrote {
+        path: path.trim().to_string(),
+        duration_ms,
+        size_bytes,
+        encoder,
+    })
 }
 
 /// The splice's drift line: `clip clip-1234: video 3007ms audio 3008ms drift -1ms`.
@@ -2280,7 +2493,9 @@ fn parse_wasapi(line: &str) -> Option<WasapiInfo> {
         native_format: field(line, "native_sample_format")?.to_string(),
         requested_sample_rate: field(line, "requested_sample_rate")?.parse().ok()?,
         requested_channels: field(line, "requested_channels")?.parse().ok()?,
-        requested_format: field(line, "requested_sample_format")?.trim_matches('"').to_string(),
+        requested_format: field(line, "requested_sample_format")?
+            .trim_matches('"')
+            .to_string(),
         converting: field(line, "converting")?.starts_with("true"),
     })
 }
@@ -2298,7 +2513,12 @@ fn parse_epoch_ms(text: &str) -> Option<u64> {
     let hour: u64 = text.get(11..13)?.parse().ok()?;
     let minute: u64 = text.get(14..16)?.parse().ok()?;
     let second: u64 = text.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     let days = days_from_civil(year, month, day);
@@ -2430,7 +2650,9 @@ fn segments_on_disk(dir: &Path) -> Result<Vec<u64>> {
     let mut numbers = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if let Some(rest) = name.strip_prefix("seg-") {
             if let Some(number) = rest.strip_suffix(".mp4") {
                 if let Ok(number) = number.parse() {
@@ -2484,8 +2706,20 @@ enum Stream {
 fn drain_pipes(child: &mut Child) -> Receiver<(Stream, String)> {
     let (tx, rx) = mpsc::channel();
     for (stream, pipe) in [
-        (Stream::Stdout, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-        (Stream::Stderr, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
+        (
+            Stream::Stdout,
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+        (
+            Stream::Stderr,
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
     ] {
         let Some(pipe) = pipe else { continue };
         let tx = tx.clone();
@@ -2524,8 +2758,12 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
     // SAFETY: the handle comes from a live `Child` this function is called on, and both
     // callees only write into the structs passed by pointer.
     let (cpu_s, rss_bytes) = unsafe {
-        let (mut creation, mut exit, mut kernel, mut user) =
-            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let (mut creation, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
         if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
             return None;
         }
@@ -2555,11 +2793,8 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
     // (`*mut rusage_info_t` is a `*mut c_void` out-parameter).
     unsafe {
         let mut buffer: libc::rusage_info_t = info.as_mut_ptr().cast();
-        let rc = libc::proc_pid_rusage(
-            child.id() as libc::c_int,
-            libc::RUSAGE_INFO_V2,
-            &mut buffer,
-        );
+        let rc =
+            libc::proc_pid_rusage(child.id() as libc::c_int, libc::RUSAGE_INFO_V2, &mut buffer);
         if rc != 0 {
             return None;
         }
@@ -2603,7 +2838,11 @@ fn parse_ps_time(text: &str) -> Option<f64> {
     };
     let parts: Vec<&str> = rest.split(':').collect();
     let seconds = match parts.as_slice() {
-        [h, m, s] => h.parse::<f64>().ok()? * 3600.0 + m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?,
+        [h, m, s] => {
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + s.parse::<f64>().ok()?
+        }
         [m, s] => m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?,
         [s] => s.parse::<f64>().ok()?,
         _ => return None,
@@ -2618,7 +2857,14 @@ fn parse_ps_time(text: &str) -> Option<f64> {
 /// The clip's stream types, in ffprobe's own order.
 fn ffprobe_stream_counts(bin: &FfmpegBinaries, clip: &Path) -> Result<Vec<String>> {
     let out = Command::new(&bin.ffprobe)
-        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(clip)
         .output()
         .with_context(|| format!("running {} on {}", bin.ffprobe.display(), clip.display()))?;
@@ -2637,7 +2883,14 @@ fn ffprobe_stream_counts(bin: &FfmpegBinaries, clip: &Path) -> Result<Vec<String
 
 fn ffprobe_json(bin: &FfmpegBinaries, clip: &Path) -> Result<String> {
     let out = Command::new(&bin.ffprobe)
-        .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
         .arg(clip)
         .output()
         .context("running ffprobe")?;
@@ -2692,7 +2945,15 @@ fn frame_stats(bin: &FfmpegBinaries, clip: &Path) -> Result<Option<FrameStats>> 
         .args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
         .arg(clip)
         .args([
-            "-frames:v", "1", "-vf", "scale=160:90", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=160:90",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
         ])
         .output()
         .context("decoding one frame")?;
@@ -2751,9 +3012,11 @@ mod tests {
             }
         );
         // A line without `configured=` still parses: the declared rate is the fallback.
-        let older = parse_status("frames=1 segments=2 bytes=3 span=4ms dropped=0 \
-                                  dropped_audio=0 skipped=0 fps=29.9/30")
-            .expect("an older status line still parses");
+        let older = parse_status(
+            "frames=1 segments=2 bytes=3 span=4ms dropped=0 \
+                                  dropped_audio=0 skipped=0 fps=29.9/30",
+        )
+        .expect("an older status line still parses");
         assert_eq!((older.declared, older.configured), (30, 30));
         // A line that is missing a field is not a status line, not a half-filled one.
         assert!(parse_status("frames=1 segments=2").is_none());
@@ -2777,7 +3040,10 @@ mod tests {
              media=44000ms wall=44123ms (drift 123ms); waiting for post-roll",
         )
         .expect("the hotkey's own line");
-        assert_eq!((trigger.media_ms, trigger.wall_ms, trigger.drift_ms), (44000, 44123, 123));
+        assert_eq!(
+            (trigger.media_ms, trigger.wall_ms, trigger.drift_ms),
+            (44000, 44123, 123)
+        );
 
         let wrote = parse_wrote(
             "2026-09-23T19:21:03.000000Z  INFO localplay_recorder: wrote \
@@ -2844,7 +3110,10 @@ mod tests {
         let clean = strip_ansi(coloured);
         assert!(!clean.contains('\u{1b}'));
         assert_eq!(field(&clean, "frames"), Some("10"));
-        assert_eq!(parse_epoch_ms(&clean), parse_epoch_ms("2026-09-23T19:20:27.157909Z x"));
+        assert_eq!(
+            parse_epoch_ms(&clean),
+            parse_epoch_ms("2026-09-23T19:20:27.157909Z x")
+        );
     }
 
     #[test]
@@ -2855,7 +3124,10 @@ mod tests {
         // The invariant is `None` or a real number, never a plausible zero: in a sandboxed shell
         // `proc_pid_rusage` answers `rc = 0` and leaves the buffer untouched, and reporting that as
         // "0.0 MB" would be a fabricated measurement, so the harness marks the check not-performed.
-        let mut child = Command::new("sleep").arg("5").spawn().expect("spawning sleep");
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawning sleep");
         if let Some((cpu_s, rss_bytes)) = sample_process(&child) {
             assert!(
                 rss_bytes > 0,
@@ -2885,10 +3157,17 @@ mod tests {
         assert!(!opts.dev_software && !opts.no_build && !opts.clean_work);
 
         let opts = parse_options(
-            &["--seconds", "90", "--report", "/tmp/r.md", "--dev-software-encoder", "--clean-work"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
+            &[
+                "--seconds",
+                "90",
+                "--report",
+                "/tmp/r.md",
+                "--dev-software-encoder",
+                "--clean-work",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
             repo,
         )
         .expect("the full flag list parses");
@@ -2899,9 +3178,12 @@ mod tests {
 
     #[test]
     fn a_run_that_is_too_short_is_refused_rather_than_run() {
-        let err = parse_options(&["--seconds".to_string(), "2".to_string()], Path::new("/repo"))
-            .expect_err("a two-second run cannot fill the ring")
-            .to_string();
+        let err = parse_options(
+            &["--seconds".to_string(), "2".to_string()],
+            Path::new("/repo"),
+        )
+        .expect_err("a two-second run cannot fill the ring")
+        .to_string();
         assert!(err.contains("at least 5"), "got: {err}");
         let err = parse_options(&["--nonsense".to_string()], Path::new("/repo"))
             .expect_err("an unknown flag must be refused")
@@ -2926,8 +3208,12 @@ mod tests {
         );
         session.pass("a", "a", "—", "x", "y");
         session.not_performed("b", "b", "—", "x", "y", "reason");
-        assert!(session.console_summary().contains("1 passed, 0 failed, 1 not performed"));
+        assert!(session
+            .console_summary()
+            .contains("1 passed, 0 failed, 1 not performed"));
         session.fail("c", "c", "—", "x", "y", "reason");
-        assert!(session.console_summary().contains("1 passed, 1 failed, 1 not performed"));
+        assert!(session
+            .console_summary()
+            .contains("1 passed, 1 failed, 1 not performed"));
     }
 }

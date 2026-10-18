@@ -107,7 +107,10 @@ impl Baseline {
     /// meaningful. A document naming no steam id cannot be compared and is treated as a different
     /// player, not as a zero.
     fn same_player(&self, snapshot: &GsiSnapshot) -> bool {
-        match (self.steamid.as_deref(), snapshot.player.first().and_then(player_steamid)) {
+        match (
+            self.steamid.as_deref(),
+            snapshot.player.first().and_then(player_steamid),
+        ) {
             (Some(previous), Some(current)) => previous == current,
             _ => false,
         }
@@ -214,9 +217,7 @@ fn in_game(snapshot: &GsiSnapshot, game: Game) -> bool {
     match game {
         // Counter-Strike keeps the map name set all session, so the phase separates a running match
         // from the scoreboard after one.
-        Game::Cs2 => {
-            !snapshot.map.name.trim().is_empty() && snapshot.map.phase != "gameover"
-        }
+        Game::Cs2 => !snapshot.map.name.trim().is_empty() && snapshot.map.phase != "gameover",
         // Dota 2 reports a rules state; the states before and after a match are named.
         Game::Dota2 => {
             let state = snapshot.map.game_state.as_str();
@@ -237,11 +238,7 @@ fn map_phase(snapshot: &GsiSnapshot, game: Game) -> String {
 }
 
 /// Kill / death / assist, from the scoreboard deltas.
-fn scoreboard_events(
-    baseline: &Baseline,
-    snapshot: &GsiSnapshot,
-    game: Game,
-) -> Vec<GameEvent> {
+fn scoreboard_events(baseline: &Baseline, snapshot: &GsiSnapshot, game: Game) -> Vec<GameEvent> {
     let Some(player) = snapshot.player.first() else {
         return Vec::new();
     };
@@ -255,7 +252,12 @@ fn scoreboard_events(
     for (kind, previous, current, label) in [
         (EventKind::Kill, baseline.kills, player.kills(), "kills"),
         (EventKind::Death, baseline.deaths, player.deaths(), "deaths"),
-        (EventKind::Assist, baseline.assists, player.assists(), "assists"),
+        (
+            EventKind::Assist,
+            baseline.assists,
+            player.assists(),
+            "assists",
+        ),
     ] {
         let (Some(previous), Some(current)) = (previous, current) else {
             continue;
@@ -400,7 +402,10 @@ mod tests {
     /// The single player a Counter-Strike fixture describes, for editing one field at a time
     /// instead of a hundred near-copies of the JSON.
     fn player_of(snapshot: &mut GsiSnapshot) -> &mut Player {
-        snapshot.player.first_mut().expect("the fixture names one player")
+        snapshot
+            .player
+            .first_mut()
+            .expect("the fixture names one player")
     }
 
     fn kinds(events: &[GameEvent]) -> Vec<EventKind> {
@@ -435,7 +440,11 @@ mod tests {
         let mut tracker = Tracker::default();
         let start = tracker.observe(&cs2());
 
-        assert_eq!(kinds(&start), vec![EventKind::GameStart], "one event, not one per stat");
+        assert_eq!(
+            kinds(&start),
+            vec![EventKind::GameStart],
+            "one event, not one per stat"
+        );
         assert!(tracker.in_game());
         let body = payload(&start, EventKind::GameStart);
         assert!(body.contains("\"game\":\"cs2\""), "got {body}");
@@ -453,7 +462,10 @@ mod tests {
         let mut tracker = Tracker::default();
         tracker.observe(&cs2());
         for _ in 0..5 {
-            assert!(tracker.observe(&cs2()).is_empty(), "a heartbeat is not an event");
+            assert!(
+                tracker.observe(&cs2()).is_empty(),
+                "a heartbeat is not an event"
+            );
         }
     }
 
@@ -489,7 +501,10 @@ mod tests {
         let events = tracker.observe(&next);
         assert_eq!(kinds(&events), vec![EventKind::Kill], "one clip, not two");
         let body = payload(&events, EventKind::Kill);
-        assert!(body.contains("\"delta\":2"), "and the delta is not hidden: {body}");
+        assert!(
+            body.contains("\"delta\":2"),
+            "and the delta is not hidden: {body}"
+        );
         assert!(body.contains("\"total\":14"), "got {body}");
     }
 
@@ -570,18 +585,27 @@ mod tests {
 
         let mut planted = carry.clone();
         planted.bomb.state = "planting".into();
-        assert!(tracker.observe(&planted).is_empty(), "planting is not planted yet");
+        assert!(
+            tracker.observe(&planted).is_empty(),
+            "planting is not planted yet"
+        );
 
         planted.bomb.state = "planted".into();
         let events = tracker.observe(&planted);
         assert_eq!(kinds(&events), vec![EventKind::BombPlanted]);
         assert!(payload(&events, EventKind::BombPlanted).contains("\"countdown\":\"38.5\""));
 
-        assert!(tracker.observe(&planted).is_empty(), "the same plant twice is one plant");
+        assert!(
+            tracker.observe(&planted).is_empty(),
+            "the same plant twice is one plant"
+        );
 
         let mut defused = planted.clone();
         defused.bomb.state = "defused".into();
-        assert_eq!(kinds(&tracker.observe(&defused)), vec![EventKind::BombDefused]);
+        assert_eq!(
+            kinds(&tracker.observe(&defused)),
+            vec![EventKind::BombDefused]
+        );
     }
 
     #[test]
@@ -595,7 +619,10 @@ mod tests {
 
         let mut planted = carry.clone();
         planted.round.bomb = "planted".into();
-        assert_eq!(kinds(&tracker.observe(&planted)), vec![EventKind::BombPlanted]);
+        assert_eq!(
+            kinds(&tracker.observe(&planted)),
+            vec![EventKind::BombPlanted]
+        );
     }
 
     #[test]
@@ -653,7 +680,10 @@ mod tests {
         unknown.provider.appid = 0;
         unknown.provider.name = "Nothing We Know".into();
         assert!(tracker.observe(&unknown).is_empty());
-        assert!(tracker.in_game(), "an unattributable payload is not the end of a game");
+        assert!(
+            tracker.in_game(),
+            "an unattributable payload is not the end of a game"
+        );
 
         // And the next real payload still works.
         let mut next = cs2();
@@ -697,7 +727,10 @@ mod tests {
         // And the strategy time of the next match starts a new one.
         let mut next_match = document(DOTA_IN_GAME);
         next_match.map.game_state = "DOTA_GAMERULES_STATE_STRATEGY_TIME".into();
-        assert_eq!(kinds(&tracker.observe(&next_match)), vec![EventKind::GameStart]);
+        assert_eq!(
+            kinds(&tracker.observe(&next_match)),
+            vec![EventKind::GameStart]
+        );
     }
 
     #[test]

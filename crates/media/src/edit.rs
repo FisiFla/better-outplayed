@@ -118,9 +118,12 @@ pub fn remux_stream_lossless(
     // pipe.
     let budget = copy_budget(bytes.len() as u64);
     let mut cmd = crate::sidecar_command(&bin.ffmpeg);
-    cmd.args(["-v", "error", "-y", "-i", "pipe:0", "-map", "0", "-c", "copy"]);
+    cmd.args([
+        "-v", "error", "-y", "-i", "pipe:0", "-map", "0", "-c", "copy",
+    ]);
     for (index, title) in audio_titles(audio_streams).iter().enumerate() {
-        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
     }
     cmd.args(["-movflags", "+faststart"]).arg(dst);
 
@@ -218,7 +221,8 @@ pub fn add_chapters(
         .arg(&meta)
         .args(["-map", "0", "-map_chapters", "1", "-c", "copy"]);
     for (index, title) in audio_titles(audio_streams).iter().enumerate() {
-        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
     }
     cmd.args(["-movflags", "+faststart"]).arg(&tmp);
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -280,7 +284,8 @@ pub fn concat_lossless_sized(
         .arg(list_file)
         .args(["-map", "0", "-c", "copy"]);
     for (index, title) in audio_titles(audio_streams).iter().enumerate() {
-        cmd.arg(format!("-metadata:s:a:{index}")).arg(format!("title={title}"));
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
     }
     cmd.args(["-movflags", "+faststart"]).arg(dst);
     expect_success(cmd, "concat", dst, copy_budget(total_bytes))
@@ -343,7 +348,12 @@ pub fn check_concat_layout(bin: &FfmpegBinaries, segments: &[PathBuf]) -> Result
 
 /// `video/h264 64x48, audio/aac 48000Hz 2ch`: the shapes, for a refusal message.
 fn describe(layout: &StreamLayout) -> String {
-    layout.streams.iter().map(|s| s.summary()).collect::<Vec<_>>().join(", ")
+    layout
+        .streams
+        .iter()
+        .map(|s| s.summary())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn expect_success(cmd: Command, what: &str, dst: &Path, budget: Duration) -> Result<()> {
@@ -356,7 +366,10 @@ fn expect_success(cmd: Command, what: &str, dst: &Path, budget: Duration) -> Res
         );
     }
     if !dst.is_file() {
-        bail!("{what} reported success but {} does not exist", dst.display());
+        bail!(
+            "{what} reported success but {} does not exist",
+            dst.display()
+        );
     }
     dst.metadata()
         .map(|_| ())
@@ -428,7 +441,10 @@ mod tests {
 
     #[test]
     fn a_plain_unix_path_is_untouched() {
-        assert_eq!(concat_list_path(Path::new("/tmp/a/seg.mp4")), "/tmp/a/seg.mp4");
+        assert_eq!(
+            concat_list_path(Path::new("/tmp/a/seg.mp4")),
+            "/tmp/a/seg.mp4"
+        );
     }
 
     #[test]
@@ -459,7 +475,10 @@ mod tests {
         // never be smaller than the floor and must rise with size.
         assert_eq!(copy_budget(0), COPY_FLOOR, "no bytes means the floor alone");
         assert_eq!(copy_budget(1), COPY_FLOOR, "a byte is not a second");
-        assert!(copy_budget(COPY_MIN_BYTES_PER_SEC) > COPY_FLOOR, "10MB buys a second");
+        assert!(
+            copy_budget(COPY_MIN_BYTES_PER_SEC) > COPY_FLOOR,
+            "10MB buys a second"
+        );
 
         // 4 GB is ~429 seconds on top of the floor. Asserted as a range so the test does not restate
         // the arithmetic it checks.
@@ -472,7 +491,10 @@ mod tests {
     }
 
     fn chapter(start_ms: u64, title: &str) -> Chapter {
-        Chapter { start_ms, title: title.to_string() }
+        Chapter {
+            start_ms,
+            title: title.to_string(),
+        }
     }
 
     #[test]
@@ -489,8 +511,14 @@ mod tests {
     #[test]
     fn a_first_mark_after_zero_gets_a_lead_in_chapter() {
         let meta = ffmetadata(&[chapter(1000, "Kill")], 4000);
-        assert!(meta.contains(&format!("START=0\nEND=1000\ntitle={LEAD_IN_TITLE}\n")), "{meta}");
-        assert!(meta.contains("START=1000\nEND=4000\ntitle=Kill\n"), "{meta}");
+        assert!(
+            meta.contains(&format!("START=0\nEND=1000\ntitle={LEAD_IN_TITLE}\n")),
+            "{meta}"
+        );
+        assert!(
+            meta.contains("START=1000\nEND=4000\ntitle=Kill\n"),
+            "{meta}"
+        );
     }
 
     #[test]

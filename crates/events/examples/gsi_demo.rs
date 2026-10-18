@@ -91,8 +91,10 @@ fn main() {
 
     println!();
     if seen == 0 {
-        println!("no payload arrived in {seconds}s — nothing was derived (which is itself the \
-                  answer for an idle listener: it does nothing on its own)");
+        println!(
+            "no payload arrived in {seconds}s — nothing was derived (which is itself the \
+                  answer for an idle listener: it does nothing on its own)"
+        );
     } else {
         println!("{seen} event(s) derived from the payloads that arrived");
     }

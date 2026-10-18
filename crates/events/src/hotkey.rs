@@ -11,9 +11,9 @@
 
 use anyhow::Result;
 use std::fmt;
-use std::sync::mpsc::{channel, Receiver};
 #[cfg(windows)]
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
 /// How long [`listen`] waits for the registering thread to report its outcome. The call itself
@@ -34,7 +34,12 @@ pub struct Hotkey {
 impl Hotkey {
     /// Accepts the `"Ctrl+F8"` form used in `config.example.toml`.
     pub fn parse(spec: &str) -> Result<Self> {
-        let mut hk = Self { ctrl: false, alt: false, shift: false, vk: 0 };
+        let mut hk = Self {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            vk: 0,
+        };
         let mut key = None;
         for part in spec.split('+') {
             match part.trim().to_ascii_lowercase().as_str() {
@@ -54,7 +59,11 @@ impl Hotkey {
 /// failure names it.
 impl fmt::Display for Hotkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (set, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")] {
+        for (set, name) in [
+            (self.ctrl, "Ctrl"),
+            (self.alt, "Alt"),
+            (self.shift, "Shift"),
+        ] {
             if set {
                 write!(f, "{name}+")?;
             }
@@ -92,13 +101,18 @@ pub const fn supported() -> bool {
 fn parse_key(key: Option<&str>) -> Result<u32> {
     let key = key.ok_or_else(|| anyhow::anyhow!("hotkey has no main key (e.g. \"Ctrl+F8\")"))?;
     if let Some(n) = key.strip_prefix('f') {
-        let n: u32 = n.parse().map_err(|_| anyhow::anyhow!("bad function key: F{n}"))?;
+        let n: u32 = n
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad function key: F{n}"))?;
         if (1..=24).contains(&n) {
             return Ok(0x70 + n - 1); // VK_F1..VK_F24
         }
         anyhow::bail!("function key out of range: F{n}");
     }
-    let ch = key.chars().next().ok_or_else(|| anyhow::anyhow!("empty key"))?;
+    let ch = key
+        .chars()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty key"))?;
     if ch.is_ascii_alphanumeric() {
         return Ok(ch.to_ascii_uppercase() as u32); // VK_A..VK_Z / VK_0..VK_9
     }
@@ -110,13 +124,15 @@ fn parse_key(key: Option<&str>) -> Result<u32> {
 pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     let presses = listen_all(vec![hk])?;
     let (tx, rx) = channel();
-    std::thread::Builder::new().name("localplay-hotkey-fwd".into()).spawn(move || {
-        while presses.recv().is_ok() {
-            if tx.send(()).is_err() {
-                break;
+    std::thread::Builder::new()
+        .name("localplay-hotkey-fwd".into())
+        .spawn(move || {
+            while presses.recv().is_ok() {
+                if tx.send(()).is_err() {
+                    break;
+                }
             }
-        }
-    })?;
+        })?;
     Ok(rx)
 }
 
@@ -135,7 +151,11 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
-    let chords = hks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let chords = hks
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let (tx, rx) = channel();
     // The registration outcome: `Ok(())` once every chord is held, else `Err(message)`. A separate
     // channel from the presses, because one is a handshake and the other a stream.
@@ -220,7 +240,15 @@ mod tests {
     #[test]
     fn parses_a_function_key_chord() {
         let hk = Hotkey::parse("Ctrl+F8").expect("Ctrl+F8 must parse");
-        assert_eq!(hk, Hotkey { ctrl: true, alt: false, shift: false, vk: 0x77 });
+        assert_eq!(
+            hk,
+            Hotkey {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                vk: 0x77
+            }
+        );
     }
 
     #[test]
@@ -255,7 +283,10 @@ mod tests {
         // The same spelling both front-ends print, whatever case or order the config used.
         assert_eq!(Hotkey::parse("Ctrl+F8").unwrap().to_string(), "Ctrl+F8");
         assert_eq!(Hotkey::parse("ctrl+f8").unwrap().to_string(), "Ctrl+F8");
-        assert_eq!(Hotkey::parse("shift+ctrl+alt+f24").unwrap().to_string(), "Ctrl+Alt+Shift+F24");
+        assert_eq!(
+            Hotkey::parse("shift+ctrl+alt+f24").unwrap().to_string(),
+            "Ctrl+Alt+Shift+F24"
+        );
         assert_eq!(Hotkey::parse("Alt+A").unwrap().to_string(), "Alt+A");
         assert_eq!(Hotkey::parse("Ctrl+7").unwrap().to_string(), "Ctrl+7");
         assert_eq!(Hotkey::parse("F1").unwrap().to_string(), "F1");
@@ -267,14 +298,23 @@ mod tests {
         // would tell the user to press a chord that does nothing.
         for spec in ["Ctrl+F8", "Ctrl+Alt+Shift+K", "Shift+F12", "Ctrl+9"] {
             let parsed = Hotkey::parse(spec).unwrap();
-            assert_eq!(Hotkey::parse(&parsed.to_string()).unwrap(), parsed, "round trip: {spec}");
+            assert_eq!(
+                Hotkey::parse(&parsed.to_string()).unwrap(),
+                parsed,
+                "round trip: {spec}"
+            );
         }
     }
 
     #[test]
     fn a_chord_outside_the_key_names_prints_its_virtual_key_code() {
         // No `parse` path can build this, and the display must not invent a key name for it.
-        let odd = Hotkey { ctrl: true, alt: false, shift: false, vk: 0x5B };
+        let odd = Hotkey {
+            ctrl: true,
+            alt: false,
+            shift: false,
+            vk: 0x5B,
+        };
         assert_eq!(odd.to_string(), "Ctrl+VK(0x5b)");
     }
 
@@ -295,7 +335,10 @@ mod tests {
         // there would be about the host, not the code.
         let chord = Hotkey::parse("Ctrl+F8").unwrap();
         let rx = listen(chord).expect("the non-Windows listener is a stub, not a failure");
-        assert!(!wait_for_press(&rx, Duration::from_millis(50)), "nothing may fire off Windows");
+        assert!(
+            !wait_for_press(&rx, Duration::from_millis(50)),
+            "nothing may fire off Windows"
+        );
         assert!(!supported());
     }
 
@@ -312,7 +355,10 @@ mod tests {
         let chord = Hotkey::parse("Ctrl+F8").unwrap();
         if let Err(err) = listen(chord) {
             let text = err.to_string();
-            assert!(text.contains("Ctrl+F8"), "the failure must name the chord: {text}");
+            assert!(
+                text.contains("Ctrl+F8"),
+                "the failure must name the chord: {text}"
+            );
             assert!(
                 text.contains("could not be registered") || text.contains("NOT installed"),
                 "the failure must say what went wrong, not just that something did: {text}"

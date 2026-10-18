@@ -80,7 +80,10 @@ impl GameSnapshot {
             .all_players
             .iter()
             .map(|p| {
-                let name = p.riot_id_game_name.as_deref().or(p.summoner_name.as_deref());
+                let name = p
+                    .riot_id_game_name
+                    .as_deref()
+                    .or(p.summoner_name.as_deref());
                 let local = [p.summoner_name.as_deref(), p.riot_id_game_name.as_deref()]
                     .into_iter()
                     .flatten()
@@ -210,7 +213,10 @@ mod tests {
         assert_eq!(snapshot.game_data.game_mode, "CLASSIC");
         assert_eq!(snapshot.game_data.map_name, "Map11");
         assert_eq!(snapshot.game_data.map_number, 11);
-        assert!(snapshot.game_time() > 600.0, "the fixture is well into the game");
+        assert!(
+            snapshot.game_time() > 600.0,
+            "the fixture is well into the game"
+        );
         assert_eq!(snapshot.all_players.len(), 2);
         assert_eq!(snapshot.all_players[0].scores.kills, 5);
         assert_eq!(snapshot.event_stream().len(), 6);
@@ -228,7 +234,10 @@ mod tests {
         assert_eq!(events[2].victim_name.as_deref(), Some("ZedMain"));
         assert_eq!(events[2].assisters, vec!["SupportMain".to_string()]);
 
-        let dragon = events.iter().find(|e| e.event_name == "DragonKill").expect("a dragon");
+        let dragon = events
+            .iter()
+            .find(|e| e.event_name == "DragonKill")
+            .expect("a dragon");
         assert_eq!(dragon.monster_type.as_deref(), Some("DRAGON"));
         assert_eq!(dragon.monster_sub_type.as_deref(), Some("FIRE_DRAGON"));
         assert_eq!(dragon.stolen.as_deref(), Some("False"));
@@ -264,7 +273,10 @@ mod tests {
     #[test]
     fn an_empty_document_is_not_a_game() {
         let snapshot = parse(b"{}").unwrap().expect("an object, not null");
-        assert!(!snapshot.game_present(), "an empty document describes no game");
+        assert!(
+            !snapshot.game_present(),
+            "an empty document describes no game"
+        );
         assert!(snapshot.player_names().is_empty());
     }
 
@@ -277,7 +289,11 @@ mod tests {
             &b"\xff\xfe\x00"[..],
             &b""[..],
         ] {
-            assert!(parse(body).is_err(), "{:?} must not parse", String::from_utf8_lossy(body));
+            assert!(
+                parse(body).is_err(),
+                "{:?} must not parse",
+                String::from_utf8_lossy(body)
+            );
         }
     }
 

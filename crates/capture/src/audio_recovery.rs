@@ -115,7 +115,9 @@ impl<O: SourceOpener> RecoveringSource<O> {
     }
 
     fn check_switch(&mut self) {
-        let Some((_, open_key)) = self.stream.as_ref() else { return };
+        let Some((_, open_key)) = self.stream.as_ref() else {
+            return;
+        };
         match self.opener.wanted() {
             Ok(wanted) if wanted != *open_key => {
                 tracing::info!(from = %open_key, to = %wanted, "game audio source changed; reopening");
@@ -124,7 +126,9 @@ impl<O: SourceOpener> RecoveringSource<O> {
             }
             Ok(_) => {}
             // Not knowing what is wanted is no reason to drop a stream that still works.
-            Err(e) => tracing::debug!(error = %e, "could not tell which game audio source is wanted"),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not tell which game audio source is wanted")
+            }
         }
     }
 
@@ -158,7 +162,10 @@ mod tests {
     use anyhow::anyhow;
     use std::collections::VecDeque;
 
-    const FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+    const FORMAT: AudioFormat = AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
     const BLOCK: usize = 480;
 
     fn ms(n: u64) -> Duration {
@@ -180,7 +187,11 @@ mod tests {
                 None => Ok(None),
                 Some(Step::Packet(at, value)) => {
                     out.extend(std::iter::repeat_n(value, BLOCK * 4));
-                    Ok(Some(PacketInfo { frames: BLOCK, time: Some(at), discontinuity: false }))
+                    Ok(Some(PacketInfo {
+                        frames: BLOCK,
+                        time: Some(at),
+                        discontinuity: false,
+                    }))
                 }
                 Some(Step::Gone) => Err(SourceGone("AUDCLNT_E_DEVICE_INVALIDATED".into()).into()),
                 Some(Step::Fail) => Err(anyhow!("GetBuffer failed for another reason")),
@@ -210,7 +221,11 @@ mod tests {
     }
 
     fn opener(opens: Vec<Option<(Vec<Step>, &'static str)>>, wanted: &'static str) -> FakeOpener {
-        FakeOpener { opens: opens.into(), wanted, attempts: 0 }
+        FakeOpener {
+            opens: opens.into(),
+            wanted,
+            attempts: 0,
+        }
     }
 
     fn blocks(source: &mut RecoveringSource<FakeOpener>) -> Vec<Block> {
@@ -219,19 +234,29 @@ mod tests {
 
     /// One value per frame across `blocks`.
     fn frames(blocks: &[Block]) -> Vec<u8> {
-        blocks.iter().flat_map(|b| b.buffer.data.chunks_exact(4).map(|f| f[0])).collect()
+        blocks
+            .iter()
+            .flat_map(|b| b.buffer.data.chunks_exact(4).map(|f| f[0]))
+            .collect()
     }
 
     #[test]
     fn an_unplugged_device_is_reopened_and_the_outage_is_silence() {
         let first = vec![Step::Packet(ms(0), 1), Step::Packet(ms(10), 1), Step::Gone];
         let second = vec![Step::Packet(ms(1_000), 2)];
-        let opener = opener(vec![Some((first, "headset")), None, Some((second, "speakers"))], "speakers");
-        let mut source = RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
+        let opener = opener(
+            vec![Some((first, "headset")), None, Some((second, "speakers"))],
+            "speakers",
+        );
+        let mut source =
+            RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
 
         source.poll(ms(20)).unwrap(); // two packets, then the device is gone
         assert!(source.stream().is_none());
-        assert_eq!(source.opener.attempts, 2, "reopened at once, and that first try failed");
+        assert_eq!(
+            source.opener.attempts, 2,
+            "reopened at once, and that first try failed"
+        );
         source.poll(ms(300)).unwrap(); // still inside the retry interval
         assert_eq!(source.opener.attempts, 2);
         source.poll(ms(600)).unwrap(); // reopened
@@ -240,22 +265,37 @@ mod tests {
 
         let blocks = blocks(&mut source);
         let frames = frames(&blocks);
-        assert_eq!(frames.len(), 101 * BLOCK, "one unbroken second plus the new packet");
+        assert_eq!(
+            frames.len(),
+            101 * BLOCK,
+            "one unbroken second plus the new packet"
+        );
         assert!(frames[..2 * BLOCK].iter().all(|&s| s == 1));
-        assert!(frames[2 * BLOCK..100 * BLOCK].iter().all(|&s| s == 0), "the outage is silence");
+        assert!(
+            frames[2 * BLOCK..100 * BLOCK].iter().all(|&s| s == 0),
+            "the outage is silence"
+        );
         assert!(frames[100 * BLOCK..].iter().all(|&s| s == 2));
         for (i, block) in blocks.iter().enumerate() {
-            assert_eq!(block.buffer.pts, ms(10 * i as u64), "block {i} sits on the timeline");
+            assert_eq!(
+                block.buffer.pts,
+                ms(10 * i as u64),
+                "block {i} sits on the timeline"
+            );
         }
     }
 
     #[test]
     fn a_new_default_device_replaces_a_stream_that_still_works() {
         let opener = opener(
-            vec![Some((vec![Step::Packet(ms(0), 1)], "speakers")), Some((vec![Step::Packet(ms(1_000), 2)], "headset"))],
+            vec![
+                Some((vec![Step::Packet(ms(0), 1)], "speakers")),
+                Some((vec![Step::Packet(ms(1_000), 2)], "headset")),
+            ],
             "speakers",
         );
-        let mut source = RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
+        let mut source =
+            RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
         source.poll(ms(500)).unwrap();
         assert_eq!(source.generation(), 1);
 
@@ -264,7 +304,10 @@ mod tests {
         assert_eq!(source.generation(), 1, "checked only once a second");
         source.poll(ms(1_000)).unwrap();
         assert_eq!(source.generation(), 2);
-        assert_eq!(source.stream.as_ref().map(|(_, k)| k.as_str()), Some("headset"));
+        assert_eq!(
+            source.stream.as_ref().map(|(_, k)| k.as_str()),
+            Some("headset")
+        );
         source.poll(ms(1_010)).unwrap();
 
         let frames = frames(&blocks(&mut source));
@@ -279,12 +322,17 @@ mod tests {
             .chain(std::iter::repeat_with(|| None).take(9))
             .chain(std::iter::once(Some((late, "b"))))
             .collect();
-        let mut source = RecoveringSource::start(opener(opens, "b"), AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
+        let mut source =
+            RecoveringSource::start(opener(opens, "b"), AudioTimeline::new(FORMAT, ms(0)), ms(0))
+                .unwrap();
         for t in (0..=5_000).step_by(100) {
             source.poll(ms(t)).unwrap();
         }
         source.poll(ms(5_100)).unwrap();
-        assert_eq!(source.opener.attempts, 11, "one open plus ten retries 500ms apart");
+        assert_eq!(
+            source.opener.attempts, 11,
+            "one open plus ten retries 500ms apart"
+        );
         let frames = frames(&blocks(&mut source));
         assert_eq!(frames.len(), 501 * BLOCK);
         assert!(frames[500 * BLOCK..].iter().all(|&s| s == 3));
@@ -293,12 +341,18 @@ mod tests {
     #[test]
     fn an_error_that_is_not_a_lost_device_is_returned() {
         let opener = opener(vec![Some((vec![Step::Fail], "a"))], "a");
-        let mut source = RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
+        let mut source =
+            RecoveringSource::start(opener, AudioTimeline::new(FORMAT, ms(0)), ms(0)).unwrap();
         assert!(source.poll(ms(10)).is_err());
     }
 
     #[test]
     fn failing_to_open_at_start_is_an_error() {
-        assert!(RecoveringSource::start(opener(vec![None], "a"), AudioTimeline::new(FORMAT, ms(0)), ms(0)).is_err());
+        assert!(RecoveringSource::start(
+            opener(vec![None], "a"),
+            AudioTimeline::new(FORMAT, ms(0)),
+            ms(0)
+        )
+        .is_err());
     }
 }

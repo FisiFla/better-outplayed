@@ -140,7 +140,9 @@ pub fn gsi_targets(libraries: &[PathBuf]) -> Vec<GsiTarget> {
         .iter()
         .map(|&game| {
             let install = find_install(game, libraries);
-            let installed = install.as_ref().is_some_and(|dir| cfg_path(game, dir).is_file());
+            let installed = install
+                .as_ref()
+                .is_some_and(|dir| cfg_path(game, dir).is_file());
             GsiTarget {
                 game,
                 label: game.label().to_string(),
@@ -187,13 +189,19 @@ pub fn install_gsi_cfg(
     // `game/csgo` is not somewhere to start creating folders.
     let target = cfg_path(game, install);
     let dest = crate::paths::ensure_new_file_within(install, &target).map_err(|why| {
-        CommandError::new(ErrorCode::InvalidInput, format!("{}: {why}", target.display()))
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("{}: {why}", target.display()),
+        )
     })?;
     let cfg_dir = dest.parent().unwrap_or(install);
     if game == GsiGame::Cs2 && !cfg_dir.is_dir() {
         return Err(CommandError::new(
             ErrorCode::InvalidInput,
-            format!("{} does not exist; is Counter-Strike 2 fully installed?", cfg_dir.display()),
+            format!(
+                "{} does not exist; is Counter-Strike 2 fully installed?",
+                cfg_dir.display()
+            ),
         ));
     }
     let token = gsi::load_or_create_token(&app_data_dir.join("gsi-token.txt"))
@@ -202,8 +210,16 @@ pub fn install_gsi_cfg(
     let replaced = dest.is_file();
     std::fs::write(&dest, game.render(port, &token))
         .map_err(|e| CommandError::io("writing", &dest, e))?;
-    tracing::info!("installed the {} GSI cfg at {}", game.label(), dest.display());
-    Ok(GsiInstallOutcome { game, path: dest.to_string_lossy().into_owned(), replaced })
+    tracing::info!(
+        "installed the {} GSI cfg at {}",
+        game.label(),
+        dest.display()
+    );
+    Ok(GsiInstallOutcome {
+        game,
+        path: dest.to_string_lossy().into_owned(),
+        replaced,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -299,7 +315,11 @@ pub fn disk_health(dir: &Path) -> Option<DiskHealth> {
 pub fn recent_problems(log: &str, max: usize) -> Vec<String> {
     let mut found: Vec<String> = log
         .lines()
-        .filter(|l| l.split_whitespace().take(3).any(|w| w == "ERROR" || w == "WARN"))
+        .filter(|l| {
+            l.split_whitespace()
+                .take(3)
+                .any(|w| w == "ERROR" || w == "WARN")
+        })
         .map(|l| l.trim().chars().take(400).collect())
         .collect();
     let drop = found.len().saturating_sub(max);
@@ -311,9 +331,14 @@ pub fn recent_problems(log: &str, max: usize) -> Vec<String> {
 pub fn read_recent_problems(log_path: &Path, max: usize) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 256 * 1024;
-    let Ok(mut file) = std::fs::File::open(log_path) else { return Vec::new() };
+    let Ok(mut file) = std::fs::File::open(log_path) else {
+        return Vec::new();
+    };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(TAIL)))
+        .is_err()
+    {
         return Vec::new();
     }
     let mut bytes = Vec::new();
@@ -336,7 +361,10 @@ mod tests {
     #[test]
     fn library_paths_are_read_from_the_vdf_and_unescaped() {
         let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Games\\\\Steam\"\n\t\t\"label\"\t\t\"\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"D:\\\\SteamLibrary\"\n\t}\n}\n";
-        assert_eq!(parse_library_paths(vdf), vec!["C:\\Games\\Steam", "D:\\SteamLibrary"]);
+        assert_eq!(
+            parse_library_paths(vdf),
+            vec!["C:\\Games\\Steam", "D:\\SteamLibrary"]
+        );
     }
 
     #[test]
@@ -346,7 +374,10 @@ mod tests {
         std::fs::create_dir_all(steam.path().join("steamapps")).unwrap();
         std::fs::write(
             steam.path().join("steamapps/libraryfolders.vdf"),
-            format!("\"x\"\n{{\n\"0\"\n{{\n\"path\" \"{}\"\n}}\n}}\n", second.path().display()),
+            format!(
+                "\"x\"\n{{\n\"0\"\n{{\n\"path\" \"{}\"\n}}\n}}\n",
+                second.path().display()
+            ),
         )
         .unwrap();
         let install = fake_steam(second.path(), GsiGame::Dota2);
@@ -426,15 +457,24 @@ mod tests {
         let stopped = RecorderStatus::stopped();
         assert_eq!(recorder_state(&stopped), RecorderState::Idle);
         assert_eq!(
-            recorder_state(&RecorderStatus { running: true, ..stopped.clone() }),
+            recorder_state(&RecorderStatus {
+                running: true,
+                ..stopped.clone()
+            }),
             RecorderState::Recording
         );
         assert_eq!(
-            recorder_state(&RecorderStatus { watching_games: true, ..stopped.clone() }),
+            recorder_state(&RecorderStatus {
+                watching_games: true,
+                ..stopped.clone()
+            }),
             RecorderState::Waiting
         );
         assert_eq!(
-            recorder_state(&RecorderStatus { error: Some("boom".into()), ..stopped }),
+            recorder_state(&RecorderStatus {
+                error: Some("boom".into()),
+                ..stopped
+            }),
             RecorderState::Failed
         );
     }

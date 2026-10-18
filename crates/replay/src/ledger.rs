@@ -101,8 +101,8 @@ impl SegmentLedger {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Self::from_toml(&text)
     }
 }
@@ -131,7 +131,10 @@ mod tests {
 
         let evicted = l.evict_to_cap(25);
 
-        assert_eq!(evicted.iter().map(|s| s.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            evicted.iter().map(|s| s.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert_eq!(l.total_bytes(), 20);
     }
 
@@ -143,7 +146,11 @@ mod tests {
         }
         // Cap is unsatisfiable; a partial clip is worse than being over budget.
         let evicted = l.evict_to_cap(1);
-        assert_eq!(l.len(), 1, "keeps the newest segment so a clip is still possible");
+        assert_eq!(
+            l.len(),
+            1,
+            "keeps the newest segment so a clip is still possible"
+        );
         assert_eq!(evicted.len(), 3);
     }
 

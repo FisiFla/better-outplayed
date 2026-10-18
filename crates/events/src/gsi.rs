@@ -74,7 +74,10 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new(now: Instant) -> Self {
-        Self { window_start: now, count: 0 }
+        Self {
+            window_start: now,
+            count: 0,
+        }
     }
 
     /// Whether a connection arriving at `now` may be served.
@@ -104,7 +107,8 @@ impl std::io::Read for DeadlineReader<'_> {
         if left.is_zero() {
             return Err(ErrorKind::TimedOut.into());
         }
-        self.stream.set_read_timeout(Some(left.min(REQUEST_TIMEOUT)))?;
+        self.stream
+            .set_read_timeout(Some(left.min(REQUEST_TIMEOUT)))?;
         self.stream.read(buf)
     }
 }
@@ -123,7 +127,11 @@ pub struct GsiConfig {
 impl GsiConfig {
     /// The production configuration: the default path, and the caller's token.
     pub fn new(port: u16, token: impl Into<String>) -> Self {
-        Self { port, token: token.into(), path: DEFAULT_PATH.to_string() }
+        Self {
+            port,
+            token: token.into(),
+            path: DEFAULT_PATH.to_string(),
+        }
     }
 }
 
@@ -200,8 +208,12 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
         bail!("the GSI listener needs a token; generate one and put it in the game's cfg file");
     }
     let listener = bind_loopback(config.port)?;
-    let addr = listener.local_addr().context("reading the listener's address")?;
-    listener.set_nonblocking(true).context("making the listener non-blocking")?;
+    let addr = listener
+        .local_addr()
+        .context("reading the listener's address")?;
+    listener
+        .set_nonblocking(true)
+        .context("making the listener non-blocking")?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -215,7 +227,11 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
         .spawn(move || serve(listener, &config, &sink, &flag))
         .context("spawning the GSI thread")?;
 
-    Ok(GsiListener { stop, thread: Some(thread), addr })
+    Ok(GsiListener {
+        stop,
+        thread: Some(thread),
+        addr,
+    })
 }
 
 /// The accept loop. One connection at a time: GSI is a handful of POSTs a second from one
@@ -287,7 +303,10 @@ fn handle(
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_nodelay(true);
 
-    let mut reader = DeadlineReader { stream: &mut *stream, deadline: Instant::now() + REQUEST_DEADLINE };
+    let mut reader = DeadlineReader {
+        stream: &mut *stream,
+        deadline: Instant::now() + REQUEST_DEADLINE,
+    };
     let request = match http::read_request(&mut reader, &config.path) {
         Ok(request) => request,
         Err(reject) => {
@@ -335,10 +354,16 @@ fn handle(
 fn log_event(event: &GameEvent) {
     match event.kind {
         crate::EventKind::GameStart => {
-            tracing::info!("a GSI game is being watched: {}", event.payload.as_deref().unwrap_or(""))
+            tracing::info!(
+                "a GSI game is being watched: {}",
+                event.payload.as_deref().unwrap_or("")
+            )
         }
         crate::EventKind::GameEnd => tracing::info!("the GSI game is over"),
-        kind => tracing::debug!("GSI event: {kind} {}", event.payload.as_deref().unwrap_or("")),
+        kind => tracing::debug!(
+            "GSI event: {kind} {}",
+            event.payload.as_deref().unwrap_or("")
+        ),
     }
 }
 
@@ -384,7 +409,10 @@ impl Counters {
                  (it carries the token) and restart the game."
             );
         } else {
-            tracing::debug!("the GSI listener has rejected {} payloads by token", self.refused_tokens);
+            tracing::debug!(
+                "the GSI listener has rejected {} payloads by token",
+                self.refused_tokens
+            );
         }
     }
 
@@ -396,7 +424,10 @@ impl Counters {
                  is answering the excess with HTTP 429"
             );
         } else {
-            tracing::debug!("the GSI listener has rate-limited {} connections", self.rate_limited);
+            tracing::debug!(
+                "the GSI listener has rate-limited {} connections",
+                self.rate_limited
+            );
         }
     }
 
@@ -408,7 +439,10 @@ impl Counters {
                  dropped and the request answered with HTTP 400"
             );
         } else {
-            tracing::debug!("the GSI listener has dropped {} unparseable payloads", self.malformed);
+            tracing::debug!(
+                "the GSI listener has dropped {} unparseable payloads",
+                self.malformed
+            );
         }
     }
 }
@@ -425,8 +459,14 @@ mod tests {
             assert!(limiter.allow(t0), "request {n} is inside the cap");
         }
         assert!(!limiter.allow(t0), "the next one is over it");
-        assert!(!limiter.allow(t0 + RATE_WINDOW / 2), "and so is one later in the same window");
-        assert!(limiter.allow(t0 + RATE_WINDOW), "a new window starts afresh");
+        assert!(
+            !limiter.allow(t0 + RATE_WINDOW / 2),
+            "and so is one later in the same window"
+        );
+        assert!(
+            limiter.allow(t0 + RATE_WINDOW),
+            "a new window starts afresh"
+        );
     }
 
     #[test]
@@ -435,8 +475,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let mut reader = DeadlineReader { stream: &mut server, deadline: Instant::now() };
-        let err = reader.read(&mut [0u8; 8]).expect_err("the deadline has passed");
+        let mut reader = DeadlineReader {
+            stream: &mut server,
+            deadline: Instant::now(),
+        };
+        let err = reader
+            .read(&mut [0u8; 8])
+            .expect_err("the deadline has passed");
         assert_eq!(err.kind(), ErrorKind::TimedOut);
     }
     use std::net::SocketAddr;
@@ -449,7 +494,9 @@ mod tests {
     fn a_listener_refuses_to_bind_anything_that_is_not_loopback() {
         for addr in ["0.0.0.0:0", "192.168.0.1:45671", "[::]:45671", "8.8.8.8:80"] {
             let addr: SocketAddr = addr.parse().expect("a socket address");
-            let err = bind(addr).map(|_| ()).expect_err("only loopback may be bound");
+            let err = bind(addr)
+                .map(|_| ())
+                .expect_err("only loopback may be bound");
             assert!(
                 err.to_string().contains("loopback"),
                 "the error must name the rule: {err}"
@@ -471,14 +518,31 @@ mod tests {
     fn the_token_gate_accepts_only_the_exact_token() {
         let expected = "0123456789abcdef0123456789abcdef";
         let with = |token: &str| {
-            snapshot(&format!(r#"{{"auth":{{"token":"{token}"}},"provider":{{"appid":730}}}}"#))
+            snapshot(&format!(
+                r#"{{"auth":{{"token":"{token}"}},"provider":{{"appid":730}}}}"#
+            ))
         };
 
-        assert!(token_matches(expected, &with(expected)), "the same token is accepted");
-        assert!(!token_matches(expected, &with("0123456789abcdef0123456789abcdee")), "one byte off");
-        assert!(!token_matches(expected, &with("0123456789abcdef0123456789abcde")), "one byte short");
-        assert!(!token_matches(expected, &with("0123456789abcdef0123456789abcdefg")), "one byte long");
-        assert!(!token_matches(expected, &with("")), "an empty token is not a token");
+        assert!(
+            token_matches(expected, &with(expected)),
+            "the same token is accepted"
+        );
+        assert!(
+            !token_matches(expected, &with("0123456789abcdef0123456789abcdee")),
+            "one byte off"
+        );
+        assert!(
+            !token_matches(expected, &with("0123456789abcdef0123456789abcde")),
+            "one byte short"
+        );
+        assert!(
+            !token_matches(expected, &with("0123456789abcdef0123456789abcdefg")),
+            "one byte long"
+        );
+        assert!(
+            !token_matches(expected, &with("")),
+            "an empty token is not a token"
+        );
         assert!(
             !token_matches(expected, &snapshot(r#"{"provider":{"appid":730}}"#)),
             "a payload with no auth block is refused"
@@ -501,9 +565,10 @@ mod tests {
         for end in 0..expected.len() {
             let prefix = &expected[..end];
             assert!(
-                !token_matches(expected, &snapshot(&format!(
-                    r#"{{"auth":{{"token":"{prefix}"}}}}"#
-                ))),
+                !token_matches(
+                    expected,
+                    &snapshot(&format!(r#"{{"auth":{{"token":"{prefix}"}}}}"#))
+                ),
                 "a {end}-byte prefix must not be accepted"
             );
         }
@@ -512,7 +577,9 @@ mod tests {
     #[test]
     fn a_listener_without_a_token_refuses_to_start() {
         let (sink, _rx) = std::sync::mpsc::channel();
-        let err = spawn(GsiConfig::new(0, ""), sink).map(|_| ()).expect_err("no token");
+        let err = spawn(GsiConfig::new(0, ""), sink)
+            .map(|_| ())
+            .expect_err("no token");
         assert!(format!("{err:#}").contains("token"), "got: {err:#}");
     }
 }

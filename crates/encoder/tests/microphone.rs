@@ -58,7 +58,11 @@ struct Tone {
 
 impl Tone {
     fn new(hz: f64) -> Self {
-        Self { hz, phase: 0.0, pts: Duration::ZERO }
+        Self {
+            hz,
+            phase: 0.0,
+            pts: Duration::ZERO,
+        }
     }
 
     /// One 10 ms block: 480 frames of 48 kHz stereo s16le.
@@ -67,14 +71,19 @@ impl Tone {
         const FRAMES: usize = 480;
         let mut data = Vec::with_capacity(FRAMES * 2 * 2);
         for _ in 0..FRAMES {
-            let sample = (0.5 * (std::f64::consts::TAU * self.hz * self.phase / RATE).sin()
+            let sample = (0.5
+                * (std::f64::consts::TAU * self.hz * self.phase / RATE).sin()
                 * f64::from(i16::MAX)) as i16;
             self.phase += 1.0;
             data.extend_from_slice(&sample.to_le_bytes());
             data.extend_from_slice(&sample.to_le_bytes());
         }
-        let block =
-            AudioBuffer { data, frames: FRAMES, pts: self.pts, format: AudioFormat::default() };
+        let block = AudioBuffer {
+            data,
+            frames: FRAMES,
+            pts: self.pts,
+            format: AudioFormat::default(),
+        };
         self.pts += Duration::from_millis(10);
         block
     }
@@ -92,14 +101,21 @@ fn feed_for(
     let started = Instant::now();
     let mut next_block_at = started;
     while started.elapsed() < feed {
-        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+        if let Some(frame) = video
+            .next_frame(Duration::from_millis(5))
+            .expect("next frame")
+        {
             encoder.submit_video(frame).expect("submit video");
         }
         let now = Instant::now();
         while next_block_at <= now {
-            encoder.submit_audio(game.block()).expect("submit game audio");
+            encoder
+                .submit_audio(game.block())
+                .expect("submit game audio");
             if let Some(tone) = mic.as_deref_mut() {
-                encoder.submit_mic_audio(tone.block()).expect("submit microphone audio");
+                encoder
+                    .submit_mic_audio(tone.block())
+                    .expect("submit microphone audio");
             }
             next_block_at += Duration::from_millis(10);
         }
@@ -131,7 +147,11 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         "the encoder owns the microphone listener, and reports its port"
     );
 
-    let mut video = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
+    let mut video = StubCapture::new(StubConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
+    });
     video.start().expect("start the capture stub");
     let mut game = Tone::new(GAME_TONE_HZ);
     let mut mic = Tone::new(MIC_TONE_HZ);
@@ -143,10 +163,18 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         0,
         "no microphone block may be lost: the track's timeline is its sample count"
     );
-    assert_eq!(encoder.dropped_audio_blocks(), 0, "and neither may the game audio's");
+    assert_eq!(
+        encoder.dropped_audio_blocks(),
+        0,
+        "and neither may the game audio's"
+    );
 
     let segments = segments_in(dir.path());
-    assert!(segments.len() >= 2, "3s of wall clock at 1s segments: got {}", segments.len());
+    assert!(
+        segments.len() >= 2,
+        "3s of wall clock at 1s segments: got {}",
+        segments.len()
+    );
     let first = &segments[0];
 
     // What the container says.
@@ -195,8 +223,14 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
          {mic_other:.1} dB at {GAME_TONE_HZ} Hz"
     );
 
-    assert!(game_own > AUDIBLE_DB, "the game track is not silent: {game_own:.1} dB");
-    assert!(mic_own > AUDIBLE_DB, "the microphone track is not silent: {mic_own:.1} dB");
+    assert!(
+        game_own > AUDIBLE_DB,
+        "the game track is not silent: {game_own:.1} dB"
+    );
+    assert!(
+        mic_own > AUDIBLE_DB,
+        "the microphone track is not silent: {mic_own:.1} dB"
+    );
     assert!(
         game_own - game_other > SEPARATION_DB,
         "track 1 must carry the game tone and not the microphone's: {game_own:.1} dB in its \
@@ -263,9 +297,17 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
     assert!(cfg.mic_audio.is_none(), "the microphone is opt-in");
 
     let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
-    assert_eq!(encoder.mic_port(), None, "no microphone, no microphone port");
+    assert_eq!(
+        encoder.mic_port(),
+        None,
+        "no microphone, no microphone port"
+    );
 
-    let mut video = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
+    let mut video = StubCapture::new(StubConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
+    });
     video.start().expect("start the capture stub");
     let mut game = Tone::new(GAME_TONE_HZ);
     feed_for(&mut encoder, &mut video, &mut game, None, FEED_WITHOUT_MIC);
@@ -275,7 +317,11 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
     assert!(!segments.is_empty(), "a segment was written");
     let streams = streams_of(&probe_json(&bin, &segments[0]));
 
-    assert_eq!(streams.iter().filter(|s| s.codec_type == "video").count(), 1, "{streams:#?}");
+    assert_eq!(
+        streams.iter().filter(|s| s.codec_type == "video").count(),
+        1,
+        "{streams:#?}"
+    );
     assert_eq!(
         streams.iter().filter(|s| s.codec_type == "audio").count(),
         1,
@@ -284,7 +330,10 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
     );
     // No mapping means no title metadata: the one audio stream is untagged.
     assert_eq!(
-        streams.iter().find(|s| s.codec_type == "audio").and_then(|s| s.title.clone()),
+        streams
+            .iter()
+            .find(|s| s.codec_type == "audio")
+            .and_then(|s| s.title.clone()),
         None,
         "the single-track path gains no metadata: {streams:#?}"
     );
@@ -321,8 +370,11 @@ fn a_microphone_block_the_encoder_cannot_use_is_refused_out_loud() {
 
     // 2. A microphone input, but the block's format differs from the declared one.
     let mut cfg = cfg;
-    cfg.mic_audio =
-        Some(MicAudioSpec { sample_rate: 44_100, channels: 1, sample_format: SampleFormat::S16Le });
+    cfg.mic_audio = Some(MicAudioSpec {
+        sample_rate: 44_100,
+        channels: 1,
+        sample_format: SampleFormat::S16Le,
+    });
     let mut declared_44k_mono = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
     let err = declared_44k_mono
         .submit_mic_audio(Tone::new(MIC_TONE_HZ).block()) // 48kHz stereo, like every backend here
@@ -349,7 +401,14 @@ fn segments_in(dir: &Path) -> Vec<PathBuf> {
 /// `ffprobe`'s JSON for one file, so the scanner and `MediaInfo` read the same bytes.
 fn probe_json(bin: &FfmpegBinaries, path: &Path) -> String {
     let out = Command::new(&bin.ffprobe)
-        .args(["-v", "error", "-print_format", "json", "-show_streams", "-show_format"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+        ])
         .arg(path)
         .output()
         .expect("run ffprobe");
@@ -391,7 +450,9 @@ fn audio_duration_of(streams: &[ProbedStream], index: usize) -> u64 {
 /// no tags, and this test needs every stream and its title. It reads the slice of JSON ffprobe
 /// emits here (objects of scalars plus one nested `tags` object) and panics on any other shape.
 fn streams_of(json: &str) -> Vec<ProbedStream> {
-    let streams_at = json.find("\"streams\"").expect("ffprobe json has a streams array");
+    let streams_at = json
+        .find("\"streams\"")
+        .expect("ffprobe json has a streams array");
     let open = streams_at + json[streams_at..].find('[').expect("streams is an array");
     let close = matching_delimiter(json, open, '[', ']');
     let body = &json[open + 1..close];
@@ -462,7 +523,10 @@ fn track_title(object: &str) -> Option<String> {
 fn string_field(object: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let after_key = object.find(&needle)? + needle.len();
-    let rest = object[after_key..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = object[after_key..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
     let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
@@ -477,7 +541,15 @@ fn band_energy_db(bin: &FfmpegBinaries, path: &Path, stream: usize, hz: f64) -> 
     let out = Command::new(&bin.ffmpeg)
         .args(["-hide_banner", "-nostdin", "-i"])
         .arg(path)
-        .args(["-map", &format!("0:a:{stream}"), "-af", &filter, "-f", "null", "-"])
+        .args([
+            "-map",
+            &format!("0:a:{stream}"),
+            "-af",
+            &filter,
+            "-f",
+            "null",
+            "-",
+        ])
         .output()
         .expect("run ffmpeg to measure a band");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -493,7 +565,12 @@ fn band_energy_db(bin: &FfmpegBinaries, path: &Path, stream: usize, hz: f64) -> 
 /// Parses `[volumedetect] mean_volume: -23.4 dB`, or `-inf dB` for silence.
 fn mean_volume_db(stderr: &str) -> Option<f64> {
     let line = stderr.lines().find(|line| line.contains("mean_volume:"))?;
-    let value = line.split("mean_volume:").nth(1)?.trim().strip_suffix("dB")?.trim();
+    let value = line
+        .split("mean_volume:")
+        .nth(1)?
+        .trim()
+        .strip_suffix("dB")?
+        .trim();
     if value == "-inf" {
         return Some(f64::NEG_INFINITY);
     }

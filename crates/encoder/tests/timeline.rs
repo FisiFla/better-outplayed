@@ -82,7 +82,8 @@ const FEED: Duration = Duration::from_secs(3);
 #[test]
 fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
     let _slot = wall_clock_slot();
-    let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");    let dir = tempfile::tempdir().expect("a scratch temp dir");
+    let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+    let dir = tempfile::tempdir().expect("a scratch temp dir");
 
     let cfg = EncodeConfig::for_tests_software(
         VideoCodec::H264,
@@ -109,7 +110,10 @@ fn media_time_tracks_the_wall_clock_when_capture_delivers_a_different_rate() {
     let mut frames: u64 = 0;
     let mut audio_frames: u64 = 0;
     while Instant::now() < until {
-        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+        if let Some(frame) = video
+            .next_frame(Duration::from_millis(5))
+            .expect("next frame")
+        {
             encoder.submit_video(frame).expect("submit video");
             frames += 1;
         }
@@ -230,14 +234,23 @@ const STARVED_PROBE: Duration = Duration::from_millis(1_000);
 fn noise_frame(width: u32, height: u32, seed: u64) -> Frame {
     let mut state = seed | 1;
     let mut next = move || {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (state >> 33) as u8
     };
     let mut data = Vec::with_capacity((width * height * 4) as usize);
     for _ in 0..width * height {
         data.extend_from_slice(&[next(), next(), next(), 255]);
     }
-    Frame { data, pts: Duration::ZERO, width, height, format: PixelFormat::Bgra8, texture: None }
+    Frame {
+        data,
+        pts: Duration::ZERO,
+        width,
+        height,
+        format: PixelFormat::Bgra8,
+        texture: None,
+    }
 }
 
 /// Every scratch segment, in order.
@@ -452,8 +465,9 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
         SEGMENT_MS,
     );
     let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
-    let frames: Vec<Frame> =
-        (0..4).map(|i| noise_frame(320, 180, 0xB5AD_1CE5 + i * 13)).collect();
+    let frames: Vec<Frame> = (0..4)
+        .map(|i| noise_frame(320, 180, 0xB5AD_1CE5 + i * 13))
+        .collect();
     let mut audio = StubAudio::new(AudioFormat::default());
     audio.start().expect("start the audio stub");
 
@@ -481,7 +495,10 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
 
     // Splice every segment as the clip path does: a concat list of whole segments.
     let segments = segments_in(dir.path());
-    assert!(segments.len() >= 2, "a starved pipeline still cuts segments: {segments:?}");
+    assert!(
+        segments.len() >= 2,
+        "a starved pipeline still cuts segments: {segments:?}"
+    );
     let list = dir.path().join("clip.concat.txt");
     let mut text = String::new();
     for seg in &segments {
@@ -498,7 +515,9 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
     let info = MediaInfo::probe(&bin, &clip).expect("the clip must be a readable media file");
     let video = info.video.as_ref().expect("the clip must carry video");
     let audio_ms = info.audio.as_ref().and_then(|a| a.duration_ms).unwrap_or(0);
-    let video_ms = video.duration_ms.expect("the video stream must have a duration");
+    let video_ms = video
+        .duration_ms
+        .expect("the video stream must have a duration");
     let coded = video_frames(&bin, &clip);
     for seg in &segments {
         let i = MediaInfo::probe(&bin, seg).expect("probe a segment");
@@ -640,7 +659,15 @@ fn decode_every_frame(bin: &FfmpegBinaries, path: &Path, width: u32, height: u32
     let out = std::process::Command::new(&bin.ffmpeg)
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgra", "-"])
+        .args([
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-",
+        ])
         .output()
         .expect("ffmpeg must run");
     assert!(

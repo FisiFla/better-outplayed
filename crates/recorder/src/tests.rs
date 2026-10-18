@@ -35,7 +35,9 @@ fn application_data_dir(what: &str) -> (Option<tempfile::TempDir>, PathBuf) {
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-tests");
             std::fs::create_dir_all(&base).expect("creating the test scratch root under target/");
             // Canonical: the store refuses to delete through a `..` path.
-            let base = base.canonicalize().expect("canonicalising the test scratch root");
+            let base = base
+                .canonicalize()
+                .expect("canonicalising the test scratch root");
             let dir = tempfile::Builder::new()
                 .prefix(&format!("{what}-"))
                 .tempdir_in(&base)
@@ -92,7 +94,11 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
         audio_bitrate_kbps: None,
         // No `[audio] enabled`: an absent value records the game audio (`RecorderConfig::game_audio`).
         audio_enabled: None,
-        sources: Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS }),
+        sources: Sources::Stub(StubConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            fps: FPS,
+        }),
         dev_software_encoder: true,
     }
 }
@@ -101,7 +107,12 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
 ///
 /// The pipeline is paced on the wall clock, so a test can wait for a counter to reach a value
 /// but never assert it instantly.
-fn wait_for(recorder: &Recorder, budget: Duration, what: &str, check: impl Fn(&RecorderStatus) -> bool) -> RecorderStatus {
+fn wait_for(
+    recorder: &Recorder,
+    budget: Duration,
+    what: &str,
+    check: impl Fn(&RecorderStatus) -> bool,
+) -> RecorderStatus {
     let deadline = Instant::now() + budget;
     loop {
         let status = recorder.status();
@@ -131,20 +142,32 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     //    The bar is the full window (`pre + post`), not "non-empty": no window can be covered by
     //    footage that does not exist yet, so an earlier trigger returns a clip one pre-roll short.
     let wanted_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
-    let first = wait_for(&recorder, Duration::from_secs(30), "the window to be buffered", |s| {
-        s.frames > 0 && s.span_ms >= wanted_ms
-    });
+    let first = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the window to be buffered",
+        |s| s.frames > 0 && s.span_ms >= wanted_ms,
+    );
     assert!(first.running, "the recorder must report itself as running");
-    assert!(first.segments > 0, "a non-zero span implies a completed segment: {first:?}");
-    assert!(first.bytes > 0, "the ring holds footage, so it has bytes: {first:?}");
+    assert!(
+        first.segments > 0,
+        "a non-zero span implies a completed segment: {first:?}"
+    );
+    assert!(
+        first.bytes > 0,
+        "the ring holds footage, so it has bytes: {first:?}"
+    );
     assert_eq!(first.configured_fps, FPS);
     assert_eq!(first.error, None, "nothing has failed");
     eprintln!("after the buffer filled: {first:?}");
 
     let span_before = first.span_ms;
-    let second = wait_for(&recorder, Duration::from_secs(20), "the span to grow", |s| {
-        s.span_ms > span_before
-    });
+    let second = wait_for(
+        &recorder,
+        Duration::from_secs(20),
+        "the span to grow",
+        |s| s.span_ms > span_before,
+    );
     assert!(
         second.frames > first.frames,
         "frames must advance with the span: {} -> {}",
@@ -158,7 +181,9 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
 
     // 2. The trigger (media-time path): `clip_now` blocks until the post-roll is on disk, splices
     //    losslessly and indexes the result.
-    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    let clip = recorder
+        .clip_now()
+        .expect("the trigger must produce a clip");
     eprintln!(
         "clip_now() wrote {} ({}ms, {} bytes, encoder={}, indexed as {:?}, media t={}ms)",
         clip.metadata.path.display(),
@@ -170,8 +195,14 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     );
     assert!(clip.metadata.path.is_file(), "the clip must exist on disk");
     assert!(clip.metadata.size_bytes > 0, "and must not be empty");
-    assert_eq!(clip.metadata.size_bytes, std::fs::metadata(&clip.metadata.path).unwrap().len());
-    assert_eq!(clip.metadata.encoder, "libx264", "the encoder that actually ran");
+    assert_eq!(
+        clip.metadata.size_bytes,
+        std::fs::metadata(&clip.metadata.path).unwrap().len()
+    );
+    assert_eq!(
+        clip.metadata.encoder, "libx264",
+        "the encoder that actually ran"
+    );
     // The window is `[trigger - pre, trigger + post]` in media terms, spliced from whole segments,
     // so the clip covers the request to within one segment.
     //
@@ -230,17 +261,27 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     // 4. Clean shutdown: thread joined, encoder flushed, sources stopped, nothing panicked.
     recorder.stop().expect("stop must succeed");
     let stopped = recorder.status();
-    assert!(!stopped.running, "the status must report the recorder stopped");
-    assert!(stopped.clips >= 1, "the session counted its clip: {stopped:?}");
+    assert!(
+        !stopped.running,
+        "the status must report the recorder stopped"
+    );
+    assert!(
+        stopped.clips >= 1,
+        "the session counted its clip: {stopped:?}"
+    );
     assert_eq!(stopped.error, None, "a clean stop has no failure to report");
     eprintln!("after stop: {stopped:?}");
 
     // 5. Idempotence: a second stop, and a status read after it, must not panic or hang.
-    recorder.stop().expect("a second stop is a no-op, not an error");
+    recorder
+        .stop()
+        .expect("a second stop is a no-op, not an error");
     assert!(!recorder.status().running);
 
     // 6. A trigger after the stop fails loudly rather than hanging for ever.
-    let err = recorder.clip_now().expect_err("there is nothing left to clip");
+    let err = recorder
+        .clip_now()
+        .expect_err("there is nothing left to clip");
     assert!(
         err.to_string().contains("not running") || err.to_string().contains("stopped"),
         "the error must say the recorder is gone: {err}"
@@ -260,12 +301,17 @@ fn a_clip_records_why_it_was_taken() {
 
     let recorder = Recorder::start(cfg).expect("the recorder starts");
     let ready_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
-    wait_for(&recorder, Duration::from_secs(30), "enough media for a clip", |s| {
-        s.span_ms >= ready_ms
-    });
+    wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "enough media for a clip",
+        |s| s.span_ms >= ready_ms,
+    );
 
     // 1. Manual: exactly what the CLI does on a hotkey press.
-    let manual = recorder.clip_now().expect("the manual trigger produces a clip");
+    let manual = recorder
+        .clip_now()
+        .expect("the manual trigger produces a clip");
 
     // 2. An event: the derived reason a driver hands over, through the same call.
     let kill = GameEvent::new(
@@ -279,7 +325,10 @@ fn a_clip_records_why_it_was_taken() {
 
     // 3. A marker: no clip, just the row.
     let marker_id = recorder
-        .note_event(GameEvent::bare(localplay_events::Source::Gsi, EventKind::RoundStart))
+        .note_event(GameEvent::bare(
+            localplay_events::Source::Gsi,
+            EventKind::RoundStart,
+        ))
         .expect("the marker is recorded");
 
     recorder.stop().expect("stop must succeed");
@@ -309,8 +358,14 @@ fn a_clip_records_why_it_was_taken() {
         "all three events belong to the one recording session: {events:?}"
     );
 
-    let kill_row = events.iter().find(|e| e.kind == "kill").expect("the kill's row");
-    assert_eq!(kill_row.clip_id, evented.id, "linked to the clip it produced");
+    let kill_row = events
+        .iter()
+        .find(|e| e.kind == "kill")
+        .expect("the kill's row");
+    assert_eq!(
+        kill_row.clip_id, evented.id,
+        "linked to the clip it produced"
+    );
     assert_eq!(
         kill_row.at_ms,
         evented.started_at_ms + PRE_SECONDS * 1000,
@@ -318,13 +373,20 @@ fn a_clip_records_why_it_was_taken() {
          (the clip starts earlier than the moment that caused it)"
     );
     assert!(
-        kill_row.payload.as_deref().unwrap_or("").contains("ChampionKill"),
+        kill_row
+            .payload
+            .as_deref()
+            .unwrap_or("")
+            .contains("ChampionKill"),
         "the integration's detail is persisted verbatim: {:?}",
         kill_row.payload
     );
     eprintln!("event row: {kill_row:?}");
 
-    let marker_row = events.iter().find(|e| e.id == marker_id).expect("the marker's row");
+    let marker_row = events
+        .iter()
+        .find(|e| e.id == marker_id)
+        .expect("the marker's row");
     assert_eq!(marker_row.kind, "round_start");
     assert_eq!(marker_row.clip_id, None, "a marker has no clip");
     assert_eq!(marker_row.payload, None);
@@ -341,14 +403,29 @@ fn a_clip_records_why_it_was_taken() {
         .iter()
         .find(|e| e.kind == BOOKMARK_KIND)
         .expect("the manual clip recorded a bookmark");
-    assert_eq!(bookmark.clip_id, manual.id, "linked to the hotkey's own clip");
-    assert!(bookmark.payload.is_none(), "a bookmark has no source to describe");
-    assert_eq!(bookmark.session_id, session_id, "and it belongs to the same session");
+    assert_eq!(
+        bookmark.clip_id, manual.id,
+        "linked to the hotkey's own clip"
+    );
+    assert!(
+        bookmark.payload.is_none(),
+        "a bookmark has no source to describe"
+    );
+    assert_eq!(
+        bookmark.session_id, session_id,
+        "and it belongs to the same session"
+    );
 
     // The event's clip is a real clip: the reason changes what is recorded about it, not the media path.
-    let info = localplay_media::probe::MediaInfo::probe(&recorder_bin(&app_data_dir), &evented.metadata.path)
-        .expect("the event-triggered clip is a readable media file");
-    assert!(info.video.is_some() && info.audio.is_some(), "video and audio, as for a hotkey clip");
+    let info = localplay_media::probe::MediaInfo::probe(
+        &recorder_bin(&app_data_dir),
+        &evented.metadata.path,
+    )
+    .expect("the event-triggered clip is a readable media file");
+    assert!(
+        info.video.is_some() && info.audio.is_some(),
+        "video and audio, as for a hotkey clip"
+    );
     // The clip must carry the whole pre-roll: that footage was already on disk, so a shorter clip
     // would mean the splice dropped footage.
     //
@@ -367,10 +444,16 @@ fn a_clip_records_why_it_was_taken() {
     let bin = recorder_bin(&app_data_dir);
     assert_eq!(
         chapter_starts(&evented.metadata.path, &bin),
-        [(0, edit::LEAD_IN_TITLE.to_string()), (PRE_SECONDS * 1000, "Kill".to_string())]
+        [
+            (0, edit::LEAD_IN_TITLE.to_string()),
+            (PRE_SECONDS * 1000, "Kill".to_string())
+        ]
     );
     assert!(chapter_starts(&manual.metadata.path, &bin).is_empty());
-    let row = clips.iter().find(|c| Some(c.id) == evented.id).expect("the event clip's row");
+    let row = clips
+        .iter()
+        .find(|c| Some(c.id) == evented.id)
+        .expect("the event clip's row");
     assert_eq!(
         row.size_bytes,
         std::fs::metadata(&evented.metadata.path).unwrap().len(),
@@ -392,7 +475,10 @@ fn chapter_starts(path: &Path, bin: &FfmpegBinaries) -> Vec<(u64, String)> {
         .iter()
         .map(|c| {
             let start: f64 = c["start_time"].as_str().unwrap().parse().unwrap();
-            ((start * 1000.0).round() as u64, c["tags"]["title"].as_str().unwrap().to_string())
+            (
+                (start * 1000.0).round() as u64,
+                c["tags"]["title"].as_str().unwrap().to_string(),
+            )
         })
         .collect()
 }
@@ -421,7 +507,11 @@ fn the_pacer_and_the_encoder_are_told_the_same_rate() {
     cfg.encode.fps = 120;
     cfg.encode.adapt_fps = true;
     // The source offers the configured rate; the pipeline may only keep what it declared.
-    cfg.sources = Sources::Stub(StubConfig { width: WIDTH, height: HEIGHT, fps: 120 });
+    cfg.sources = Sources::Stub(StubConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        fps: 120,
+    });
 
     // A measurement well below the configured rate, as on a 4K machine.
     let measured_fps = 10.0;
@@ -442,7 +532,10 @@ fn the_pacer_and_the_encoder_are_told_the_same_rate() {
     .expect("the recorder starts");
 
     let status = recorder.status();
-    assert_eq!(status.configured_fps, 120, "what the config asked for is still reported");
+    assert_eq!(
+        status.configured_fps, 120,
+        "what the config asked for is still reported"
+    );
     assert_eq!(
         status.effective_fps, 10,
         "the pipeline must run at the measured 10fps: 10.0 floored is 10, and the encoder \
@@ -450,11 +543,19 @@ fn the_pacer_and_the_encoder_are_told_the_same_rate() {
     );
 
     // What the pacer admits: the source offers 120fps, so frames reaching the encoder per second is the pacer's rate.
-    let first = wait_for(&recorder, Duration::from_secs(10), "a first rate sample", |s| s.frames > 0);
+    let first = wait_for(
+        &recorder,
+        Duration::from_secs(10),
+        "a first rate sample",
+        |s| s.frames > 0,
+    );
     let t0 = Instant::now();
-    let second = wait_for(&recorder, Duration::from_secs(10), "two seconds of capture", |_| {
-        Instant::now().duration_since(t0) >= Duration::from_millis(2000)
-    });
+    let second = wait_for(
+        &recorder,
+        Duration::from_secs(10),
+        "two seconds of capture",
+        |_| Instant::now().duration_since(t0) >= Duration::from_millis(2000),
+    );
     let wall = Instant::now().duration_since(t0).as_secs_f64();
     let submitted = (second.frames - first.frames) as f64;
     let observed = submitted / wall;
@@ -491,13 +592,20 @@ fn the_pacer_and_the_encoder_are_told_the_same_rate() {
     // (`MEDIA_WINDOW_MS`), and measure how long that took. A warped clock still fails (at 0.66x the
     // ratio is near 0.66).
     const MEDIA_WINDOW_MS: u64 = 3_000;
-    let steady =
-        wait_for(&recorder, Duration::from_secs(15), "the first segment on disk", |s| s.span_ms > 0);
+    let steady = wait_for(
+        &recorder,
+        Duration::from_secs(15),
+        "the first segment on disk",
+        |s| s.span_ms > 0,
+    );
     let span_first = steady.span_ms;
     let t1 = Instant::now();
-    let third = wait_for(&recorder, Duration::from_secs(30), "three more seconds of media", |s| {
-        s.span_ms.saturating_sub(span_first) >= MEDIA_WINDOW_MS
-    });
+    let third = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "three more seconds of media",
+        |s| s.span_ms.saturating_sub(span_first) >= MEDIA_WINDOW_MS,
+    );
     let media = (third.span_ms.saturating_sub(span_first)) as f64;
     let wall = Instant::now().duration_since(t1).as_secs_f64() * 1000.0;
     eprintln!(
@@ -529,7 +637,10 @@ fn with_adaptation_off_the_configured_rate_is_declared_and_nothing_is_measured()
 
     let status = recorder.status();
     assert_eq!(status.configured_fps, 60);
-    assert_eq!(status.effective_fps, 60, "the configured rate is declared as it always was");
+    assert_eq!(
+        status.effective_fps, 60,
+        "the configured rate is declared as it always was"
+    );
     recorder.stop().expect("stop must succeed");
 }
 
@@ -539,9 +650,12 @@ fn a_stopped_recorder_keeps_reporting_a_stable_status() {
     // value, not a panic or hang. The counters are the ones the session reached, not zeros.
     let (_tmp, app_data_dir) = application_data_dir("stopped-status");
     let recorder = Recorder::start(stub_config(&app_data_dir)).expect("the recorder starts");
-    wait_for(&recorder, Duration::from_secs(30), "the buffer to start", |s| {
-        s.frames > 0
-    });
+    wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the buffer to start",
+        |s| s.frames > 0,
+    );
 
     recorder.stop().expect("stop must succeed");
     let first = recorder.status();
@@ -559,7 +673,9 @@ fn an_unusable_encoder_configuration_fails_before_any_capture_starts() {
     let mut cfg = stub_config(dir.path());
     cfg.encode.codec = "vp9".to_string();
 
-    let err = Recorder::start(cfg).map(|_| ()).expect_err("vp9 is not a clip codec");
+    let err = Recorder::start(cfg)
+        .map(|_| ())
+        .expect_err("vp9 is not a clip codec");
     assert!(
         err.to_string().contains("unsupported encode.codec"),
         "the error must name the setting: {err}"
@@ -570,8 +686,13 @@ fn an_unusable_encoder_configuration_fails_before_any_capture_starts() {
     let mut cfg = stub_config(dir.path());
     cfg.dev_software_encoder = false;
     cfg.encode.vendor = "intel-arc".to_string();
-    let err = Recorder::start(cfg).map(|_| ()).expect_err("that is not a vendor");
-    assert!(err.to_string().contains("unknown encode.vendor"), "got: {err}");
+    let err = Recorder::start(cfg)
+        .map(|_| ())
+        .expect_err("that is not a vendor");
+    assert!(
+        err.to_string().contains("unknown encode.vendor"),
+        "got: {err}"
+    );
 
     // Observable consequence of the ordering: neither failure reached the scratch directory.
     assert!(
@@ -602,7 +723,10 @@ use localplay_store::SESSION_MODE_SESSION;
 fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
     RecorderOptions {
         mode,
-        mic: MicSection { enabled: mic, device: String::new() },
+        mic: MicSection {
+            enabled: mic,
+            device: String::new(),
+        },
         games: GamesSection::default(),
         game: None,
     }
@@ -611,7 +735,14 @@ fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
 /// The `(video, audio)` stream counts of a file, counted by ffprobe (`MediaInfo` reports only the first stream of each kind).
 fn stream_counts(path: &Path, bin: &FfmpegBinaries) -> (usize, usize) {
     let output = std::process::Command::new(&bin.ffprobe)
-        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(path)
         .output()
         .expect("running ffprobe");
@@ -656,7 +787,10 @@ fn wait_for_finished_session(bin: &FfmpegBinaries, db: &Path) -> localplay_store
         if let Some(row) = sessions.iter().find(|row| row.ended_at_ms.is_some()) {
             return row.clone();
         }
-        assert!(Instant::now() < deadline, "no finished session appeared: {sessions:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no finished session appeared: {sessions:?}"
+        );
         let _ = bin;
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -673,9 +807,12 @@ fn a_full_session_records_into_its_own_directory_and_keeps_every_segment() {
     let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
         .expect("the session recorder starts");
 
-    let grown = wait_for(&recorder, Duration::from_secs(40), "four seconds of session", |s| {
-        s.span_ms >= 4_000
-    });
+    let grown = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "four seconds of session",
+        |s| s.span_ms >= 4_000,
+    );
     assert_eq!(grown.mode, RecordingMode::FullSession);
     assert!(
         grown.segments >= 4,
@@ -690,27 +827,56 @@ fn a_full_session_records_into_its_own_directory_and_keeps_every_segment() {
     // The segments are in a per-session directory under the sessions area, not in scratch/.
     let (dirs, files) = sessions_on_disk(&app_data_dir);
     assert_eq!(dirs.len(), 1, "one session directory: {dirs:?}");
-    assert!(files.is_empty(), "no session file exists until the recording stops: {files:?}");
     assert!(
-        dirs[0].file_name().unwrap().to_string_lossy().starts_with("session-"),
+        files.is_empty(),
+        "no session file exists until the recording stops: {files:?}"
+    );
+    assert!(
+        dirs[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("session-"),
         "named from the wall clock: {:?}",
         dirs[0]
     );
-    let segments_in_dir = std::fs::read_dir(&dirs[0]).unwrap().filter_map(|e| e.ok()).count();
-    assert!(segments_in_dir >= 4, "the segments are there: {segments_in_dir}");
+    let segments_in_dir = std::fs::read_dir(&dirs[0])
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+    assert!(
+        segments_in_dir >= 4,
+        "the segments are there: {segments_in_dir}"
+    );
 
     recorder.stop().expect("stop must succeed");
 
     // One finished session, one file, both streams, and the temporary segments gone.
     let row = wait_for_finished_session(&bin, &db_path);
     assert_eq!(row.mode, SESSION_MODE_SESSION);
-    assert_eq!(row.game, None, "a manually started recording carries no game name");
-    let final_path = row.final_path.clone().expect("the row names the session file");
+    assert_eq!(
+        row.game, None,
+        "a manually started recording carries no game name"
+    );
+    let final_path = row
+        .final_path
+        .clone()
+        .expect("the row names the session file");
     let final_path = PathBuf::from(&final_path);
     assert!(final_path.is_file(), "{final_path:?} exists");
-    assert_eq!(stream_counts(&final_path, &bin), (1, 1), "one video, one audio track");
-    assert_eq!(row.size_bytes as u64, std::fs::metadata(&final_path).unwrap().len());
-    assert!(row.size_bytes > 4 * 1_024, "the session file is bigger than the cap: {row:?}");
+    assert_eq!(
+        stream_counts(&final_path, &bin),
+        (1, 1),
+        "one video, one audio track"
+    );
+    assert_eq!(
+        row.size_bytes as u64,
+        std::fs::metadata(&final_path).unwrap().len()
+    );
+    assert!(
+        row.size_bytes > 4 * 1_024,
+        "the session file is bigger than the cap: {row:?}"
+    );
     let info = localplay_media::probe::MediaInfo::probe(&bin, &final_path).expect("probing it");
     assert!(
         info.duration_ms >= 4_000,
@@ -725,8 +891,15 @@ fn a_full_session_records_into_its_own_directory_and_keeps_every_segment() {
          recorded in"
     );
     let (dirs, files) = sessions_on_disk(&app_data_dir);
-    assert!(dirs.is_empty(), "the temporary segments are removed: {dirs:?}");
-    assert_eq!(files, vec![final_path], "and the session file is the only thing left");
+    assert!(
+        dirs.is_empty(),
+        "the temporary segments are removed: {dirs:?}"
+    );
+    assert_eq!(
+        files,
+        vec![final_path],
+        "and the session file is the only thing left"
+    );
 }
 
 #[test]
@@ -746,19 +919,33 @@ fn a_full_session_with_a_microphone_concatenates_both_audio_tracks() {
         status.mic_port.is_some(),
         "and the encoder declared a second audio input: {status:?}"
     );
-    assert_eq!(status.dropped_mic_audio, 0, "nothing has been dropped: {status:?}");
+    assert_eq!(
+        status.dropped_mic_audio, 0,
+        "nothing has been dropped: {status:?}"
+    );
 
-    let grown = wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| {
-        s.span_ms >= 3_000
-    });
-    assert_eq!(grown.dropped_mic_audio, 0, "the voice track is being fed: {grown:?}");
+    let grown = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "three seconds of session",
+        |s| s.span_ms >= 3_000,
+    );
+    assert_eq!(
+        grown.dropped_mic_audio, 0,
+        "the voice track is being fed: {grown:?}"
+    );
     assert_eq!(grown.error, None);
 
     // A clip taken during the session carries both tracks too: its trigger splices with `-map 0`.
-    wait_for(&recorder, Duration::from_secs(40), "enough media for a clip", |s| {
-        s.span_ms >= (PRE_SECONDS + POST_SECONDS) * 1000
-    });
-    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "enough media for a clip",
+        |s| s.span_ms >= (PRE_SECONDS + POST_SECONDS) * 1000,
+    );
+    let clip = recorder
+        .clip_now()
+        .expect("the trigger must produce a clip");
     assert_eq!(
         stream_counts(&clip.metadata.path, &bin),
         (1, 2),
@@ -788,12 +975,17 @@ fn a_clip_taken_during_a_full_session_is_the_same_instant_splice() {
     let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
         .expect("the session recorder starts");
     let ready_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
-    wait_for(&recorder, Duration::from_secs(40), "enough media for a clip", |s| {
-        s.span_ms >= ready_ms
-    });
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "enough media for a clip",
+        |s| s.span_ms >= ready_ms,
+    );
 
     // The hotkey path in session mode: an instant clip out of the footage the session is writing.
-    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    let clip = recorder
+        .clip_now()
+        .expect("the trigger must produce a clip");
     assert!(clip.metadata.path.is_file());
     assert_eq!(stream_counts(&clip.metadata.path, &bin), (1, 1));
     assert_eq!(clip.metadata.encoder, "libx264");
@@ -824,7 +1016,12 @@ fn the_session_row_is_opened_before_capture_and_kept_current_while_it_records() 
 
     let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
         .expect("the session recorder starts");
-    wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| s.span_ms >= 3_000);
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "three seconds of session",
+        |s| s.span_ms >= 3_000,
+    );
 
     // Read the row through a second connection, as the desktop shell's session list would.
     let store = open_clip_index(&db_path).expect("the index opens");
@@ -846,14 +1043,23 @@ fn the_session_row_is_opened_before_capture_and_kept_current_while_it_records() 
     drop(store);
 
     recorder.stop().expect("stop must succeed");
-    recorder.stop().expect("a second stop is a no-op, not an error");
+    recorder
+        .stop()
+        .expect("a second stop is a no-op, not an error");
 
     let store = open_clip_index(&db_path).expect("the index opens");
     let rows = store.list_sessions().unwrap();
-    assert_eq!(rows.len(), 1, "a second stop does not open a second session");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a second stop does not open a second session"
+    );
     let finished = &rows[0];
     assert_eq!(finished.id, id);
-    assert!(finished.ended_at_ms.is_some(), "the row is closed: {finished:?}");
+    assert!(
+        finished.ended_at_ms.is_some(),
+        "the row is closed: {finished:?}"
+    );
     let path = PathBuf::from(finished.final_path.clone().expect("the session file"));
     assert!(path.is_file());
     assert_eq!(
@@ -886,16 +1092,35 @@ fn the_microphone_is_off_by_default_and_leaves_the_encoder_invocation_unchanged(
     // The engine's default is the microphone off.
     let options = RecorderOptions::default();
     assert!(!options.mic.enabled, "the microphone is opt-in");
-    assert_eq!(options.mode, RecordingMode::ReplayBuffer, "and so is full-session mode");
-    assert!(!options.games.auto_record, "and so is game-driven recording");
+    assert_eq!(
+        options.mode,
+        RecordingMode::ReplayBuffer,
+        "and so is full-session mode"
+    );
+    assert!(
+        !options.games.auto_record,
+        "and so is game-driven recording"
+    );
 
     let recorder = Recorder::start(cfg).expect("the recorder starts");
     let status = recorder.status();
     assert!(!status.mic);
-    assert!(status.mic_port.is_none(), "the encoder opened no microphone input: {status:?}");
+    assert!(
+        status.mic_port.is_none(),
+        "the encoder opened no microphone input: {status:?}"
+    );
     assert_eq!(status.dropped_mic_audio, 0);
-    wait_for(&recorder, Duration::from_secs(30), "the buffer to start", |s| s.span_ms > 0);
-    assert_eq!(recorder.status().dropped_mic_audio, 0, "and stays 0 while recording");
+    wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the buffer to start",
+        |s| s.span_ms > 0,
+    );
+    assert_eq!(
+        recorder.status().dropped_mic_audio,
+        0,
+        "and stays 0 while recording"
+    );
     recorder.stop().expect("stop must succeed");
 }
 
@@ -935,17 +1160,29 @@ fn auto_record_off_starts_no_watcher_and_records_immediately() {
     // With `auto_record` false `GamesSection::start` returns `None`: it starts nothing, not even a thread.
     let (sink, _changes) = mpsc::channel();
     assert!(
-        GamesSection::default().start(sink.clone()).expect("starting nothing cannot fail").is_none(),
+        GamesSection::default()
+            .start(sink.clone())
+            .expect("starting nothing cannot fail")
+            .is_none(),
         "auto_record = false must start nothing"
     );
-    let off = GamesSection { watch: vec![WatchedGame::by_process("Dota 2", "dota2.exe")], ..GamesSection::default() };
-    assert!(off.start(sink).expect("still nothing").is_none(), "nor with a watch list");
+    let off = GamesSection {
+        watch: vec![WatchedGame::by_process("Dota 2", "dota2.exe")],
+        ..GamesSection::default()
+    };
+    assert!(
+        off.start(sink).expect("still nothing").is_none(),
+        "nor with a watch list"
+    );
 
     // And the recorder with default options is recording, not armed: no channel, receiver or supervisor thread exists.
     let (_tmp, app_data_dir) = application_data_dir("games-off");
     let recorder = Recorder::start(stub_config(&app_data_dir)).expect("the recorder starts");
     let status = recorder.status();
-    assert!(status.running, "a recorder with nothing watched records now: {status:?}");
+    assert!(
+        status.running,
+        "a recorder with nothing watched records now: {status:?}"
+    );
     assert!(!status.watching_games, "and has no watcher: {status:?}");
     assert!(!recorder.is_armed());
     assert_eq!(status.game, None);
@@ -975,10 +1212,22 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
     {
         let store = open_clip_index(&db_path).expect("the index opens");
         let id = store
-            .start_session(Some("Dota 2"), SESSION_MODE_SESSION, now_ms() - two_days_ms, &old_dir.display().to_string(), 0)
+            .start_session(
+                Some("Dota 2"),
+                SESSION_MODE_SESSION,
+                now_ms() - two_days_ms,
+                &old_dir.display().to_string(),
+                0,
+            )
             .expect("opening the old session");
         store
-            .end_session(id, now_ms() - two_days_ms + 1_000, Some(&old_file.display().to_string()), 512, 0)
+            .end_session(
+                id,
+                now_ms() - two_days_ms + 1_000,
+                Some(&old_file.display().to_string()),
+                512,
+                0,
+            )
             .expect("ending the old session");
     }
 
@@ -989,22 +1238,35 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
         cfg,
         options(RecordingMode::FullSession, false),
         // The supervisor builds the shipping probe itself; this panicking closure proves it is not called.
-        &|_cfg: &EncodeConfig| panic!("the injected measurement belongs to a recording `start` begins itself"),
+        &|_cfg: &EncodeConfig| {
+            panic!("the injected measurement belongs to a recording `start` begins itself")
+        },
         Some((changes, None)),
     )
     .expect("the armed recorder starts");
 
     let armed = recorder.status();
-    assert!(!armed.running, "nothing is recorded before a game starts: {armed:?}");
-    assert!(armed.watching_games && recorder.is_armed(), "but a watcher is running");
+    assert!(
+        !armed.running,
+        "nothing is recorded before a game starts: {armed:?}"
+    );
+    assert!(
+        armed.watching_games && recorder.is_armed(),
+        "but a watcher is running"
+    );
     assert_eq!(armed.game, None);
     assert_eq!(armed.error, None, "being armed is not an error");
 
     // The game starts: the recording begins, with the game's name in the session row.
-    presence.send(PresenceChange::Started(game.clone())).expect("telling the recorder");
-    let recording = wait_for(&recorder, Duration::from_secs(40), "the game's recording to start", |s| {
-        s.running && s.span_ms >= 3_000
-    });
+    presence
+        .send(PresenceChange::Started(game.clone()))
+        .expect("telling the recorder");
+    let recording = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the game's recording to start",
+        |s| s.running && s.span_ms >= 3_000,
+    );
     assert_eq!(recording.game.as_deref(), Some("Dota 2"), "{recording:?}");
     let store = open_clip_index(&db_path).expect("the index opens");
     let running: Vec<_> = store
@@ -1014,35 +1276,66 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
         .filter(|row| row.ended_at_ms.is_none())
         .collect();
     assert_eq!(running.len(), 1, "one running session: {running:?}");
-    assert_eq!(running[0].game.as_deref(), Some("Dota 2"), "carrying the detected title");
+    assert_eq!(
+        running[0].game.as_deref(),
+        Some("Dota 2"),
+        "carrying the detected title"
+    );
     drop(store);
 
     // The game stops: recording closed, session file written, retention pass run (removing the two-day-old session only).
-    presence.send(PresenceChange::Stopped(game.clone())).expect("telling the recorder");
-    wait_for(&recorder, Duration::from_secs(40), "the recording to stop", |s| !s.running);
+    presence
+        .send(PresenceChange::Stopped(game.clone()))
+        .expect("telling the recorder");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the recording to stop",
+        |s| !s.running,
+    );
     let stopped = recorder.status();
-    assert_eq!(stopped.game, None, "no game is being recorded any more: {stopped:?}");
+    assert_eq!(
+        stopped.game, None,
+        "no game is being recorded any more: {stopped:?}"
+    );
     assert!(stopped.watching_games, "but the watcher is still armed");
 
     let store = open_clip_index(&db_path).expect("the index opens");
     let sessions = store.list_sessions().expect("listing sessions");
-    assert_eq!(sessions.len(), 1, "the old session was evicted, the new one kept: {sessions:?}");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the old session was evicted, the new one kept: {sessions:?}"
+    );
     let session = &sessions[0];
     assert_eq!(session.game.as_deref(), Some("Dota 2"));
     let file = PathBuf::from(session.final_path.clone().expect("the new session file"));
-    assert!(file.is_file(), "the session the game produced is on disk: {file:?}");
+    assert!(
+        file.is_file(),
+        "the session the game produced is on disk: {file:?}"
+    );
     assert_eq!(stream_counts(&file, &bin), (1, 1));
-    assert!(!old_file.exists(), "the retention pass removed the old session's file");
+    assert!(
+        !old_file.exists(),
+        "the retention pass removed the old session's file"
+    );
     assert!(!old_dir.exists(), "and its scratch directory");
     drop(store);
 
     // A second game starts and the application shuts down mid-session: the supervisor closes that
     // session exactly as the game stopping did.
-    presence.send(PresenceChange::Started(game.clone())).expect("telling the recorder");
-    wait_for(&recorder, Duration::from_secs(40), "the second game's recording", |s| {
-        s.running && s.span_ms >= 3_000
-    });
-    recorder.stop().expect("stopping the recorder stops the watcher and its recording too");
+    presence
+        .send(PresenceChange::Started(game.clone()))
+        .expect("telling the recorder");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the second game's recording",
+        |s| s.running && s.span_ms >= 3_000,
+    );
+    recorder
+        .stop()
+        .expect("stopping the recorder stops the watcher and its recording too");
     assert!(!recorder.is_armed(), "and leaves nothing armed");
     assert!(!recorder.is_running());
     let store = open_clip_index(&db_path).expect("the index opens");
@@ -1051,7 +1344,10 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
         .iter()
         .find(|row| row.id != session.id)
         .expect("the second game's session row: {sessions:?}");
-    assert!(other.ended_at_ms.is_some(), "stopping the application closed it: {other:?}");
+    assert!(
+        other.ended_at_ms.is_some(),
+        "stopping the application closed it: {other:?}"
+    );
     let file = PathBuf::from(other.final_path.clone().expect("with its session file"));
     assert!(file.is_file(), "{file:?} exists");
     assert_eq!(stream_counts(&file, &bin), (1, 1));
@@ -1072,9 +1368,17 @@ fn a_crashed_session_is_recovered_when_the_next_run_starts() {
     let id = {
         let store = open_clip_index(&db_path).expect("the index opens");
         let id = store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_700_000_000_000, &session_dir.display().to_string(), 0)
+            .start_session(
+                Some("League of Legends"),
+                SESSION_MODE_SESSION,
+                1_700_000_000_000,
+                &session_dir.display().to_string(),
+                0,
+            )
             .expect("the row the crash left behind");
-        store.set_session_size(id, bytes as i64).expect("its last known size");
+        store
+            .set_session_size(id, bytes as i64)
+            .expect("its last known size");
         id
     };
 
@@ -1083,12 +1387,25 @@ fn a_crashed_session_is_recovered_when_the_next_run_starts() {
     recorder.stop().expect("stop must succeed");
 
     let store = open_clip_index(&db_path).expect("the index opens");
-    let row = store.get_session(id).expect("reading the row").expect("the row exists");
-    assert!(row.ended_at_ms.is_some(), "the crashed session was closed: {row:?}");
+    let row = store
+        .get_session(id)
+        .expect("reading the row")
+        .expect("the row exists");
+    assert!(
+        row.ended_at_ms.is_some(),
+        "the crashed session was closed: {row:?}"
+    );
     let file = PathBuf::from(row.final_path.expect("and it names the recovered file"));
     assert!(file.is_file(), "{file:?} exists");
-    assert_eq!(stream_counts(&file, &bin), (1, 1), "with the streams its segments carried");
-    assert_eq!(row.size_bytes as u64, std::fs::metadata(&file).unwrap().len());
+    assert_eq!(
+        stream_counts(&file, &bin),
+        (1, 1),
+        "with the streams its segments carried"
+    );
+    assert_eq!(
+        row.size_bytes as u64,
+        std::fs::metadata(&file).unwrap().len()
+    );
     assert!(!session_dir.exists(), "and the temporary segments are gone");
 }
 
@@ -1102,17 +1419,31 @@ fn dropping_a_recorder_finalises_and_closes_its_session() {
 
     let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
         .expect("the session recorder starts");
-    wait_for(&recorder, Duration::from_secs(40), "three seconds of session", |s| s.span_ms >= 3_000);
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "three seconds of session",
+        |s| s.span_ms >= 3_000,
+    );
     drop(recorder);
 
     let row = wait_for_finished_session(&bin, &db_path);
-    assert!(row.ended_at_ms.is_some(), "the drop closed the session: {row:?}");
+    assert!(
+        row.ended_at_ms.is_some(),
+        "the drop closed the session: {row:?}"
+    );
     let file = PathBuf::from(row.final_path.clone().expect("the session file"));
     assert!(file.is_file(), "{file:?} exists");
     assert_eq!(stream_counts(&file, &bin), (1, 1));
-    assert_eq!(row.size_bytes as u64, std::fs::metadata(&file).unwrap().len());
+    assert_eq!(
+        row.size_bytes as u64,
+        std::fs::metadata(&file).unwrap().len()
+    );
     let (dirs, _files) = sessions_on_disk(&app_data_dir);
-    assert!(dirs.is_empty(), "and the temporary segments went with it: {dirs:?}");
+    assert!(
+        dirs.is_empty(),
+        "and the temporary segments went with it: {dirs:?}"
+    );
 }
 
 /// Everything in `dir`, by name. An absent directory counts as empty: the strongest form of
@@ -1120,7 +1451,12 @@ fn dropping_a_recorder_finalises_and_closes_its_session() {
 fn entries_in(dir: &Path) -> Vec<String> {
     match std::fs::read_dir(dir) {
         Ok(entries) => entries
-            .map(|e| e.expect("a directory entry").file_name().to_string_lossy().into_owned())
+            .map(|e| {
+                e.expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(err) => panic!("reading {}: {err}", dir.display()),
@@ -1142,9 +1478,12 @@ fn buffering_writes_nothing_to_disk_and_only_a_saved_clip_does() {
 
     let recorder = Recorder::start(cfg).expect("the recorder starts");
     let wanted_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
-    let filled = wait_for(&recorder, Duration::from_secs(30), "the window to be buffered", |s| {
-        s.frames > 0 && s.span_ms >= wanted_ms
-    });
+    let filled = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the window to be buffered",
+        |s| s.frames > 0 && s.span_ms >= wanted_ms,
+    );
     assert!(filled.running, "the recorder must report itself as running");
 
     // Not a segment, not a partial file, not even the directory.
@@ -1160,9 +1499,14 @@ fn buffering_writes_nothing_to_disk_and_only_a_saved_clip_does() {
     );
 
     // The trigger is the one thing allowed to touch the disk.
-    let clip = recorder.clip_now().expect("the trigger must produce a clip");
+    let clip = recorder
+        .clip_now()
+        .expect("the trigger must produce a clip");
     assert!(clip.metadata.path.is_file(), "the saved clip is on disk");
-    assert!(entries_in(&scratch).is_empty(), "saving a clip left a scratch trail");
+    assert!(
+        entries_in(&scratch).is_empty(),
+        "saving a clip left a scratch trail"
+    );
 
     let saved = entries_in(&clips);
     assert_eq!(
@@ -1241,7 +1585,10 @@ fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default()
     cfg.audio_bitrate_kbps = Some(96);
     let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
         .expect("a 96 kbps configuration");
-    assert_eq!(encode.audio_bitrate_kbps, 96, "the configured value must reach the encoder");
+    assert_eq!(
+        encode.audio_bitrate_kbps, 96,
+        "the configured value must reach the encoder"
+    );
 
     cfg.audio_bitrate_kbps = None;
     let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
@@ -1251,7 +1598,10 @@ fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default()
         localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS,
         "an unset value must be the pipeline's default"
     );
-    assert_eq!(encode.audio_bitrate_kbps, 192, "which is 192 kbps, not zero and not 128");
+    assert_eq!(
+        encode.audio_bitrate_kbps, 192,
+        "which is 192 kbps, not zero and not 128"
+    );
 }
 
 /// `[audio] enabled` reaches the encoder's configuration, and a front-end that carries no value
@@ -1307,16 +1657,35 @@ fn a_microphone_with_the_game_audio_off_is_refused_at_start() {
 fn a_clip_window_is_clamped_to_the_buffers_ceiling_and_defaults_to_the_configured_one() {
     // (default pre, default post, max pre, max post), all in ms.
     let resolve = |w: ClipWindow| w.resolve(2_000, 1_000, 4_000, 1_000);
-    assert_eq!(resolve(ClipWindow::default()), (2_000, 1_000), "unset is the configured window");
-    assert_eq!(resolve(ClipWindow::new(1, 0)), (1_000, 0), "a short clip");
-    assert_eq!(resolve(ClipWindow::new(4, 1)), (4_000, 1_000), "up to the ceiling is honoured");
-    assert_eq!(resolve(ClipWindow::new(60, 30)), (4_000, 1_000), "beyond it is clamped, not refused");
     assert_eq!(
-        resolve(ClipWindow { pre_seconds: Some(3), post_seconds: None }),
+        resolve(ClipWindow::default()),
+        (2_000, 1_000),
+        "unset is the configured window"
+    );
+    assert_eq!(resolve(ClipWindow::new(1, 0)), (1_000, 0), "a short clip");
+    assert_eq!(
+        resolve(ClipWindow::new(4, 1)),
+        (4_000, 1_000),
+        "up to the ceiling is honoured"
+    );
+    assert_eq!(
+        resolve(ClipWindow::new(60, 30)),
+        (4_000, 1_000),
+        "beyond it is clamped, not refused"
+    );
+    assert_eq!(
+        resolve(ClipWindow {
+            pre_seconds: Some(3),
+            post_seconds: None
+        }),
         (3_000, 1_000),
         "one half set leaves the other at the configured value"
     );
-    assert_eq!(resolve(ClipWindow::new(0, 0)), (0, 1_000), "an empty window still holds a second");
+    assert_eq!(
+        resolve(ClipWindow::new(0, 0)),
+        (0, 1_000),
+        "an empty window still holds a second"
+    );
 }
 
 #[test]
@@ -1329,9 +1698,12 @@ fn a_short_and_a_long_clip_come_out_of_one_recording_at_their_own_lengths() {
     cfg.buffer.max_pre_seconds = LONG_PRE;
 
     let recorder = Recorder::start(cfg).expect("the recorder starts");
-    wait_for(&recorder, Duration::from_secs(40), "enough media for a long clip", |s| {
-        s.span_ms >= (LONG_PRE + POST_SECONDS + 1) * 1000
-    });
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "enough media for a long clip",
+        |s| s.span_ms >= (LONG_PRE + POST_SECONDS + 1) * 1000,
+    );
 
     let long = recorder
         .clip_now_in(ClipReason::Manual, ClipWindow::new(LONG_PRE, POST_SECONDS))

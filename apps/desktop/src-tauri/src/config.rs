@@ -35,9 +35,11 @@
 
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
-use localplay_recorder::event_driver::EventsSection;
+use localplay_recorder::config::{
+    BufferSection, CaptureSection, EncodeSection, MicSection, StorageSection,
+};
 use localplay_recorder::config_schema;
-use localplay_recorder::config::{BufferSection, CaptureSection, EncodeSection, MicSection, StorageSection};
+use localplay_recorder::event_driver::EventsSection;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -299,7 +301,11 @@ impl EngineOptionsConfig {
             events: EventsSection,
         }
         config_schema::parse::<File>(text)
-            .map(|f| Self { mic: f.mic, games: f.games, events: f.events })
+            .map(|f| Self {
+                mic: f.mic,
+                games: f.games,
+                events: f.events,
+            })
             .map_err(|err| {
                 CommandError::new(
                     ErrorCode::InvalidInput,
@@ -371,15 +377,22 @@ pub enum SettingEdit {
 /// A preset is only a name for a bitrate: nothing but `bitrate_kbps` is stored, so the engine
 /// and CLI need no second key. `balanced` is the example config's 20 Mbit/s. A bitrate matching
 /// no preset reads back as `custom`.
-pub const QUALITY_PRESETS: [(&str, u32); 3] = [("low", 8_000), ("balanced", 20_000), ("high", 40_000)];
+pub const QUALITY_PRESETS: [(&str, u32); 3] =
+    [("low", 8_000), ("balanced", 20_000), ("high", 40_000)];
 
 /// The preset name a bitrate corresponds to, or `"custom"`.
 pub fn quality_for_bitrate(kbps: u32) -> &'static str {
-    QUALITY_PRESETS.iter().find(|(_, b)| *b == kbps).map_or("custom", |(name, _)| name)
+    QUALITY_PRESETS
+        .iter()
+        .find(|(_, b)| *b == kbps)
+        .map_or("custom", |(name, _)| name)
 }
 
 fn preset_bitrate(name: &str) -> Option<u32> {
-    QUALITY_PRESETS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+    QUALITY_PRESETS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, b)| *b)
 }
 
 impl SettingEdit {
@@ -442,7 +455,10 @@ fn mistyped(key: &'static str) -> CommandError {
             "the config file's [{section}] {key} is not a {what}, so it cannot be used",
             section = key.split('.').next().unwrap_or("config"),
             what = match key {
-                "storage.clips_dir" | "encode.output_size" | "capture.window" | "mic.device"
+                "storage.clips_dir"
+                | "encode.output_size"
+                | "capture.window"
+                | "mic.device"
                 | "capture.output_device" => "string",
                 "encode.fps" | "encode.bitrate_kbps" | "capture.monitor" => "integer",
                 "mic.enabled" | "games.auto_record" => "true/false value",
@@ -465,9 +481,11 @@ fn get_str(
 ) -> Result<Option<String>, CommandError> {
     match table(doc, table_key).and_then(|t| t.get(value_key)) {
         None => Ok(None),
-        Some(item) => {
-            item.as_str().map(str::to_string).map(Some).ok_or_else(|| mistyped(full_key))
-        }
+        Some(item) => item
+            .as_str()
+            .map(str::to_string)
+            .map(Some)
+            .ok_or_else(|| mistyped(full_key)),
     }
 }
 
@@ -479,7 +497,10 @@ fn get_int(
 ) -> Result<Option<i64>, CommandError> {
     match table(doc, table_key).and_then(|t| t.get(value_key)) {
         None => Ok(None),
-        Some(item) => item.as_integer().map(Some).ok_or_else(|| mistyped(full_key)),
+        Some(item) => item
+            .as_integer()
+            .map(Some)
+            .ok_or_else(|| mistyped(full_key)),
     }
 }
 
@@ -502,10 +523,9 @@ fn is_absolute_either(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some('/') | Some('\\') => true,
-        Some(drive) if drive.is_ascii_alphabetic() => matches!(
-            (chars.next(), chars.next()),
-            (Some(':'), Some('/' | '\\'))
-        ),
+        Some(drive) if drive.is_ascii_alphabetic() => {
+            matches!((chars.next(), chars.next()), (Some(':'), Some('/' | '\\')))
+        }
         _ => false,
     }
 }
@@ -530,12 +550,14 @@ fn validate_fps(fps: u32) -> Result<(), CommandError> {
 /// added a `16..=16384` bound the engine lacks, so `output_size = " 1920x1080"` recorded fine
 /// while `get_settings` failed and the panel never rendered.
 fn validate_output_size(size: &str) -> Result<(), CommandError> {
-    localplay_recorder::parse_output_size(size).map(|_| ()).map_err(|err| {
-        CommandError::new(
-            ErrorCode::InvalidInput,
-            format!("the config file's encode.output_size is not usable: {err:#}"),
-        )
-    })
+    localplay_recorder::parse_output_size(size)
+        .map(|_| ())
+        .map_err(|err| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!("the config file's encode.output_size is not usable: {err:#}"),
+            )
+        })
 }
 
 /// Why a clips directory is refused, or `None` when it is acceptable.
@@ -682,13 +704,19 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
     config_schema::check(&text).map_err(|err| {
         CommandError::new(
             ErrorCode::InvalidInput,
-            format!("the config file {} could not be read: {err}", path.display()),
+            format!(
+                "the config file {} could not be read: {err}",
+                path.display()
+            ),
         )
     })?;
     let doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
         CommandError::new(
             ErrorCode::InvalidInput,
-            format!("the config file {} could not be parsed: {err}", path.display()),
+            format!(
+                "the config file {} could not be parsed: {err}",
+                path.display()
+            ),
         )
     })?;
     let example: toml_edit::DocumentMut = EXAMPLE_CONFIG.parse().map_err(|err| {
@@ -711,8 +739,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             if config_exists {
                 defaulted.push("storage.clips_dir");
             }
-            get_str(&example, "storage", "clips_dir", "storage.clips_dir")?
-                .unwrap_or_default()
+            get_str(&example, "storage", "clips_dir", "storage.clips_dir")?.unwrap_or_default()
         }
     };
     let fps = match get_int(&doc, "encode", "fps", "encode.fps")? {
@@ -738,8 +765,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             if config_exists {
                 defaulted.push("encode.output_size");
             }
-            get_str(&example, "encode", "output_size", "encode.output_size")?
-                .unwrap_or_default()
+            get_str(&example, "encode", "output_size", "encode.output_size")?.unwrap_or_default()
         }
     };
     let mic_enabled = match get_bool(&doc, "mic", "enabled", "mic.enabled")? {
@@ -837,7 +863,9 @@ fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, Comman
     };
     // `[[games.watch]]` is an array of tables, which `as_array` does not see; a `watch = "..."`
     // string is a mistype either way.
-    let tables = watch.as_array_of_tables().ok_or_else(|| mistyped("games.watch"))?;
+    let tables = watch
+        .as_array_of_tables()
+        .ok_or_else(|| mistyped("games.watch"))?;
     tables
         .iter()
         .map(|entry| {
@@ -894,7 +922,10 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
         CommandError::new(
             ErrorCode::InvalidInput,
-            format!("the config file {} could not be parsed: {err}", path.display()),
+            format!(
+                "the config file {} could not be parsed: {err}",
+                path.display()
+            ),
         )
     })?;
 
@@ -924,9 +955,7 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             Some(_) => {
                 return Err(CommandError::new(
                     ErrorCode::InvalidInput,
-                    format!(
-                        "the config file's [{section}] is not a table, so nothing was written"
-                    ),
+                    format!("the config file's [{section}] is not a table, so nothing was written"),
                 ));
             }
         }
@@ -935,7 +964,9 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::Fps(fps) => toml_edit::value(*fps as i64),
             SettingEdit::OutputSize(size) => toml_edit::value(size.clone()),
             SettingEdit::MicEnabled(enabled) => toml_edit::value(*enabled),
-            SettingEdit::MicDevice(id) | SettingEdit::OutputDevice(id) => toml_edit::value(id.clone()),
+            SettingEdit::MicDevice(id) | SettingEdit::OutputDevice(id) => {
+                toml_edit::value(id.clone())
+            }
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
             // Validated above, so the preset exists; the fallback is the balanced rate.
             SettingEdit::Quality(name) => {
@@ -976,7 +1007,11 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
     tracing::info!(
         "settings written to {}: {}",
         path.display(),
-        edits.iter().map(SettingEdit::key).collect::<Vec<_>>().join(", ")
+        edits
+            .iter()
+            .map(SettingEdit::key)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     Ok(())
 }
@@ -1005,8 +1040,14 @@ mod tests {
         // gets. It also pins this module to the repository's real file: if `[storage]` is renamed or
         // re-typed there, this fails.
         let cfg = StorageConfig::example().expect("config.example.toml must stay readable");
-        assert_eq!(cfg.clips_dir, "", "the example leaves the clips directory to the app dir");
-        assert_eq!(cfg.max_total_bytes, 53_687_091_200, "50 GiB, as spec §10 documents");
+        assert_eq!(
+            cfg.clips_dir, "",
+            "the example leaves the clips directory to the app dir"
+        );
+        assert_eq!(
+            cfg.max_total_bytes, 53_687_091_200,
+            "50 GiB, as spec §10 documents"
+        );
         assert_eq!(cfg.max_age_days, 7);
     }
 
@@ -1034,7 +1075,11 @@ mod tests {
         // than refusing to start.
         let err = StorageConfig::from_toml("[buffer]\npre_seconds = 30\n").unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(err.message.contains("storage"), "the message must name the section: {}", err.message);
+        assert!(
+            err.message.contains("storage"),
+            "the message must name the section: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1085,7 +1130,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(err.message.contains("[buffer]"), "the message must name the sections: {}", err.message);
+        assert!(
+            err.message.contains("[buffer]"),
+            "the message must name the sections: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1103,12 +1152,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        assert_eq!(StorageConfig::load(&path).unwrap(), StorageConfig::example().unwrap());
+        assert_eq!(
+            StorageConfig::load(&path).unwrap(),
+            StorageConfig::example().unwrap()
+        );
 
         let cfg = BackgroundConfig::load(&path).unwrap();
         assert_eq!(cfg, BackgroundConfig::example().unwrap());
         assert_eq!(cfg.clip_hotkey, DEFAULT_CLIP_HOTKEY);
-        assert!(!cfg.start_with_system, "start_with_system is off unless it is asked for");
+        assert!(
+            !cfg.start_with_system,
+            "start_with_system is off unless it is asked for"
+        );
 
         let rec = RecordingConfig::load(&path).unwrap();
         assert_eq!(rec.buffer.pre_seconds, 30);
@@ -1138,7 +1193,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cfg.clip_hotkey, "Alt+F9", "the user's chord is used verbatim");
+        assert_eq!(
+            cfg.clip_hotkey, "Alt+F9",
+            "the user's chord is used verbatim"
+        );
         assert!(cfg.start_with_system);
     }
 
@@ -1196,10 +1254,9 @@ mod tests {
         assert_eq!(absent.events, EventsSection::default());
         assert!(absent.events.lol_poll_enabled);
 
-        let set = EngineOptionsConfig::from_toml(
-            "[events]\nlol_poll_enabled = false\ngsi_port = 0\n",
-        )
-        .unwrap();
+        let set =
+            EngineOptionsConfig::from_toml("[events]\nlol_poll_enabled = false\ngsi_port = 0\n")
+                .unwrap();
         assert!(!set.events.lol_poll_enabled);
         assert_eq!(set.events.gsi_port, 0);
     }
@@ -1261,7 +1318,10 @@ mod tests {
         assert!(!settings.defaulted.contains(&"storage.clips_dir"));
         assert_eq!(
             settings.watch_titles,
-            default_watch().iter().map(|w| w.name.clone()).collect::<Vec<_>>()
+            default_watch()
+                .iter()
+                .map(|w| w.name.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1295,18 +1355,26 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[storage]\nclips_dir = \"\"\n").unwrap();
         let before = read_effective_settings(&path).unwrap();
-        assert_eq!((before.capture_monitor, before.capture_window.as_str()), (0, ""));
+        assert_eq!(
+            (before.capture_monitor, before.capture_window.as_str()),
+            (0, "")
+        );
         assert!(before.defaulted.contains(&"capture.monitor"));
 
         write_settings(
             &path,
-            &[SettingEdit::CaptureMonitor(1), SettingEdit::CaptureWindow("League".into())],
+            &[
+                SettingEdit::CaptureMonitor(1),
+                SettingEdit::CaptureWindow("League".into()),
+            ],
         )
         .unwrap();
         let after = read_effective_settings(&path).unwrap();
-        assert_eq!((after.capture_monitor, after.capture_window.as_str()), (1, "League"));
+        assert_eq!(
+            (after.capture_monitor, after.capture_window.as_str()),
+            (1, "League")
+        );
         assert!(!after.defaulted.contains(&"capture.monitor"));
-
     }
 
     #[test]
@@ -1316,13 +1384,22 @@ mod tests {
         // No file yet: the writer starts from the example, so this is a complete config.
         write_settings(
             &path,
-            &[SettingEdit::CaptureMonitor(1), SettingEdit::CaptureWindow("League".into())],
+            &[
+                SettingEdit::CaptureMonitor(1),
+                SettingEdit::CaptureWindow("League".into()),
+            ],
         )
         .unwrap();
         let rec = RecordingConfig::load(&path).unwrap();
-        assert_eq!((rec.capture.monitor, rec.capture.window.as_str()), (1, "League"));
+        assert_eq!(
+            (rec.capture.monitor, rec.capture.window.as_str()),
+            (1, "League")
+        );
         let default = RecordingConfig::example().unwrap();
-        assert!(default.capture.target().is_default(), "the example records the primary monitor");
+        assert!(
+            default.capture.target().is_default(),
+            "the example records the primary monitor"
+        );
     }
 
     #[test]
@@ -1356,17 +1433,23 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[capture]\nmonitor = -1\n").unwrap();
         let err = read_effective_settings(&path).unwrap_err();
-        assert!(err.message.contains("capture.monitor"), "got: {}", err.message);
+        assert!(
+            err.message.contains("capture.monitor"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
     fn a_missing_file_reads_the_example_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let settings =
-            read_effective_settings(&dir.path().join("config.toml")).unwrap();
+        let settings = read_effective_settings(&dir.path().join("config.toml")).unwrap();
 
         assert!(!settings.config_exists);
-        assert!(settings.defaulted.is_empty(), "no file, no per-key fallback to name");
+        assert!(
+            settings.defaulted.is_empty(),
+            "no file, no per-key fallback to name"
+        );
         assert_eq!(settings.fps, 60);
         assert!(!settings.auto_record);
     }
@@ -1400,8 +1483,14 @@ mod tests {
         let settings = read_effective_settings(&path).unwrap();
 
         assert_eq!(settings.fps, 1000, "the engine bounds nothing");
-        assert_eq!(settings.clips_dir, "clips", "the engine takes the string as given");
-        assert_eq!(settings.output_size, " 1920 x 1080", "the engine's parser trims");
+        assert_eq!(
+            settings.clips_dir, "clips",
+            "the engine takes the string as given"
+        );
+        assert_eq!(
+            settings.output_size, " 1920 x 1080",
+            "the engine's parser trims"
+        );
     }
 
     #[test]
@@ -1415,7 +1504,11 @@ mod tests {
         let err = read_effective_settings(&path).unwrap_err();
 
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(err.message.contains("encode.output_size"), "got: {}", err.message);
+        assert!(
+            err.message.contains("encode.output_size"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1451,10 +1544,16 @@ mod tests {
         .unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.contains("# a comment the writer must keep"), "comments survive");
+        assert!(
+            after.contains("# a comment the writer must keep"),
+            "comments survive"
+        );
         assert!(after.contains("fps = 60"));
         assert!(after.contains("auto_record = false"));
-        assert!(after.contains("clips_dir = \"D:\\\\clips\""), "untouched keys survive");
+        assert!(
+            after.contains("clips_dir = \"D:\\\\clips\""),
+            "untouched keys survive"
+        );
         assert!(after.contains("output_size = \"1280x720\""));
         assert!(after.contains("enabled = true"));
         assert!(
@@ -1477,7 +1576,10 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("schema_version = 1"), "stamped: {text}");
-        assert!(text.contains("# mine"), "a hand-written comment survives: {text}");
+        assert!(
+            text.contains("# mine"),
+            "a hand-written comment survives: {text}"
+        );
         assert!(read_effective_settings(&path).is_ok());
     }
 
@@ -1499,7 +1601,11 @@ mod tests {
             assert_eq!(err.code, ErrorCode::InvalidInput);
             assert!(err.message.contains("schema version 99"), "{}", err.message);
         }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "the file is untouched");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            newer,
+            "the file is untouched"
+        );
     }
 
     #[test]
@@ -1512,7 +1618,10 @@ mod tests {
 
         let settings = read_effective_settings(&path).unwrap();
         assert!(settings.mic_enabled);
-        assert!(settings.defaulted.contains(&"encode.fps"), "nothing else was invented");
+        assert!(
+            settings.defaulted.contains(&"encode.fps"),
+            "nothing else was invented"
+        );
     }
 
     #[test]
@@ -1524,7 +1633,10 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("output_size = \"1920x1080\""));
-        assert!(text.contains("[storage]"), "the example's sections came along");
+        assert!(
+            text.contains("[storage]"),
+            "the example's sections came along"
+        );
         let settings = read_effective_settings(&path).unwrap();
         assert!(settings.config_exists);
         assert_eq!(settings.output_size, "1920x1080");
@@ -1547,15 +1659,15 @@ mod tests {
         let (dir, path) = settings_file();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = write_settings(
-            &path,
-            &[SettingEdit::Fps(60), SettingEdit::Fps(0)],
-        )
-        .unwrap_err();
+        let err = write_settings(&path, &[SettingEdit::Fps(60), SettingEdit::Fps(0)]).unwrap_err();
 
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("encode.fps"), "got: {}", err.message);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "all or nothing");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "all or nothing"
+        );
         assert_eq!(
             leftovers(dir.path()),
             Vec::<String>::new(),
@@ -1612,7 +1724,10 @@ mod tests {
 
     #[test]
     fn clips_dir_accepts_empty_or_an_absolute_directory_with_something_in_it() {
-        assert!(validate_clips_dir("").is_ok(), "empty resets to the default");
+        assert!(
+            validate_clips_dir("").is_ok(),
+            "empty resets to the default"
+        );
         assert!(validate_clips_dir("/media/clips").is_ok());
         assert!(validate_clips_dir("C:\\clips").is_ok());
         assert!(validate_clips_dir("C:/clips").is_ok());
@@ -1643,14 +1758,21 @@ mod tests {
         ] {
             let err = validate_clips_dir(bad).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidInput, "{bad:?} must be refused");
-            assert!(err.message.contains("storage.clips_dir"), "got: {}", err.message);
+            assert!(
+                err.message.contains("storage.clips_dir"),
+                "got: {}",
+                err.message
+            );
         }
     }
 
     #[test]
     fn the_extra_hotkeys_are_off_unless_the_file_sets_them() {
         let off = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Ctrl+F8\"\n").unwrap();
-        assert_eq!((off.toggle_recording_hotkey, off.bookmark_hotkey), (None, None));
+        assert_eq!(
+            (off.toggle_recording_hotkey, off.bookmark_hotkey),
+            (None, None)
+        );
         let on = BackgroundConfig::from_toml(
             "[hotkeys]\nclip = \"Ctrl+F8\"\ntoggle_recording = \"Ctrl+F9\"\nbookmark = \"Ctrl+F10\"\n",
         )
@@ -1667,8 +1789,14 @@ mod tests {
         assert!(validate_output_size("").is_ok(), "empty is the native size");
         assert!(validate_output_size("1920x1080").is_ok());
         assert!(validate_output_size("640x480").is_ok());
-        assert!(validate_output_size("1920 x 1080").is_ok(), "the engine trims");
-        assert!(validate_output_size("99999x1080").is_ok(), "the engine bounds nothing");
+        assert!(
+            validate_output_size("1920 x 1080").is_ok(),
+            "the engine trims"
+        );
+        assert!(
+            validate_output_size("99999x1080").is_ok(),
+            "the engine bounds nothing"
+        );
 
         for bad in ["wide", "1920x", "x1080", "1920x1080x2"] {
             assert!(

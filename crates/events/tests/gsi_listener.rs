@@ -59,9 +59,11 @@ fn kinds(events: &[GameEvent]) -> Vec<EventKind> {
 
 /// Send raw bytes and read whatever comes back.
 fn raw_request(addr: SocketAddr, request: &[u8]) -> String {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .expect("loopback connects");
-    stream.set_read_timeout(Some(Duration::from_secs(3))).expect("a read timeout");
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("loopback connects");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("a read timeout");
     stream.write_all(request).expect("the request is sent");
     stream.flush().expect("flushed");
     let mut raw = Vec::new();
@@ -96,7 +98,9 @@ fn with_token(fixture: &str, token: &str) -> String {
 
 /// A document with no `auth` block at all, as a cfg file without one produces.
 fn without_auth(fixture: &str) -> String {
-    let start = fixture.find("\"auth\"").expect("the fixture has an auth block");
+    let start = fixture
+        .find("\"auth\"")
+        .expect("the fixture has an auth block");
     let end = fixture[start..].find("},").expect("the block ends") + start + 2;
     fixture.replace(&fixture[start..end], "")
 }
@@ -111,10 +115,16 @@ fn the_listener_is_bound_to_loopback_and_answers_on_the_configured_path() {
 
     // A wrong path, and a method that is not POST, are refused by status.
     assert_eq!(status_of(&post(addr, "/", CS2_COMPETITIVE)), 404);
-    assert_eq!(status_of(&post(addr, "/liveclientdata/allgamedata", CS2_COMPETITIVE)), 404);
+    assert_eq!(
+        status_of(&post(addr, "/liveclientdata/allgamedata", CS2_COMPETITIVE)),
+        404
+    );
     let get = format!("GET /gsi HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     assert_eq!(status_of(&raw_request(addr, get.as_bytes())), 405);
-    assert!(harness.drained().is_empty(), "nothing was derived from any of those");
+    assert!(
+        harness.drained().is_empty(),
+        "nothing was derived from any of those"
+    );
 }
 
 #[test]
@@ -125,19 +135,30 @@ fn a_post_with_the_configured_token_is_accepted_and_derives_the_expected_events(
     // 1. First payload of a match: an attach. Its scoreboard (12 kills, 5 deaths, 3 assists) is
     //    adopted, not reported.
     let response = post(addr, "/gsi", CS2_COMPETITIVE);
-    assert_eq!(status_of(&response), 200, "the token is the configured one: {response}");
+    assert_eq!(
+        status_of(&response),
+        200,
+        "the token is the configured one: {response}"
+    );
     let attach = harness.drained();
     assert_eq!(kinds(&attach), vec![EventKind::GameStart]);
     assert_eq!(attach[0].source.as_str(), "gsi");
     assert!(
-        attach[0].payload.as_deref().unwrap_or("").contains("\"map\":\"de_dust2\""),
+        attach[0]
+            .payload
+            .as_deref()
+            .unwrap_or("")
+            .contains("\"map\":\"de_dust2\""),
         "the attach records which map: {:?}",
         attach[0].payload
     );
 
     // 2. A heartbeat that repeats the state exactly: nothing.
     assert_eq!(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)), 200);
-    assert!(harness.drained().is_empty(), "a repeated payload is not an event");
+    assert!(
+        harness.drained().is_empty(),
+        "a repeated payload is not an event"
+    );
 
     // 3. Round 5 ends, and the next round begins with a kill for the player.
     let mut next: serde_json::Value =
@@ -191,7 +212,10 @@ fn a_post_with_a_wrong_token_is_rejected_and_derives_nothing() {
             "the response must not echo the configured token: {response}"
         );
     }
-    assert!(harness.drained().is_empty(), "a refused payload derives nothing");
+    assert!(
+        harness.drained().is_empty(),
+        "a refused payload derives nothing"
+    );
 }
 
 #[test]
@@ -200,7 +224,10 @@ fn a_post_with_no_auth_block_at_all_is_rejected() {
     let addr = harness.addr();
 
     let body = without_auth(CS2_COMPETITIVE);
-    assert!(!body.contains("auth"), "the fixture really has no auth block: {body}");
+    assert!(
+        !body.contains("auth"),
+        "the fixture really has no auth block: {body}"
+    );
     assert_eq!(status_of(&post(addr, "/gsi", &body)), 403);
     assert!(harness.drained().is_empty());
 
@@ -223,7 +250,11 @@ fn a_malformed_body_yields_nothing_and_does_not_stop_the_listener() {
         "{\"auth\":{\"token\":\"fixture-token-not-a-secret\"", // truncated mid-token
     ] {
         let response = post(addr, "/gsi", body);
-        assert_eq!(status_of(&response), 400, "{body:?} must be refused, got {response}");
+        assert_eq!(
+            status_of(&response),
+            400,
+            "{body:?} must be refused, got {response}"
+        );
     }
     assert!(harness.drained().is_empty(), "no payload derived anything");
 
@@ -247,7 +278,11 @@ fn a_body_with_no_declared_length_is_refused_before_it_is_read() {
     let chunked = format!(
         "POST /gsi HTTP/1.1\r\nHost: {addr}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"
     );
-    assert_eq!(status_of(&raw_request(addr, chunked.as_bytes())), 411, "GSI sends a length");
+    assert_eq!(
+        status_of(&raw_request(addr, chunked.as_bytes())),
+        411,
+        "GSI sends a length"
+    );
 }
 
 #[test]
@@ -285,7 +320,10 @@ fn a_dota_payload_is_derived_from_its_own_scoreboard() {
     next["player"]["kills"] = serde_json::json!(5);
     next["player"]["deaths"] = serde_json::json!(3);
     assert_eq!(status_of(&post(addr, "/gsi", &next.to_string())), 200);
-    assert_eq!(kinds(&harness.drained()), vec![EventKind::Kill, EventKind::Death]);
+    assert_eq!(
+        kinds(&harness.drained()),
+        vec![EventKind::Kill, EventKind::Death]
+    );
 }
 
 #[test]
@@ -312,7 +350,9 @@ fn the_main_menu_never_produces_an_event() {
 #[test]
 fn a_listener_started_without_a_token_refuses_to_start() {
     let (sink, _events) = channel();
-    let err = gsi::spawn(GsiConfig::new(0, ""), sink).map(|_| ()).expect_err("no token");
+    let err = gsi::spawn(GsiConfig::new(0, ""), sink)
+        .map(|_| ())
+        .expect_err("no token");
     assert!(format!("{err:#}").contains("token"), "got: {err:#}");
     assert_eq!(with_token(CS2_COMPETITIVE, TOKEN), CS2_COMPETITIVE);
 }
@@ -333,12 +373,22 @@ fn a_flood_of_connections_is_answered_429_and_the_listener_recovers() {
             })
         })
         .collect();
-    let statuses: Vec<u16> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+    let statuses: Vec<u16> = workers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
     assert!(statuses.contains(&429), "the excess is refused with 429");
-    assert!(statuses.iter().all(|s| *s == 403 || *s == 429), "and nothing else is served");
+    assert!(
+        statuses.iter().all(|s| *s == 403 || *s == 429),
+        "and nothing else is served"
+    );
     assert!(harness.drained().is_empty(), "a flood derives no events");
 
     // The window rolls over, and the listener serves again.
     std::thread::sleep(gsi::RATE_WINDOW + Duration::from_millis(100));
-    assert_eq!(status_of(&post(addr, "/gsi", "{}")), 403, "served again (403: no token)");
+    assert_eq!(
+        status_of(&post(addr, "/gsi", "{}")),
+        403,
+        "served again (403: no token)"
+    );
 }

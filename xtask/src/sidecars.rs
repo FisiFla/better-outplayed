@@ -119,8 +119,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
 }
 
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse_manifest(&text)
 }
 
@@ -247,7 +247,11 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Check a file against an expected lowercase-hex SHA-256, returning the actual digest.
@@ -455,8 +459,7 @@ pub fn scan<R: Read + Seek>(
         };
         // Every entry, allowlisted or not. An archive that smuggles `../escape.txt` or an absolute path
         // anywhere is not the archive the recorded hash was reviewed for.
-        validate_entry_path(&name)
-            .with_context(|| format!("zip entry #{index} ({name:?})"))?;
+        validate_entry_path(&name).with_context(|| format!("zip entry #{index} ({name:?})"))?;
         if is_symlink {
             bail!(
                 "zip entry #{index} ({name:?}) is a symbolic link; sidecar archives must \
@@ -549,7 +552,10 @@ pub fn extract_allowlisted(
             .with_context(|| format!("choosing a destination for {:?}", m.archive_name))?;
         // Guaranteed by the suffix match above; asserted so a change to either rule fails the run
         // instead of writing a differently-named binary.
-        if dest.file_name().map(|f| f.to_string_lossy().to_string()).as_deref()
+        if dest
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .as_deref()
             != Some(m.file_name.as_str())
         {
             bail!(
@@ -588,8 +594,8 @@ fn write_entry_to_disk<R: Read>(entry: &mut R, dest: &Path) -> Result<u64> {
     let partial = dest.with_file_name(format!("{file_name}.part"));
 
     let copied = (|| -> Result<u64> {
-        let out = File::create(&partial)
-            .with_context(|| format!("creating {}", partial.display()))?;
+        let out =
+            File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
         let mut writer = BufWriter::with_capacity(1 << 16, out);
         let mut buf = [0u8; 64 * 1024];
         let mut written = 0u64;
@@ -605,7 +611,9 @@ fn write_entry_to_disk<R: Read>(entry: &mut R, dest: &Path) -> Result<u64> {
                      file; refusing (possible decompression bomb)"
                 );
             }
-            writer.write_all(&buf[..n]).context("writing an extracted file")?;
+            writer
+                .write_all(&buf[..n])
+                .context("writing an extracted file")?;
         }
         writer.flush().context("flushing an extracted file")?;
         Ok(written)
@@ -681,7 +689,13 @@ fn validate_url(entry: &Entry) -> Result<()> {
 fn work_archive(work_dir: &Path, target: &str) -> PathBuf {
     let safe: String = target
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     work_dir.join(format!("{safe}.zip"))
 }
@@ -736,7 +750,10 @@ pub fn record(
         // fail on. Say so here, while a human is looking.
         let mut archive_reader = open_archive(&archive)?;
         let scan = scan(&mut archive_reader, binaries_dir, &entry.binaries)?;
-        println!("archive holds {} entries; the allowlist resolves to:", scan.entry_count);
+        println!(
+            "archive holds {} entries; the allowlist resolves to:",
+            scan.entry_count
+        );
         for m in &scan.matches {
             println!(
                 "  {:<22} <- {} ({} bytes)",
@@ -753,7 +770,10 @@ pub fn record(
             .with_context(|| format!("writing {}", manifest_path.display()))?;
         println!("{} updated.", manifest_path.display());
     } else {
-        println!("{} already records these hashes; left unchanged.", manifest_path.display());
+        println!(
+            "{} already records these hashes; left unchanged.",
+            manifest_path.display()
+        );
     }
 
     println!(
@@ -801,7 +821,10 @@ pub fn fetch(
     println!("target   {}", entry.target);
     if let Some(host) = host {
         if host != entry.target {
-            println!("host     {host} (fetching another platform's sidecar: {})", entry.target);
+            println!(
+                "host     {host} (fetching another platform's sidecar: {})",
+                entry.target
+            );
         } else {
             println!("host     {host}");
         }
@@ -1003,8 +1026,18 @@ mod tests {
             dir,
             "sidecar.zip",
             &[
-                FixtureEntry { name: "ffmpeg-7.1-essentials_build/", data: &[], mode: None, is_dir: true },
-                FixtureEntry { name: "ffmpeg-7.1-essentials_build/bin/", data: &[], mode: None, is_dir: true },
+                FixtureEntry {
+                    name: "ffmpeg-7.1-essentials_build/",
+                    data: &[],
+                    mode: None,
+                    is_dir: true,
+                },
+                FixtureEntry {
+                    name: "ffmpeg-7.1-essentials_build/bin/",
+                    data: &[],
+                    mode: None,
+                    is_dir: true,
+                },
                 FixtureEntry {
                     name: "ffmpeg-7.1-essentials_build/bin/ffmpeg.exe",
                     data: b"pretend ffmpeg",
@@ -1029,7 +1062,12 @@ mod tests {
                     mode: Some(0o100_644),
                     is_dir: false,
                 },
-                FixtureEntry { name: "ffmpeg.exe", data: b"decoy at the archive root", mode: None, is_dir: false },
+                FixtureEntry {
+                    name: "ffmpeg.exe",
+                    data: b"decoy at the archive root",
+                    mode: None,
+                    is_dir: false,
+                },
             ],
         )
     }
@@ -1085,7 +1123,8 @@ mod tests {
             "ffmpeg.exe\0",
             "nodir/..",
         ] {
-            let err = entry_destination(root, name).expect_err(&format!("{name:?} must be refused"));
+            let err =
+                entry_destination(root, name).expect_err(&format!("{name:?} must be refused"));
             assert!(
                 !err.to_string().is_empty(),
                 "the refusal must say why: {name:?}"
@@ -1184,7 +1223,10 @@ mod tests {
         let msg = format!("{err:#}");
         // Printed so `--nocapture` shows the refusal itself, not just a passing test.
         println!("zip-slip refusal: {msg}");
-        assert!(msg.contains("escape.txt"), "the error must name the entry: {msg}");
+        assert!(
+            msg.contains("escape.txt"),
+            "the error must name the entry: {msg}"
+        );
         assert!(
             msg.contains(".."),
             "the error must say what was wrong with it: {msg}"
@@ -1235,12 +1277,20 @@ mod tests {
             let archive = write_fixture(
                 tmp.path(),
                 file,
-                &[FixtureEntry { name, data: b"escaped", mode: Some(0o100_644), is_dir: false }],
+                &[FixtureEntry {
+                    name,
+                    data: b"escaped",
+                    mode: Some(0o100_644),
+                    is_dir: false,
+                }],
             );
             let err = extract_allowlisted(&archive, &dest, &allowlist(&["bin/ffmpeg.exe"]))
                 .expect_err("a drive-prefixed or backslashed entry must be refused");
             let msg = format!("{err:#}");
-            assert!(msg.contains(reason), "{name:?} should report {reason:?}: {msg}");
+            assert!(
+                msg.contains(reason),
+                "{name:?} should report {reason:?}: {msg}"
+            );
             assert!(!dest.exists(), "{name:?} was not allowed to write anything");
         }
     }
@@ -1272,15 +1322,28 @@ mod tests {
 
         // First, the fixture really is what the test thinks it is.
         let mut reader = open_archive(&archive).expect("opening the fixture");
-        let mode = reader.by_name("ffmpeg-7.1-essentials_build/bin/ffprobe.exe").expect("entry").unix_mode();
-        assert!(is_symlink_mode(mode), "fixture mode {mode:?} should read as a symlink");
+        let mode = reader
+            .by_name("ffmpeg-7.1-essentials_build/bin/ffprobe.exe")
+            .expect("entry")
+            .unix_mode();
+        assert!(
+            is_symlink_mode(mode),
+            "fixture mode {mode:?} should read as a symlink"
+        );
 
-        let err = extract_allowlisted(&archive, &dest, &allowlist(&["bin/ffmpeg.exe", "bin/ffprobe.exe"]))
-            .expect_err("a symlink entry must be refused, allowlisted or not");
+        let err = extract_allowlisted(
+            &archive,
+            &dest,
+            &allowlist(&["bin/ffmpeg.exe", "bin/ffprobe.exe"]),
+        )
+        .expect_err("a symlink entry must be refused, allowlisted or not");
         let msg = format!("{err:#}");
         println!("symlink refusal: {msg}");
         assert!(msg.contains("symbolic link"), "{msg}");
-        assert!(msg.contains("ffprobe.exe"), "the error must name the entry: {msg}");
+        assert!(
+            msg.contains("ffprobe.exe"),
+            "the error must name the entry: {msg}"
+        );
         assert!(!dest.exists());
     }
 
@@ -1296,7 +1359,10 @@ mod tests {
         )
         .expect_err("a missing allowlisted path must fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("bin/ffplay.exe"), "must name the missing path: {msg}");
+        assert!(
+            msg.contains("bin/ffplay.exe"),
+            "must name the missing path: {msg}"
+        );
         assert!(!dest.exists(), "a failed extraction writes nothing");
     }
 
@@ -1344,8 +1410,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let archive = windows_like_archive(tmp.path());
         let mut reader = open_archive(&archive).expect("opening the fixture");
-        let scan = scan(&mut reader, tmp.path(), &allowlist(&["bin/ffprobe.exe"]))
-            .expect("scanning");
+        let scan =
+            scan(&mut reader, tmp.path(), &allowlist(&["bin/ffprobe.exe"])).expect("scanning");
         assert_eq!(scan.matches.len(), 1);
         assert_eq!(scan.matches[0].file_name, "ffprobe.exe");
         assert_eq!(
@@ -1451,7 +1517,10 @@ binaries = [\"bin/ffmpeg\"]
         )
         .expect("rewriting");
         assert!(updated.contains("sha256 = \"deadbeef\""));
-        assert!(updated.contains("sha256 = \"aaaa\""), "the other entry is untouched");
+        assert!(
+            updated.contains("sha256 = \"aaaa\""),
+            "the other entry is untouched"
+        );
         assert!(updated.contains("# Recorded on first fetch. Reviewed in the PR."));
         assert!(updated.contains("# LGPL ffmpeg builds only"));
         assert!(!updated.contains("RECORD_ME"));
@@ -1460,7 +1529,11 @@ binaries = [\"bin/ffmpeg\"]
         let after: Vec<_> = updated.lines().collect();
         assert_eq!(before.len(), after.len());
         assert_eq!(
-            before.iter().zip(after.iter()).filter(|(a, b)| a != b).count(),
+            before
+                .iter()
+                .zip(after.iter())
+                .filter(|(a, b)| a != b)
+                .count(),
             1
         );
         // Rewriting is idempotent, and the result still parses.
@@ -1477,18 +1550,18 @@ binaries = [\"bin/ffmpeg\"]
     fn rewrite_refuses_to_report_success_for_a_target_it_did_not_find() {
         let err = rewrite_sha256(SAMPLE, &[("x86_64-unknown-linux-gnu".into(), "x".into())])
             .expect_err("a target that is not in the file must be an error");
-        assert!(format!("{err:#}").contains("x86_64-unknown-linux-gnu"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("x86_64-unknown-linux-gnu"),
+            "{err:#}"
+        );
     }
 
     #[test]
     fn rewrite_keeps_two_hashes_for_the_same_target_distinct() {
         // The `target` line is what scopes a `sha256` line: the second entry must not be
         // rewritten by an update aimed at the first.
-        let updated = rewrite_sha256(
-            SAMPLE,
-            &[("aarch64-apple-darwin".into(), "cafe".into())],
-        )
-        .expect("rewriting");
+        let updated = rewrite_sha256(SAMPLE, &[("aarch64-apple-darwin".into(), "cafe".into())])
+            .expect("rewriting");
         assert!(updated.contains("sha256 = \"cafe\""));
         assert!(updated.contains("sha256 = \"RECORD_ME\""));
         assert!(!updated.contains("sha256 = \"aaaa\""));
@@ -1500,7 +1573,10 @@ binaries = [\"bin/ffmpeg\"]
         assert_eq!(manifest.platform.len(), 2);
         assert_eq!(manifest.platform[0].sha256, UNRECORDED);
         assert_eq!(manifest.platform[0].archive_kind.as_deref(), Some("zip"));
-        assert_eq!(manifest.platform[0].binaries, allowlist(&["bin/ffmpeg.exe"]));
+        assert_eq!(
+            manifest.platform[0].binaries,
+            allowlist(&["bin/ffmpeg.exe"])
+        );
     }
 
     // -----------------------------------------------------------------------------------
@@ -1516,26 +1592,40 @@ binaries = [\"bin/ffmpeg\"]
         let manifest = parse_manifest(SAMPLE).expect("parsing");
         let entries = entries_of(&manifest);
 
-        let picked = select_entry(&entries, Some("aarch64-apple-darwin"), Some("x86_64-apple-darwin"))
-            .expect("explicit --target wins over the host");
+        let picked = select_entry(
+            &entries,
+            Some("aarch64-apple-darwin"),
+            Some("x86_64-apple-darwin"),
+        )
+        .expect("explicit --target wins over the host");
         assert_eq!(picked.target, "aarch64-apple-darwin");
 
-        let by_host = select_entry(&entries, None, Some("x86_64-pc-windows-msvc"))
-            .expect("the host's entry");
+        let by_host =
+            select_entry(&entries, None, Some("x86_64-pc-windows-msvc")).expect("the host's entry");
         assert_eq!(by_host.target, "x86_64-pc-windows-msvc");
 
         let err = select_entry(&entries, Some("x86_64-unknown-linux-gnu"), None)
             .expect_err("a target that is not in the manifest must be an error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("x86_64-pc-windows-msvc"), "must list what exists: {msg}");
-        assert!(msg.contains("aarch64-apple-darwin"), "must list what exists: {msg}");
+        assert!(
+            msg.contains("x86_64-pc-windows-msvc"),
+            "must list what exists: {msg}"
+        );
+        assert!(
+            msg.contains("aarch64-apple-darwin"),
+            "must list what exists: {msg}"
+        );
     }
 
     #[test]
     fn a_host_with_no_entry_says_so_instead_of_fetching_anything() {
         let manifest = parse_manifest(SAMPLE).expect("parsing");
-        let err = select_entry(&entries_of(&manifest), None, Some("x86_64-unknown-linux-gnu"))
-            .expect_err("the host has no entry, which must be an error and not a fetch");
+        let err = select_entry(
+            &entries_of(&manifest),
+            None,
+            Some("x86_64-unknown-linux-gnu"),
+        )
+        .expect_err("the host has no entry, which must be an error and not a fetch");
         let msg = format!("{err:#}");
         assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
         assert!(msg.contains("--target"), "must say how to proceed: {msg}");
@@ -1583,7 +1673,10 @@ binaries = [\"bin/ffmpeg\"]
         let msg = format!("{err:#}");
         assert!(msg.contains("sha256 = \"RECORD_ME\""), "{msg}");
         assert!(msg.contains("sidecars record"), "must name the fix: {msg}");
-        assert!(msg.contains("trusted network"), "must say where to record: {msg}");
+        assert!(
+            msg.contains("trusted network"),
+            "must say where to record: {msg}"
+        );
         assert!(
             msg.contains(&binaries.display().to_string()),
             "must name the sidecar directory: {msg}"
@@ -1594,7 +1687,11 @@ binaries = [\"bin/ffmpeg\"]
     #[test]
     fn fetch_refuses_a_placeholder_url_before_downloading() {
         let tmp = TempDir::new().expect("temp dir");
-        let manifest = manifest_file(tmp.path(), &"a".repeat(64), "https://example.invalid/PLACEHOLDER.zip");
+        let manifest = manifest_file(
+            tmp.path(),
+            &"a".repeat(64),
+            "https://example.invalid/PLACEHOLDER.zip",
+        );
         let err = fetch(
             &manifest,
             &tmp.path().join("binaries"),
@@ -1609,7 +1706,11 @@ binaries = [\"bin/ffmpeg\"]
     #[test]
     fn fetch_refuses_a_plain_http_url() {
         let tmp = TempDir::new().expect("temp dir");
-        let manifest = manifest_file(tmp.path(), &"a".repeat(64), "http://example.invalid/ffmpeg.zip");
+        let manifest = manifest_file(
+            tmp.path(),
+            &"a".repeat(64),
+            "http://example.invalid/ffmpeg.zip",
+        );
         let err = fetch(
             &manifest,
             &tmp.path().join("binaries"),
@@ -1660,7 +1761,11 @@ binaries = [\"bin/ffmpeg\"]
     #[test]
     fn record_refuses_an_entry_with_a_placeholder_url() {
         let tmp = TempDir::new().expect("temp dir");
-        let manifest = manifest_file(tmp.path(), UNRECORDED, "https://example.invalid/PLACEHOLDER.zip");
+        let manifest = manifest_file(
+            tmp.path(),
+            UNRECORDED,
+            "https://example.invalid/PLACEHOLDER.zip",
+        );
         let before = fs::read_to_string(&manifest).expect("reading");
         let err = record(
             &manifest,
@@ -1709,7 +1814,10 @@ binaries = [\"bin/ffmpeg\"]
             Some("aarch64-apple-darwin"),
         )
         .expect_err("an unknown target must be an error");
-        assert!(format!("{err:#}").contains("aarch64-apple-darwin"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("aarch64-apple-darwin"),
+            "{err:#}"
+        );
     }
 
     // -----------------------------------------------------------------------------------
@@ -1746,8 +1854,14 @@ binaries = [\"bin/ffmpeg\"]
         assert_eq!(recorded.len(), 64, "record wrote a sha256: {recorded}");
         assert_ne!(recorded, UNRECORDED);
 
-        fetch(&manifest, &binaries, Some(TARGET), host_target().as_deref(), &work)
-            .expect("fetching the recorded Windows sidecar");
+        fetch(
+            &manifest,
+            &binaries,
+            Some(TARGET),
+            host_target().as_deref(),
+            &work,
+        )
+        .expect("fetching the recorded Windows sidecar");
 
         for name in ["ffmpeg.exe", "ffprobe.exe"] {
             let path = binaries.join(name);
@@ -1766,7 +1880,9 @@ binaries = [\"bin/ffmpeg\"]
         let mut found = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&current) else { continue };
+            let Ok(entries) = fs::read_dir(&current) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {

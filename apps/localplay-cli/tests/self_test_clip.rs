@@ -18,7 +18,7 @@
 //! Nothing here sends, simulates or injects a keyboard or mouse event; the trigger is an
 //! in-process call, and an assertion below pins the log line that says so.
 
-use localplay_cli::{BufferOptions, run_buffer_with};
+use localplay_cli::{run_buffer_with, BufferOptions};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -107,7 +107,10 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         .map(|e| e.path())
         .filter(|p| {
             p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n.starts_with("clip-") && std::path::Path::new(n).extension().is_some_and(|e| e == "mp4")
+                n.starts_with("clip-")
+                    && std::path::Path::new(n)
+                        .extension()
+                        .is_some_and(|e| e == "mp4")
             })
         })
         .collect();
@@ -160,7 +163,10 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         .lines()
         .find(|l| l.contains("wrote ") && l.contains("encoder=libx264"))
         .expect("a `wrote …` line naming the encoder");
-    assert!(wrote.contains("bytes"), "the wrote line carries the size: {wrote}");
+    assert!(
+        wrote.contains("bytes"),
+        "the wrote line carries the size: {wrote}"
+    );
     assert!(
         log.contains(&clip.display().to_string()),
         "the wrote line must name the clip that is on disk; log:\n{log}"

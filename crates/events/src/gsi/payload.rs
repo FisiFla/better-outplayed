@@ -225,7 +225,10 @@ mod tests {
         assert_eq!(gsi.map.team_t.score, 1);
         assert_eq!(gsi.round.phase, "live");
         assert_eq!(gsi.bomb.state, "planted");
-        assert_eq!(gsi.player.first().unwrap().steamid.as_deref(), Some("76561198000000001"));
+        assert_eq!(
+            gsi.player.first().unwrap().steamid.as_deref(),
+            Some("76561198000000001")
+        );
         assert_eq!(gsi.player.first().unwrap().kills(), Some(12));
         assert_eq!(gsi.player.first().unwrap().deaths(), Some(5));
         assert_eq!(gsi.player.first().unwrap().assists(), Some(3));
@@ -247,7 +250,11 @@ mod tests {
         assert_eq!(gsi.map.game_state, "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS");
         assert_eq!(gsi.map.game_time, 1240);
         let player = gsi.player.first().expect("a single player block");
-        assert_eq!(player.kills(), Some(4), "Dota puts the scoreboard on `player`");
+        assert_eq!(
+            player.kills(),
+            Some(4),
+            "Dota puts the scoreboard on `player`"
+        );
         assert_eq!(player.deaths(), Some(2));
         assert_eq!(player.assists(), Some(6));
         assert_eq!(gsi.hero.name, "npc_dota_hero_queenofpain");
@@ -260,7 +267,10 @@ mod tests {
             PlayerBlock::Many(players) => assert_eq!(players.len(), 2),
             other => panic!("expected the observer shape, got {other:?}"),
         }
-        assert_eq!(gsi.player.first().unwrap().steamid.as_deref(), Some("76561198000000009"));
+        assert_eq!(
+            gsi.player.first().unwrap().steamid.as_deref(),
+            Some("76561198000000009")
+        );
     }
 
     #[test]
@@ -296,7 +306,10 @@ mod tests {
         assert_eq!(player.assists(), None);
 
         let cs2 = Player {
-            match_stats: MatchStats { kills: Some(0), ..Default::default() },
+            match_stats: MatchStats {
+                kills: Some(0),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cs2.kills(), Some(0), "a real zero is a value");

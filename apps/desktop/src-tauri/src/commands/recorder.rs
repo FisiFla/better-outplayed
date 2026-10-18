@@ -1,16 +1,16 @@
 //! The shell's side of the recording engine: the recorder slot and its status DTOs.
 
+use super::settings::recorder_options;
+use super::*;
 use crate::config::{EngineOptionsConfig, RecordingConfig};
+#[cfg(test)]
+use localplay_capture::stub::StubConfig;
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::event_driver::{EventDriver, Policy};
 use localplay_recorder::{RecordedClip, Recorder, RecorderConfig, RecorderStatus, Sources};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-#[cfg(test)]
-use localplay_capture::stub::StubConfig;
-use super::*;
-use super::settings::recorder_options;
 
 // ---------------------------------------------------------------------------------------
 // Recording
@@ -160,7 +160,10 @@ impl RecordedClipDto {
 
 impl RecorderHost {
     pub fn new(app_data_dir: PathBuf, bins: Option<FfmpegBinaries>) -> Self {
-        Self { app_data_dir, bins, current: Mutex::new(None),
+        Self {
+            app_data_dir,
+            bins,
+            current: Mutex::new(None),
             events: Mutex::new(None),
             clip_hook: Arc::new(OnceLock::new()),
         }
@@ -194,7 +197,10 @@ impl RecorderHost {
 
     /// The engine's own status, undigested (the health page wants the encoder name).
     pub fn raw_status(&self) -> RecorderStatus {
-        self.handle().ok().flatten().map_or_else(RecorderStatus::stopped, |r| r.status())
+        self.handle()
+            .ok()
+            .flatten()
+            .map_or_else(RecorderStatus::stopped, |r| r.status())
     }
 
     /// The slot, or the error a poisoned slot deserves.
@@ -296,9 +302,13 @@ impl RecorderHost {
         // the configured microphone and watcher. Malformed sections refuse the start, like the capture
         // sections: a typo'd mic flag must not record silently without it.
         let engine = EngineOptionsConfig::load(&self.config_path())?;
-        let recorder = Recorder::start_with_options(cfg, recorder_options(&engine)).map_err(|err| {
-            CommandError::new(ErrorCode::Recording, format!("could not start recording: {err:#}"))
-        })?;
+        let recorder =
+            Recorder::start_with_options(cfg, recorder_options(&engine)).map_err(|err| {
+                CommandError::new(
+                    ErrorCode::Recording,
+                    format!("could not start recording: {err:#}"),
+                )
+            })?;
         let status = RecordingStatusDto::from(recorder.status());
         let recorder = Arc::new(recorder);
         *slot = Some(Arc::clone(&recorder));
@@ -343,7 +353,11 @@ impl RecorderHost {
         &self,
         settings: &RecordingConfig,
     ) -> Result<RecordingStatusDto, CommandError> {
-        let stub = StubConfig { width: 1280, height: 720, fps: settings.encode.fps };
+        let stub = StubConfig {
+            width: 1280,
+            height: 720,
+            fps: settings.encode.fps,
+        };
         self.start_with(settings, Sources::Stub(stub), true, false)
     }
 
@@ -363,7 +377,10 @@ impl RecorderHost {
             return Ok(RecordingStatusDto::from(RecorderStatus::stopped()));
         };
         let outcome = recorder.stop().map_err(|err| {
-            CommandError::new(ErrorCode::Recording, format!("stopping the recorder failed: {err:#}"))
+            CommandError::new(
+                ErrorCode::Recording,
+                format!("stopping the recorder failed: {err:#}"),
+            )
         });
         let status = RecordingStatusDto::from(recorder.status());
         // The status is reported either way (a recorder that failed while stopping still has counters
@@ -383,7 +400,10 @@ impl RecorderHost {
             )
         })?;
         let clip = recorder.clip_now().map_err(|err| {
-            CommandError::new(ErrorCode::Recording, format!("taking a clip failed: {err:#}"))
+            CommandError::new(
+                ErrorCode::Recording,
+                format!("taking a clip failed: {err:#}"),
+            )
         })?;
         let dto = RecordedClipDto::from_clip(&clip);
         Self::announce(&self.clip_hook, &dto);
@@ -394,7 +414,10 @@ impl RecorderHost {
     /// a note recorded where a game event would be.
     pub fn bookmark(&self) -> Result<(), CommandError> {
         let recorder = self.handle()?.ok_or_else(|| {
-            CommandError::new(ErrorCode::Recording, "nothing is recording, so there is no timeline to bookmark")
+            CommandError::new(
+                ErrorCode::Recording,
+                "nothing is recording, so there is no timeline to bookmark",
+            )
         })?;
         recorder
             .note_event(localplay_events::GameEvent::bare(
@@ -403,7 +426,10 @@ impl RecorderHost {
             ))
             .map(|_| ())
             .map_err(|err| {
-                CommandError::new(ErrorCode::Recording, format!("the bookmark was not saved: {err:#}"))
+                CommandError::new(
+                    ErrorCode::Recording,
+                    format!("the bookmark was not saved: {err:#}"),
+                )
             })
     }
 
@@ -413,12 +439,11 @@ impl RecorderHost {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use localplay_media::probe::MediaInfo;
     use super::*;
     use crate::commands::test_support::*;
+    use localplay_media::probe::MediaInfo;
     use std::time::{Duration, Instant};
 
     // -- recording -----------------------------------------------------------------------
@@ -429,8 +454,15 @@ mod tests {
     /// real binaries, but no test here lets a start reach capturing (see
     /// `a_start_the_engine_refuses_fails_before_any_capture_starts`).
     fn host(f: &Fixture, with_ffmpeg: bool) -> RecorderHost {
-        let app_data_dir = f.paths.db_path.parent().expect("the db lives in the app dir");
-        RecorderHost::new(app_data_dir.to_path_buf(), with_ffmpeg.then(|| f.bins.clone()))
+        let app_data_dir = f
+            .paths
+            .db_path
+            .parent()
+            .expect("the db lives in the app dir");
+        RecorderHost::new(
+            app_data_dir.to_path_buf(),
+            with_ffmpeg.then(|| f.bins.clone()),
+        )
     }
 
     #[test]
@@ -439,7 +471,10 @@ mod tests {
         let status = host(&f, true).status().unwrap();
 
         assert_eq!(status, RecordingStatusDto::from(RecorderStatus::stopped()));
-        assert!(!status.running, "a shell that has never recorded reports not running");
+        assert!(
+            !status.running,
+            "a shell that has never recorded reports not running"
+        );
         assert_eq!(status.configured_fps, 0, "and claims no configured rate");
         assert_eq!(status.effective_fps, 0, "nor a rate in use");
         assert_eq!(status.error, None);
@@ -450,10 +485,16 @@ mod tests {
         let f = Fixture::new();
         let host = host(&f, false);
 
-        let err = host.start(&RecordingConfig::example().unwrap()).unwrap_err();
+        let err = host
+            .start(&RecordingConfig::example().unwrap())
+            .unwrap_err();
 
         assert_eq!(err.code, ErrorCode::FfmpegUnavailable);
-        assert!(err.message.contains("ffmpeg was not found"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ffmpeg was not found"),
+            "got: {}",
+            err.message
+        );
         assert!(!host.status().unwrap().running, "and nothing was started");
     }
 
@@ -477,7 +518,10 @@ mod tests {
             "the message must name the setting, through the command error: {}",
             err.message
         );
-        assert!(!host.status().unwrap().running, "a failed start leaves nothing running");
+        assert!(
+            !host.status().unwrap().running,
+            "a failed start leaves nothing running"
+        );
     }
 
     /// **The integration test for the feature the background half exists for.**
@@ -540,8 +584,14 @@ mod tests {
         let outcome = crate::background::on_hotkey_press(|| host.clip_now());
 
         let status = host.status().unwrap();
-        assert!(outcome.saved_a_clip(), "the press saved no clip: {outcome:?}");
-        assert_eq!(status.clips, 1, "the engine counted exactly one clip, not two");
+        assert!(
+            outcome.saved_a_clip(),
+            "the press saved no clip: {outcome:?}"
+        );
+        assert_eq!(
+            status.clips, 1,
+            "the engine counted exactly one clip, not two"
+        );
 
         // One file on disk, named as the trigger path names them.
         let clips: Vec<PathBuf> = std::fs::read_dir(&f.paths.clips_dir)
@@ -554,7 +604,11 @@ mod tests {
                     .is_some_and(|name| name.starts_with("clip-") && name.ends_with(".mp4"))
             })
             .collect();
-        assert_eq!(clips.len(), 1, "expected exactly one clip file, got {clips:?}");
+        assert_eq!(
+            clips.len(),
+            1,
+            "expected exactly one clip file, got {clips:?}"
+        );
 
         // And it is real media of the configured window, produced by the real splice.
         //
@@ -575,14 +629,19 @@ mod tests {
         let expected_ms = (PRE_SECONDS + POST_SECONDS) * 1_000;
         let segment_ms = settings.buffer.segment_time * 1_000;
         let video = info.video.as_ref().expect("a video stream");
-        let video_ms = video.duration_ms.expect("ffprobe reports the video stream's duration");
+        let video_ms = video
+            .duration_ms
+            .expect("ffprobe reports the video stream's duration");
         assert!(
             video_ms >= expected_ms * 3 / 4 && video_ms <= expected_ms + 2 * segment_ms,
             "the clip's video is {video_ms}ms, which is not the configured window \
              ({expected_ms}ms ± the segment grid): a clip that carries only one side of the \
              window, or is empty, is the failure this rules out"
         );
-        assert_eq!(video.codec, "h264", "the software encoder is libx264 in a test build");
+        assert_eq!(
+            video.codec, "h264",
+            "the software encoder is libx264 in a test build"
+        );
 
         // One row in the index: the row `clip_now` wrote, in the store this shell reads.
         let rows = f.store.list_clips().unwrap();
@@ -602,7 +661,10 @@ mod tests {
         let first = host.stop().unwrap();
         let second = host.stop().unwrap();
 
-        assert_eq!(first, second, "a stop with nothing running is a value, not a failure");
+        assert_eq!(
+            first, second,
+            "a stop with nothing running is a value, not a failure"
+        );
         assert!(!first.running);
         assert_eq!(first.error, None);
     }
@@ -626,8 +688,14 @@ mod tests {
     fn the_recording_dto_json_matches_the_typescript_interface() {
         // `src/lib/types.ts` mirrors these two structs by hand, like the clip and storage DTOs: without
         // this, a rename on either side is found by a user watching a status readout that never moves.
-        let status = serde_json::to_value(RecordingStatusDto::from(RecorderStatus::stopped())).unwrap();
-        let mut keys: Vec<&str> = status.as_object().unwrap().keys().map(String::as_str).collect();
+        let status =
+            serde_json::to_value(RecordingStatusDto::from(RecorderStatus::stopped())).unwrap();
+        let mut keys: Vec<&str> = status
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
@@ -662,11 +730,23 @@ mod tests {
             started_at_ms: 4_000,
         })
         .unwrap();
-        let mut keys: Vec<&str> = clip.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = clip
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
-            ["codec", "duration_ms", "id", "path", "size_bytes", "started_at_ms"]
+            [
+                "codec",
+                "duration_ms",
+                "id",
+                "path",
+                "size_bytes",
+                "started_at_ms"
+            ]
         );
         assert_eq!(clip["id"], 3, "an indexed clip carries its row id");
     }

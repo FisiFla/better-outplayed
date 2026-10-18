@@ -86,7 +86,11 @@ pub fn game_audio_backend(
                 AudioFormat::default()
             );
         }
-        Ok(Box::new(crate::wasapi::WasapiLoopback::with_source(source, Some(find_game), output_device)?))
+        Ok(Box::new(crate::wasapi::WasapiLoopback::with_source(
+            source,
+            Some(find_game),
+            output_device,
+        )?))
     }
     #[cfg(not(windows))]
     {

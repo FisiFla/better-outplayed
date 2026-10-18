@@ -50,15 +50,24 @@ pub struct CommandError {
 
 impl CommandError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn clip_not_found(id: i64) -> Self {
-        Self::new(ErrorCode::ClipNotFound, format!("no clip with id {id} is in the index"))
+        Self::new(
+            ErrorCode::ClipNotFound,
+            format!("no clip with id {id} is in the index"),
+        )
     }
 
     pub fn session_not_found(id: i64) -> Self {
-        Self::new(ErrorCode::SessionNotFound, format!("no session with id {id} is in the index"))
+        Self::new(
+            ErrorCode::SessionNotFound,
+            format!("no session with id {id} is in the index"),
+        )
     }
 
     /// `{:#}` on the wrapped error keeps the `context` chain, which is where the useful
@@ -72,7 +81,10 @@ impl CommandError {
     }
 
     pub(crate) fn io(action: &str, path: &Path, err: std::io::Error) -> Self {
-        Self::new(ErrorCode::Io, format!("{action} failed for {}: {err}", path.display()))
+        Self::new(
+            ErrorCode::Io,
+            format!("{action} failed for {}: {err}", path.display()),
+        )
     }
 }
 
@@ -83,7 +95,6 @@ impl std::fmt::Display for CommandError {
 }
 
 impl std::error::Error for CommandError {}
-
 
 #[cfg(test)]
 mod tests {

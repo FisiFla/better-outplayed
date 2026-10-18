@@ -1,6 +1,6 @@
 //! Choosing a hardware encoder, and failing loudly when there isn't one.
 
-use crate::{VideoCodec, Vendor};
+use crate::{Vendor, VideoCodec};
 use anyhow::{bail, Context, Result};
 use localplay_media::{smoke_test_encoder, FfmpegBinaries};
 use std::sync::{Mutex, OnceLock};
@@ -200,8 +200,14 @@ mod tests {
         .expect_err("amf was requested and amf cannot encode");
 
         let msg = err.to_string();
-        assert!(msg.contains("h264_amf"), "the failure names the encoder: {msg}");
-        assert!(msg.contains("DLL amfrt64.dll failed to open"), "and ffmpeg's reason: {msg}");
+        assert!(
+            msg.contains("h264_amf"),
+            "the failure names the encoder: {msg}"
+        );
+        assert!(
+            msg.contains("DLL amfrt64.dll failed to open"),
+            "and ffmpeg's reason: {msg}"
+        );
         assert!(
             !msg.contains("h264_nvenc") && !msg.contains("h264_qsv"),
             "no other vendor was even considered: {msg}"
@@ -225,7 +231,10 @@ mod tests {
         for name in ["h264_nvenc", "h264_qsv", "h264_amf"] {
             assert!(msg.contains(name), "{name} must be named: {msg}");
         }
-        assert!(msg.contains("not advertised"), "the absent ones say why: {msg}");
+        assert!(
+            msg.contains("not advertised"),
+            "the absent ones say why: {msg}"
+        );
         assert!(
             msg.contains("h264_amf: advertised, but it could not encode a single frame"),
             "the advertised one reports its own failure: {msg}"
@@ -235,8 +244,7 @@ mod tests {
             "and carries ffmpeg's concrete reason: {msg}"
         );
         assert!(
-            msg.contains("will not fall back to CPU encoding")
-                && msg.contains("game performance"),
+            msg.contains("will not fall back to CPU encoding") && msg.contains("game performance"),
             "the no-CPU-fallback guarantee and its reason must survive: {msg}"
         );
     }
@@ -274,10 +282,16 @@ mod tests {
         )
         .expect_err("being listed is not enough; it has to encode a frame");
 
-        assert!(err.to_string().contains("could not encode a single frame"), "got: {err}");
+        assert!(
+            err.to_string().contains("could not encode a single frame"),
+            "got: {err}"
+        );
     }
 
     fn advertised_all_h264() -> Vec<String> {
-        ["h264_nvenc", "h264_qsv", "h264_amf"].iter().map(|s| s.to_string()).collect()
+        ["h264_nvenc", "h264_qsv", "h264_amf"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }

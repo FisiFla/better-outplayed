@@ -40,6 +40,7 @@ use crate::{clock_base, CaptureBackend, Frame, PixelFormat};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
+use windows::core::BOOL;
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess,
@@ -50,32 +51,29 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DisplayId;
 use windows::Graphics::SizeInt32;
 use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
-use windows::core::BOOL;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE,
-    D3D11_USAGE_DEFAULT,
-    ID3D11Multithread,};
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource,
+    ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, HDC, HMONITOR, MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    EnumDisplayMonitors, MonitorFromWindow, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::CoUninitialize;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+};
 
 /// Buffers in the frame pool. A consumer that copies each frame out before asking for the next needs only a couple.
 const BUFFER_COUNT: i32 = 2;
@@ -176,7 +174,10 @@ fn create_handover_texture(
         MipLevels: 1,
         ArraySize: 1,
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
@@ -425,12 +426,10 @@ impl Session {
         if let Err(e) = capture.SetIsBorderRequired(false) {
             tracing::debug!("the capture border could not be disabled: {e}");
         }
-        capture.StartCapture().context("GraphicsCaptureSession::StartCapture")?;
-        tracing::info!(
-            width = size.0,
-            height = size.1,
-            "WGC capture started"
-        );
+        capture
+            .StartCapture()
+            .context("GraphicsCaptureSession::StartCapture")?;
+        tracing::info!(width = size.0, height = size.1, "WGC capture started");
 
         Ok(Self {
             device,
@@ -500,7 +499,8 @@ impl Session {
 
     /// Stage-copy the frame's D3D11 texture into CPU-visible memory as BGRA8.
     fn copy_out(&mut self, frame: &Direct3D11CaptureFrame, pts: Duration) -> Result<Frame> {
-        let surface: IDirect3DSurface = frame.Surface().context("Direct3D11CaptureFrame::Surface")?;
+        let surface: IDirect3DSurface =
+            frame.Surface().context("Direct3D11CaptureFrame::Surface")?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
         // SAFETY: `access` is the frame's own surface; `GetInterface` is the documented way to reach the
         // underlying D3D11 texture from it.
@@ -579,7 +579,14 @@ impl Session {
             self.context.Unmap(dst, 0);
         }
 
-        Ok(Frame { data, pts, width, height, format: PixelFormat::Bgra8, texture: None })
+        Ok(Frame {
+            data,
+            pts,
+            width,
+            height,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        })
     }
 
     /// Ask this session to hand out textures rather than pixels.
@@ -637,7 +644,10 @@ impl Session {
                 ArraySize: 1,
                 Format: format,
                 // WGC textures are never multisampled, and a staging copy must match the source's sample description.
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -719,7 +729,9 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
 
 /// Wrap the D3D11 device for WinRT, which is what the frame pool takes.
 fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
-    let dxgi_device: IDXGIDevice = device.cast().context("casting ID3D11Device to IDXGIDevice")?;
+    let dxgi_device: IDXGIDevice = device
+        .cast()
+        .context("casting ID3D11Device to IDXGIDevice")?;
     // SAFETY: `dxgi_device` is live, and the returned IInspectable is the WinRT projection of that same device.
     let inspectable = unsafe {
         CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
@@ -761,7 +773,10 @@ fn create_capture_item(target: &CaptureTarget) -> Result<GraphicsCaptureItem> {
     let monitor = if target.monitor == 0 {
         primary
     } else {
-        pick_monitor(&ordered_monitors(primary, &enumerate_monitors()), target.monitor)?
+        pick_monitor(
+            &ordered_monitors(primary, &enumerate_monitors()),
+            target.monitor,
+        )?
     };
 
     match create_item_via_interop(monitor) {
@@ -828,7 +843,10 @@ fn visible_windows() -> Vec<(HWND, String)> {
     let mut windows: Vec<(HWND, String)> = Vec::new();
     // SAFETY: the callback only pushes into `windows`, which outlives the synchronous call.
     unsafe {
-        let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut Vec<(HWND, String)> as isize));
+        let _ = EnumWindows(
+            Some(collect),
+            LPARAM(&mut windows as *mut Vec<(HWND, String)> as isize),
+        );
     }
     windows
 }
@@ -840,7 +858,9 @@ fn create_item_for_window(hwnd: HWND) -> Result<GraphicsCaptureItem> {
             .context("activating IGraphicsCaptureItemInterop for GraphicsCaptureItem")?;
     // SAFETY: `hwnd` came from EnumWindows moments ago; a stale handle is an error return.
     unsafe {
-        interop.CreateForWindow(hwnd).context("IGraphicsCaptureItemInterop::CreateForWindow")
+        interop
+            .CreateForWindow(hwnd)
+            .context("IGraphicsCaptureItemInterop::CreateForWindow")
     }
 }
 
@@ -882,7 +902,11 @@ fn create_item_via_display_id(monitor: HMONITOR) -> Result<GraphicsCaptureItem> 
 /// rawvideo pipe differently from the frames arriving on it.
 fn pixel_size(size: SizeInt32) -> Result<(u32, u32)> {
     if size.Width < 1 || size.Height < 1 {
-        bail!("the capture item reported a {}x{} physical size", size.Width, size.Height);
+        bail!(
+            "the capture item reported a {}x{} physical size",
+            size.Width,
+            size.Height
+        );
     }
     Ok((size.Width as u32, size.Height as u32))
 }

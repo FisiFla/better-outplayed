@@ -10,12 +10,21 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Every hardware-encoder id the app knows about, in the order `vendor = "auto"` tries them.
-pub const CANDIDATES: [&str; 6] =
-    ["h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"];
+pub const CANDIDATES: [&str; 6] = [
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "h264_amf",
+    "hevc_amf",
+];
 
 /// The vendors a config may name, paired with their H.264 encoder id.
-pub const VENDORS: [(&str, &str); 3] =
-    [("nvenc", "h264_nvenc"), ("qsv", "h264_qsv"), ("amf", "h264_amf")];
+pub const VENDORS: [(&str, &str); 3] = [
+    ("nvenc", "h264_nvenc"),
+    ("qsv", "h264_qsv"),
+    ("amf", "h264_amf"),
+];
 
 /// What the probe found about one encoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,14 +69,20 @@ impl ProbeReport {
     /// works here, a legitimate state: the check is then reported as not performed, not faked.
     pub fn unusable_h264_vendor(&self) -> Option<(&'static str, &'static str)> {
         let unusable = VENDORS.iter().filter(|(_, encoder)| !self.works(encoder));
-        let advertised_fails = unusable
-            .clone()
-            .find(|(_, encoder)| self.state_of(encoder).is_some_and(|s| matches!(s, State::Fails(_))));
-        advertised_fails.or_else(|| unusable.into_iter().next()).copied()
+        let advertised_fails = unusable.clone().find(|(_, encoder)| {
+            self.state_of(encoder)
+                .is_some_and(|s| matches!(s, State::Fails(_)))
+        });
+        advertised_fails
+            .or_else(|| unusable.into_iter().next())
+            .copied()
     }
 
     fn state_of(&self, encoder: &str) -> Option<&State> {
-        self.rows.iter().find(|(name, _)| name == encoder).map(|(_, state)| state)
+        self.rows
+            .iter()
+            .find(|(name, _)| name == encoder)
+            .map(|(_, state)| state)
     }
 
     /// The text `xtask probe` prints (and the report embeds verbatim).
@@ -117,5 +132,8 @@ pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
         };
         rows.push((name.to_string(), state));
     }
-    Ok(ProbeReport { ffmpeg: bin.ffmpeg.clone(), rows })
+    Ok(ProbeReport {
+        ffmpeg: bin.ffmpeg.clone(),
+        rows,
+    })
 }

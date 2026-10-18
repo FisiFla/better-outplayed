@@ -83,7 +83,9 @@ pub fn read_request(stream: &mut impl Read, path: &str) -> Result<Request, Rejec
     if length > MAX_BODY_BYTES as u64 {
         return Err(Reject::TooLarge);
     }
-    let body = framed.body(&head, MAX_BODY_BYTES).map_err(|_| Reject::TooLarge)?;
+    let body = framed
+        .body(&head, MAX_BODY_BYTES)
+        .map_err(|_| Reject::TooLarge)?;
     Ok(Request { body })
 }
 
@@ -115,7 +117,10 @@ mod tests {
     #[test]
     fn a_query_string_does_not_hide_the_path() {
         let raw = b"POST /gsi?token=x HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
-        assert!(read(raw).is_ok(), "the query is ignored, not part of the route");
+        assert!(
+            read(raw).is_ok(),
+            "the query is ignored, not part of the route"
+        );
     }
 
     #[test]
@@ -125,7 +130,13 @@ mod tests {
             let raw = format!("{method} /gsi HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{}}");
             let result = read(raw.as_bytes());
             if method == "post" {
-                assert_eq!(result, Ok(Request { body: b"{}".to_vec() }), "the method is case-insensitive");
+                assert_eq!(
+                    result,
+                    Ok(Request {
+                        body: b"{}".to_vec()
+                    }),
+                    "the method is case-insensitive"
+                );
             } else {
                 assert_eq!(result, Err(Reject::MethodNotAllowed), "{method}");
             }
@@ -148,7 +159,8 @@ mod tests {
 
     #[test]
     fn a_chunked_body_is_refused_rather_than_guessed_at() {
-        let raw = b"POST /gsi HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
+        let raw =
+            b"POST /gsi HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
         assert_eq!(read(raw), Err(Reject::LengthRequired), "GSI sends a length");
     }
 
@@ -171,7 +183,11 @@ mod tests {
     fn a_request_that_is_not_http_is_400() {
         assert_eq!(read(b"garbage\r\n\r\n"), Err(Reject::Malformed));
         assert_eq!(read(b""), Err(Reject::Malformed));
-        assert_eq!(read(b"POST /gsi\r\n\r\n"), Err(Reject::Malformed), "no HTTP version");
+        assert_eq!(
+            read(b"POST /gsi\r\n\r\n"),
+            Err(Reject::Malformed),
+            "no HTTP version"
+        );
     }
 
     #[test]

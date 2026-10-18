@@ -34,14 +34,22 @@ impl FpsDecision {
     ///
     /// With `adapt` off the configured rate wins. With it on, a lower measurement reduces the rate,
     /// rounded down (never declare more than was measured), with a floor of 1.
-    pub fn decide(configured: u32, adapt: bool, measurement: Option<ThroughputMeasurement>) -> Self {
+    pub fn decide(
+        configured: u32,
+        adapt: bool,
+        measurement: Option<ThroughputMeasurement>,
+    ) -> Self {
         // Zero would break `-framerate` and `1 / fps`; the config reader refuses it, and the clamp keeps this total for direct callers.
         let configured = configured.max(1);
         let effective = match (adapt, measurement) {
             (true, Some(m)) if m.fps < f64::from(configured) => (m.fps.floor() as u32).max(1),
             _ => configured,
         };
-        Self { configured, measurement, effective }
+        Self {
+            configured,
+            measurement,
+            effective,
+        }
     }
 
     /// The rate both consumers are given: the pacer's interval and the encoder child's `-framerate`.
@@ -93,7 +101,11 @@ mod tests {
                 "measured {measured_fps}fps must not raise or lower a configured 30: {d:?}"
             );
             assert!(!d.reduced());
-            assert_eq!(d.configured(), 30, "the configured rate is still what is reported");
+            assert_eq!(
+                d.configured(),
+                30,
+                "the configured rate is still what is reported"
+            );
         }
     }
 
@@ -109,11 +121,21 @@ mod tests {
     #[test]
     fn a_measurement_below_the_configured_rate_reduces_the_rate_and_rounds_down() {
         let d = FpsDecision::decide(30, true, measured(24.3, (3840, 2160)));
-        assert_eq!(d.effective(), 24, "24.3 frames per second is a 24fps pipeline, not a 25");
+        assert_eq!(
+            d.effective(),
+            24,
+            "24.3 frames per second is a 24fps pipeline, not a 25"
+        );
         assert!(d.reduced());
         assert_eq!(d.configured(), 30);
-        let m = d.measurement().expect("the measurement is kept for the log line");
-        assert_eq!(m.source_size, (3840, 2160), "and it says what resolution it was taken at");
+        let m = d
+            .measurement()
+            .expect("the measurement is kept for the log line");
+        assert_eq!(
+            m.source_size,
+            (3840, 2160),
+            "and it says what resolution it was taken at"
+        );
 
         // Below 1fps is a broken pipeline, not a rate of zero.
         let d = FpsDecision::decide(30, true, measured(0.4, (3840, 2160)));
@@ -124,8 +146,15 @@ mod tests {
     #[test]
     fn with_adaptation_off_the_configured_rate_is_declared_whatever_was_measured() {
         let d = FpsDecision::decide(30, false, measured(12.0, (3840, 2160)));
-        assert_eq!(d.effective(), 30, "no measurement may reduce the rate when adapting is off");
-        assert!(!d.reduced(), "and nothing was reduced, so startup says nothing about a shortfall");
+        assert_eq!(
+            d.effective(),
+            30,
+            "no measurement may reduce the rate when adapting is off"
+        );
+        assert!(
+            !d.reduced(),
+            "and nothing was reduced, so startup says nothing about a shortfall"
+        );
         let d = FpsDecision::decide(30, false, None);
         assert_eq!(d.effective(), 30);
         assert!(d.measurement().is_none(), "no probe ran");

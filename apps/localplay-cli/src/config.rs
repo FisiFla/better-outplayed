@@ -76,8 +76,8 @@ impl Config {
     }
 
     pub fn load(path: &PathBuf) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Self::from_toml(&text)
     }
 
@@ -150,7 +150,10 @@ mod tests {
         assert!(format!("{err:#}").contains("schema version 2"), "{err:#}");
 
         let legacy = example.replace("schema_version = 1\n", "");
-        assert!(Config::from_toml(&legacy).is_ok(), "files from before the field are version 1");
+        assert!(
+            Config::from_toml(&legacy).is_ok(),
+            "files from before the field are version 1"
+        );
     }
 
     #[test]
@@ -160,16 +163,31 @@ mod tests {
         assert_eq!(cfg.buffer.pre_seconds, 30);
         assert_eq!(cfg.buffer.post_seconds, 5);
         assert!(cfg.audio.enabled);
-        assert_eq!(cfg.audio.source, "loopback", "the example names the implemented source");
+        assert_eq!(
+            cfg.audio.source, "loopback",
+            "the example names the implemented source"
+        );
         assert_eq!(cfg.audio.codec, "aac", "and the implemented codec");
-        assert_eq!(cfg.audio.bitrate_kbps, 192, "and the shipped default bitrate");
+        assert_eq!(
+            cfg.audio.bitrate_kbps, 192,
+            "and the shipped default bitrate"
+        );
         assert_eq!(cfg.hotkeys.clip, "Ctrl+F8");
         // The sections a fresh install runs with: the replay buffer, no microphone, and nothing
         // watched, which is the safety posture.
-        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::ReplayBuffer);
-        assert!(!cfg.mic.enabled, "the example must not turn the microphone on");
+        assert_eq!(
+            cfg.recorder.mode,
+            localplay_recorder::RecordingMode::ReplayBuffer
+        );
+        assert!(
+            !cfg.mic.enabled,
+            "the example must not turn the microphone on"
+        );
         assert!(!cfg.games.auto_record, "the example must not auto-record");
-        assert!(cfg.storage.sessions.max_total_bytes > 0, "the session rules have defaults");
+        assert!(
+            cfg.storage.sessions.max_total_bytes > 0,
+            "the session rules have defaults"
+        );
     }
 
     /// A `config.toml` without the optional newer sections parses and means buffer mode, no
@@ -212,10 +230,20 @@ lol_poll_enabled = true
 gsi_port = 45671
 ";
         let cfg = Config::from_toml(text).expect("a pre-Phase-5 file must keep parsing");
-        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::ReplayBuffer);
+        assert_eq!(
+            cfg.recorder.mode,
+            localplay_recorder::RecordingMode::ReplayBuffer
+        );
         assert!(!cfg.mic.enabled, "no [mic] means no microphone");
-        assert!(!cfg.games.auto_record, "no [games] means nothing is watched");
-        assert_eq!(cfg.games.watch, localplay_events::process::default_watch(), "with the default watch list, unused while auto_record is off");
+        assert!(
+            !cfg.games.auto_record,
+            "no [games] means nothing is watched"
+        );
+        assert_eq!(
+            cfg.games.watch,
+            localplay_events::process::default_watch(),
+            "with the default watch list, unused while auto_record is off"
+        );
         assert_eq!(
             cfg.storage.sessions,
             localplay_recorder::config::SessionStorageRules::default(),
@@ -230,7 +258,10 @@ gsi_port = 45671
         let text = include_str!("../../../config.example.toml")
             .replace("mode = \"buffer\"", "mode = \"session\"");
         let cfg = Config::from_toml(&text).expect("the session mode parses");
-        assert_eq!(cfg.recorder.mode, localplay_recorder::RecordingMode::FullSession);
+        assert_eq!(
+            cfg.recorder.mode,
+            localplay_recorder::RecordingMode::FullSession
+        );
     }
 
     /// The microphone is opt-in, and `[mic] enabled = true` is the whole opt-in.
@@ -238,7 +269,10 @@ gsi_port = 45671
     fn the_microphone_is_opt_in_through_the_file() {
         let text = include_str!("../../../config.example.toml")
             .replace("[mic]\nenabled = false", "[mic]\nenabled = true");
-        assert!(text.contains("[mic]\nenabled = true"), "the substitution must apply");
+        assert!(
+            text.contains("[mic]\nenabled = true"),
+            "the substitution must apply"
+        );
         let cfg = Config::from_toml(&text).expect("mic.enabled = true parses");
         assert!(cfg.mic.enabled);
     }
@@ -261,7 +295,10 @@ gsi_port = 45671
     fn rejects_an_audio_codec_that_is_not_aac() {
         let text = include_str!("../../../config.example.toml")
             .replace("codec = \"aac\"", "codec = \"opus\"");
-        assert!(text.contains("codec = \"opus\""), "the substitution must apply");
+        assert!(
+            text.contains("codec = \"opus\""),
+            "the substitution must apply"
+        );
         let err = Config::from_toml(&text).unwrap_err();
         assert!(
             err.to_string().contains("audio.codec") && err.to_string().contains("aac"),
@@ -273,7 +310,10 @@ gsi_port = 45671
     fn rejects_an_audio_source_that_is_not_loopback() {
         let text = include_str!("../../../config.example.toml")
             .replace("source = \"loopback\"", "source = \"microphone\"");
-        assert!(text.contains("source = \"microphone\""), "the substitution must apply");
+        assert!(
+            text.contains("source = \"microphone\""),
+            "the substitution must apply"
+        );
         let err = Config::from_toml(&text).unwrap_err();
         assert!(
             err.to_string().contains("audio.source") && err.to_string().contains("loopback"),
@@ -314,7 +354,10 @@ gsi_port = 45671
     fn the_example_enables_adaptation_and_the_key_can_turn_it_off() {
         let example = Config::from_toml(include_str!("../../../config.example.toml"))
             .expect("the example is valid");
-        assert!(example.encode.adapt_fps, "config.example.toml must enable adaptation");
+        assert!(
+            example.encode.adapt_fps,
+            "config.example.toml must enable adaptation"
+        );
 
         let text = include_str!("../../../config.example.toml")
             .replace("adapt_fps = true", "adapt_fps = false");
@@ -330,12 +373,17 @@ gsi_port = 45671
             .join("\n");
         assert!(
             text.contains("fps = 60")
-                && !text.lines().any(|l| l.trim_start().starts_with("adapt_fps =")),
+                && !text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("adapt_fps =")),
             "the setting must be gone from the text being parsed (a comment mentioning the \
              key is fine — the point is that no value is set)"
         );
         let default = Config::from_toml(&text).expect("the key is optional");
-        assert!(default.encode.adapt_fps, "the default is measured behaviour, not silence");
+        assert!(
+            default.encode.adapt_fps,
+            "the default is measured behaviour, not silence"
+        );
     }
 
     #[test]
@@ -349,6 +397,9 @@ gsi_port = 45671
         assert_eq!(buffer.segment_time, 1);
         assert_eq!(encode.codec, "h264");
         assert_eq!(storage.max_age_days, 7);
-        assert!(storage.sessions.max_age_days > 0, "the sessions rules are part of the same section");
+        assert!(
+            storage.sessions.max_age_days > 0,
+            "the sessions rules are part of the same section"
+        );
     }
 }

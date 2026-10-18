@@ -61,8 +61,10 @@ impl Head {
 
     /// Whether the body is chunked. Any other `Transfer-Encoding` value is not chunked.
     pub fn chunked(&self) -> bool {
-        self.header("transfer-encoding")
-            .is_some_and(|v| v.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked")))
+        self.header("transfer-encoding").is_some_and(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
     }
 
     /// The status code, on a response.
@@ -101,7 +103,11 @@ pub struct Framed<R> {
 
 impl<R: Read> Framed<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner, buf: Vec::new(), pos: 0 }
+        Self {
+            inner,
+            buf: Vec::new(),
+            pos: 0,
+        }
     }
 
     /// Read one message head. Fails, never panics and never allocates past [`MAX_HEAD_BYTES`], if
@@ -223,7 +229,8 @@ impl<R: Read> Framed<R> {
             let size_field = std::str::from_utf8(size_field)
                 .context("a chunk size that is not ASCII")?
                 .trim();
-            let size = u64::from_str_radix(size_field, 16).context("a chunk size that is not hex")?;
+            let size =
+                u64::from_str_radix(size_field, 16).context("a chunk size that is not hex")?;
             if size == 0 {
                 // Trailers: header lines until a blank one. They are unused but must come off the wire.
                 loop {
@@ -232,9 +239,10 @@ impl<R: Read> Framed<R> {
                     }
                 }
             }
-            let size = usize::try_from(size).ok().filter(|s| out.len() + *s <= max).with_context(
-                || format!("a chunked body over this caller's {max}-byte limit"),
-            )?;
+            let size = usize::try_from(size)
+                .ok()
+                .filter(|s| out.len() + *s <= max)
+                .with_context(|| format!("a chunked body over this caller's {max}-byte limit"))?;
             let chunk = self.exactly(size)?;
             out.extend_from_slice(&chunk);
             // The chunk's own CRLF.
@@ -299,8 +307,9 @@ fn parse_head(bytes: &[u8]) -> Result<Head> {
         if line.is_empty() {
             continue;
         }
-        let (name, value) =
-            line.split_once(':').context("a header line with no colon in it")?;
+        let (name, value) = line
+            .split_once(':')
+            .context("a header line with no colon in it")?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     Ok(Head { start, headers })
@@ -311,7 +320,9 @@ fn parse_start_line(line: &str) -> Result<StartLine> {
     let first = parts.next().unwrap_or_default();
     if first.starts_with("HTTP/") {
         let code = parts.next().context("a status line with no status code")?;
-        let code: u16 = code.parse().context("a status line whose code is not a number")?;
+        let code: u16 = code
+            .parse()
+            .context("a status line whose code is not a number")?;
         if !(100..=599).contains(&code) {
             bail!("a status code outside 100..=599");
         }
@@ -321,17 +332,24 @@ fn parse_start_line(line: &str) -> Result<StartLine> {
         bail!("an empty start line");
     }
     let target = parts.next().context("a request line with no target")?;
-    let version = parts.next().context("a request line with no HTTP version")?;
+    let version = parts
+        .next()
+        .context("a request line with no HTTP version")?;
     if !version.starts_with("HTTP/") {
         bail!("a request line that does not name HTTP");
     }
-    Ok(StartLine::Request { method: first.to_ascii_uppercase(), target: target.to_string() })
+    Ok(StartLine::Request {
+        method: first.to_ascii_uppercase(),
+        target: target.to_string(),
+    })
 }
 
 /// Write a response with no body, which is all either integration answers with. `status` is
 /// written as given, with no reason phrase (permitted by HTTP/1.1).
 pub fn write_response(out: &mut impl std::io::Write, status: u16) -> std::io::Result<()> {
-    out.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())?;
+    out.write_all(
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
     out.flush()
 }
 
@@ -368,7 +386,11 @@ mod tests {
         let (head, body) = read_all(raw).expect("a well-formed response");
         assert_eq!(head.status(), Some(200));
         assert_eq!(head.content_length(), Some(13));
-        assert_eq!(head.header("CONTENT-TYPE"), Some("application/json"), "lookup ignores case");
+        assert_eq!(
+            head.header("CONTENT-TYPE"),
+            Some("application/json"),
+            "lookup ignores case"
+        );
         assert_eq!(body, b"{\"a\":\"hello\"}");
     }
 
@@ -422,9 +444,14 @@ mod tests {
     fn a_head_that_never_ends_is_an_error_and_not_an_allocation() {
         let mut raw = b"HTTP/1.1 200 OK\r\n".to_vec();
         raw.extend(vec![b'X'; 200_000]);
-        let err = Framed::new(Cursor::new(raw)).head().expect_err("no terminator");
+        let err = Framed::new(Cursor::new(raw))
+            .head()
+            .expect_err("no terminator");
         let message = format!("{err:#}");
-        assert!(message.contains("exceeds"), "the cap must be what stops it: {message}");
+        assert!(
+            message.contains("exceeds"),
+            "the cap must be what stops it: {message}"
+        );
     }
 
     #[test]
@@ -432,7 +459,9 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 900000\r\n\r\n";
         let mut framed = Framed::new(Cursor::new(raw.to_vec()));
         let head = framed.head().unwrap();
-        let err = framed.body(&head, 1024).expect_err("30 bytes is over a 1024-byte limit");
+        let err = framed
+            .body(&head, 1024)
+            .expect_err("30 bytes is over a 1024-byte limit");
         assert!(format!("{err:#}").contains("limit"), "got: {err:#}");
     }
 
@@ -445,25 +474,41 @@ mod tests {
 
     #[test]
     fn a_connection_that_sends_nothing_is_an_error() {
-        let err = Framed::new(Cursor::new(Vec::new())).head().expect_err("nothing to read");
-        assert!(format!("{err:#}").contains("without sending"), "got: {err:#}");
+        let err = Framed::new(Cursor::new(Vec::new()))
+            .head()
+            .expect_err("nothing to read");
+        assert!(
+            format!("{err:#}").contains("without sending"),
+            "got: {err:#}"
+        );
 
         let err = Framed::new(Cursor::new(b"HTTP/1.1 200 OK\r\n".to_vec()))
             .head()
             .expect_err("a half head");
-        assert!(format!("{err:#}").contains("before the end"), "got: {err:#}");
+        assert!(
+            format!("{err:#}").contains("before the end"),
+            "got: {err:#}"
+        );
     }
 
     #[test]
     fn a_start_line_that_is_not_http_is_an_error() {
-        assert!(Framed::new(Cursor::new(b"garbage\r\n\r\n".to_vec())).head().is_err());
-        assert!(Framed::new(Cursor::new(b"\r\n\r\n".to_vec())).head().is_err());
+        assert!(Framed::new(Cursor::new(b"garbage\r\n\r\n".to_vec()))
+            .head()
+            .is_err());
+        assert!(Framed::new(Cursor::new(b"\r\n\r\n".to_vec()))
+            .head()
+            .is_err());
         assert!(
-            Framed::new(Cursor::new(b"GET /\r\n\r\n".to_vec())).head().is_err(),
+            Framed::new(Cursor::new(b"GET /\r\n\r\n".to_vec()))
+                .head()
+                .is_err(),
             "a request line with no HTTP version"
         );
         assert!(
-            Framed::new(Cursor::new(b"HTTP/1.1 abc OK\r\n\r\n".to_vec())).head().is_err(),
+            Framed::new(Cursor::new(b"HTTP/1.1 abc OK\r\n\r\n".to_vec()))
+                .head()
+                .is_err(),
             "a status code that is not a number"
         );
     }
@@ -471,7 +516,9 @@ mod tests {
     #[test]
     fn a_header_line_without_a_colon_is_an_error() {
         let raw = b"HTTP/1.1 200 OK\r\nthis is not a header\r\n\r\n";
-        let err = Framed::new(Cursor::new(raw.to_vec())).head().expect_err("no colon");
+        let err = Framed::new(Cursor::new(raw.to_vec()))
+            .head()
+            .expect_err("no colon");
         assert!(format!("{err:#}").contains("colon"), "got: {err:#}");
     }
 
@@ -504,6 +551,9 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 403\r\n"), "got: {text}");
         assert!(text.contains("Content-Length: 0\r\n"), "got: {text}");
         assert!(text.contains("Connection: close\r\n"), "got: {text}");
-        assert!(text.ends_with("\r\n\r\n"), "the head ends, and there is no body: {text}");
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "the head ends, and there is no body: {text}"
+        );
     }
 }

@@ -48,7 +48,10 @@ pub fn resolve(
     let available_ms = ledger.span_ms();
     let needed_ms = trigger_ms + post_ms;
     if available_ms < needed_ms {
-        return Err(WindowError::PostRollUnavailable { needed_ms, available_ms });
+        return Err(WindowError::PostRollUnavailable {
+            needed_ms,
+            available_ms,
+        });
     }
 
     let want_start = trigger_ms.saturating_sub(pre_ms);
@@ -66,7 +69,10 @@ pub fn resolve(
         .cloned()
         .collect();
 
-    Ok(SegmentWindow { segments, truncated_front })
+    Ok(SegmentWindow {
+        segments,
+        truncated_front,
+    })
 }
 
 #[cfg(test)]
@@ -100,7 +106,10 @@ mod tests {
         // 3s of buffer, but 30s of pre-roll requested.
         let w = resolve(&ledger(3), 2_000, 30_000, 1_000).unwrap();
         assert_eq!(w.seqs(), vec![0, 1, 2]);
-        assert!(w.truncated_front, "caller must be able to warn about a short pre-roll");
+        assert!(
+            w.truncated_front,
+            "caller must be able to warn about a short pre-roll"
+        );
     }
 
     #[test]

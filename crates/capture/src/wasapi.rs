@@ -53,47 +53,50 @@ use crate::{
     clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
     GameAudioSource, GameFinder, NativeAudioFormat, SampleEncoding,
 };
+use anyhow::{bail, Context, Result};
 use std::mem::ManuallyDrop;
 use std::sync::mpsc;
-use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
-use windows::core::{implement, Interface, IUnknown, Ref, HRESULT};
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows::core::{implement, IUnknown, Interface, Ref, HRESULT};
+use windows::Wdk::System::SystemServices::RtlGetVersion;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
     IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_E_DEVICE_INVALIDATED,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoTaskMemFree, IAgileObject, IAgileObject_Impl, BLOB, CLSCTX_ALL,
 };
-use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Variant::VT_BLOB;
 
 /// The format every consumer downstream assumes and the audio engine is asked to deliver, so the
 /// audio timeline is exactly derivable from the byte count. Kept in step with [`AudioFormat::default`].
 ///
 /// `pub(crate)` because the microphone backend targets this same format: two tracks in one
 /// container have one format between them, and a test pins both backends to it.
-pub(crate) const TARGET: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+pub(crate) const TARGET: AudioFormat = AudioFormat {
+    sample_rate: 48_000,
+    channels: 2,
+};
 
 /// Bytes per captured frame: two channels of 16-bit PCM. Every packet is already in this format.
 const BYTES_PER_FRAME: usize = TARGET.channels as usize * 2;
@@ -252,8 +255,15 @@ impl AudioBackend for WasapiLoopback {
     /// Returns the next whole 10ms block, or `Ok(None)` when nothing is due within `timeout`. A zero
     /// timeout is a non-blocking "is anything due?" check, how the CLI drains audio without starving video.
     fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-        let Self { source, silence_watch, watched_generation, .. } = self;
-        let source = source.as_mut().context("WASAPI loopback capture is not started")?;
+        let Self {
+            source,
+            silence_watch,
+            watched_generation,
+            ..
+        } = self;
+        let source = source
+            .as_mut()
+            .context("WASAPI loopback capture is not started")?;
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -269,13 +279,16 @@ impl AudioBackend for WasapiLoopback {
 
             if let Some(block) = source.next_block() {
                 let buffer = block.buffer;
-                let block_duration =
-                    Duration::from_micros(buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate));
+                let block_duration = Duration::from_micros(
+                    buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate),
+                );
                 // Diagnostic only: if the endpoint was engine-converted and every block so far was pure
                 // silence, this is the reported AUTOCONVERTPCM failure and the user should hear about it
                 // rather than find a silent clip. It latches (one warning per session) and never errors or
                 // stops capture. Padding is skipped: the engine sending nothing says nothing about conversion.
-                if !block.filler && silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
+                if !block.filler
+                    && silence_watch.observe(block_duration, is_silent_block(&buffer.data))
+                {
                     tracing::warn!(
                         silent_run_secs = silence_watch.silent_run().as_secs_f64(),
                         capture_secs = silence_watch.elapsed().as_secs_f64(),
@@ -309,7 +322,10 @@ impl AudioBackend for WasapiLoopback {
             // SAFETY: `client.event` is a live auto-reset event owned by `self`.
             let signalled = unsafe { WaitForSingleObject(client.event.0, wait_ms) };
             if signalled != WAIT_OBJECT_0 && signalled != WAIT_TIMEOUT {
-                bail!("waiting on the WASAPI capture event failed (WAIT_EVENT {})", signalled.0);
+                bail!(
+                    "waiting on the WASAPI capture event failed (WAIT_EVENT {})",
+                    signalled.0
+                );
             }
         }
     }
@@ -347,13 +363,19 @@ impl WasapiFactory {
             CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
                 .context("CoCreateInstance(MMDeviceEnumerator)")?
         };
-        Ok(Self { enumerator, output_device: output_device.to_owned() })
+        Ok(Self {
+            enumerator,
+            output_device: output_device.to_owned(),
+        })
     }
 
     /// The configured output endpoint, or the default output when none is configured.
     fn default_device(&self) -> Result<IMMDevice> {
         if !self.output_device.is_empty() {
-            return crate::audio_devices::windows_impl::device_by_id(&self.enumerator, &self.output_device);
+            return crate::audio_devices::windows_impl::device_by_id(
+                &self.enumerator,
+                &self.output_device,
+            );
         }
         // SAFETY: the enumerator is alive; eRender/eConsole is the default output.
         unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
@@ -389,7 +411,11 @@ fn process_loopback_supported() -> bool {
     // SAFETY: `info` is a valid OSVERSIONINFOW with its size set, as the call requires.
     let status = unsafe { RtlGetVersion(&mut info) };
     let supported = status.is_ok() && info.dwBuildNumber >= PROCESS_LOOPBACK_MIN_BUILD;
-    tracing::debug!(build = info.dwBuildNumber, supported, "process loopback availability");
+    tracing::debug!(
+        build = info.dwBuildNumber,
+        supported,
+        "process loopback availability"
+    );
     supported
 }
 
@@ -461,7 +487,9 @@ fn open_process_client(pid: u32) -> Result<Client> {
     // SAFETY: the operation has completed, so its result is ready; both out-parameters are valid.
     unsafe { operation.GetActivateResult(&mut result, &mut activated) }
         .context("IActivateAudioInterfaceAsyncOperation::GetActivateResult")?;
-    result.ok().with_context(|| format!("process loopback activation for pid {pid}"))?;
+    result
+        .ok()
+        .with_context(|| format!("process loopback activation for pid {pid}"))?;
     let audio: IAudioClient = activated
         .context("process loopback activation returned no interface")?
         .cast()
@@ -469,7 +497,9 @@ fn open_process_client(pid: u32) -> Result<Client> {
 
     // The virtual device has no mix format or period to read; the engine converts into `TARGET`.
     let client = start_stream(audio, PROCESS_BUFFER_HNS, false, || {
-        format!("IAudioClient::Initialize(process loopback for pid {pid}, requested 48kHz stereo s16)")
+        format!(
+            "IAudioClient::Initialize(process loopback for pid {pid}, requested 48kHz stereo s16)"
+        )
     })?;
     tracing::info!(pid, "WASAPI process loopback capture started");
     Ok(client)
@@ -489,8 +519,12 @@ fn device_id(device: &IMMDevice) -> Result<String> {
 
 /// Whether an HRESULT means the endpoint behind the stream is gone, so a reopen can recover.
 fn is_endpoint_gone(e: &windows::core::Error) -> bool {
-    [AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING]
-        .contains(&e.code())
+    [
+        AUDCLNT_E_DEVICE_INVALIDATED,
+        AUDCLNT_E_RESOURCES_INVALIDATED,
+        AUDCLNT_E_SERVICE_NOT_RUNNING,
+    ]
+    .contains(&e.code())
 }
 
 /// Context for a capture call, marking a lost endpoint as [`SourceGone`] so it is reopened.
@@ -614,7 +648,14 @@ fn start_stream(
     // SAFETY: the stream is fully configured at this point.
     unsafe { audio.Start() }.context("IAudioClient::Start")?;
     let (anchor_hns, anchor) = qpc_anchor()?;
-    Ok(Client { audio, capture, event, converting, anchor_hns, anchor })
+    Ok(Client {
+        audio,
+        capture,
+        event,
+        converting,
+        anchor_hns,
+        anchor,
+    })
 }
 
 /// The QPC in 100ns units and the shared clock, read back to back. `Instant` is QPC-based on
@@ -693,7 +734,11 @@ pub(crate) fn native_format(format: *const WAVEFORMATEX) -> NativeAudioFormat {
         SampleEncoding::Other
     };
 
-    NativeAudioFormat { sample_rate, channels, encoding }
+    NativeAudioFormat {
+        sample_rate,
+        channels,
+        encoding,
+    }
 }
 
 /// A PCM sample width as a [`SampleEncoding`]; anything else is [`SampleEncoding::Other`].
@@ -745,7 +790,13 @@ impl PacketSource for Client {
         // QPC position already says when the first frame played.
         unsafe {
             self.capture
-                .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc_position))
+                .GetBuffer(
+                    &mut data,
+                    &mut frames,
+                    &mut flags,
+                    None,
+                    Some(&mut qpc_position),
+                )
                 .map_err(capture_call("IAudioCaptureClient::GetBuffer"))?
         };
 
@@ -756,7 +807,8 @@ impl PacketSource for Client {
         copied?;
         released.map_err(capture_call("IAudioCaptureClient::ReleaseBuffer"))?;
 
-        let timestamp_ok = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc_position != 0;
+        let timestamp_ok =
+            flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc_position != 0;
         Ok(Some(PacketInfo {
             frames: frames as usize,
             time: timestamp_ok

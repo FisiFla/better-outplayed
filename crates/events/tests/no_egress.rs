@@ -39,7 +39,11 @@ fn no_http_client_is_constructed_outside_the_loopback_module() {
     let mut offenders = Vec::new();
 
     for entry in walk_rs(&root) {
-        let rel = entry.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = entry
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel.contains("/target/") {
             continue;
         }
@@ -74,7 +78,11 @@ fn certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed() {
     let mut name_offenders = Vec::new();
 
     for entry in walk_rs(&root) {
-        let rel = entry.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = entry
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel.contains("/target/") {
             continue;
         }
@@ -102,8 +110,14 @@ fn certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed() {
 
     // The client must really pin: platform roots off, Riot's root added.
     let client = code_of(&root.join(THE_ONE_FILE));
-    assert!(client.contains("disable_built_in_roots(true)"), "platform roots must be disabled");
-    assert!(client.contains("add_root_certificate"), "the pinned root must be added");
+    assert!(
+        client.contains("disable_built_in_roots(true)"),
+        "platform roots must be disabled"
+    );
+    assert!(
+        client.contains("add_root_certificate"),
+        "the pinned root must be added"
+    );
 
     // That file must also pin the address: the relaxation and the loopback endpoint are one
     // decision, not two.
@@ -163,7 +177,11 @@ fn only_the_loopback_modules_talk_to_a_socket_at_all() {
     let mut connecting: Vec<String> = Vec::new();
 
     for entry in walk_rs(&root) {
-        let rel = entry.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = entry
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel.contains("/target/") || rel.ends_with("no_egress.rs") {
             continue;
         }
@@ -201,12 +219,18 @@ fn code_of(path: &Path) -> String {
 
 fn walk_rs(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for e in entries.filter_map(|e| e.ok()) {
         let p = e.path();
         // Prune build output and VCS metadata: `target/` holds the crates.io registry cache, whose
         // vendored sources would otherwise be walked on every run.
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if p.is_dir() && (name == "target" || name == ".git") {
             continue;
         }

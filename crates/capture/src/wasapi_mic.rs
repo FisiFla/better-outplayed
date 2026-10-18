@@ -68,7 +68,10 @@ use std::time::{Duration, Instant};
 /// The format the microphone backend publishes and asks the engine for: the crate's canonical
 /// [`AudioFormat::default`], spelled out so the microphone and system-audio backends can be
 /// compared as values (the recorder declares both tracks with `-ar 48000 -ac 2`).
-pub const MICROPHONE_FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+pub const MICROPHONE_FORMAT: AudioFormat = AudioFormat {
+    sample_rate: 48_000,
+    channels: 2,
+};
 
 /// Peak sample of the [`StubMicrophone`]'s default waveform: about -12 dBFS, clearly not silence
 /// and a plausible voice level.
@@ -265,13 +268,11 @@ impl AudioBackend for StubMicrophone {
 #[cfg(windows)]
 mod wasapi_impl {
     use crate::platform::init_com;
-    use crate::{
-        clock_base, is_silent_block, AudioBackend, AudioBuffer, ConvertedSilenceWatch,
-    };
+    use crate::{clock_base, is_silent_block, AudioBackend, AudioBuffer, ConvertedSilenceWatch};
     // Shared with the loopback backend rather than copied: the same three questions asked of a
     // different endpoint, which keeps the log lines comparable and the published format identical.
-    use crate::wasapi::{native_format, qpc_anchor, requested_format, MixFormatGuard, TARGET};
     use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
+    use crate::wasapi::{native_format, qpc_anchor, requested_format, MixFormatGuard, TARGET};
     use anyhow::{bail, Context, Result};
     use std::time::{Duration, Instant};
     use windows::core::IUnknown;
@@ -442,7 +443,13 @@ mod wasapi_impl {
         /// timeout is a non-blocking "is anything due?" check, how the recorder drains the microphone
         /// without starving the video.
         fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
-            let Self { client, timeline, silence_watch, last_state_check, .. } = self;
+            let Self {
+                client,
+                timeline,
+                silence_watch,
+                last_state_check,
+                ..
+            } = self;
             let client = client
                 .as_mut()
                 .context("WASAPI microphone capture is not started")?;
@@ -465,7 +472,9 @@ mod wasapi_impl {
                     // reported AUTOCONVERTPCM-delivers-silence failure, and a user whose clip has no voice track
                     // should hear about it. It latches (one warning per session) and never errors or stops capture.
                     // Padding is skipped: it says nothing about what the microphone hears.
-                    if !block.filler && silence_watch.observe(block_duration, is_silent_block(&buffer.data)) {
+                    if !block.filler
+                        && silence_watch.observe(block_duration, is_silent_block(&buffer.data))
+                    {
                         tracing::warn!(
                             silent_run_secs = silence_watch.silent_run().as_secs_f64(),
                             capture_secs = silence_watch.elapsed().as_secs_f64(),
@@ -565,7 +574,8 @@ mod wasapi_impl {
         // opened with it. A failure here is still fatal: it is the call that proves the endpoint is usable.
         // SAFETY: the native format is allocated with CoTaskMemAlloc by the audio engine and freed by
         // `MixFormatGuard` when this function returns; the fields are copied out before then.
-        let raw_mix = unsafe { audio.GetMixFormat() }.map_err(wasapi_call("IAudioClient::GetMixFormat"))?;
+        let raw_mix =
+            unsafe { audio.GetMixFormat() }.map_err(wasapi_call("IAudioClient::GetMixFormat"))?;
         let raw_mix = MixFormatGuard(raw_mix);
         let native = native_format(raw_mix.0);
 
@@ -587,7 +597,11 @@ mod wasapi_impl {
         // SAFETY: both out-parameters are valid.
         unsafe { audio.GetDevicePeriod(Some(&mut default_period), Some(&mut minimum_period)) }
             .map_err(wasapi_call("IAudioClient::GetDevicePeriod"))?;
-        let buffer_duration = if default_period > 0 { default_period } else { 10 * HNS_PER_MS };
+        let buffer_duration = if default_period > 0 {
+            default_period
+        } else {
+            10 * HNS_PER_MS
+        };
 
         // Deliberately no fallback to the device's own format if this fails: those bytes would be
         // labelled 48kHz stereo and the byte-count timeline would drift against the game track and the
@@ -656,8 +670,8 @@ mod wasapi_impl {
     /// never deliver another packet, so saying so beats waiting forever.
     fn check_endpoint_alive(client: &Client, since_packet: Duration) -> Result<()> {
         // SAFETY: the device is alive for at least as long as `client`, which outlives this call.
-        let state = unsafe { client.device.GetState() }
-            .map_err(wasapi_call("IMMDevice::GetState"))?;
+        let state =
+            unsafe { client.device.GetState() }.map_err(wasapi_call("IMMDevice::GetState"))?;
         if state.0 & DEVICE_STATE_ACTIVE.0 == 0 {
             bail!(
                 "the microphone endpoint has delivered no packet for {:.1}s and is no longer \
@@ -716,7 +730,13 @@ mod wasapi_impl {
             // QPC position already says when the first frame was recorded.
             unsafe {
                 self.capture
-                    .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc_position))
+                    .GetBuffer(
+                        &mut data,
+                        &mut frames,
+                        &mut flags,
+                        None,
+                        Some(&mut qpc_position),
+                    )
                     .map_err(wasapi_call("IAudioCaptureClient::GetBuffer"))?
             };
 
@@ -807,8 +827,16 @@ mod tests {
             block.frames * block.format.channels as usize * 2,
             "byte length must be exactly frames x channels x 2"
         );
-        assert_eq!(block.data.len(), AudioFormat::default().bytes_per_10ms(), "1920 bytes");
-        assert_eq!(block.pts, Duration::ZERO, "the first block is stamped at the run's origin");
+        assert_eq!(
+            block.data.len(),
+            AudioFormat::default().bytes_per_10ms(),
+            "1920 bytes"
+        );
+        assert_eq!(
+            block.pts,
+            Duration::ZERO,
+            "the first block is stamped at the run's origin"
+        );
     }
 
     #[test]
@@ -832,7 +860,10 @@ mod tests {
             .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
             .max()
             .expect("a block has samples");
-        assert_eq!(peak, 1_234, "the waveform's peak is the amplitude that was asked for");
+        assert_eq!(
+            peak, 1_234,
+            "the waveform's peak is the amplitude that was asked for"
+        );
         assert_eq!(
             silent_block.data.len(),
             silent_block.frames * silent_block.format.channels as usize * 2,
@@ -905,7 +936,10 @@ mod tests {
                 .next_buffer(Duration::from_secs(1))
                 .expect("poll the stub microphone")
                 .expect("a block is due");
-            assert_eq!(system_block.format, mic_block.format, "one canonical format, one track shape");
+            assert_eq!(
+                system_block.format, mic_block.format,
+                "one canonical format, one track shape"
+            );
             assert_eq!(system_block.frames, mic_block.frames);
             assert_eq!(system_block.data.len(), mic_block.data.len());
         }

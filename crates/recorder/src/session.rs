@@ -25,8 +25,8 @@ use anyhow::{bail, Context, Result};
 use localplay_media::{edit, FfmpegBinaries, MediaInfo};
 use localplay_replay::ledger::{Segment, SegmentLedger};
 use localplay_replay::scanner::{self, newly_complete, next_segment_number};
-use localplay_replay::window;
 use localplay_replay::splice::{ClipMetadata, ClipSplicer};
+use localplay_replay::window;
 use localplay_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
 
@@ -233,7 +233,10 @@ fn observed_names(dir: &Path) -> Result<Vec<String>> {
 
 /// The sequence numbers of the segments in `dir` (concat lists and stray files are not segments).
 fn observed_seqs(dir: &Path) -> Result<Vec<u64>> {
-    Ok(observed_names(dir)?.iter().filter_map(|n| scanner::segment_seq(n)).collect())
+    Ok(observed_names(dir)?
+        .iter()
+        .filter_map(|n| scanner::segment_seq(n))
+        .collect())
 }
 
 /// Every segment file in `dir`, in sequence order, with their actual sizes.
@@ -394,7 +397,16 @@ pub fn finalise(
 /// cannot tell whether the microphone survived.
 fn audio_stream_count(bin: &FfmpegBinaries, path: &Path) -> Option<usize> {
     let output = localplay_media::sidecar_command(&bin.ffprobe)
-        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(path)
         .output()
         .ok()?;
@@ -463,15 +475,28 @@ pub fn recover_sessions(
     let rows = match store.list_sessions() {
         Ok(rows) => rows,
         Err(err) => {
-            tracing::warn!("could not read the session store to recover unfinished sessions: {err:#}");
+            tracing::warn!(
+                "could not read the session store to recover unfinished sessions: {err:#}"
+            );
             return report;
         }
     };
-    let named: Vec<PathBuf> = rows.iter().map(|row| PathBuf::from(&row.scratch_dir)).collect();
+    let named: Vec<PathBuf> = rows
+        .iter()
+        .map(|row| PathBuf::from(&row.scratch_dir))
+        .collect();
 
     for row in &rows {
         if row.mode == SESSION_MODE_SESSION {
-            recover_session_row(store, row, sessions_dir, bin, segment_ms, encoder, &mut report);
+            recover_session_row(
+                store,
+                row,
+                sessions_dir,
+                bin,
+                segment_ms,
+                encoder,
+                &mut report,
+            );
         } else if row.ended_at_ms.is_none() {
             // A buffer-mode row (or a mode a newer build wrote): the ring owns its footage; just stamp the end so retention sees it as history.
             match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
@@ -665,14 +690,25 @@ pub(crate) fn layout_test_segments(dir: &Path, audio: usize) -> Result<Vec<Segme
         let out = dir.join(format!("seg-{seq:06}.mp4"));
         let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
         cmd.args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=10:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
         ]);
         if audio == 2 {
             cmd.args(["-f", "lavfi", "-i", "sine=frequency=880:duration=1"]);
         }
-        cmd.args(["-c:v", "libx264", "-g", "10", "-c:a", "aac", "-map", "0:v", "-map", "1:a"]);
+        cmd.args([
+            "-c:v", "libx264", "-g", "10", "-c:a", "aac", "-map", "0:v", "-map", "1:a",
+        ]);
         if audio == 2 {
             cmd.args(["-map", "2:a"]);
         }
@@ -716,7 +752,8 @@ mod tests {
 
     /// A temp directory under `target/`, so a test run never leaves leftovers in the user's temp or home.
     fn temp_dir(what: &str) -> tempfile::TempDir {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-session-tests");
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/recorder-session-tests");
         std::fs::create_dir_all(&base).expect("creating the test scratch root");
         tempfile::Builder::new()
             .prefix(what)
@@ -733,7 +770,13 @@ mod tests {
     /// A `sessions` row for a recording that is (or was) running over `dir`.
     fn running_session(store: &Store, dir: &Path, mode: &str) -> i64 {
         store
-            .start_session(Some("Dota 2"), mode, 1_700_000_000_000, &dir.display().to_string(), 0)
+            .start_session(
+                Some("Dota 2"),
+                mode,
+                1_700_000_000_000,
+                &dir.display().to_string(),
+                0,
+            )
             .expect("opening a session row")
     }
 
@@ -765,7 +808,11 @@ mod tests {
         // The finalise: both tracks, and the file is as long as the two segments.
         let out = dir.path().join("session.mp4");
         let meta2 = finalise(&bin(), &out, &segments, "libx264", true).expect("the finalise");
-        assert_eq!(audio_stream_count(&bin(), &out), Some(2), "both tracks survive");
+        assert_eq!(
+            audio_stream_count(&bin(), &out),
+            Some(2),
+            "both tracks survive"
+        );
         let info = MediaInfo::probe(&bin(), &out).expect("probing the session file");
         assert!(info.video.is_some(), "the video stream is there");
         assert!(
@@ -799,7 +846,11 @@ mod tests {
         let info = MediaInfo::probe(&bin(), &out).expect("probing it");
         assert!(info.video.is_some() && info.audio.is_some());
         assert_eq!(audio_stream_count(&bin(), &out), Some(1));
-        assert!(meta.duration_ms >= 1_900, "{}ms for two 1s segments", meta.duration_ms);
+        assert!(
+            meta.duration_ms >= 1_900,
+            "{}ms for two 1s segments",
+            meta.duration_ms
+        );
 
         // A finalise with nothing to concatenate is an error, not an empty file.
         let err = finalise(&bin(), &dir.path().join("empty.mp4"), &[], "libx264", false)
@@ -822,16 +873,35 @@ mod tests {
             "libx264".into(),
         )
         .expect("opening the session ring");
-        assert_eq!(ring.adopt_existing().expect("adopting"), 1, "one complete segment");
+        assert_eq!(
+            ring.adopt_existing().expect("adopting"),
+            1,
+            "one complete segment"
+        );
         assert_eq!(ring.segment_count(), 1);
         assert_eq!(ring.span_ms(), 1_000, "one second of completed footage");
         ring.scan().expect("scanning again changes nothing");
-        assert_eq!(ring.segment_count(), 1, "the newest file is still being written");
+        assert_eq!(
+            ring.segment_count(),
+            1,
+            "the newest file is still being written"
+        );
 
         ring.scan_all().expect("the shutdown scan");
-        assert_eq!(ring.segment_count(), 2, "at shutdown the newest segment counts");
+        assert_eq!(
+            ring.segment_count(),
+            2,
+            "at shutdown the newest segment counts"
+        );
         assert_eq!(ring.span_ms(), 2_000);
-        assert_eq!(ring.bytes_on_disk(), segments_on_disk(&session_dir, 1_000).unwrap().iter().map(|s| s.bytes).sum::<u64>());
+        assert_eq!(
+            ring.bytes_on_disk(),
+            segments_on_disk(&session_dir, 1_000)
+                .unwrap()
+                .iter()
+                .map(|s| s.bytes)
+                .sum::<u64>()
+        );
         assert_eq!(
             ring.reserve_number().unwrap(),
             2,
@@ -856,7 +926,11 @@ mod tests {
         )
         .expect("opening");
         ring.adopt_existing().expect("adopting");
-        assert_eq!(ring.reserve_number().expect("reserving"), 2, "segments 0 and 1 exist");
+        assert_eq!(
+            ring.reserve_number().expect("reserving"),
+            2,
+            "segments 0 and 1 exist"
+        );
         assert_eq!(
             ring.span_ms(),
             0,
@@ -875,20 +949,34 @@ mod tests {
         let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
         let store = store();
         let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
-        store.set_session_size(id, bytes as i64).expect("the running size");
+        store
+            .set_session_size(id, bytes as i64)
+            .expect("the running size");
 
         let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
 
-        assert_eq!(report.recovered, vec![id], "the crashed session was finalised: {report:?}");
-        let row = store.get_session(id).unwrap().expect("the row is still there");
+        assert_eq!(
+            report.recovered,
+            vec![id],
+            "the crashed session was finalised: {report:?}"
+        );
+        let row = store
+            .get_session(id)
+            .unwrap()
+            .expect("the row is still there");
         let final_path = row.final_path.expect("the row names the session file");
         assert!(Path::new(&final_path).is_file(), "{final_path} must exist");
         assert!(row.ended_at_ms.is_some(), "and the row is closed");
         assert!(row.size_bytes > 0, "with the real size: {}", row.size_bytes);
-        assert_eq!(row.size_bytes as u64, std::fs::metadata(&final_path).unwrap().len());
+        assert_eq!(
+            row.size_bytes as u64,
+            std::fs::metadata(&final_path).unwrap().len()
+        );
         assert_eq!(
             final_path,
-            session_file_path(&sessions_dir, row.started_at_ms).display().to_string(),
+            session_file_path(&sessions_dir, row.started_at_ms)
+                .display()
+                .to_string(),
             "the file is named from the session's own start instant"
         );
         assert_eq!(audio_stream_count(&bin(), Path::new(&final_path)), Some(1));
@@ -917,7 +1005,10 @@ mod tests {
 
         assert_eq!(report.unfinalised, vec![id], "{report:?}");
         assert!(report.recovered.is_empty());
-        assert!(session_dir.join("seg-000000.mp4").is_file(), "the segments are kept");
+        assert!(
+            session_dir.join("seg-000000.mp4").is_file(),
+            "the segments are kept"
+        );
         let row = store.get_session(id).unwrap().unwrap();
         assert!(
             row.ended_at_ms.is_none(),
@@ -960,14 +1051,27 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(closed, expected, "{report:?}");
         assert_eq!(report.orphan_dirs, vec![orphan.clone()], "{report:?}");
-        assert!(store.get_session(empty).unwrap().unwrap().ended_at_ms.is_some());
-        assert!(store.get_session(buffered).unwrap().unwrap().ended_at_ms.is_some());
+        assert!(store
+            .get_session(empty)
+            .unwrap()
+            .unwrap()
+            .ended_at_ms
+            .is_some());
+        assert!(store
+            .get_session(buffered)
+            .unwrap()
+            .unwrap()
+            .ended_at_ms
+            .is_some());
         assert!(!empty_dir.exists(), "an empty session directory is removed");
         assert!(
             scratch.join("seg-000000.mp4").is_file(),
             "a buffer session's scratch directory is the ring's, and is never touched"
         );
-        assert!(orphan.is_dir(), "an unnamed directory is reported, never deleted");
+        assert!(
+            orphan.is_dir(),
+            "an unnamed directory is reported, never deleted"
+        );
     }
 
     /// A finished session whose segments remain is reported and left alone; retention removes the duplicate with the row.
@@ -982,15 +1086,28 @@ mod tests {
         let file = session_file_path(&sessions_dir, 1_700_000_000_000);
         std::fs::write(&file, b"a finished session").unwrap();
         store
-            .end_session(id, 1_700_000_001_000, Some(&file.display().to_string()), 20, 0)
+            .end_session(
+                id,
+                1_700_000_001_000,
+                Some(&file.display().to_string()),
+                20,
+                0,
+            )
             .expect("ending it");
 
         let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
 
-        assert_eq!(report.leftover_dirs, vec![session_dir.clone()], "{report:?}");
+        assert_eq!(
+            report.leftover_dirs,
+            vec![session_dir.clone()],
+            "{report:?}"
+        );
         assert!(report.recovered.is_empty() && report.unfinalised.is_empty());
         assert!(session_dir.is_dir(), "reported, not removed");
-        assert!(report.orphan_dirs.is_empty(), "the row names it, so it is not an orphan");
+        assert!(
+            report.orphan_dirs.is_empty(),
+            "the row names it, so it is not an orphan"
+        );
     }
 
     /// Two recordings starting in the same second get different directories (the name is claimed by creating it).
@@ -1010,7 +1127,9 @@ mod tests {
             "named from the session's start instant, like its file"
         );
         assert_eq!(
-            session_file_path(&sessions, 1_700_000_000_000).file_name().unwrap(),
+            session_file_path(&sessions, 1_700_000_000_000)
+                .file_name()
+                .unwrap(),
             "session-1700000000.mp4"
         );
     }

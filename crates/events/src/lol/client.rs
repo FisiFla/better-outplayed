@@ -108,7 +108,10 @@ impl LoopbackClient {
     /// up a mock under their own root. Still a pin (platform roots stay disabled), never a way to
     /// skip verification.
     pub fn for_endpoint_with_root(endpoint: Endpoint, root_pem: &[u8]) -> Result<Self, FetchError> {
-        debug_assert!(endpoint.is_loopback(), "an Endpoint is loopback by construction");
+        debug_assert!(
+            endpoint.is_loopback(),
+            "an Endpoint is loopback by construction"
+        );
         let tls_err = |e: &dyn std::fmt::Display| FetchError::Tls(endpoint.addr(), format!("{e}"));
         let root = Certificate::from_pem(root_pem).map_err(|e| tls_err(&e))?;
         let connector = TlsConnector::builder()
@@ -123,7 +126,10 @@ impl LoopbackClient {
             .use_sni(false)
             .build()
             .map_err(|e| tls_err(&e))?;
-        Ok(Self { endpoint, connector })
+        Ok(Self {
+            endpoint,
+            connector,
+        })
     }
 
     /// The endpoint this client is pinned to.
@@ -138,10 +144,14 @@ impl LoopbackClient {
     /// between polls lives in [`crate::lol::derive`], which is pure.
     pub fn get(&self) -> Result<Response, FetchError> {
         let addr = self.endpoint.addr();
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        let stream =
+            TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| self.io_error(e))?;
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(|e| self.io_error(e))?;
-        stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|e| self.io_error(e))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|e| self.io_error(e))?;
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| self.io_error(e))?;
         // The payload is small and the poller synchronous: a delayed ACK would be the slowest part of
         // a one-second poll.
         let _ = stream.set_nodelay(true);
@@ -149,9 +159,7 @@ impl LoopbackClient {
         let host = self.endpoint.host_header();
         let mut tls = match self.connector.connect(&host, stream) {
             Ok(tls) => tls,
-            Err(HandshakeError::Failure(e)) => {
-                return Err(FetchError::Tls(addr, format!("{e}")))
-            }
+            Err(HandshakeError::Failure(e)) => return Err(FetchError::Tls(addr, format!("{e}"))),
             // The socket is blocking and `connect` drives the handshake to completion; a non-blocking
             // handshake would be a bug.
             Err(HandshakeError::WouldBlock(_)) => return Err(FetchError::Timeout(addr)),
@@ -164,11 +172,14 @@ impl LoopbackClient {
              User-Agent: localplay/0.1\r\nConnection: close\r\n\r\n",
             self.endpoint.path()
         );
-        tls.write_all(request.as_bytes()).map_err(|e| self.io_error(e))?;
+        tls.write_all(request.as_bytes())
+            .map_err(|e| self.io_error(e))?;
         tls.flush().map_err(|e| self.io_error(e))?;
 
         let mut framed = Framed::new(tls);
-        let head = framed.head().map_err(|e| FetchError::Protocol(format!("{e:#}")))?;
+        let head = framed
+            .head()
+            .map_err(|e| FetchError::Protocol(format!("{e:#}")))?;
         let status = head
             .status()
             .ok_or_else(|| FetchError::Protocol("the response has no status line".into()))?;
@@ -212,9 +223,15 @@ mod tests {
     fn the_pinned_root_is_riots_and_parses() {
         let pem = std::str::from_utf8(RIOT_ROOT_PEM).expect("a PEM is ASCII");
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
-        let der = Certificate::from_pem(RIOT_ROOT_PEM).expect("the pinned root parses").to_der().unwrap();
+        let der = Certificate::from_pem(RIOT_ROOT_PEM)
+            .expect("the pinned root parses")
+            .to_der()
+            .unwrap();
         let needle = b"LoL Game Engineering Certificate Authority";
-        assert!(der.windows(needle.len()).any(|w| w == needle), "it is Riot's CA");
+        assert!(
+            der.windows(needle.len()).any(|w| w == needle),
+            "it is Riot's CA"
+        );
     }
 
     #[test]
@@ -271,7 +288,10 @@ mod tests {
             matches!(err, FetchError::Tls(..)),
             "a peer that is not speaking TLS is a TLS error: {err}"
         );
-        assert!(!err.is_no_game(), "and it is not silently read as 'no game'");
+        assert!(
+            !err.is_no_game(),
+            "and it is not silently read as 'no game'"
+        );
         let _ = server.join();
     }
 }

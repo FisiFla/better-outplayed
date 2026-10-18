@@ -117,7 +117,11 @@ impl AudioTimeline {
         let mut skip = 0;
         if let Some(time) = info.time {
             let at = self.frame_at(time);
-            let tolerance = if info.discontinuity { 0 } else { self.block_frames() };
+            let tolerance = if info.discontinuity {
+                0
+            } else {
+                self.block_frames()
+            };
             if at > self.placed + tolerance {
                 self.pad(at - self.placed);
             } else if at + tolerance < self.placed {
@@ -161,14 +165,22 @@ impl AudioTimeline {
         }
         let data: Vec<u8> = self.pending.drain(..block_bytes).collect();
         let (start, end) = (self.emitted, self.emitted + block_frames);
-        let filler = self.fills.iter().any(|&(from, to)| from <= start && end <= to);
+        let filler = self
+            .fills
+            .iter()
+            .any(|&(from, to)| from <= start && end <= to);
         while self.fills.front().is_some_and(|&(_, to)| to <= end) {
             self.fills.pop_front();
         }
         let pts = self.time_of(start);
         self.emitted = end;
         Some(Block {
-            buffer: AudioBuffer { data, frames: block_frames as usize, pts, format: self.format },
+            buffer: AudioBuffer {
+                data,
+                frames: block_frames as usize,
+                pts,
+                format: self.format,
+            },
             filler,
         })
     }
@@ -188,7 +200,10 @@ pub(crate) fn qpc_to_shared(hns: u64, anchor_hns: u64, anchor: Duration) -> Opti
 mod tests {
     use super::*;
 
-    const FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+    const FORMAT: AudioFormat = AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
     const BLOCK: usize = 480;
     const ORIGIN: Duration = Duration::from_secs(5);
 
@@ -197,8 +212,20 @@ mod tests {
     }
 
     /// A packet of `frames` frames, every sample `value` (0 for a silent packet).
-    fn packet(at: Option<Duration>, frames: usize, value: u8, discontinuity: bool) -> (PacketInfo, Vec<u8>) {
-        (PacketInfo { frames, time: at, discontinuity }, vec![value; frames * 4])
+    fn packet(
+        at: Option<Duration>,
+        frames: usize,
+        value: u8,
+        discontinuity: bool,
+    ) -> (PacketInfo, Vec<u8>) {
+        (
+            PacketInfo {
+                frames,
+                time: at,
+                discontinuity,
+            },
+            vec![value; frames * 4],
+        )
     }
 
     /// Plays back a scripted list of packets, then reports nothing waiting.
@@ -233,17 +260,25 @@ mod tests {
 
     /// The first byte of every frame across `blocks`, in order: one value per frame on the timeline.
     fn frames(blocks: &[Block]) -> Vec<u8> {
-        blocks.iter().flat_map(|b| b.buffer.data.chunks_exact(4).map(|f| f[0])).collect()
+        blocks
+            .iter()
+            .flat_map(|b| b.buffer.data.chunks_exact(4).map(|f| f[0]))
+            .collect()
     }
 
     #[test]
     fn a_steady_stream_passes_through_byte_for_byte() {
-        let packets = (0..10).map(|i| packet(Some(ORIGIN + ms(10 * i)), BLOCK, i as u8 + 1, false)).collect();
+        let packets = (0..10)
+            .map(|i| packet(Some(ORIGIN + ms(10 * i)), BLOCK, i as u8 + 1, false))
+            .collect();
         let (blocks, timeline) = run(packets);
 
         assert_eq!(blocks.len(), 10);
         for (i, block) in blocks.iter().enumerate() {
-            assert!(block.buffer.data.iter().all(|&b| b == i as u8 + 1), "block {i} is packet {i}");
+            assert!(
+                block.buffer.data.iter().all(|&b| b == i as u8 + 1),
+                "block {i} is packet {i}"
+            );
             assert_eq!(block.buffer.pts, ORIGIN + ms(10 * i as u64));
             assert!(!block.filler);
         }
@@ -259,7 +294,10 @@ mod tests {
             packet(Some(ORIGIN + ms(17)), BLOCK, 3, false),
         ];
         let (blocks, _) = run(packets);
-        assert_eq!(frames(&blocks), [vec![1; BLOCK], vec![2; BLOCK], vec![3; BLOCK]].concat());
+        assert_eq!(
+            frames(&blocks),
+            [vec![1; BLOCK], vec![2; BLOCK], vec![3; BLOCK]].concat()
+        );
     }
 
     #[test]
@@ -274,11 +312,18 @@ mod tests {
 
         assert_eq!(frames.len(), 6 * BLOCK);
         assert!(frames[..BLOCK].iter().all(|&s| s == 1));
-        assert!(frames[BLOCK..5 * BLOCK].iter().all(|&s| s == 0), "40ms of silence");
+        assert!(
+            frames[BLOCK..5 * BLOCK].iter().all(|&s| s == 0),
+            "40ms of silence"
+        );
         assert!(frames[5 * BLOCK..].iter().all(|&s| s == 2));
         let filler: Vec<bool> = blocks.iter().map(|b| b.filler).collect();
         assert_eq!(filler, [false, true, true, true, true, false]);
-        assert_eq!(blocks[5].buffer.pts, ORIGIN + ms(50), "the late packet keeps its own time");
+        assert_eq!(
+            blocks[5].buffer.pts,
+            ORIGIN + ms(50),
+            "the late packet keeps its own time"
+        );
     }
 
     #[test]
@@ -290,7 +335,10 @@ mod tests {
                 packet(Some(ORIGIN + ms(15)), BLOCK, 2, discontinuity),
             ];
             let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
-            while !timeline.drain(&mut FakeSource::new(packets.clone()), 16).unwrap() {}
+            while !timeline
+                .drain(&mut FakeSource::new(packets.clone()), 16)
+                .unwrap()
+            {}
             timeline.placed
         };
         assert_eq!(gap(false), 2 * BLOCK as u64);
@@ -306,8 +354,14 @@ mod tests {
             packet(Some(ORIGIN + ms(30)), BLOCK, 3, false),
         ];
         let (blocks, _) = run(packets);
-        assert_eq!(frames(&blocks), [vec![1; BLOCK], vec![0; 2 * BLOCK], vec![3; BLOCK]].concat());
-        assert!(blocks.iter().all(|b| !b.filler), "device silence is not filler");
+        assert_eq!(
+            frames(&blocks),
+            [vec![1; BLOCK], vec![0; 2 * BLOCK], vec![3; BLOCK]].concat()
+        );
+        assert!(
+            blocks.iter().all(|b| !b.filler),
+            "device silence is not filler"
+        );
     }
 
     #[test]
@@ -344,11 +398,15 @@ mod tests {
             blocks.push(block);
         }
         assert_eq!(blocks.len(), 90, "one second less the 100ms lag");
-        assert!(blocks.iter().all(|b| b.filler && b.buffer.data.iter().all(|&s| s == 0)));
+        assert!(blocks
+            .iter()
+            .all(|b| b.filler && b.buffer.data.iter().all(|&s| s == 0)));
 
         // The engine resumes: its first packet lands at its own time, after the rest of the gap.
         let resumed = packet(Some(ORIGIN + Duration::from_secs(1)), BLOCK, 7, false);
-        timeline.drain(&mut FakeSource::new(vec![resumed]), 16).unwrap();
+        timeline
+            .drain(&mut FakeSource::new(vec![resumed]), 16)
+            .unwrap();
         assert_eq!(timeline.placed, 48_000 + BLOCK as u64);
         let mut tail = Vec::new();
         while let Some(block) = timeline.next_block() {
@@ -371,10 +429,15 @@ mod tests {
 
     #[test]
     fn drain_reports_a_source_that_still_has_packets() {
-        let packets = (0..20).map(|i| packet(Some(ORIGIN + ms(10 * i)), BLOCK, 1, false)).collect();
+        let packets = (0..20)
+            .map(|i| packet(Some(ORIGIN + ms(10 * i)), BLOCK, 1, false))
+            .collect();
         let mut source = FakeSource::new(packets);
         let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
-        assert!(!timeline.drain(&mut source, 16).unwrap(), "four packets are still waiting");
+        assert!(
+            !timeline.drain(&mut source, 16).unwrap(),
+            "four packets are still waiting"
+        );
         assert!(timeline.drain(&mut source, 16).unwrap());
         assert_eq!(timeline.placed, 20 * BLOCK as u64);
     }
@@ -383,8 +446,18 @@ mod tests {
     fn a_qpc_position_converts_onto_the_shared_clock() {
         let anchor = Duration::from_secs(10);
         assert_eq!(qpc_to_shared(1_000_000, 1_000_000, anchor), Some(anchor));
-        assert_eq!(qpc_to_shared(1_000_010, 1_000_000, anchor), Some(anchor + Duration::from_micros(1)));
-        assert_eq!(qpc_to_shared(900_000, 1_000_000, anchor), Some(anchor - ms(10)));
-        assert_eq!(qpc_to_shared(0, 200_000_000, anchor), None, "before the shared clock began");
+        assert_eq!(
+            qpc_to_shared(1_000_010, 1_000_000, anchor),
+            Some(anchor + Duration::from_micros(1))
+        );
+        assert_eq!(
+            qpc_to_shared(900_000, 1_000_000, anchor),
+            Some(anchor - ms(10))
+        );
+        assert_eq!(
+            qpc_to_shared(0, 200_000_000, anchor),
+            None,
+            "before the shared clock began"
+        );
     }
 }

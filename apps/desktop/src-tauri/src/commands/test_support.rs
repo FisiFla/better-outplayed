@@ -1,10 +1,9 @@
 //! Shared fixtures for the per-module test suites (a real store, real ffmpeg output).
 
 use super::*;
-use localplay_store::NewClip;
 use localplay_media::binaries::run_with_timeout;
+use localplay_store::NewClip;
 use std::time::Duration;
-
 
 /// The wall clock the session fixtures start at: deliberately enormous, so a timeline offset
 /// computed against the wall start instead of the media epoch is unmistakably wrong.
@@ -12,8 +11,10 @@ pub(crate) const WALL_START_MS: i64 = 1_700_000_000_000;
 
 /// A cap nothing reaches and an age nothing exceeds: the policy is a no-op, so a test not about
 /// it cannot trip over it.
-pub(crate) const GENEROUS: StorageConfigView =
-    StorageConfigView { max_total_bytes: u64::MAX, max_age_days: 3_650 };
+pub(crate) const GENEROUS: StorageConfigView = StorageConfigView {
+    max_total_bytes: u64::MAX,
+    max_age_days: 3_650,
+};
 
 pub(crate) struct Fixture {
     /// Held so the temporary directory outlives the store and the clips in it.
@@ -38,7 +39,14 @@ impl Fixture {
         std::fs::create_dir_all(&paths.clips_dir).unwrap();
         let store = Store::open(&paths.db_path).unwrap();
         store.migrate().unwrap();
-        Self { _dir: dir, store, paths, storage, bins, warnings: Vec::new() }
+        Self {
+            _dir: dir,
+            store,
+            paths,
+            storage,
+            bins,
+            warnings: Vec::new(),
+        }
     }
 
     pub(crate) fn deps(&self) -> Deps<'_> {
@@ -54,13 +62,22 @@ impl Fixture {
     /// The same dependencies with no ffmpeg found — what an install without the
     /// sidecars sees.
     pub(crate) fn deps_without_ffmpeg(&self) -> Deps<'_> {
-        Deps { bins: None, ..self.deps() }
+        Deps {
+            bins: None,
+            ..self.deps()
+        }
     }
 
     /// Index a clip whose file exists on disk but is never opened or decoded: an empty stand-in,
     /// enough for the list, favourite, policy and validation tests. A test about a missing file
     /// removes it afterwards.
-    pub(crate) fn add_row(&self, name: &str, started_at_ms: u64, duration_ms: u64, size_bytes: u64) -> i64 {
+    pub(crate) fn add_row(
+        &self,
+        name: &str,
+        started_at_ms: u64,
+        duration_ms: u64,
+        size_bytes: u64,
+    ) -> i64 {
         let path = self.paths.clips_dir.join(name);
         std::fs::write(&path, b"").unwrap();
         self.store
@@ -163,7 +180,9 @@ pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32)
     let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("testsrc2=size=320x180:rate=10:duration={seconds}"))
-        .args(["-c:v", "mpeg4", "-q:v", "5", "-g", "10", "-pix_fmt", "yuv420p"])
+        .args([
+            "-c:v", "mpeg4", "-q:v", "5", "-g", "10", "-pix_fmt", "yuv420p",
+        ])
         .arg(path);
     let out = run_with_timeout(cmd, Duration::from_secs(60)).expect("spawning ffmpeg");
     assert!(
@@ -179,7 +198,12 @@ pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32)
 /// `-f md5` hashes packet payloads, so equal hashes mean byte-identical streams. Nothing is
 /// decoded or encoded on either side, which makes it evidence about a stream copy rather than a
 /// proxy for one.
-pub(crate) fn stream_md5(bins: &FfmpegBinaries, src: &Path, seek_ms: u64, dur_ms: Option<u64>) -> String {
+pub(crate) fn stream_md5(
+    bins: &FfmpegBinaries,
+    src: &Path,
+    seek_ms: u64,
+    dur_ms: Option<u64>,
+) -> String {
     let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])
         .arg(format!("{:.3}", seek_ms as f64 / 1000.0))
@@ -197,4 +221,3 @@ pub(crate) fn stream_md5(bins: &FfmpegBinaries, src: &Path, seek_ms: u64, dur_ms
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
-

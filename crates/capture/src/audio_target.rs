@@ -43,7 +43,11 @@ pub(crate) struct GameAudioOpener<F> {
 impl<F: LoopbackFactory> GameAudioOpener<F> {
     /// `find_game` is `None` for whole-output capture.
     pub fn new(factory: F, find_game: Option<GameFinder>) -> Self {
-        Self { factory, find_game, refused_pid: None }
+        Self {
+            factory,
+            find_game,
+            refused_pid: None,
+        }
     }
 
     fn target(&mut self) -> Option<u32> {
@@ -63,7 +67,10 @@ impl<F: LoopbackFactory> SourceOpener for GameAudioOpener<F> {
         if let Some(pid) = self.target() {
             match self.factory.open_process(pid) {
                 Ok(stream) => {
-                    tracing::info!(pid, "game audio: capturing the game process only (process loopback)");
+                    tracing::info!(
+                        pid,
+                        "game audio: capturing the game process only (process loopback)"
+                    );
                     return Ok((stream, process_key(pid)));
                 }
                 Err(e) => {
@@ -105,7 +112,11 @@ mod tests {
         fn pull(&mut self, out: &mut Vec<u8>) -> Result<Option<PacketInfo>> {
             if std::mem::take(&mut self.1) {
                 out.extend(std::iter::repeat_n(self.0, 480 * 4));
-                return Ok(Some(PacketInfo { frames: 480, time: None, discontinuity: false }));
+                return Ok(Some(PacketInfo {
+                    frames: 480,
+                    time: None,
+                    discontinuity: false,
+                }));
             }
             Ok(None)
         }
@@ -146,9 +157,13 @@ mod tests {
     fn the_game_is_captured_alone_once_it_runs_and_the_output_again_after_it_exits() {
         let (pid, find) = finder();
         let opener = GameAudioOpener::new(Fake::default(), Some(find));
-        let format = AudioFormat { sample_rate: 48_000, channels: 2 };
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
         let ms = Duration::from_millis;
-        let mut source = RecoveringSource::start(opener, AudioTimeline::new(format, ms(0)), ms(0)).unwrap();
+        let mut source =
+            RecoveringSource::start(opener, AudioTimeline::new(format, ms(0)), ms(0)).unwrap();
 
         *pid.lock().unwrap() = Some(42);
         source.poll(ms(1_000)).unwrap();
@@ -169,10 +184,20 @@ mod tests {
     fn a_refused_activation_falls_back_to_the_output_and_is_not_retried() {
         let (pid, find) = finder();
         *pid.lock().unwrap() = Some(7);
-        let mut opener = GameAudioOpener::new(Fake { refuse_process: true, ..Fake::default() }, Some(find));
+        let mut opener = GameAudioOpener::new(
+            Fake {
+                refuse_process: true,
+                ..Fake::default()
+            },
+            Some(find),
+        );
         let (_, key) = opener.open().unwrap();
         assert_eq!(key, "system:speakers");
-        assert_eq!(opener.wanted().unwrap(), key, "so the open stream is kept, not reopened every second");
+        assert_eq!(
+            opener.wanted().unwrap(),
+            key,
+            "so the open stream is kept, not reopened every second"
+        );
 
         // A new game process is tried again.
         *pid.lock().unwrap() = Some(8);
@@ -192,7 +217,10 @@ mod tests {
         struct Section {
             game_audio: GameAudioSource,
         }
-        let parse = |v: &str| serde_json::from_str::<Section>(&format!("{{\"game_audio\":\"{v}\"}}")).map(|s| s.game_audio);
+        let parse = |v: &str| {
+            serde_json::from_str::<Section>(&format!("{{\"game_audio\":\"{v}\"}}"))
+                .map(|s| s.game_audio)
+        };
         assert_eq!(parse("app").unwrap(), GameAudioSource::App);
         assert_eq!(parse("system").unwrap(), GameAudioSource::System);
         assert!(parse("discord").is_err());

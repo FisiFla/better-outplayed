@@ -80,7 +80,10 @@ const V2_SESSION_COLUMNS: [(&str, &str); 4] = [
         "mode",
         "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'buffer'",
     ),
-    ("final_path", "ALTER TABLE sessions ADD COLUMN final_path TEXT"),
+    (
+        "final_path",
+        "ALTER TABLE sessions ADD COLUMN final_path TEXT",
+    ),
     (
         "size_bytes",
         "ALTER TABLE sessions ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0",
@@ -150,7 +153,11 @@ pub const MAX_TITLE_CHARS: usize = 120;
 /// A tag as stored: trimmed, internal whitespace collapsed, lower-cased. `None` for a tag that is
 /// empty after that or longer than [`MAX_TAG_CHARS`]: refused, not truncated.
 pub fn normalize_tag(raw: &str) -> Option<String> {
-    let tag = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let tag = raw
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     let n = tag.chars().count();
     (n > 0 && n <= MAX_TAG_CHARS && !tag.chars().any(char::is_control)).then_some(tag)
 }
@@ -317,11 +324,15 @@ pub struct Store {
 
 impl Store {
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self { conn: Connection::open_in_memory().context("opening in-memory db")? })
+        Ok(Self {
+            conn: Connection::open_in_memory().context("opening in-memory db")?,
+        })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self { conn: Connection::open(path).with_context(|| format!("opening {}", path.display()))? })
+        Ok(Self {
+            conn: Connection::open(path).with_context(|| format!("opening {}", path.display()))?,
+        })
     }
 
     /// Forward-only migrations. A schema newer than this build is refused rather than downgraded.
@@ -332,7 +343,9 @@ impl Store {
     /// crash part-way leaves a database one step behind, upgraded by the next call, never one
     /// claiming a version it lacks.
     pub fn migrate(&self) -> Result<()> {
-        let current: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let current: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if current > SCHEMA_VERSION {
             anyhow::bail!(
                 "database schema v{current} is newer than this build supports (v{SCHEMA_VERSION}); \
@@ -357,7 +370,8 @@ impl Store {
         if current < 5 {
             self.upgrade_to_v5()?;
         }
-        self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     }
 
@@ -370,7 +384,12 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
-        let Some(db_path) = self.conn.path().filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        let Some(db_path) = self
+            .conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+        else {
             return Ok(());
         };
         if !populated {
@@ -382,7 +401,12 @@ impl Store {
         let _ = std::fs::remove_file(&backup);
         self.conn
             .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-            .with_context(|| format!("backing up the database to {} before migrating", backup.display()))?;
+            .with_context(|| {
+                format!(
+                    "backing up the database to {} before migrating",
+                    backup.display()
+                )
+            })?;
 
         // Retention: keep the two newest `<db>.v*.bak`.
         if let (Some(dir), Some(base)) = (db_path.parent(), db_path.file_name()) {
@@ -458,7 +482,9 @@ impl Store {
     }
 
     pub fn schema_version(&self) -> Result<i32> {
-        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
     pub fn insert_clip(&self, clip: &NewClip) -> Result<i64> {
@@ -501,8 +527,11 @@ impl Store {
         })?;
         let mut clips = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut tags: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
-        let mut stmt = self.conn.prepare("SELECT clip_id, tag FROM clip_tags ORDER BY tag")?;
+        let mut tags: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT clip_id, tag FROM clip_tags ORDER BY tag")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (id, tag) = row?;
             tags.entry(id).or_default().push(tag);
@@ -517,16 +546,20 @@ impl Store {
     /// exists. The file is never touched (see [`V5_CLIP_COLUMNS`]).
     pub fn set_clip_title(&self, id: i64, title: &str) -> Result<bool> {
         let title = normalize_title(title)?;
-        let updated =
-            self.conn.execute("UPDATE clips SET title = ?2 WHERE id = ?1", params![id, title])?;
+        let updated = self.conn.execute(
+            "UPDATE clips SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
         Ok(updated > 0)
     }
 
     /// Set or clear the game a clip belongs to. Returns whether the clip exists.
     pub fn set_clip_game(&self, id: i64, game: Option<&str>) -> Result<bool> {
         let game = game.map(str::trim).filter(|g| !g.is_empty());
-        let updated =
-            self.conn.execute("UPDATE clips SET game = ?2 WHERE id = ?1", params![id, game])?;
+        let updated = self.conn.execute(
+            "UPDATE clips SET game = ?2 WHERE id = ?1",
+            params![id, game],
+        )?;
         Ok(updated > 0)
     }
 
@@ -549,14 +582,20 @@ impl Store {
             anyhow::bail!("a clip carries at most {MAX_TAGS_PER_CLIP} tags");
         }
         let tx = self.conn.unchecked_transaction()?;
-        let exists: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)", params![id], |r| r.get(0))?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
         if !exists {
             return Ok(false);
         }
         tx.execute("DELETE FROM clip_tags WHERE clip_id = ?1", params![id])?;
         for tag in &clean {
-            tx.execute("INSERT INTO clip_tags (clip_id, tag) VALUES (?1, ?2)", params![id, tag])?;
+            tx.execute(
+                "INSERT INTO clip_tags (clip_id, tag) VALUES (?1, ?2)",
+                params![id, tag],
+            )?;
         }
         tx.commit()?;
         Ok(true)
@@ -607,8 +646,10 @@ impl Store {
             "SELECT id, session_id, kind, at, payload, clip_id FROM events
              WHERE session_id = ?1 AND at >= ?2 AND at < ?3 ORDER BY at, id",
         )?;
-        let rows =
-            stmt.query_map(params![session_id, from_ms as i64, to_ms as i64], read_event)?;
+        let rows = stmt.query_map(
+            params![session_id, from_ms as i64, to_ms as i64],
+            read_event,
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -627,11 +668,11 @@ impl Store {
     /// Total bytes the indexed clips claim: the figure `storage.max_total_bytes` caps. It is what the
     /// rows recorded when written, not a fresh `stat`, so a file changed behind the index will disagree.
     pub fn total_bytes(&self) -> Result<u64> {
-        let bytes: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM clips",
-            [],
-            |r| r.get(0),
-        )?;
+        let bytes: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM clips", [], |r| {
+                    r.get(0)
+                })?;
         Ok(bytes.max(0) as u64)
     }
 
@@ -650,13 +691,18 @@ impl Store {
     pub fn delete_clip_returning_path(&self, id: i64) -> Result<Option<String>> {
         let path: Option<String> = self
             .conn
-            .query_row("SELECT path FROM clips WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row("SELECT path FROM clips WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
             .optional()?;
         let Some(path) = path else {
             return Ok(None);
         };
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("UPDATE events SET clip_id = NULL WHERE clip_id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE events SET clip_id = NULL WHERE clip_id = ?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM clip_tags WHERE clip_id = ?1", params![id])?;
         let removed = tx.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         tx.commit()?;
@@ -734,7 +780,11 @@ impl Store {
     ) -> Result<()> {
         let ended: Option<Option<i64>> = self
             .conn
-            .query_row("SELECT ended_at FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .optional()?;
         match ended {
             None => anyhow::bail!("cannot end session #{id}: no such session"),
@@ -769,7 +819,11 @@ impl Store {
     pub fn set_session_size(&self, id: i64, size_bytes: i64) -> Result<()> {
         let ended: Option<Option<i64>> = self
             .conn
-            .query_row("SELECT ended_at FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .optional()?;
         match ended {
             None => anyhow::bail!("cannot size session #{id}: no such session"),
@@ -779,8 +833,10 @@ impl Store {
             ),
             Some(None) => {}
         }
-        self.conn
-            .execute("UPDATE sessions SET size_bytes = ?2 WHERE id = ?1", params![id, size_bytes])?;
+        self.conn.execute(
+            "UPDATE sessions SET size_bytes = ?2 WHERE id = ?1",
+            params![id, size_bytes],
+        )?;
         Ok(())
     }
 
@@ -801,9 +857,9 @@ impl Store {
     /// A missing id is `Ok(None)`, not an error: an evicted id, one a UI still has in a list, and
     /// one that never existed are the same state.
     pub fn get_session(&self, id: i64) -> Result<Option<Session>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"
+        ))?;
         Ok(stmt.query_row(params![id], read_session).optional()?)
     }
 
@@ -908,11 +964,20 @@ impl Store {
         }
 
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("UPDATE events SET session_id = NULL WHERE session_id = ?1", params![id])?;
-        tx.execute("UPDATE clips SET session_id = NULL WHERE session_id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE events SET session_id = NULL WHERE session_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "UPDATE clips SET session_id = NULL WHERE session_id = ?1",
+            params![id],
+        )?;
         let removed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
-        Ok((removed == 1).then_some(SessionPaths { final_path, scratch_dir }))
+        Ok((removed == 1).then_some(SessionPaths {
+            final_path,
+            scratch_dir,
+        }))
     }
 }
 
@@ -979,27 +1044,35 @@ mod tests {
         s.migrate().unwrap();
         let v1 = s.schema_version().unwrap();
         s.migrate().unwrap();
-        assert_eq!(s.schema_version().unwrap(), v1, "re-migrating must not bump the version");
+        assert_eq!(
+            s.schema_version().unwrap(),
+            v1,
+            "re-migrating must not bump the version"
+        );
     }
 
     #[test]
     fn inserts_and_lists_clips_newest_first() {
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
-        let a = s.insert_clip(&NewClip {
-            path: "/clips/a.mp4".into(),
-            started_at_ms: 1_000,
-            duration_ms: 4_000,
-            size_bytes: 100,
-            codec: "h264".into(),
-        }).unwrap();
-        let _b = s.insert_clip(&NewClip {
-            path: "/clips/b.mp4".into(),
-            started_at_ms: 2_000,
-            duration_ms: 4_000,
-            size_bytes: 200,
-            codec: "h264".into(),
-        }).unwrap();
+        let a = s
+            .insert_clip(&NewClip {
+                path: "/clips/a.mp4".into(),
+                started_at_ms: 1_000,
+                duration_ms: 4_000,
+                size_bytes: 100,
+                codec: "h264".into(),
+            })
+            .unwrap();
+        let _b = s
+            .insert_clip(&NewClip {
+                path: "/clips/b.mp4".into(),
+                started_at_ms: 2_000,
+                duration_ms: 4_000,
+                size_bytes: 200,
+                codec: "h264".into(),
+            })
+            .unwrap();
 
         let clips = s.list_clips().unwrap();
         assert_eq!(clips.len(), 2);
@@ -1047,12 +1120,17 @@ mod tests {
             v.sort();
             v
         };
-        assert!(backups(dir.path()).is_empty(), "a fresh database has nothing to back up");
+        assert!(
+            backups(dir.path()).is_empty(),
+            "a fresh database has nothing to back up"
+        );
 
         // Pretend the file is one schema behind, three times over.
         for version in [2, 3, 2] {
             let s = Store::open(&db).unwrap();
-            s.conn.execute_batch(&format!("PRAGMA user_version = {version}")).unwrap();
+            s.conn
+                .execute_batch(&format!("PRAGMA user_version = {version}"))
+                .unwrap();
             drop(s);
             let s = Store::open(&db).unwrap();
             s.migrate().unwrap();
@@ -1077,31 +1155,47 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
         let before = now_ms();
-        let id = s.insert_clip(&NewClip {
-            path: "/clips/timed.mp4".into(),
-            started_at_ms: 1_000,
-            duration_ms: 1_000,
-            size_bytes: 1,
-            codec: "h264".into(),
-        }).unwrap();
+        let id = s
+            .insert_clip(&NewClip {
+                path: "/clips/timed.mp4".into(),
+                started_at_ms: 1_000,
+                duration_ms: 1_000,
+                size_bytes: 1,
+                codec: "h264".into(),
+            })
+            .unwrap();
         let after = now_ms();
 
-        let clip = s.list_clips().unwrap().into_iter().find(|c| c.id == id).unwrap();
-        assert!(clip.created_at_ms >= before && clip.created_at_ms <= after, "got {}", clip.created_at_ms);
+        let clip = s
+            .list_clips()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap();
+        assert!(
+            clip.created_at_ms >= before && clip.created_at_ms <= after,
+            "got {}",
+            clip.created_at_ms
+        );
     }
 
     #[test]
     fn toggles_a_favourite_and_reports_a_missing_id() {
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
-        let id = s.insert_clip(&NewClip {
-            path: "/clips/fav.mp4".into(),
-            started_at_ms: 1_000,
-            duration_ms: 1_000,
-            size_bytes: 1,
-            codec: "h264".into(),
-        }).unwrap();
-        assert!(!s.list_clips().unwrap()[0].favourite, "clips are not favourites by default");
+        let id = s
+            .insert_clip(&NewClip {
+                path: "/clips/fav.mp4".into(),
+                started_at_ms: 1_000,
+                duration_ms: 1_000,
+                size_bytes: 1,
+                codec: "h264".into(),
+            })
+            .unwrap();
+        assert!(
+            !s.list_clips().unwrap()[0].favourite,
+            "clips are not favourites by default"
+        );
 
         assert!(s.set_favourite(id, true).unwrap());
         assert!(s.list_clips().unwrap()[0].favourite);
@@ -1127,7 +1221,8 @@ mod tests {
                 duration_ms: 1_000,
                 size_bytes: bytes,
                 codec: "h264".into(),
-            }).unwrap();
+            })
+            .unwrap();
         }
         assert_eq!(s.total_bytes().unwrap(), 350);
     }
@@ -1157,9 +1252,13 @@ mod tests {
             .unwrap();
 
         // A highlight: the event that produced the clip.
-        let kill = s.insert_event(&an_event("kill", 34_000, Some(clip))).unwrap();
+        let kill = s
+            .insert_event(&an_event("kill", 34_000, Some(clip)))
+            .unwrap();
         // A marker: recorded, no clip.
-        let round = s.insert_event(&an_event("round_start", 40_000, None)).unwrap();
+        let round = s
+            .insert_event(&an_event("round_start", 40_000, None))
+            .unwrap();
         assert_ne!(kill, round);
 
         let events = s.list_events().unwrap();
@@ -1168,22 +1267,32 @@ mod tests {
         assert_eq!(events[0].at_ms, 34_000);
         assert_eq!(events[0].clip_id, Some(clip));
         assert!(events[0].payload.as_deref().unwrap().contains("kill"));
-        assert_eq!(events[0].session_id, None, "this engine opens no session row");
+        assert_eq!(
+            events[0].session_id, None,
+            "this engine opens no session row"
+        );
         assert_eq!(events[1].kind, "round_start");
         assert_eq!(events[1].clip_id, None, "a marker has no clip");
 
         let for_clip = s.events_for_clip(clip).unwrap();
         assert_eq!(for_clip.len(), 1, "the clip's own events");
         assert_eq!(for_clip[0].id, kill);
-        assert!(s.events_for_clip(clip + 1).unwrap().is_empty(), "no such clip, no events");
+        assert!(
+            s.events_for_clip(clip + 1).unwrap().is_empty(),
+            "no such clip, no events"
+        );
     }
 
     #[test]
     fn events_in_range_is_one_session_half_open_and_ordered() {
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
-        let mine = s.start_session(None, SESSION_MODE_BUFFER, 1, "/scratch/a", 0).unwrap();
-        let other = s.start_session(None, SESSION_MODE_BUFFER, 2, "/scratch/b", 0).unwrap();
+        let mine = s
+            .start_session(None, SESSION_MODE_BUFFER, 1, "/scratch/a", 0)
+            .unwrap();
+        let other = s
+            .start_session(None, SESSION_MODE_BUFFER, 2, "/scratch/b", 0)
+            .unwrap();
         let at = |session: i64, kind: &str, at_ms: u64| NewEvent {
             session_id: Some(session),
             ..an_event(kind, at_ms, None)
@@ -1194,8 +1303,12 @@ mod tests {
         s.insert_event(&at(mine, "at_end", 3_000)).unwrap();
         s.insert_event(&at(other, "elsewhere", 1_500)).unwrap();
 
-        let kinds: Vec<String> =
-            s.events_in_range(mine, 1_000, 3_000).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<String> = s
+            .events_in_range(mine, 1_000, 3_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert_eq!(kinds, ["kill", "death"]);
     }
 
@@ -1208,7 +1321,10 @@ mod tests {
             s.insert_event(&an_event("kill", 1_000, Some(42))).is_err(),
             "there is no clip 42"
         );
-        assert!(s.list_events().unwrap().is_empty(), "and nothing was written");
+        assert!(
+            s.list_events().unwrap().is_empty(),
+            "and nothing was written"
+        );
     }
 
     #[test]
@@ -1225,7 +1341,10 @@ mod tests {
         .unwrap();
         let events = s.list_events().unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload, None, "the column is nullable and stays null");
+        assert_eq!(
+            events[0].payload, None,
+            "the column is nullable and stays null"
+        );
     }
 
     #[test]
@@ -1243,13 +1362,24 @@ mod tests {
                 codec: "h264".into(),
             })
             .unwrap();
-        s.insert_event(&an_event("kill", 1_000, Some(clip))).unwrap();
+        s.insert_event(&an_event("kill", 1_000, Some(clip)))
+            .unwrap();
 
         // Delete the clip as the executor does: row first, then the file (none here, which the executor tolerates).
-        assert_eq!(s.delete_clip_returning_path(clip).unwrap().as_deref(), Some("/clips/gone.mp4"));
+        assert_eq!(
+            s.delete_clip_returning_path(clip).unwrap().as_deref(),
+            Some("/clips/gone.mp4")
+        );
         let events = s.list_events().unwrap();
-        assert_eq!(events.len(), 1, "the event row survives the clip it pointed at");
-        assert_eq!(events[0].clip_id, None, "and no longer names a row that is gone");
+        assert_eq!(
+            events.len(),
+            1,
+            "the event row survives the clip it pointed at"
+        );
+        assert_eq!(
+            events[0].clip_id, None,
+            "and no longer names a row that is gone"
+        );
         assert!(s.list_clips().unwrap().is_empty());
     }
 
@@ -1259,17 +1389,23 @@ mod tests {
         // is deleted without a committed row naming it.
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
-        let id = s.insert_clip(&NewClip {
-            path: "/clips/c.mp4".into(),
-            started_at_ms: 1_000,
-            duration_ms: 1_000,
-            size_bytes: 1,
-            codec: "h264".into(),
-        }).unwrap();
+        let id = s
+            .insert_clip(&NewClip {
+                path: "/clips/c.mp4".into(),
+                started_at_ms: 1_000,
+                duration_ms: 1_000,
+                size_bytes: 1,
+                codec: "h264".into(),
+            })
+            .unwrap();
 
         let removed = s.delete_clip_returning_path(id).unwrap();
         assert_eq!(removed.as_deref(), Some("/clips/c.mp4"));
-        assert_eq!(s.delete_clip_returning_path(id).unwrap(), None, "second delete is a no-op");
+        assert_eq!(
+            s.delete_clip_returning_path(id).unwrap(),
+            None,
+            "second delete is a no-op"
+        );
     }
 
     // ------------------------------------------------------------- sessions
@@ -1277,7 +1413,13 @@ mod tests {
     /// A session that is running: opened, not ended, and nothing on disk yet.
     fn running_session(store: &Store) -> i64 {
         store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000_000, "/scratch/1", 0)
+            .start_session(
+                Some("League of Legends"),
+                SESSION_MODE_SESSION,
+                1_000_000,
+                "/scratch/1",
+                0,
+            )
             .expect("open the session")
     }
 
@@ -1288,7 +1430,11 @@ mod tests {
     fn clip_session_id(store: &Store, clip_id: i64) -> Option<i64> {
         store
             .conn
-            .query_row("SELECT session_id FROM clips WHERE id = ?1", params![clip_id], |r| r.get(0))
+            .query_row(
+                "SELECT session_id FROM clips WHERE id = ?1",
+                params![clip_id],
+                |r| r.get(0),
+            )
             .expect("the clip row")
     }
 
@@ -1298,12 +1444,18 @@ mod tests {
         s.migrate().expect("migrate the store");
         let id = running_session(&s);
 
-        let running = s.get_session(id).expect("the session").expect("it is there");
+        let running = s
+            .get_session(id)
+            .expect("the session")
+            .expect("it is there");
         assert_eq!(running.id, id);
         assert_eq!(running.game.as_deref(), Some("League of Legends"));
         assert_eq!(running.mode, SESSION_MODE_SESSION);
         assert_eq!(running.started_at_ms, 1_000_000);
-        assert_eq!(running.ended_at_ms, None, "a session is running until it is ended");
+        assert_eq!(
+            running.ended_at_ms, None,
+            "a session is running until it is ended"
+        );
         assert_eq!(running.scratch_dir, "/scratch/1");
         assert_eq!(running.final_path, None, "there is no session file yet");
         assert_eq!(running.size_bytes, 0);
@@ -1316,7 +1468,10 @@ mod tests {
 
         s.end_session(id, 1_120_000, Some("/sessions/1.mp4"), 4_096, 118_400)
             .expect("the session ends");
-        let ended = s.get_session(id).expect("the session").expect("it is still there");
+        let ended = s
+            .get_session(id)
+            .expect("the session")
+            .expect("it is still there");
         assert_eq!(ended.ended_at_ms, Some(1_120_000));
         assert_eq!(ended.final_path.as_deref(), Some("/sessions/1.mp4"));
         assert_eq!(ended.size_bytes, 4_096);
@@ -1340,7 +1495,10 @@ mod tests {
             .start_session(None, SESSION_MODE_BUFFER, 5, "/scratch/2", 0)
             .expect("the session opens");
         assert_eq!(
-            s.get_session(id).expect("the session").expect("the session row").game,
+            s.get_session(id)
+                .expect("the session")
+                .expect("the session row")
+                .game,
             None,
             "a session with no game"
         );
@@ -1349,8 +1507,15 @@ mod tests {
         let err = s
             .start_session(None, "ful-session", 6, "/scratch/3", 0)
             .expect_err("an unknown mode is refused");
-        assert!(format!("{err:#}").contains("unknown session mode"), "{err:#}");
-        assert_eq!(s.list_sessions().expect("the sessions").len(), 1, "and nothing was written");
+        assert!(
+            format!("{err:#}").contains("unknown session mode"),
+            "{err:#}"
+        );
+        assert_eq!(
+            s.list_sessions().expect("the sessions").len(),
+            1,
+            "and nothing was written"
+        );
     }
 
     #[test]
@@ -1358,15 +1523,23 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let id = running_session(&s);
-        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0).expect("the session ends");
+        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0)
+            .expect("the session ends");
 
         let err = s
             .end_session(id, 1_200_000, Some("/sessions/other.mp4"), 9_999, 0)
             .expect_err("a second finalisation is refused, not silently ignored");
         assert!(format!("{err:#}").contains("already ended"), "{err:#}");
 
-        let row = s.get_session(id).expect("the session").expect("the session row");
-        assert_eq!(row.ended_at_ms, Some(1_100_000), "the first end time still stands");
+        let row = s
+            .get_session(id)
+            .expect("the session")
+            .expect("the session row");
+        assert_eq!(
+            row.ended_at_ms,
+            Some(1_100_000),
+            "the first end time still stands"
+        );
         assert_eq!(row.final_path.as_deref(), Some("/sessions/1.mp4"));
         assert_eq!(row.size_bytes, 4_096);
     }
@@ -1386,8 +1559,15 @@ mod tests {
     fn getting_a_session_that_does_not_exist_is_none_with_no_events() {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
-        assert_eq!(s.get_session(7).expect("the session"), None, "no such session, no error, no panic");
-        assert!(s.events_for_session(7).expect("the timeline").is_empty(), "and no timeline to plot");
+        assert_eq!(
+            s.get_session(7).expect("the session"),
+            None,
+            "no such session, no error, no panic"
+        );
+        assert!(
+            s.events_for_session(7).expect("the timeline").is_empty(),
+            "and no timeline to plot"
+        );
     }
 
     #[test]
@@ -1406,7 +1586,11 @@ mod tests {
             .expect("the session opens");
 
         assert_eq!(
-            s.list_sessions().expect("the sessions").iter().map(|s| s.id).collect::<Vec<_>>(),
+            s.list_sessions()
+                .expect("the sessions")
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
             vec![tied, second, first],
             "most recently started first"
         );
@@ -1428,13 +1612,15 @@ mod tests {
                 1_000_000, // media: where the ledger stood when it began
             )
             .expect("open the session");
-        let clip = s.insert_clip(&NewClip {
-            path: "/clips/kill.mp4".into(),
-            started_at_ms: 30_000,
-            duration_ms: 12_000,
-            size_bytes: 100,
-            codec: "h264_nvenc".into(),
-        }).expect("the clip is indexed");
+        let clip = s
+            .insert_clip(&NewClip {
+                path: "/clips/kill.mp4".into(),
+                started_at_ms: 30_000,
+                duration_ms: 12_000,
+                size_bytes: 100,
+                codec: "h264_nvenc".into(),
+            })
+            .expect("the clip is indexed");
 
         // Inserted out of order, of every provenance: a manual hotkey bookmark, a game-derived kill that
         // produced a clip, a game-derived death, a marker with no clip, and one event before the
@@ -1452,21 +1638,30 @@ mod tests {
                 at_ms: at,
                 payload: Some(format!("{{\"source\":\"test\",\"event\":\"{kind}\"}}")),
                 clip_id,
-            }).expect("the event is written");
+            })
+            .expect("the event is written");
         }
         // An event of another session must not appear; nor must one with no session.
         let other = s
             .start_session(None, SESSION_MODE_BUFFER, 2_000_000, "/scratch/other", 0)
             .expect("the session opens");
-        s.insert_event(&an_event("kill", 2_000_001, None)).expect("the event is written");
-        s.insert_event(&an_event("kill", 2_000_002, None)).expect("the event is written");
+        s.insert_event(&an_event("kill", 2_000_001, None))
+            .expect("the event is written");
+        s.insert_event(&an_event("kill", 2_000_002, None))
+            .expect("the event is written");
         s.conn
-            .execute("UPDATE events SET session_id = ?2 WHERE at = ?1", params![2_000_001, other])
+            .execute(
+                "UPDATE events SET session_id = ?2 WHERE at = ?1",
+                params![2_000_001, other],
+            )
             .expect("the statement");
 
         let timeline = s.events_for_session(session).expect("the timeline");
         assert_eq!(
-            timeline.iter().map(|e| (e.kind.as_str(), e.offset_ms)).collect::<Vec<_>>(),
+            timeline
+                .iter()
+                .map(|e| (e.kind.as_str(), e.offset_ms))
+                .collect::<Vec<_>>(),
             vec![
                 ("assist", -1),
                 ("bookmark", 0),
@@ -1480,15 +1675,20 @@ mod tests {
             timeline[1].offset_ms, 0,
             "an event at the session's own start instant is exactly 0"
         );
-        assert_eq!(timeline[3].clip_id, Some(clip), "the clip an event produced travels too");
-        assert!(timeline[1].clip_id.is_none(), "a bookmark that produced no clip says so");
-        assert!(
-            timeline[3]
-                .payload
-                .as_deref()
-                .expect("the payload is the JSON the caller stored")
-                .contains("kill")
+        assert_eq!(
+            timeline[3].clip_id,
+            Some(clip),
+            "the clip an event produced travels too"
         );
+        assert!(
+            timeline[1].clip_id.is_none(),
+            "a bookmark that produced no clip says so"
+        );
+        assert!(timeline[3]
+            .payload
+            .as_deref()
+            .expect("the payload is the JSON the caller stored")
+            .contains("kill"));
 
         let other_timeline = s.events_for_session(other).expect("the timeline");
         assert_eq!(other_timeline.len(), 1, "one event on the other session");
@@ -1501,11 +1701,23 @@ mod tests {
         let id = running_session(&s);
 
         s.set_session_favourite(id, true).expect("the toggle");
-        assert!(s.get_session(id).expect("the session").expect("the session row").favourite);
+        assert!(
+            s.get_session(id)
+                .expect("the session")
+                .expect("the session row")
+                .favourite
+        );
         s.set_session_favourite(id, false).expect("the toggle");
-        assert!(!s.get_session(id).expect("the session").expect("the session row").favourite);
+        assert!(
+            !s.get_session(id)
+                .expect("the session")
+                .expect("the session row")
+                .favourite
+        );
 
-        let err = s.set_session_favourite(id + 1, true).expect_err("no such session");
+        let err = s
+            .set_session_favourite(id + 1, true)
+            .expect_err("no such session");
         assert!(format!("{err:#}").contains("no session"), "{err:#}");
     }
 
@@ -1523,13 +1735,26 @@ mod tests {
         // A recorder keeps the running total current on its scan tick; without this the sessions cap
         // would plan against zero bytes for a live recording.
         s.set_session_size(id, 3_000).expect("the running size");
-        assert_eq!(s.total_session_bytes().expect("the session store's bytes"), 3_000);
+        assert_eq!(
+            s.total_session_bytes().expect("the session store's bytes"),
+            3_000
+        );
 
         // Once it has ended, `end_session` owns the number.
-        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0).expect("the session ends");
-        assert_eq!(s.total_session_bytes().expect("the session store's bytes"), 4_096);
-        assert!(s.set_session_size(id, 1).is_err(), "a finished session's size is final");
-        assert!(s.set_session_size(id + 1, 1).is_err(), "and there is no session to size");
+        s.end_session(id, 1_100_000, Some("/sessions/1.mp4"), 4_096, 0)
+            .expect("the session ends");
+        assert_eq!(
+            s.total_session_bytes().expect("the session store's bytes"),
+            4_096
+        );
+        assert!(
+            s.set_session_size(id, 1).is_err(),
+            "a finished session's size is final"
+        );
+        assert!(
+            s.set_session_size(id + 1, 1).is_err(),
+            "and there is no session to size"
+        );
     }
 
     #[test]
@@ -1537,31 +1762,45 @@ mod tests {
         let s = Store::open_in_memory().expect("an in-memory store");
         s.migrate().expect("migrate the store");
         let session = running_session(&s);
-        s.end_session(session, 1_120_000, Some("/sessions/1.mp4"), 9_000, 0).expect("the session ends");
+        s.end_session(session, 1_120_000, Some("/sessions/1.mp4"), 9_000, 0)
+            .expect("the session ends");
 
         // A clip extracted from the session. `insert_clip` takes no session_id, so the link is written
         // as the session recorder writes it; the foreign key would refuse the delete below if the store
         // did not detach it.
-        let clip = s.insert_clip(&NewClip {
-            path: "/clips/from-session.mp4".into(),
-            started_at_ms: 30_000,
-            duration_ms: 12_000,
-            size_bytes: 100,
-            codec: "h264_nvenc".into(),
-        }).expect("the clip is indexed");
+        let clip = s
+            .insert_clip(&NewClip {
+                path: "/clips/from-session.mp4".into(),
+                started_at_ms: 30_000,
+                duration_ms: 12_000,
+                size_bytes: 100,
+                codec: "h264_nvenc".into(),
+            })
+            .expect("the clip is indexed");
         s.conn
-            .execute("UPDATE clips SET session_id = ?2 WHERE id = ?1", params![clip, session])
+            .execute(
+                "UPDATE clips SET session_id = ?2 WHERE id = ?1",
+                params![clip, session],
+            )
             .expect("the statement");
-        assert_eq!(clip_session_id(&s, clip), Some(session), "the clip is linked to the session");
-        let event = s.insert_event(&NewEvent {
-            session_id: Some(session),
-            kind: "kill".into(),
-            at_ms: 1_030_000,
-            payload: None,
-            clip_id: Some(clip),
-        }).expect("the event is written");
+        assert_eq!(
+            clip_session_id(&s, clip),
+            Some(session),
+            "the clip is linked to the session"
+        );
+        let event = s
+            .insert_event(&NewEvent {
+                session_id: Some(session),
+                kind: "kill".into(),
+                at_ms: 1_030_000,
+                payload: None,
+                clip_id: Some(clip),
+            })
+            .expect("the event is written");
 
-        let paths = s.delete_session_returning_paths(session).expect("the session is deleted");
+        let paths = s
+            .delete_session_returning_paths(session)
+            .expect("the session is deleted");
         assert_eq!(
             paths,
             Some(SessionPaths {
@@ -1571,23 +1810,45 @@ mod tests {
             "the row names what the caller must remove, and nothing else"
         );
 
-        assert_eq!(s.get_session(session).expect("the session"), None, "the session row is gone");
+        assert_eq!(
+            s.get_session(session).expect("the session"),
+            None,
+            "the session row is gone"
+        );
         let clips = s.list_clips().expect("the clips");
-        assert_eq!(clips.len(), 1, "an extracted clip is a first-class artefact and survives");
+        assert_eq!(
+            clips.len(),
+            1,
+            "an extracted clip is a first-class artefact and survives"
+        );
         assert_eq!(clips[0].id, clip);
         assert_eq!(clips[0].path, PathBuf::from("/clips/from-session.mp4"));
-        assert_eq!(clip_session_id(&s, clip), None, "only the link to the gone row is cleared");
+        assert_eq!(
+            clip_session_id(&s, clip),
+            None,
+            "only the link to the gone row is cleared"
+        );
         let events = s.list_events().expect("the events");
         assert_eq!(events.len(), 1, "the event survives as history");
         assert_eq!(events[0].id, event);
-        assert_eq!(events[0].session_id, None, "and no longer names a row that is gone");
-        assert_eq!(events[0].clip_id, Some(clip), "the clip it produced is still there");
+        assert_eq!(
+            events[0].session_id, None,
+            "and no longer names a row that is gone"
+        );
+        assert_eq!(
+            events[0].clip_id,
+            Some(clip),
+            "the clip it produced is still there"
+        );
         assert!(
-            s.events_for_session(session).expect("the timeline").is_empty(),
+            s.events_for_session(session)
+                .expect("the timeline")
+                .is_empty(),
             "the timeline of a session that no longer exists is empty, not an error"
         );
         assert_eq!(
-            s.delete_session_returning_paths(session).expect("the session is deleted"),
+            s.delete_session_returning_paths(session)
+                .expect("the session is deleted"),
             None,
             "a second delete is a no-op"
         );
@@ -1604,19 +1865,29 @@ mod tests {
             .delete_session_returning_paths(id)
             .expect_err("a running session must not be deletable");
         assert!(format!("{err:#}").contains("still recording"), "{err:#}");
-        assert!(s.get_session(id).expect("the session").is_some(), "the row is untouched");
+        assert!(
+            s.get_session(id).expect("the session").is_some(),
+            "the row is untouched"
+        );
 
         // The escape hatch is explicit: end it and it becomes an ordinary deletable session. A session
         // left running by a crash is the same case; this is how a recovery pass resolves it.
-        s.end_session(id, 1_200_000, None, 0, 0).expect("the session ends");
-        let paths = s.delete_session_returning_paths(id).expect("the session is deleted");
+        s.end_session(id, 1_200_000, None, 0, 0)
+            .expect("the session ends");
+        let paths = s
+            .delete_session_returning_paths(id)
+            .expect("the session is deleted");
         assert_eq!(
             paths,
-            Some(SessionPaths { final_path: None, scratch_dir: "/scratch/1".into() }),
+            Some(SessionPaths {
+                final_path: None,
+                scratch_dir: "/scratch/1".into()
+            }),
             "a session with no final file hands back only its scratch directory"
         );
         assert_eq!(
-            s.delete_session_returning_paths(id + 1).expect("the session is deleted"),
+            s.delete_session_returning_paths(id + 1)
+                .expect("the session is deleted"),
             None,
             "no such row"
         );
@@ -1625,8 +1896,10 @@ mod tests {
     /// A database with the v1 tables, v1's `user_version`, and a row in each table.
     fn v1_database(path: &Path) -> Store {
         let conn = Connection::open(path).expect("open the v1 database");
-        conn.execute_batch(V1_DDL).expect("the v1 tables, exactly as v1 shipped them");
-        conn.execute_batch("PRAGMA user_version = 1").expect("stamp v1");
+        conn.execute_batch(V1_DDL)
+            .expect("the v1 tables, exactly as v1 shipped them");
+        conn.execute_batch("PRAGMA user_version = 1")
+            .expect("stamp v1");
         conn.execute(
             "INSERT INTO sessions (id, game, started_at, ended_at, scratch_dir)
              VALUES (1, 'League of Legends', 1000, 61000, '/app/scratch')",
@@ -1651,9 +1924,18 @@ mod tests {
 
     /// The column names, declared types and nullability of `table`, as SQLite sees them.
     fn columns(store: &Store, table: &str) -> Vec<(String, String, i64)> {
-        let mut stmt = store.conn.prepare(&format!("PRAGMA table_info({table})")).expect("table_info");
+        let mut stmt = store
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table_info");
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
             .expect("query");
         rows.collect::<rusqlite::Result<Vec<_>>>().expect("columns")
     }
@@ -1663,7 +1945,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("localplay.db");
         let store = v1_database(&path);
-        assert_eq!(store.schema_version().expect("version"), 1, "the fixture is a v1 database");
+        assert_eq!(
+            store.schema_version().expect("version"),
+            1,
+            "the fixture is a v1 database"
+        );
 
         store.migrate().expect("the upgrade");
 
@@ -1706,11 +1992,23 @@ mod tests {
             "a legacy row was written by the buffer engine or not at all: 'buffer' is the \
              only mode that explains its own contents"
         );
-        assert_eq!(sessions[0].final_path, None, "a legacy session has no session file");
-        assert_eq!(sessions[0].size_bytes, 0, "and no recorded size to invent one from");
-        assert!(!sessions[0].favourite, "favourites default to not favourited");
+        assert_eq!(
+            sessions[0].final_path, None,
+            "a legacy session has no session file"
+        );
+        assert_eq!(
+            sessions[0].size_bytes, 0,
+            "and no recorded size to invent one from"
+        );
+        assert!(
+            !sessions[0].favourite,
+            "favourites default to not favourited"
+        );
         for column in ["mode", "final_path", "size_bytes", "favourite"] {
-            assert!(column_exists(&store.conn, "sessions", column).expect("table_info"), "{column}");
+            assert!(
+                column_exists(&store.conn, "sessions", column).expect("table_info"),
+                "{column}"
+            );
         }
 
         // The upgraded shape is the shape a new database gets: no drift between created and upgraded databases.
@@ -1748,9 +2046,12 @@ mod tests {
         {
             let conn = Connection::open(&path).expect("open");
             conn.execute_batch(V1_DDL).expect("v1 tables");
-            conn.execute_batch("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'buffer'")
-                .expect("one of v2's columns is already there");
-            conn.execute_batch("PRAGMA user_version = 1").expect("still stamped v1");
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'buffer'",
+            )
+            .expect("one of v2's columns is already there");
+            conn.execute_batch("PRAGMA user_version = 1")
+                .expect("still stamped v1");
             conn.execute(
                 "INSERT INTO sessions (id, game, started_at, ended_at, scratch_dir, mode)
                  VALUES (1, NULL, 5, 6, '/scratch/x', 'session')",
@@ -1760,13 +2061,30 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("open through the store");
-        store.migrate().expect("the upgrade must not die on a duplicate column");
+        store
+            .migrate()
+            .expect("the upgrade must not die on a duplicate column");
         assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
-        for column in ["mode", "final_path", "size_bytes", "favourite", "media_epoch_ms"] {
-            assert!(column_exists(&store.conn, "sessions", column).expect("table_info"), "{column}");
+        for column in [
+            "mode",
+            "final_path",
+            "size_bytes",
+            "favourite",
+            "media_epoch_ms",
+        ] {
+            assert!(
+                column_exists(&store.conn, "sessions", column).expect("table_info"),
+                "{column}"
+            );
         }
-        let session = store.get_session(1).expect("read").expect("the row survived");
-        assert_eq!(session.mode, SESSION_MODE_SESSION, "an existing value is never overwritten");
+        let session = store
+            .get_session(1)
+            .expect("read")
+            .expect("the row survived");
+        assert_eq!(
+            session.mode, SESSION_MODE_SESSION,
+            "an existing value is never overwritten"
+        );
     }
 
     #[test]
@@ -1776,7 +2094,8 @@ mod tests {
         {
             let conn = Connection::open(&path).expect("open");
             conn.execute_batch(V1_DDL).expect("tables");
-            conn.execute_batch("PRAGMA user_version = 99").expect("a newer build's version");
+            conn.execute_batch("PRAGMA user_version = 99")
+                .expect("a newer build's version");
             conn.execute(
                 "INSERT INTO sessions (id, game, started_at, ended_at, scratch_dir)
                  VALUES (1, NULL, 1, 2, '/scratch/future')",
@@ -1786,9 +2105,18 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("open through the store");
-        let err = store.migrate().expect_err("a newer schema must be refused, never downgraded");
-        assert!(format!("{err:#}").contains("newer than this build supports"), "{err:#}");
-        assert_eq!(store.schema_version().expect("version"), 99, "the version is not rewritten");
+        let err = store
+            .migrate()
+            .expect_err("a newer schema must be refused, never downgraded");
+        assert!(
+            format!("{err:#}").contains("newer than this build supports"),
+            "{err:#}"
+        );
+        assert_eq!(
+            store.schema_version().expect("version"),
+            99,
+            "the version is not rewritten"
+        );
         // Read through SQL: a refused v99 database has no `mode` column to read, which is the
         // fail-closed outcome. What matters is that the row is still there.
         let rows: i64 = store
@@ -1825,10 +2153,18 @@ mod tests {
         let clips = store.list_clips().unwrap();
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].path, PathBuf::from("/app/clips/kill.mp4"));
-        assert_eq!(clips[0].game.as_deref(), Some("League of Legends"), "game back-filled from the session");
+        assert_eq!(
+            clips[0].game.as_deref(),
+            Some("League of Legends"),
+            "game back-filled from the session"
+        );
         assert_eq!(clips[0].title, None);
         assert!(clips[0].tags.is_empty());
-        assert_eq!(store.events_for_clip(1).unwrap().len(), 1, "the event is untouched");
+        assert_eq!(
+            store.events_for_clip(1).unwrap().len(),
+            1,
+            "the event is untouched"
+        );
     }
 
     #[test]
@@ -1853,14 +2189,21 @@ mod tests {
         let c = &s.list_clips().unwrap()[0];
         assert_eq!(c.title.as_deref(), Some("Pentakill"));
         assert_eq!(c.game.as_deref(), Some("Valorant"));
-        assert_eq!(c.tags, vec!["ace".to_string(), "clutch play".to_string()], "normalized, de-duplicated, sorted");
+        assert_eq!(
+            c.tags,
+            vec!["ace".to_string(), "clutch play".to_string()],
+            "normalized, de-duplicated, sorted"
+        );
 
         // Blank clears.
         s.set_clip_title(id, "   ").unwrap();
         s.set_clip_game(id, None).unwrap();
         s.set_clip_tags(id, &[]).unwrap();
         let c = &s.list_clips().unwrap()[0];
-        assert_eq!((c.title.clone(), c.game.clone(), c.tags.clone()), (None, None, vec![]));
+        assert_eq!(
+            (c.title.clone(), c.game.clone(), c.tags.clone()),
+            (None, None, vec![])
+        );
     }
 
     #[test]
@@ -1874,12 +2217,20 @@ mod tests {
         let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
         s.set_clip_tags(id, &["keep".into()]).unwrap();
         assert!(s.set_clip_tags(id, &["ok".into(), "   ".into()]).is_err());
-        assert!(s.set_clip_tags(id, &["x".repeat(MAX_TAG_CHARS + 1)]).is_err());
+        assert!(s
+            .set_clip_tags(id, &["x".repeat(MAX_TAG_CHARS + 1)])
+            .is_err());
         let many: Vec<String> = (0..=MAX_TAGS_PER_CLIP).map(|i| format!("t{i}")).collect();
         assert!(s.set_clip_tags(id, &many).is_err());
-        assert_eq!(s.list_clips().unwrap()[0].tags, vec!["keep".to_string()], "a refused set changes nothing");
+        assert_eq!(
+            s.list_clips().unwrap()[0].tags,
+            vec!["keep".to_string()],
+            "a refused set changes nothing"
+        );
 
-        assert!(s.set_clip_title(id, &"x".repeat(MAX_TITLE_CHARS + 1)).is_err());
+        assert!(s
+            .set_clip_title(id, &"x".repeat(MAX_TITLE_CHARS + 1))
+            .is_err());
         assert!(s.set_clip_title(id, "bad\ntitle").is_err());
     }
 
@@ -1890,7 +2241,10 @@ mod tests {
         let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
         s.set_clip_tags(id, &["a".into()]).unwrap();
         s.delete_clip_returning_path(id).unwrap();
-        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM clip_tags", [], |r| r.get(0)).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM clip_tags", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
     }
 }

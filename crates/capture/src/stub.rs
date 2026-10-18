@@ -23,7 +23,13 @@ pub struct StubCapture {
 
 impl StubCapture {
     pub fn new(cfg: StubConfig) -> Self {
-        Self { cfg, frame_index: 0, started_at: None, read_back: 0, discarded: 0 }
+        Self {
+            cfg,
+            frame_index: 0,
+            started_at: None,
+            read_back: 0,
+            discarded: 0,
+        }
     }
 
     /// How many frames this source has materialised: pixel buffers built by [`Self::render_next`],
@@ -74,11 +80,16 @@ impl StubCapture {
                 ]);
             }
         }
-        let pts = Duration::from_micros(
-            self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64,
-        );
+        let pts = Duration::from_micros(self.frame_index * 1_000_000 / self.cfg.fps.max(1) as u64);
         self.frame_index += 1;
-        Frame { data, pts, width: w, height: h, format: PixelFormat::Bgra8, texture: None }
+        Frame {
+            data,
+            pts,
+            width: w,
+            height: h,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        }
     }
 }
 
@@ -146,7 +157,11 @@ pub struct StubAudio {
 
 impl StubAudio {
     pub fn new(format: AudioFormat) -> Self {
-        Self { format, block_index: 0, started_at: None }
+        Self {
+            format,
+            block_index: 0,
+            started_at: None,
+        }
     }
 
     pub fn drain_for(&mut self, elapsed: Duration) -> Vec<AudioBuffer> {
@@ -203,7 +218,11 @@ mod tests {
 
     #[test]
     fn stub_emits_the_requested_frame_count_at_the_requested_rate() {
-        let cfg = StubConfig { width: 64, height: 48, fps: 60 };
+        let cfg = StubConfig {
+            width: 64,
+            height: 48,
+            fps: 60,
+        };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
         // 0.25s of timeline.
@@ -213,11 +232,18 @@ mod tests {
 
     #[test]
     fn stub_frame_pts_are_monotonic_and_frame_sized() {
-        let cfg = StubConfig { width: 64, height: 48, fps: 30 };
+        let cfg = StubConfig {
+            width: 64,
+            height: 48,
+            fps: 30,
+        };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
         let frames = cap.drain_for(Duration::from_millis(100));
-        assert!(frames.windows(2).all(|w| w[0].pts < w[1].pts), "pts must increase");
+        assert!(
+            frames.windows(2).all(|w| w[0].pts < w[1].pts),
+            "pts must increase"
+        );
         // BGRA8 = 4 bytes per pixel.
         assert_eq!(frames[0].data.len(), 64 * 48 * 4);
     }
@@ -230,13 +256,20 @@ mod tests {
         assert_eq!(blocks.len(), 5);
         // 48000Hz / 100 blocks = 480 frames = 960 samples stereo = 1920 bytes.
         assert_eq!(blocks[0].data.len(), 1920);
-        assert!(blocks[0].data.iter().all(|b| *b == 0), "stub audio is silence");
+        assert!(
+            blocks[0].data.iter().all(|b| *b == 0),
+            "stub audio is silence"
+        );
     }
 
     #[test]
     fn next_frame_with_zero_timeout_returns_none_when_not_due() {
         // 10 fps => frames 100ms apart, a comfortable margin over the microseconds between the calls below.
-        let cfg = StubConfig { width: 8, height: 8, fps: 10 };
+        let cfg = StubConfig {
+            width: 8,
+            height: 8,
+            fps: 10,
+        };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
         // The initial frame (pts 0) is due immediately.
@@ -255,7 +288,11 @@ mod tests {
 
     #[test]
     fn next_frame_with_a_generous_timeout_returns_some() {
-        let cfg = StubConfig { width: 8, height: 8, fps: 10 };
+        let cfg = StubConfig {
+            width: 8,
+            height: 8,
+            fps: 10,
+        };
         let mut cap = StubCapture::new(cfg);
         cap.start().unwrap();
         // Consume the immediately-due frame, then wait for the next one (100ms out).
@@ -270,7 +307,11 @@ mod tests {
     fn discarding_the_pending_frame_does_not_read_it_back() {
         // 10fps: frames are 100ms apart and the frame at pts 0 is due immediately, so the calls below
         // are deterministic without sleeping.
-        let cfg = StubConfig { width: 8, height: 8, fps: 10 };
+        let cfg = StubConfig {
+            width: 8,
+            height: 8,
+            fps: 10,
+        };
         let mut cap = StubCapture::new(cfg);
         cap.start().expect("start the stub");
 
@@ -297,15 +338,24 @@ mod tests {
         assert_eq!(cap.frames_read_back(), 0);
 
         // A frame the pump does take is counted as read back.
-        assert!(cap.next_frame(Duration::from_secs(1)).expect("wait for the frame").is_some());
+        assert!(cap
+            .next_frame(Duration::from_secs(1))
+            .expect("wait for the frame")
+            .is_some());
         assert_eq!(cap.frames_read_back(), 1);
         assert_eq!(cap.frames_discarded(), 1);
     }
 
     #[test]
     fn discarding_before_start_is_an_error() {
-        let mut cap = StubCapture::new(StubConfig { width: 8, height: 8, fps: 10 });
-        let err = cap.discard_pending().expect_err("the stub has no schedule before start");
+        let mut cap = StubCapture::new(StubConfig {
+            width: 8,
+            height: 8,
+            fps: 10,
+        });
+        let err = cap
+            .discard_pending()
+            .expect_err("the stub has no schedule before start");
         assert!(err.to_string().contains("not started"), "got: {err}");
     }
 

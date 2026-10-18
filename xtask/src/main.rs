@@ -87,9 +87,12 @@ fn sidecars_command(args: &[String]) -> Result<()> {
     match sub.as_str() {
         // `--target` on `record` exists for the same reason it does on `fetch`: a machine
         // that is not the packaging machine records, reviews and fetches the Windows entry.
-        "record" => {
-            sidecars::record(&manifest_path(), &binaries_dir(), &work_dir(), target.as_deref())
-        }
+        "record" => sidecars::record(
+            &manifest_path(),
+            &binaries_dir(),
+            &work_dir(),
+            target.as_deref(),
+        ),
         "fetch" => sidecars::fetch(
             &manifest_path(),
             &binaries_dir(),

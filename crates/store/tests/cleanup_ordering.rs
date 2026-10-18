@@ -28,7 +28,12 @@ impl Fixture {
         let db_path = dir.path().join("localplay.db");
         let store = Store::open(&db_path).expect("open the clip index");
         store.migrate().expect("migrate the clip index");
-        Self { _dir: dir, clips_dir, db_path, store }
+        Self {
+            _dir: dir,
+            clips_dir,
+            db_path,
+            store,
+        }
     }
 
     /// Write a clip file with `bytes` of content, index it, and return its row id and path.
@@ -62,7 +67,12 @@ impl Fixture {
     }
 
     fn ids(&self) -> Vec<i64> {
-        self.store.list_clips().expect("list").iter().map(|c| c.id).collect()
+        self.store
+            .list_clips()
+            .expect("list")
+            .iter()
+            .map(|c| c.id)
+            .collect()
     }
 
     /// Backdate a row's creation time, as an operator would with `sqlite3`.
@@ -85,7 +95,10 @@ impl Fixture {
 }
 
 fn policy(max_total_bytes: u64, max_age_days: u64) -> CleanupPolicy {
-    CleanupPolicy { max_total_bytes, max_age_days }
+    CleanupPolicy {
+        max_total_bytes,
+        max_age_days,
+    }
 }
 
 fn now_ms() -> i64 {
@@ -108,7 +121,10 @@ fn rows_and_files_are_deleted_and_a_favourite_is_left_alone() {
     let (a, a_path) = fx.add_clip("a.mp4", 100); // created first: evicted first
     let (b, b_path) = fx.add_clip("b.mp4", 100);
     let (fav, fav_path) = fx.add_clip("fav.mp4", 300);
-    assert!(fx.store.set_favourite(fav, true).expect("favourite the clip"));
+    assert!(fx
+        .store
+        .set_favourite(fav, true)
+        .expect("favourite the clip"));
     let stray = stray_file(&fx.clips_dir);
     for path in [&a_path, &b_path, &fav_path, &stray] {
         assert!(path.is_file(), "fixture: {} must exist", path.display());
@@ -117,7 +133,10 @@ fn rows_and_files_are_deleted_and_a_favourite_is_left_alone() {
     // 500 bytes over a 300 byte cap; the favourite alone accounts for the whole cap.
     let plan = fx.plan(&policy(300, 3_650));
     assert_eq!(plan.ids(), vec![a, b], "the two oldest non-favourites");
-    assert!(plan.cap_met(), "the favourites are inside the cap, so it is reachable");
+    assert!(
+        plan.cap_met(),
+        "the favourites are inside the cap, so it is reachable"
+    );
     assert_eq!(plan.bytes_after, 300);
 
     let outcome = execute_cleanup(&fx.store, &plan).expect("execute the plan");
@@ -125,16 +144,28 @@ fn rows_and_files_are_deleted_and_a_favourite_is_left_alone() {
     assert_eq!(outcome.deleted, 2);
     assert_eq!(outcome.failed, 0);
     assert_eq!(outcome.bytes_reclaimed, 200);
-    assert!(outcome.orphaned.is_empty(), "both files were where the rows said");
+    assert!(
+        outcome.orphaned.is_empty(),
+        "both files were where the rows said"
+    );
     assert!(outcome.already_missing.is_empty());
-    assert_eq!(outcome.bytes_after, 300, "re-read from the store after the deletes");
+    assert_eq!(
+        outcome.bytes_after, 300,
+        "re-read from the store after the deletes"
+    );
     assert!(outcome.cap_met);
 
     assert_eq!(fx.ids(), vec![fav], "the rows are gone");
     assert!(!a_path.exists(), "{} must be unlinked", a_path.display());
     assert!(!b_path.exists(), "{} must be unlinked", b_path.display());
-    assert!(fav_path.exists(), "a favourite is never deleted, file included");
-    assert!(stray.exists(), "the executor only ever unlinks paths a deleted row named");
+    assert!(
+        fav_path.exists(),
+        "a favourite is never deleted, file included"
+    );
+    assert!(
+        stray.exists(),
+        "the executor only ever unlinks paths a deleted row named"
+    );
 }
 
 #[test]
@@ -155,7 +186,10 @@ fn an_aged_clip_is_deleted_and_a_recent_one_is_kept() {
     assert_eq!(outcome.bytes_reclaimed, 100);
     assert!(outcome.cap_met);
     assert_eq!(fx.ids(), vec![recent], "the recent clip's row is untouched");
-    assert!(!old_path.exists(), "the aged clip's file is gone with its row");
+    assert!(
+        !old_path.exists(),
+        "the aged clip's file is gone with its row"
+    );
     assert!(recent_path.exists(), "the recent clip's file is untouched");
 }
 
@@ -172,23 +206,38 @@ fn a_row_whose_file_is_already_gone_is_deleted_and_reported() {
 
     let outcome = execute_cleanup(&fx.store, &plan).expect("execute the plan");
 
-    assert_eq!(outcome.deleted, 1, "the row is deleted even though the file is not there");
+    assert_eq!(
+        outcome.deleted, 1,
+        "the row is deleted even though the file is not there"
+    );
     assert_eq!(
         outcome.already_missing,
         vec![missing.clone()],
         "a row pointing at nothing is reported, not swallowed"
     );
-    assert!(outcome.orphaned.is_empty(), "there is no file on disk to orphan");
-    assert_eq!(outcome.bytes_reclaimed, 0, "nothing was reclaimed: nothing was removed");
+    assert!(
+        outcome.orphaned.is_empty(),
+        "there is no file on disk to orphan"
+    );
+    assert_eq!(
+        outcome.bytes_reclaimed, 0,
+        "nothing was reclaimed: nothing was removed"
+    );
     assert!(fx.ids().is_empty(), "no rows are left");
-    assert!(stray.exists(), "the unlink never moved away from the row's own path");
+    assert!(
+        stray.exists(),
+        "the unlink never moved away from the row's own path"
+    );
 }
 
 #[test]
 fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
     let fx = Fixture::new();
     let (fav, fav_path) = fx.add_clip("fav.mp4", 100);
-    assert!(fx.store.set_favourite(fav, true).expect("favourite the clip"));
+    assert!(fx
+        .store
+        .set_favourite(fav, true)
+        .expect("favourite the clip"));
     let stray = stray_file(&fx.clips_dir);
 
     // A path a row names that `remove_file` cannot remove: a directory, as one named `*.mp4` would
@@ -205,7 +254,10 @@ fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
 
     let outcome = execute_cleanup(&fx.store, &plan).expect("execute the plan");
 
-    assert_eq!(outcome.deleted, 1, "the row is deleted first, and it stays deleted");
+    assert_eq!(
+        outcome.deleted, 1,
+        "the row is deleted first, and it stays deleted"
+    );
     assert_eq!(
         outcome.orphaned,
         vec![doomed.clone()],
@@ -213,13 +265,22 @@ fn an_unlink_that_fails_is_reported_as_an_orphan_and_nothing_else_is_touched() {
     );
     assert!(outcome.already_missing.is_empty());
     assert_eq!(outcome.bytes_reclaimed, 0);
-    assert!(doomed.is_dir(), "the file the unlink could not remove is still there");
+    assert!(
+        doomed.is_dir(),
+        "the file the unlink could not remove is still there"
+    );
     assert!(
         doomed.join("inside.bin").exists(),
         "and the executor did not reach inside it"
     );
-    assert!(fav_path.exists(), "the favourite is untouched — it was not in the plan");
-    assert!(stray.exists(), "and neither is anything the index does not name");
+    assert!(
+        fav_path.exists(),
+        "the favourite is untouched — it was not in the plan"
+    );
+    assert!(
+        stray.exists(),
+        "and neither is anything the index does not name"
+    );
     assert_eq!(fx.ids(), vec![fav], "only the doomed clip's row is gone");
 }
 
@@ -242,7 +303,10 @@ fn a_relative_or_dotdot_path_in_a_row_is_never_unlinked() {
     assert_eq!(outcome.deleted, 2, "the rows go");
     assert!(outcome.orphaned.contains(&relative) && outcome.orphaned.contains(&dotdot));
     assert_eq!(outcome.bytes_reclaimed, 0);
-    assert!(probe.path().exists(), "the file the relative path would have hit is untouched");
+    assert!(
+        probe.path().exists(),
+        "the file the relative path would have hit is untouched"
+    );
 }
 
 #[test]
@@ -254,13 +318,19 @@ fn a_plan_id_whose_row_is_already_gone_deletes_nothing() {
 
     // The row disappears between planning and executing (another cleanup pass, a second instance, a
     // hand-edited index). With no committed row delete there is no authority to unlink anything.
-    let removed = fx.store.delete_clip_returning_path(id).expect("delete the row");
+    let removed = fx
+        .store
+        .delete_clip_returning_path(id)
+        .expect("delete the row");
     assert_eq!(removed.map(PathBuf::from), Some(path.clone()));
 
     let outcome = execute_cleanup(&fx.store, &plan).expect("execute the plan");
 
     assert_eq!(outcome.deleted, 0);
     assert_eq!(outcome.bytes_reclaimed, 0);
-    assert!(path.exists(), "the file is still there: no row named it any more");
+    assert!(
+        path.exists(),
+        "the file is still there: no row named it any more"
+    );
     assert!(outcome.orphaned.is_empty());
 }

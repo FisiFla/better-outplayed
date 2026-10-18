@@ -223,12 +223,20 @@ impl GameEvent {
     /// Build an event whose payload is `detail`, rendered as one line of JSON. Rendering a
     /// `serde_json::Value` cannot fail, and the value is produced here, never echoed from a socket.
     pub fn new(source: Source, kind: EventKind, detail: serde_json::Value) -> Self {
-        Self { source, kind, payload: Some(detail.to_string()) }
+        Self {
+            source,
+            kind,
+            payload: Some(detail.to_string()),
+        }
     }
 
     /// An event with no detail, for tests; a real derivation always has something to say.
     pub fn bare(source: Source, kind: EventKind) -> Self {
-        Self { source, kind, payload: None }
+        Self {
+            source,
+            kind,
+            payload: None,
+        }
     }
 
     /// Whether this event should become a clip (see [`EventKind::is_highlight`]).
@@ -252,7 +260,9 @@ pub struct CaptureClock {
 
 impl CaptureClock {
     pub fn new() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
 
     pub fn ms_at(&self, at: Instant) -> u64 {
@@ -284,7 +294,11 @@ mod tests {
             );
             assert_eq!(kind.to_string(), kind.as_tag());
         }
-        assert_eq!(EventKind::from_tag("round_won"), None, "an unknown tag is not an error");
+        assert_eq!(
+            EventKind::from_tag("round_won"),
+            None,
+            "an unknown tag is not an error"
+        );
     }
 
     #[test]
@@ -304,11 +318,19 @@ mod tests {
 
     #[test]
     fn highlights_are_the_moments_a_hotkey_would_have_been_pressed_for() {
-        for kind in [EventKind::Kill, EventKind::Death, EventKind::Assist, EventKind::Objective] {
+        for kind in [
+            EventKind::Kill,
+            EventKind::Death,
+            EventKind::Assist,
+            EventKind::Objective,
+        ] {
             assert!(kind.is_highlight(), "{kind} is a highlight");
         }
         for kind in EventKind::ALL.into_iter().filter(|k| k.is_objective()) {
-            assert!(kind.is_highlight(), "the objective sub-kind {kind} is a highlight");
+            assert!(
+                kind.is_highlight(),
+                "the objective sub-kind {kind} is a highlight"
+            );
         }
         assert!(EventKind::BombPlanted.is_highlight());
         assert!(EventKind::BombDefused.is_highlight());
@@ -317,7 +339,11 @@ mod tests {
             "the last seconds of a match are worth keeping"
         );
         // The markers: recorded, never a clip on their own.
-        for kind in [EventKind::GameStart, EventKind::RoundStart, EventKind::RoundEnd] {
+        for kind in [
+            EventKind::GameStart,
+            EventKind::RoundStart,
+            EventKind::RoundEnd,
+        ] {
             assert!(!kind.is_highlight(), "{kind} is a marker, not a clip");
         }
     }
@@ -330,7 +356,10 @@ mod tests {
             serde_json::json!({ "source": "lol", "killer": "Ahri" }),
         );
         let payload = event.payload.expect("a derived event carries its detail");
-        assert!(!payload.contains('\n'), "the payload column holds one line: {payload}");
+        assert!(
+            !payload.contains('\n'),
+            "the payload column holds one line: {payload}"
+        );
         assert!(payload.contains("Ahri"), "and the detail: {payload}");
     }
 }

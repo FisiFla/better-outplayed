@@ -61,7 +61,10 @@ impl StreamShape {
         match self.kind.as_str() {
             "video" => format!("video/{} {}x{}", self.codec, self.width, self.height),
             "audio" => {
-                format!("audio/{} {}Hz {}ch", self.codec, self.sample_rate, self.channels)
+                format!(
+                    "audio/{} {}Hz {}ch",
+                    self.codec, self.sample_rate, self.channels
+                )
             }
             other => format!("{other}/{}", self.codec),
         }
@@ -215,7 +218,11 @@ impl MediaInfo {
             .find(|s| s.codec_type == "audio")
             .map(|s| AudioStream {
                 codec: s.codec_name.clone(),
-                sample_rate: s.sample_rate.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0),
+                sample_rate: s
+                    .sample_rate
+                    .as_deref()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
                 channels: s.channels.unwrap_or(0),
                 duration_ms: seconds_to_ms_opt(s.duration.as_deref()),
                 start_ms: seconds_to_ms_i64_opt(s.start_time.as_deref()),
@@ -223,7 +230,12 @@ impl MediaInfo {
 
         Ok(Self {
             duration_ms: seconds_to_ms(raw.format.duration.as_deref()),
-            size_bytes: raw.format.size.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0),
+            size_bytes: raw
+                .format
+                .size
+                .as_deref()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             video,
             audio,
         })
@@ -233,8 +245,10 @@ impl MediaInfo {
     pub fn probe(bin: &FfmpegBinaries, path: &Path) -> Result<Self> {
         let mut cmd = crate::sidecar_command(&bin.ffprobe);
         cmd.args([
-            "-v", "error",
-            "-print_format", "json",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
             "-show_format",
             "-show_streams",
         ])
@@ -440,7 +454,10 @@ mod tests {
         let info = MediaInfo::from_ffprobe_json(json).expect("valid probe json");
 
         assert_eq!(info.video.as_ref().map(|v| v.codec.as_str()), Some("h264"));
-        assert_eq!(info.video.as_ref().map(|v| (v.width, v.height)), Some((320, 240)));
+        assert_eq!(
+            info.video.as_ref().map(|v| (v.width, v.height)),
+            Some((320, 240))
+        );
         assert_eq!(info.video.as_ref().and_then(|v| v.duration_ms), Some(3033));
         assert_eq!(info.video.as_ref().and_then(|v| v.start_ms), Some(0));
         assert_eq!(info.audio.as_ref().map(|a| a.codec.as_str()), Some("aac"));
@@ -634,7 +651,10 @@ mod tests {
         let stub = dir.path().join("ffmpeg");
         std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
 
         let started = std::time::Instant::now();
         let err = smoke_test_encoder(&bin, "h264_amf").expect_err("a stalled child is not a pass");

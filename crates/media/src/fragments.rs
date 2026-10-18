@@ -86,12 +86,18 @@ impl FragmentSplitter {
     /// needs it to re-apply track names: a `-c copy` carries no per-stream metadata, so
     /// `edit::audio_titles` must be told how many tracks to name.
     pub fn audio_tracks(&self) -> usize {
-        self.tracks.values().filter(|(is_video, _)| !is_video).count()
+        self.tracks
+            .values()
+            .filter(|(is_video, _)| !is_video)
+            .count()
     }
 
     /// How many video tracks the header declares. Zero before the header has been seen.
     pub fn video_tracks(&self) -> usize {
-        self.tracks.values().filter(|(is_video, _)| *is_video).count()
+        self.tracks
+            .values()
+            .filter(|(is_video, _)| *is_video)
+            .count()
     }
 
     /// Feed bytes just read from the pipe; returns whatever fragments that completed.
@@ -161,7 +167,9 @@ impl FragmentSplitter {
     /// samples span (its duration, in ms).
     fn placement(&self, moof: &[u8]) -> Result<(u64, u64)> {
         for traf in children(moof, 8, "traf") {
-            let Some(track_id) = track_id(traf) else { continue };
+            let Some(track_id) = track_id(traf) else {
+                continue;
+            };
             let Some((is_video, timescale)) = self.tracks.get(&track_id) else {
                 continue;
             };
@@ -176,7 +184,8 @@ impl FragmentSplitter {
             // A fragment whose length cannot be read is still usable, but its end must not be invented:
             // 0 makes `MemorySegment::is_closed` false, and the ring treats it as the file ledger treats
             // an untrusted segment: held, not measured.
-            let duration_ms = sample_span_ticks(traf).map_or(0, |t| t.saturating_mul(1_000) / scale);
+            let duration_ms =
+                sample_span_ticks(traf).map_or(0, |t| t.saturating_mul(1_000) / scale);
             return Ok((start_ms, duration_ms));
         }
         // A fragment with no video track is not something this pipeline produces (video is input 0 and
@@ -311,7 +320,9 @@ fn base_media_decode_time(traf: &[u8]) -> Option<u64> {
     let version = tfdt.first().copied().unwrap_or(0);
     if version == 1 {
         let b = tfdt.get(4..12)?;
-        Some(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Some(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     } else {
         let b = tfdt.get(4..8)?;
         Some(u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
@@ -462,7 +473,10 @@ mod tests {
             "a 4s stream at 1s fragments should be about four, got {}",
             fragments.len()
         );
-        assert!(splitter.pending_bytes() == 0, "no partial box should be left over");
+        assert!(
+            splitter.pending_bytes() == 0,
+            "no partial box should be left over"
+        );
     }
 
     #[test]
@@ -525,7 +539,10 @@ mod tests {
         assert_eq!(got.len(), expected.len(), "the same number of fragments");
         assert_eq!(
             got.iter().map(|f| (f.seq, f.start_ms)).collect::<Vec<_>>(),
-            expected.iter().map(|f| (f.seq, f.start_ms)).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|f| (f.seq, f.start_ms))
+                .collect::<Vec<_>>(),
             "with the same sequence numbers and start times"
         );
         assert_eq!(
@@ -543,7 +560,9 @@ mod tests {
         let data = stream(3);
         let cut = data.len() - data.len() / 4;
         let mut splitter = FragmentSplitter::new();
-        let fragments = splitter.push(&data[..cut]).expect("a partial stream is not an error");
+        let fragments = splitter
+            .push(&data[..cut])
+            .expect("a partial stream is not an error");
         assert!(
             splitter.pending_bytes() > 0,
             "the tail of the last box must be waiting, not consumed"

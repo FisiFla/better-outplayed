@@ -364,7 +364,10 @@ mod tests {
 
         // Every segment but the newest is closed, and closing set its end from the next one.
         for pair in segments.windows(2) {
-            assert!(pair[0].is_closed(), "a segment with a successor has a proven end");
+            assert!(
+                pair[0].is_closed(),
+                "a segment with a successor has a proven end"
+            );
             assert_eq!(
                 pair[0].end_ms, pair[1].start_ms,
                 "and that end is the successor's start — the segments are contiguous"
@@ -377,7 +380,10 @@ mod tests {
             segments.last().unwrap().is_closed(),
             "the newest fragment claims its own measured length, so it is closed on arrival"
         );
-        assert!(segments.iter().all(|s| s.keyframe), "every fragment starts a GOP");
+        assert!(
+            segments.iter().all(|s| s.keyframe),
+            "every fragment starts a GOP"
+        );
 
         // `span_ms` is the newest fragment's end, the media time the ring holds, not its last
         // boundary. Reading a fragment's length here instead of borrowing the next fragment's start is
@@ -390,7 +396,10 @@ mod tests {
         );
         assert_eq!(ring.stats().segments, segments.len());
         assert_eq!(ring.stats().ram_bytes, ring.bytes());
-        assert!(ring.bytes() > 0, "the fragments' bytes are what the ring holds");
+        assert!(
+            ring.bytes() > 0,
+            "the fragments' bytes are what the ring holds"
+        );
     }
 
     #[test]
@@ -469,9 +478,15 @@ mod tests {
         }
 
         let shape = |r: &MemoryRingBuffer| {
-            r.segments().map(|s| (s.seq, s.start_ms, s.end_ms, s.bytes.len())).collect::<Vec<_>>()
+            r.segments()
+                .map(|s| (s.seq, s.start_ms, s.end_ms, s.bytes.len()))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(shape(&drip), shape(&whole), "the same ring, however the bytes arrived");
+        assert_eq!(
+            shape(&drip),
+            shape(&whole),
+            "the same ring, however the bytes arrived"
+        );
         assert_eq!(drip.span_ms(), whole.span_ms());
         assert_eq!(drip.bytes(), whole.bytes());
     }
@@ -479,8 +494,15 @@ mod tests {
     #[test]
     fn a_window_selects_exactly_the_fragments_covering_the_range() {
         let ring = ring_of(5);
-        let closed: Vec<u64> = ring.segments().filter(|s| s.is_closed()).map(|s| s.start_ms).collect();
-        assert!(closed.len() >= 3, "need a few closed segments, got {closed:?}");
+        let closed: Vec<u64> = ring
+            .segments()
+            .filter(|s| s.is_closed())
+            .map(|s| s.start_ms)
+            .collect();
+        assert!(
+            closed.len() >= 3,
+            "need a few closed segments, got {closed:?}"
+        );
 
         // A range covering the second and third fragments.
         let start = closed[1];
@@ -495,7 +517,10 @@ mod tests {
             "a clip is a range of COMPLETE footage: no unproven ends"
         );
         assert!(
-            window.segments.iter().all(|s| s.start_ms < end && s.end_ms > start),
+            window
+                .segments
+                .iter()
+                .all(|s| s.start_ms < end && s.end_ms > start),
             "every selected fragment must overlap the range"
         );
 
@@ -509,8 +534,15 @@ mod tests {
         for segment in &window.segments {
             expected += segment.bytes.len();
         }
-        assert_eq!(assembled.len(), expected, "and is exactly those bytes, nothing else");
-        assert!(window.duration_ms() >= 1_000, "the window covers media time");
+        assert_eq!(
+            assembled.len(),
+            expected,
+            "and is exactly those bytes, nothing else"
+        );
+        assert!(
+            window.duration_ms() >= 1_000,
+            "the window covers media time"
+        );
     }
 
     #[test]
@@ -521,14 +553,20 @@ mod tests {
         let mut ring = MemoryRingBuffer::new(u64::MAX, 2_000);
         ring.push(&stream(5)).expect("the stream pushes");
 
-        let oldest = ring.segments().next().expect("segments survive eviction").start_ms;
+        let oldest = ring
+            .segments()
+            .next()
+            .expect("segments survive eviction")
+            .start_ms;
         assert!(
             oldest > 0,
             "the ring must have dropped footage for this test to mean anything, and the \
              oldest surviving fragment starts at {oldest}ms"
         );
 
-        let window = ring.window(0, oldest + 200).expect("a window over the surviving footage");
+        let window = ring
+            .window(0, oldest + 200)
+            .expect("a window over the surviving footage");
         assert!(
             window.truncated_front,
             "a pre-roll reaching back before the oldest surviving fragment must be reported, \
@@ -544,7 +582,10 @@ mod tests {
     #[test]
     fn a_range_the_ring_cannot_serve_is_none_rather_than_an_empty_clip() {
         let mut ring = MemoryRingBuffer::new(u64::MAX, u64::MAX);
-        assert!(ring.window(0, 1_000).is_none(), "no header yet means no clip");
+        assert!(
+            ring.window(0, 1_000).is_none(),
+            "no header yet means no clip"
+        );
 
         ring.push(&stream(3)).unwrap();
         // Past the end of everything the ring holds.
@@ -563,6 +604,10 @@ mod tests {
             "the header is a kilobyte and the one part a clip cannot be assembled without, so \
              no cap may evict it"
         );
-        assert_eq!(ring.segments().count(), 1, "and the footage itself is down to one segment");
+        assert_eq!(
+            ring.segments().count(),
+            1,
+            "and the footage itself is down to one segment"
+        );
     }
 }

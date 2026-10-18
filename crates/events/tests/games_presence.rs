@@ -18,8 +18,8 @@
 //! the Live Client Data API source on `127.0.0.1:2999`, refused when no game runs.
 
 use localplay_events::process::{
-    default_watch, GamePresence, GameWatcher, GamesSection, Presence,
-    ProcessWatcher, Signal, WatchedGame,
+    default_watch, GamePresence, GameWatcher, GamesSection, Presence, ProcessWatcher, Signal,
+    WatchedGame,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -75,7 +75,13 @@ fn the_shipped_watch_list_is_the_titles_the_project_names() {
         .map(|game| game.name.as_str())
         .collect();
     assert_eq!(by_api, vec!["League of Legends"]);
-    assert_eq!(watch.iter().filter(|game| game.signal == Signal::Process).count(), 5);
+    assert_eq!(
+        watch
+            .iter()
+            .filter(|game| game.signal == Signal::Process)
+            .count(),
+        5
+    );
     assert!(watch
         .iter()
         .any(|game| game.exe == "VALORANT-Win64-Shipping.exe" && game.signal == Signal::Process));
@@ -83,7 +89,9 @@ fn the_shipped_watch_list_is_the_titles_the_project_names() {
     // Every title is watched by a game process, not a launcher's.
     for launcher in ["LeagueClient.exe", "VALORANT.exe", "steam.exe"] {
         assert!(
-            watch.iter().all(|game| !game.exe.eq_ignore_ascii_case(launcher)),
+            watch
+                .iter()
+                .all(|game| !game.exe.eq_ignore_ascii_case(launcher)),
             "{launcher} is a launcher, and launchers are open all evening"
         );
     }
@@ -92,7 +100,9 @@ fn the_shipped_watch_list_is_the_titles_the_project_names() {
 #[test]
 fn auto_record_off_starts_nothing_and_therefore_polls_nothing() {
     let (sink, changes) = channel();
-    let started = GamesSection::default().start(sink).expect("the default section cannot fail");
+    let started = GamesSection::default()
+        .start(sink)
+        .expect("the default section cannot fail");
     assert!(
         started.is_none(),
         "auto_record defaults to false, so the default section must start no watcher"
@@ -109,7 +119,11 @@ fn auto_record_off_starts_nothing_and_therefore_polls_nothing() {
 
 #[test]
 fn auto_record_on_starts_a_watcher_that_stops_cleanly() {
-    let section = GamesSection { auto_record: true, poll_ms: 250, ..GamesSection::default() };
+    let section = GamesSection {
+        auto_record: true,
+        poll_ms: 250,
+        ..GamesSection::default()
+    };
     assert!(section.watching());
     let (sink, changes) = channel();
     let handle = section
@@ -143,10 +157,15 @@ fn a_game_already_running_is_reported_by_the_first_poll_and_only_once() {
         running: vec!["dota2.exe".to_string()],
         polls: Arc::clone(&polls),
     };
-    let mut watcher = GameWatcher::with_detector(Box::new(detector), &watch, Duration::from_millis(10));
+    let mut watcher =
+        GameWatcher::with_detector(Box::new(detector), &watch, Duration::from_millis(10));
 
     let first = watcher.poll_once();
-    assert_eq!(first.len(), 1, "a game that was already running is running now: one start");
+    assert_eq!(
+        first.len(),
+        1,
+        "a game that was already running is running now: one start"
+    );
     assert_eq!(first[0].game().name, "Dota 2");
     assert!(first[0].is_start());
     assert!(!first[0].is_stop());
@@ -158,7 +177,11 @@ fn a_game_already_running_is_reported_by_the_first_poll_and_only_once() {
         );
     }
     assert_eq!(watcher.running().len(), 1);
-    assert_eq!(polls.load(Ordering::SeqCst), 6, "one detector poll per poll_once");
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        6,
+        "one detector poll per poll_once"
+    );
 }
 
 #[test]
@@ -173,7 +196,9 @@ fn the_watcher_thread_reports_a_start_and_releases_the_sink_when_stopped() {
     let (sink, changes) = channel();
 
     let handle = localplay_events::process::spawn(watcher, sink).expect("a watcher thread");
-    let change = changes.recv_timeout(Duration::from_secs(5)).expect("the start arrives");
+    let change = changes
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the start arrives");
     assert_eq!(change.game().name, "Counter-Strike 2");
     assert_eq!(change.to_string(), "Counter-Strike 2 (cs2.exe) started");
 
@@ -193,7 +218,11 @@ fn the_process_watcher_answers_on_windows_and_refuses_clearly_elsewhere() {
 
     if cfg!(windows) {
         let presences = answer.expect("the process-list snapshot is what Windows is for");
-        assert_eq!(presences.len(), default_watch().len(), "one answer per watched title");
+        assert_eq!(
+            presences.len(),
+            default_watch().len(),
+            "one answer per watched title"
+        );
     } else {
         let err = answer.expect_err("this platform has no process-list snapshot to take");
         let message = err.to_string();

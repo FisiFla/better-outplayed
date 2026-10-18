@@ -91,7 +91,11 @@ pub struct MicAudioSpec {
 impl Default for MicAudioSpec {
     /// What every capture backend publishes: 48kHz stereo s16le (`localplay_capture::AudioFormat::default`).
     fn default() -> Self {
-        Self { sample_rate: 48_000, channels: 2, sample_format: SampleFormat::S16Le }
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: SampleFormat::S16Le,
+        }
     }
 }
 
