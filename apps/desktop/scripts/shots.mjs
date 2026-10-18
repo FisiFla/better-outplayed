@@ -718,6 +718,13 @@ function installMockSource(fixture) {
     async appStatus() {
       return { ...fixture.appStatus, hotkey: { ...fixture.appStatus.hotkey } };
     },
+    async listAudioDevices() {
+      const long = 'Speakers (Realtek High Definition Audio(R) with a very long vendor name)';
+      return {
+        inputs: [{ id: 'mic-1', name: 'Microphone (USB Audio Device with an equally long name)', is_default: true }],
+        outputs: [{ id: 'out-1', name: long, is_default: true }],
+      };
+    },
     async getSettings() {
       return { ...settings, watch_titles: [...settings.watch_titles], defaulted: [...settings.defaulted] };
     },
@@ -2010,6 +2017,20 @@ const states = [
         ((await panel.textContent()) ?? '').includes('League of Legends'),
         'the watched titles are listed',
       );
+
+      // Narrow windows: the device pickers must wrap, never push a scrollbar into view.
+      for (const width of [940, 700]) {
+        await page.setViewportSize({ width, height: 600 });
+        await page.waitForTimeout(150);
+        const over = await page.evaluate(() =>
+          [...document.querySelectorAll('.view, .settings, .settings select')].filter(
+            (el) => el.scrollWidth > el.clientWidth + 1,
+          ).length,
+        );
+        check(this.name, over === 0, `nothing scrolls sideways at ${width}px (${over} overflowing)`);
+      }
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await page.waitForTimeout(150);
 
       await panel.getByLabel(/Record watched games automatically/).check();
       await panel.getByRole('button', { name: 'Apply automatic' }).click();

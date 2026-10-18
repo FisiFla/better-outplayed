@@ -458,6 +458,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
     font: var(--t-small);
   }
 
@@ -467,7 +468,7 @@
 
   .row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
     gap: 8px;
   }
 
@@ -491,6 +492,12 @@
     border-radius: var(--r-sm);
     padding: 6px 10px;
     min-width: 0;
+    max-width: 100%;
+    text-overflow: ellipsis;
+  }
+
+  select {
+    width: 100%;
   }
 
   input:disabled,
