@@ -81,11 +81,11 @@ fn record_sink_failure(slot: &Arc<Mutex<Option<String>>>, why: String) {
     }
 }
 
-/// Start the writer thread for `path`; returns what the reader feeds and what the ring joins.
-fn start_sink(
-    path: &Path,
-    capacity: usize,
-) -> Result<(SinkFeed, JoinHandle<()>, Arc<Mutex<Option<String>>>)> {
+/// Why a session file stopped growing, shared between its writer thread and the ring.
+type SinkFailure = Arc<Mutex<Option<String>>>;
+
+/// Start the writer thread for `path`; returns what the reader feeds, the thread to join and its failure slot.
+fn start_sink(path: &Path, capacity: usize) -> Result<(SinkFeed, JoinHandle<()>, SinkFailure)> {
     let mut file = std::fs::File::create(path)
         .with_context(|| format!("creating the session file {}", path.display()))?;
     let (tx, rx) = sync_channel::<Vec<u8>>(capacity);
@@ -151,7 +151,7 @@ pub struct MemoryRing {
     /// The session file's writer thread, while a session is being saved and it has not been joined.
     sink_writer: Option<JoinHandle<()>>,
     /// Why the session file stopped growing early.
-    sink_failure: Option<Arc<Mutex<Option<String>>>>,
+    sink_failure: Option<SinkFailure>,
 }
 
 impl MemoryRing {
