@@ -109,7 +109,7 @@ const STDERR_DRAIN_POLL: Duration = Duration::from_millis(5);
 ///
 /// The broken pipe is noticed a few milliseconds before the process can be waited on. Spent only
 /// on a path that has already failed; past the deadline the error carries the symptom alone.
-const CHILD_DEATH_GRACE: Duration = Duration::from_millis(250);
+const CHILD_DEATH_GRACE: Duration = Duration::from_secs(1);
 
 /// Poll interval while waiting out that grace period.
 const CHILD_DEATH_POLL: Duration = Duration::from_millis(10);
@@ -488,6 +488,10 @@ pub struct FfmpegEncoder {
     dropped_audio: AtomicU64,
     /// Microphone blocks dropped, like [`FfmpegEncoder::dropped_audio`].
     dropped_mic_audio: AtomicU64,
+    /// Bytes of game audio dropped and not yet replaced by silence (see [`enqueue_audio`]).
+    owed_audio: usize,
+    /// Bytes of microphone audio dropped and not yet replaced by silence.
+    owed_mic_audio: usize,
     /// Text already read out of ffmpeg's stderr, which a pipe gives up only once (see
     /// [`FfmpegEncoder::drain_stderr`]); both the writer-failure report and [`Encoder::finish`] may want it.
     drained_stderr: Option<String>,
@@ -661,6 +665,8 @@ impl FfmpegEncoder {
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
+            owed_audio: 0,
+            owed_mic_audio: 0,
             drained_stderr: None,
             // No reader exists until a report asks for one.
             stderr_drain: None,
@@ -812,7 +818,7 @@ impl Encoder for FfmpegEncoder {
         // wiring mistake, not a full queue (same as `submit_mic_audio`).
         refuse_audio_without_input(self.game_audio)?;
         let queued = match self.audio_tx.as_ref() {
-            Some(tx) => enqueue_or_drop(tx, audio.data, &self.dropped_audio, "audio"),
+            Some(tx) => enqueue_audio(tx, audio.data, &self.dropped_audio, &mut self.owed_audio, "audio"),
             None => bail!("encoder already finished"),
         };
         queued.map_err(|e| self.explain_dead_writer(e))
@@ -848,7 +854,13 @@ impl Encoder for FfmpegEncoder {
                 spec.channels
             );
         }
-        let queued = enqueue_or_drop(tx, audio.data, &self.dropped_mic_audio, MICROPHONE_LABEL);
+        let queued = enqueue_audio(
+            tx,
+            audio.data,
+            &self.dropped_mic_audio,
+            &mut self.owed_mic_audio,
+            MICROPHONE_LABEL,
+        );
         queued.map_err(|e| self.explain_dead_writer(e))
     }
 
@@ -1133,6 +1145,42 @@ fn enqueue_or_drop<T>(tx: &SyncSender<T>, item: T, dropped: &AtomicU64, what: &s
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => {
             dropped.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(TrySendError::Disconnected(_)) => bail!("{what} writer thread has stopped"),
+    }
+}
+
+/// [`enqueue_or_drop`] for a PCM audio input, replacing what it drops with silence.
+///
+/// An audio input is read as a continuous byte stream, so a dropped block does not leave a brief
+/// repeat as video does: the bytes after it simply play earlier, and the track ends up shorter than
+/// the video it belongs to (a drift the length of everything dropped). `owed` counts the dropped
+/// bytes; the next block that fits is preceded by that much silence, which keeps the track on the
+/// timeline. If the queue is still full the debt grows instead, and nothing blocks.
+fn enqueue_audio(
+    tx: &SyncSender<Vec<u8>>,
+    data: Vec<u8>,
+    dropped: &AtomicU64,
+    owed: &mut usize,
+    what: &str,
+) -> Result<()> {
+    if *owed > 0 {
+        match tx.try_send(vec![0; *owed]) {
+            Ok(()) => *owed = 0,
+            Err(TrySendError::Full(_)) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                *owed += data.len();
+                return Ok(());
+            }
+            Err(TrySendError::Disconnected(_)) => bail!("{what} writer thread has stopped"),
+        }
+    }
+    match tx.try_send(data) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(data)) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            *owed += data.len();
             Ok(())
         }
         Err(TrySendError::Disconnected(_)) => bail!("{what} writer thread has stopped"),
@@ -1549,6 +1597,27 @@ mod tests {
     }
 
     #[test]
+    fn dropped_audio_is_replaced_by_silence_once_the_queue_has_room() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let dropped = AtomicU64::new(0);
+        let mut owed = 0usize;
+
+        enqueue_audio(&tx, vec![1; 4], &dropped, &mut owed, "audio").unwrap();
+        enqueue_audio(&tx, vec![2; 4], &dropped, &mut owed, "audio").unwrap();
+        enqueue_audio(&tx, vec![3; 8], &dropped, &mut owed, "audio").unwrap();
+        assert_eq!((dropped.load(Ordering::Relaxed), owed), (2, 12));
+
+        assert_eq!(rx.try_recv().unwrap(), vec![1; 4]);
+        // Room again: the debt goes first (silence), and the block that follows waits its turn.
+        enqueue_audio(&tx, vec![4; 4], &dropped, &mut owed, "audio").unwrap();
+        assert_eq!(owed, 4, "the new block did not fit behind the silence, so it is owed too");
+        assert_eq!(rx.try_recv().unwrap(), vec![0; 12]);
+        enqueue_audio(&tx, vec![5; 4], &dropped, &mut owed, "audio").unwrap();
+        assert_eq!(rx.try_recv().unwrap(), vec![0; 4]);
+        assert_eq!(owed, 4, "the silence took the slot again");
+    }
+
+    #[test]
     fn a_payload_that_fits_is_queued_and_not_counted_as_dropped() {
         let (tx, rx) = mpsc::sync_channel::<u32>(1);
         let dropped = AtomicU64::new(0);
@@ -1627,6 +1696,8 @@ mod tests {
             dropped_video: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             dropped_mic_audio: AtomicU64::new(0),
+            owed_audio: 0,
+            owed_mic_audio: 0,
             drained_stderr: None,
             // No report has asked for stderr yet, so no reader is in flight.
             stderr_drain: None,
@@ -1833,8 +1904,11 @@ mod tests {
             format: PixelFormat::Bgra8,
             texture: None,
         };
+        // Bounded by time, not by a count of attempts: on a loaded machine the pump thread can take
+        // longer than a fixed handful of 10ms sleeps to notice the dead child.
+        let give_up = Instant::now() + Duration::from_secs(20);
         let mut failure = None;
-        for _ in 0..50 {
+        while Instant::now() < give_up {
             match encoder.submit_video(frame()) {
                 Ok(()) => std::thread::sleep(Duration::from_millis(10)),
                 Err(e) => {

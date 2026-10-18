@@ -76,7 +76,7 @@ pub use config::{
 pub use fps::FpsDecision;
 pub use index::{
     cleanup_pass, clip_chapters, index_bookmark, index_clip, index_event, now_ms, open_clip_index,
-    unix_seconds,
+    unix_millis,
     CleanupReport, BOOKMARK_KIND,
 };
 pub use pump::{
@@ -1755,7 +1755,7 @@ impl Engine {
         )?;
         self.account(counts);
 
-        let stem = format!("clip-{}", unix_seconds());
+        let stem = format!("clip-{}", unix_millis());
         let mut clip = self.ledger.trigger(trigger_ms, &stem, pre_ms, post_ms)?;
         tracing::info!(
             "wrote {} ({}ms, {} bytes, encoder={})",
