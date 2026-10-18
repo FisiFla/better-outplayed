@@ -345,7 +345,12 @@ pub struct RateMeter {
 
 impl RateMeter {
     pub fn new(window: Duration) -> Self {
-        Self { window, frames: 0, since: Instant::now(), fps: 0.0 }
+        Self {
+            window,
+            frames: 0,
+            since: Instant::now(),
+            fps: 0.0,
+        }
     }
 
     /// Add `frames` to the open window and return the achieved rate.
@@ -415,23 +420,28 @@ mod tests {
             1_000,
         );
         let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-        (FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder"), dir)
+        (
+            FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder"),
+            dir,
+        )
     }
 
     /// The attribution counters measure the calls they claim to, and `plus` accumulates every field.
     #[test]
     fn the_pump_attributes_its_time_to_the_capture_and_to_the_encoder() {
         let spend = Duration::from_millis(25);
-        let mut capture = SlowCapture { size: (8, 8), spend };
+        let mut capture = SlowCapture {
+            size: (8, 8),
+            spend,
+        };
         let mut audio = StubAudio::new(AudioFormat::default());
         audio.start().expect("start the stub audio");
         let (mut encoder, _scratch) = tiny_encoder();
         let (mut pacer, _) = pacer(30);
 
         let started = Instant::now();
-        let counts =
-            pump_once_counted(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
-                .expect("one pump against a real encoder");
+        let counts = pump_once_counted(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
+            .expect("one pump against a real encoder");
         let elapsed = started.elapsed();
         encoder.finish().expect("flush");
 
@@ -451,12 +461,30 @@ mod tests {
         );
 
         // A healthy submit never blocks, so this only asserts the counter is live.
-        assert!(counts.submit <= elapsed, "the submit's wait is inside the pump as well");
+        assert!(
+            counts.submit <= elapsed,
+            "the submit's wait is inside the pump as well"
+        );
 
-        let summed = PumpCounts { submitted: 2, skipped: 3, capture: spend, submit: spend }
-            .plus(PumpCounts { submitted: 5, skipped: 7, capture: spend, submit: spend });
+        let summed = PumpCounts {
+            submitted: 2,
+            skipped: 3,
+            capture: spend,
+            submit: spend,
+        }
+        .plus(PumpCounts {
+            submitted: 5,
+            skipped: 7,
+            capture: spend,
+            submit: spend,
+        });
         assert_eq!(
-            (summed.submitted, summed.skipped, summed.capture, summed.submit),
+            (
+                summed.submitted,
+                summed.skipped,
+                summed.capture,
+                summed.submit
+            ),
             (7, 10, spend * 2, spend * 2),
             "every field accumulates, timings included"
         );
@@ -483,8 +511,14 @@ mod tests {
     #[test]
     fn a_frame_that_is_due_is_admitted() {
         let (mut p, t0) = pacer(10);
-        assert!(frame_arrived(&mut p, t0), "the first frame is due immediately");
-        assert!(frame_arrived(&mut p, t0 + 100 * MS), "the frame at the next slot is due");
+        assert!(
+            frame_arrived(&mut p, t0),
+            "the first frame is due immediately"
+        );
+        assert!(
+            frame_arrived(&mut p, t0 + 100 * MS),
+            "the frame at the next slot is due"
+        );
     }
 
     #[test]
@@ -499,7 +533,10 @@ mod tests {
         );
         // Dropping it did not move the schedule.
         assert!(!frame_arrived(&mut p, t0 + 99 * MS), "still early");
-        assert!(frame_arrived(&mut p, t0 + 100 * MS), "the slot itself is admitted");
+        assert!(
+            frame_arrived(&mut p, t0 + 100 * MS),
+            "the slot itself is admitted"
+        );
     }
 
     #[test]
@@ -526,7 +563,10 @@ mod tests {
 
         // A five-second stall: the late frame is admitted but the schedule must not stay in the past.
         let after_stall = t0 + Duration::from_secs(5);
-        assert!(frame_arrived(&mut p, after_stall), "a late frame is still a frame to encode");
+        assert!(
+            frame_arrived(&mut p, after_stall),
+            "a late frame is still a frame to encode"
+        );
 
         // A catch-up burst would admit frames until the deficit was paid; instead the pacer resynced
         // to `after_stall + interval`.
@@ -562,13 +602,26 @@ mod tests {
         let (mut p, t0) = pacer(30);
         for i in 0..20 {
             let now = t0 + Duration::from_micros(i * 2_000);
-            assert!(p.is_due(now), "no frame was taken, so no slot may have been spent");
-            assert_eq!(p.time_until_due(now), Duration::ZERO, "a due slot has no wait");
+            assert!(
+                p.is_due(now),
+                "no frame was taken, so no slot may have been spent"
+            );
+            assert_eq!(
+                p.time_until_due(now),
+                Duration::ZERO,
+                "a due slot has no wait"
+            );
         }
         // One slot is spent, not twenty.
         assert!(frame_arrived(&mut p, t0 + 20 * MS));
-        assert!(!p.is_due(t0 + 30 * MS), "the interval that frame consumed has not elapsed");
-        assert!(p.is_due(t0 + 34 * MS), "the next slot is one interval after the last");
+        assert!(
+            !p.is_due(t0 + 30 * MS),
+            "the interval that frame consumed has not elapsed"
+        );
+        assert!(
+            p.is_due(t0 + 34 * MS),
+            "the next slot is one interval after the last"
+        );
     }
 
     #[test]
@@ -598,7 +651,11 @@ mod tests {
         assert_eq!(m.record(6, t0 + Duration::from_millis(400)), 0.0);
         assert_eq!(m.record(6, t0 + Duration::from_millis(600)), 0.0);
         assert_eq!(m.record(6, t0 + Duration::from_millis(800)), 0.0);
-        fps_is(m.record(6, t0 + Duration::from_millis(1_000)), 30.0, "the window closed");
+        fps_is(
+            m.record(6, t0 + Duration::from_millis(1_000)),
+            30.0,
+            "the window closed",
+        );
     }
 
     #[test]
@@ -623,7 +680,11 @@ mod tests {
             let now = t0 + Duration::from_millis((i as u64 + 1) * 200);
             fps = m.record(reached, now);
         }
-        fps_is(fps, 24.0, "30 submitted, 6 dropped: 24 frames per second reached ffmpeg");
+        fps_is(
+            fps,
+            24.0,
+            "30 submitted, 6 dropped: 24 frames per second reached ffmpeg",
+        );
     }
 
     /// Compare a measured rate to the expected one within 0.1fps (the meter's reference clock is

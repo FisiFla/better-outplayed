@@ -21,7 +21,13 @@ impl RotatingFile {
     pub fn open(path: PathBuf, max_bytes: u64, keep: usize) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata()?.len();
-        let mut this = Self { path, max_bytes, keep, file, written };
+        let mut this = Self {
+            path,
+            max_bytes,
+            keep,
+            file,
+            written,
+        };
         if this.written >= this.max_bytes {
             this.rotate()?;
         }
@@ -48,11 +54,13 @@ impl RotatingFile {
         } else {
             let _ = fs::rename(&self.path, self.numbered(1));
         }
-        self.file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         self.written = 0;
         Ok(())
     }
-
 }
 
 impl Write for RotatingFile {
@@ -97,7 +105,10 @@ mod tests {
             .map(|n| fs::metadata(dir.path().join(n)).unwrap().len())
             .sum();
         assert!(total <= 3 * (100 + 61), "bounded: {total}");
-        assert!(fs::read_to_string(&path).unwrap().contains("000009"), "newest line is in app.log");
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("000009"),
+            "newest line is in app.log"
+        );
     }
 
     #[test]
@@ -107,6 +118,9 @@ mod tests {
         fs::write(&path, vec![b'x'; 500]).unwrap();
         let _log = RotatingFile::open(path.clone(), 100, 1).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-        assert_eq!(fs::metadata(dir.path().join("app.log.1")).unwrap().len(), 500);
+        assert_eq!(
+            fs::metadata(dir.path().join("app.log.1")).unwrap().len(),
+            500
+        );
     }
 }

@@ -21,10 +21,10 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
-use localplay_recorder::{pump_once, pump_until_span_on, FramePacer, PumpCounts};
 use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::{FfmpegBinaries, MediaInfo};
+use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
+use localplay_recorder::{pump_once, pump_until_span_on, FramePacer, PumpCounts};
 use localplay_replay::MemoryStats;
 use std::time::{Duration, Instant};
 
@@ -78,10 +78,16 @@ impl Fixture {
         // in a scratch directory.
         encode.output = EncodeOutput::FragmentedStream;
 
-        let mut capture = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
+        let mut capture = StubCapture::new(StubConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            fps: FPS,
+        });
         let mut audio = StubAudio::new(AudioFormat::default());
         let mut encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn encoder");
-        let stream = encoder.take_output_stream().expect("the stream mode exposes its pipe");
+        let stream = encoder
+            .take_output_stream()
+            .expect("the stream mode exposes its pipe");
         let ring = MemoryRing::start(
             stream,
             RingSetup {
@@ -170,8 +176,13 @@ fn the_post_roll_wait_keeps_feeding_ffmpeg_so_the_span_advances() {
     // One iteration of the steady-state pump the CLI loop uses and `pump_until_span` shares. The
     // stub clock has caught up with real time by now, so whether a frame is due does not matter;
     // what matters is that a pump iteration cannot fail.
-    pump_once(&mut fx.pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder)
-        .expect("a pump iteration must not fail");
+    pump_once(
+        &mut fx.pacer,
+        &mut fx.capture,
+        Some(&mut fx.audio),
+        &mut fx.encoder,
+    )
+    .expect("a pump iteration must not fail");
 
     let before = fx.stats();
     assert!(
@@ -271,7 +282,10 @@ fn the_trigger_and_the_post_roll_share_the_ledgers_media_clock() {
     // `need_ms` is `post_ms` further along that timeline; the budget is the wall-clock wait for it
     // (post-roll + margin, as the CLI sizes it).
     let trigger_ms = fx.span_ms();
-    assert!(trigger_ms >= PRE_MS, "sanity: the pre-roll must be fully buffered");
+    assert!(
+        trigger_ms >= PRE_MS,
+        "sanity: the pre-roll must be fully buffered"
+    );
     let need_ms = trigger_ms + POST_MS;
     let budget = Duration::from_millis(POST_MS) + Duration::from_secs(5);
 

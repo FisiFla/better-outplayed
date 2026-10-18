@@ -76,7 +76,9 @@ pub fn ensure_new_file_within(root: &Path, path: &Path) -> Result<PathBuf, PathR
             _ => return Err(PathRefusal::Unresolvable),
         }
     }
-    let mut resolved = existing.canonicalize().map_err(|_| PathRefusal::Unresolvable)?;
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|_| PathRefusal::Unresolvable)?;
     resolved.extend(tail.iter().rev());
     if resolved.starts_with(&root) {
         Ok(resolved)
@@ -98,7 +100,9 @@ pub fn is_session_name(name: &str, file: bool) -> bool {
     } else {
         name
     };
-    let Some(rest) = stem.strip_prefix("session-") else { return false };
+    let Some(rest) = stem.strip_prefix("session-") else {
+        return false;
+    };
     let mut parts = rest.splitn(2, '-');
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     match (parts.next(), parts.next()) {
@@ -161,14 +165,20 @@ mod tests {
             Err(PathRefusal::Outside)
         );
         // The parent of the root is outside it, so the root itself cannot be named.
-        assert_eq!(ensure_within(root.path(), &[root.path()]), Err(PathRefusal::Outside));
+        assert_eq!(
+            ensure_within(root.path(), &[root.path()]),
+            Err(PathRefusal::Outside)
+        );
     }
 
     #[test]
     fn dotdot_relative_and_unresolvable_paths_are_refused() {
         let root = tempfile::tempdir().unwrap();
         let sneaky = root.path().join("sub").join("..").join("..").join("x");
-        assert_eq!(ensure_within(&sneaky, &[root.path()]), Err(PathRefusal::NotAbsoluteAndClean));
+        assert_eq!(
+            ensure_within(&sneaky, &[root.path()]),
+            Err(PathRefusal::NotAbsoluteAndClean)
+        );
         assert_eq!(
             ensure_within(Path::new("relative/x.mp4"), &[root.path()]),
             Err(PathRefusal::NotAbsoluteAndClean)
@@ -187,13 +197,19 @@ mod tests {
         std::fs::write(outside.path().join("precious.mp4"), b"").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("door")).unwrap();
         assert_eq!(
-            ensure_within(&root.path().join("door").join("precious.mp4"), &[root.path()]),
+            ensure_within(
+                &root.path().join("door").join("precious.mp4"),
+                &[root.path()]
+            ),
             Err(PathRefusal::Outside),
             "a directory link out of the root resolves to outside"
         );
         // A link *as* the final component stays a link: the check is on where it lives.
-        std::os::unix::fs::symlink(outside.path().join("precious.mp4"), root.path().join("l.mp4"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("precious.mp4"),
+            root.path().join("l.mp4"),
+        )
+        .unwrap();
         let resolved = ensure_within(&root.path().join("l.mp4"), &[root.path()]).unwrap();
         assert!(resolved.starts_with(std::fs::canonicalize(root.path()).unwrap()));
     }
@@ -232,7 +248,14 @@ mod tests {
         assert!(is_session_name("session-1700000000.mp4", true));
         assert!(!is_session_name("session-1700000000.mp4", false));
         assert!(!is_session_name("session-1700000000", true));
-        for bad in ["session-", "session-x", "session-1-", "session-1-2-3", "Documents", ".."] {
+        for bad in [
+            "session-",
+            "session-x",
+            "session-1-",
+            "session-1-2-3",
+            "Documents",
+            "..",
+        ] {
             assert!(!is_session_name(bad, false), "{bad}");
         }
     }

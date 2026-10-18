@@ -40,7 +40,10 @@ impl Endpoint {
     /// Built from the constants directly so the shipping default cannot fail at run time; a test
     /// asserts the constants also satisfy the validating constructor.
     pub fn live_client() -> Self {
-        Self { addr: LIVE_CLIENT_ADDR, path: ALL_GAME_DATA_PATH.to_string() }
+        Self {
+            addr: LIVE_CLIENT_ADDR,
+            path: ALL_GAME_DATA_PATH.to_string(),
+        }
     }
 
     /// An endpoint on a loopback address, for tests pointing a poller at a mock.
@@ -60,7 +63,10 @@ impl Endpoint {
                  characters, and be at most {MAX_PATH_BYTES} bytes: {path:?}"
             );
         }
-        Ok(Self { addr, path: path.to_string() })
+        Ok(Self {
+            addr,
+            path: path.to_string(),
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -114,7 +120,10 @@ mod tests {
         assert_eq!(ep.addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(ep.addr().port(), 2999);
         assert_eq!(ep.path(), "/liveclientdata/allgamedata");
-        assert_eq!(ep.url(), "https://127.0.0.1:2999/liveclientdata/allgamedata");
+        assert_eq!(
+            ep.url(),
+            "https://127.0.0.1:2999/liveclientdata/allgamedata"
+        );
         assert!(ep.is_loopback());
         assert_eq!(ep.host_header(), "127.0.0.1:2999");
         assert_eq!(Endpoint::default(), ep, "the default is the real endpoint");
@@ -133,16 +142,16 @@ mod tests {
     #[test]
     fn an_endpoint_cannot_be_built_for_a_non_loopback_address() {
         for addr in [
-            "0.0.0.0:2999",       // every interface
-            "192.168.1.10:2999",  // the LAN
-            "10.0.0.1:2999",      // a private range
-            "8.8.8.8:2999",       // the internet
-            "[::]:2999",          // every interface, v6
-            "[fe80::1]:2999",     // link-local v6
+            "0.0.0.0:2999",      // every interface
+            "192.168.1.10:2999", // the LAN
+            "10.0.0.1:2999",     // a private range
+            "8.8.8.8:2999",      // the internet
+            "[::]:2999",         // every interface, v6
+            "[fe80::1]:2999",    // link-local v6
         ] {
             let addr: SocketAddr = addr.parse().expect("a socket address");
-            let err = Endpoint::loopback(addr, ALL_GAME_DATA_PATH)
-                .expect_err("only loopback is allowed");
+            let err =
+                Endpoint::loopback(addr, ALL_GAME_DATA_PATH).expect_err("only loopback is allowed");
             assert!(
                 err.to_string().contains("loopback"),
                 "the error must say why: {err}"
@@ -168,12 +177,12 @@ mod tests {
     fn a_path_that_could_break_the_request_line_is_refused() {
         let addr: SocketAddr = "127.0.0.1:2999".parse().unwrap();
         for path in [
-            "",                              // not a path
-            "liveclientdata",                // no leading slash
-            "/x HTTP/1.1\r\nHost: evil",     // header injection
-            "/x\nHost: evil",                // line break
-            "/x\t",                          // whitespace
-            "/x\u{7f}",                      // a control character
+            "",                          // not a path
+            "liveclientdata",            // no leading slash
+            "/x HTTP/1.1\r\nHost: evil", // header injection
+            "/x\nHost: evil",            // line break
+            "/x\t",                      // whitespace
+            "/x\u{7f}",                  // a control character
         ] {
             assert!(
                 Endpoint::loopback(addr, path).is_err(),

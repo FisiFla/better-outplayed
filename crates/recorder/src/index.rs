@@ -6,11 +6,11 @@
 use crate::config::StorageSection;
 use anyhow::{Context, Result};
 use localplay_events::GameEvent;
+use localplay_media::edit::Chapter;
 use localplay_replay::splice::ClipMetadata;
 use localplay_store::retention::{
     execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
 };
-use localplay_media::edit::Chapter;
 use localplay_store::{Event, NewClip, NewEvent, Store};
 use std::path::{Path, PathBuf};
 
@@ -120,7 +120,10 @@ pub fn clip_chapters(
     marks.dedup();
     marks
         .into_iter()
-        .map(|(at, kind)| Chapter { start_ms: at - started_at_ms, title: chapter_title(kind) })
+        .map(|(at, kind)| Chapter {
+            start_ms: at - started_at_ms,
+            title: chapter_title(kind),
+        })
         .collect()
 }
 
@@ -359,7 +362,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn event(kind: &str, at_ms: u64) -> Event {
-        Event { id: 0, session_id: Some(1), kind: kind.into(), at_ms, payload: None, clip_id: None }
+        Event {
+            id: 0,
+            session_id: Some(1),
+            kind: kind.into(),
+            at_ms,
+            payload: None,
+            clip_id: None,
+        }
     }
 
     #[test]
@@ -372,10 +382,18 @@ mod tests {
             event("death", 40_000),
         ];
         let marks = clip_chapters(&events, Some(("kill", 25_000)), 10_000, 30_000);
-        let got: Vec<(u64, &str)> = marks.iter().map(|c| (c.start_ms, c.title.as_str())).collect();
+        let got: Vec<(u64, &str)> = marks
+            .iter()
+            .map(|c| (c.start_ms, c.title.as_str()))
+            .collect();
         assert_eq!(
             got,
-            [(0, "Round start"), (2_000, "Kill"), (4_000, "Bomb planted"), (15_000, "Kill")],
+            [
+                (0, "Round start"),
+                (2_000, "Kill"),
+                (4_000, "Bomb planted"),
+                (15_000, "Kill")
+            ],
             "the 9.999s round start is before the clip and the 40s death after its end"
         );
     }
@@ -394,7 +412,12 @@ mod tests {
 
     /// The clip metadata a ring's `trigger` hands back, without running ffmpeg.
     fn metadata(path: PathBuf, size_bytes: u64) -> ClipMetadata {
-        ClipMetadata { path, duration_ms: 12_000, size_bytes, encoder: "h264_nvenc".into() }
+        ClipMetadata {
+            path,
+            duration_ms: 12_000,
+            size_bytes,
+            encoder: "h264_nvenc".into(),
+        }
     }
 
     /// An open index in a temp directory, plus the directory holding it.
@@ -433,13 +456,25 @@ mod tests {
         // A second start adopts the same index (migration is forward-only and idempotent).
         let reopened = open_clip_index(&db).expect("reopen the index");
         assert_eq!(reopened.schema_version().unwrap(), store_schema_version());
-        assert_eq!(reopened.list_clips().unwrap().len(), 1, "the clip survived the restart");
+        assert_eq!(
+            reopened.list_clips().unwrap().len(),
+            1,
+            "the clip survived the restart"
+        );
 
         // The session columns the version gate exists for are present, so a session row can be opened and closed.
         let session = reopened
-            .start_session(None, localplay_store::SESSION_MODE_BUFFER, 1_000, "scratch", 0)
+            .start_session(
+                None,
+                localplay_store::SESSION_MODE_BUFFER,
+                1_000,
+                "scratch",
+                0,
+            )
             .expect("the index carries the session columns");
-        reopened.end_session(session, 2_000, None, 0, 0).expect("and can close a session");
+        reopened
+            .end_session(session, 2_000, None, 0, 0)
+            .expect("and can close a session");
         assert_eq!(reopened.list_sessions().unwrap().len(), 1);
     }
 
@@ -459,7 +494,10 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.id, id);
         assert_eq!(row.path, path);
-        assert_eq!(row.started_at_ms, 42_000, "the ledger position is recorded as given");
+        assert_eq!(
+            row.started_at_ms, 42_000,
+            "the ledger position is recorded as given"
+        );
         assert_eq!(row.duration_ms, meta.duration_ms);
         assert_eq!(
             row.size_bytes,
@@ -488,12 +526,20 @@ mod tests {
 
         assert!(index_clip(&store, &meta, 1).is_some());
         // `clips.path` is UNIQUE, so a duplicate insert fails; the index write is the one thing that can fail after the clip exists.
-        assert_eq!(index_clip(&store, &meta, 2), None, "a duplicate insert fails");
+        assert_eq!(
+            index_clip(&store, &meta, 2),
+            None,
+            "a duplicate insert fails"
+        );
         assert!(
             path.is_file(),
             "a failed index write must never cost the clip the user asked for"
         );
-        assert_eq!(store.list_clips().unwrap().len(), 1, "and must not corrupt the index");
+        assert_eq!(
+            store.list_clips().unwrap().len(),
+            1,
+            "and must not corrupt the index"
+        );
     }
 
     #[test]
@@ -501,7 +547,8 @@ mod tests {
         let (dir, store) = index_dir();
         let path = dir.path().join("clip-1.mp4");
         std::fs::write(&path, vec![7u8; 500]).unwrap();
-        let clip_id = index_clip(&store, &metadata(path, 500), 30_000).expect("the clip is indexed");
+        let clip_id =
+            index_clip(&store, &metadata(path, 500), 30_000).expect("the clip is indexed");
 
         let kill = localplay_events::GameEvent::new(
             localplay_events::Source::Lol,
@@ -509,14 +556,19 @@ mod tests {
             // One line of JSON, as the payload column holds.
             serde_json::json!({ "source": "lol", "killer": "Ahri" }),
         );
-        let id = index_event(&store, &kill, 34_000, Some(clip_id), None).expect("the reason is written");
+        let id =
+            index_event(&store, &kill, 34_000, Some(clip_id), None).expect("the reason is written");
 
         let events = store.list_events().expect("read the events back");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, id);
         assert_eq!(events[0].kind, "kill", "the tag the vocabulary defines");
         assert_eq!(events[0].at_ms, 34_000, "media time, as given");
-        assert_eq!(events[0].clip_id, Some(clip_id), "linked to the clip it produced");
+        assert_eq!(
+            events[0].clip_id,
+            Some(clip_id),
+            "linked to the clip it produced"
+        );
         assert_eq!(events[0].session_id, None);
         assert!(events[0].payload.as_deref().unwrap_or("").contains("Ahri"));
 
@@ -530,7 +582,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "round_start");
         assert_eq!(events[1].clip_id, None);
-        assert_eq!(events[1].payload, None, "a bare event has no detail to record");
+        assert_eq!(
+            events[1].payload, None,
+            "a bare event has no detail to record"
+        );
     }
 
     #[test]
@@ -546,7 +601,12 @@ mod tests {
     }
 
     /// The storage policy, in the shape the config file gives it.
-    fn storage(clips_dir: &Path, clips_cap: u64, sessions_dir: &Path, sessions_cap: u64) -> StorageSection {
+    fn storage(
+        clips_dir: &Path,
+        clips_cap: u64,
+        sessions_dir: &Path,
+        sessions_cap: u64,
+    ) -> StorageSection {
         StorageSection {
             clips_dir: clips_dir.display().to_string(),
             max_total_bytes: clips_cap,
@@ -583,11 +643,20 @@ mod tests {
         assert_eq!(rows.len(), 1, "the cap allows one of the two clips");
         let survivor = rows[0].path.clone();
         assert!(survivor.is_file(), "the survivor's file is untouched");
-        let evicted = paths.into_iter().find(|p| *p != survivor).expect("one was evicted");
-        assert!(!evicted.exists(), "the evicted clip's row and its file are both gone");
+        let evicted = paths
+            .into_iter()
+            .find(|p| *p != survivor)
+            .expect("one was evicted");
+        assert!(
+            !evicted.exists(),
+            "the evicted clip's row and its file are both gone"
+        );
         assert_eq!(store.total_bytes().unwrap(), 1_000);
         assert_eq!(outcome.clips.deleted, 1);
-        assert_eq!(outcome.clips.bytes_reclaimed, 1_000, "measured from the files, not the rows");
+        assert_eq!(
+            outcome.clips.bytes_reclaimed, 1_000,
+            "measured from the files, not the rows"
+        );
         assert!(outcome.sessions.deleted == 0 && outcome.sessions.bytes_reclaimed == 0);
         assert!(outcome.clips.cap_met, "the clips cap is met after the pass");
 
@@ -627,9 +696,23 @@ mod tests {
             let final_path = sessions_dir.join(format!("session-{i}.mp4"));
             std::fs::write(&final_path, vec![0u8; 600]).unwrap();
             let id = store
-                .start_session(Some("Dota 2"), localplay_store::SESSION_MODE_SESSION, i * 1_000, &scratch.display().to_string(), 0)
+                .start_session(
+                    Some("Dota 2"),
+                    localplay_store::SESSION_MODE_SESSION,
+                    i * 1_000,
+                    &scratch.display().to_string(),
+                    0,
+                )
                 .unwrap();
-            store.end_session(id, i * 1_000 + 5, Some(&final_path.display().to_string()), 1_000, 0).unwrap();
+            store
+                .end_session(
+                    id,
+                    i * 1_000 + 5,
+                    Some(&final_path.display().to_string()),
+                    1_000,
+                    0,
+                )
+                .unwrap();
             if i == 2 {
                 store.set_session_favourite(id, true).unwrap();
             }
@@ -642,17 +725,32 @@ mod tests {
         let outcome = cleanup_pass(&store, &storage, &mut report);
 
         assert_eq!(store.list_clips().unwrap().len(), 1, "one clip survives");
-        assert!(store.list_clips().unwrap()[0].favourite, "and it is the favourite");
+        assert!(
+            store.list_clips().unwrap()[0].favourite,
+            "and it is the favourite"
+        );
         assert!(clip_paths[1].is_file(), "the favourite's file is untouched");
         assert!(!clip_paths[0].exists(), "the non-favourite clip is gone");
 
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1, "one session survives");
         assert!(sessions[0].favourite, "and it is the favourite");
-        assert!(session_paths[1].0.is_file(), "the favourite session's file is untouched");
-        assert!(session_paths[1].1.is_dir(), "and so is its scratch directory");
-        assert!(!session_paths[0].0.exists(), "the evicted session's file is gone");
-        assert!(!session_paths[0].1.exists(), "and so is the directory its segments lived in");
+        assert!(
+            session_paths[1].0.is_file(),
+            "the favourite session's file is untouched"
+        );
+        assert!(
+            session_paths[1].1.is_dir(),
+            "and so is its scratch directory"
+        );
+        assert!(
+            !session_paths[0].0.exists(),
+            "the evicted session's file is gone"
+        );
+        assert!(
+            !session_paths[0].1.exists(),
+            "and so is the directory its segments lived in"
+        );
         assert_eq!(store.total_session_bytes().unwrap(), 1_000);
 
         assert_eq!(outcome.clips.deleted, 1);
@@ -683,7 +781,13 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("seg-000000.mp4"), vec![0u8; 2_000]).unwrap();
         let running = store
-            .start_session(None, localplay_store::SESSION_MODE_SESSION, 1_000, &scratch.display().to_string(), 0)
+            .start_session(
+                None,
+                localplay_store::SESSION_MODE_SESSION,
+                1_000,
+                &scratch.display().to_string(),
+                0,
+            )
             .unwrap();
         store.set_session_size(running, 2_000).unwrap();
 
@@ -691,13 +795,33 @@ mod tests {
         let mut report = CleanupReport::default();
         let outcome = cleanup_pass(&store, &storage, &mut report);
 
-        assert_eq!(outcome.deleted(), 0, "nothing may be deleted to satisfy these caps");
+        assert_eq!(
+            outcome.deleted(),
+            0,
+            "nothing may be deleted to satisfy these caps"
+        );
         assert!(!outcome.clips.cap_met && !outcome.sessions.cap_met);
-        assert_eq!(report.last_clips_shortfall, Some(900), "the favourite's excess is reported");
-        assert_eq!(report.last_sessions_shortfall, Some(1_900), "the live session's is too");
+        assert_eq!(
+            report.last_clips_shortfall,
+            Some(900),
+            "the favourite's excess is reported"
+        );
+        assert_eq!(
+            report.last_sessions_shortfall,
+            Some(1_900),
+            "the live session's is too"
+        );
         assert!(clip_path.is_file(), "the favourite is untouched");
-        assert!(scratch.is_dir(), "and the live session's footage is not touched");
-        assert!(store.get_session(running).unwrap().unwrap().ended_at_ms.is_none());
+        assert!(
+            scratch.is_dir(),
+            "and the live session's footage is not touched"
+        );
+        assert!(store
+            .get_session(running)
+            .unwrap()
+            .unwrap()
+            .ended_at_ms
+            .is_none());
 
         // The report is remembered (an identical pass does not change it); once the immunity is gone the next pass evicts both classes.
         let outcome = cleanup_pass(&store, &storage, &mut report);
@@ -708,13 +832,26 @@ mod tests {
         store.end_session(running, 9_000, None, 2_000, 0).unwrap();
         store.set_favourite(clip_id, false).unwrap();
         let outcome = cleanup_pass(&store, &storage, &mut report);
-        assert_eq!(outcome.deleted(), 2, "once nothing is immune, both classes shrink: {outcome:?}");
+        assert_eq!(
+            outcome.deleted(),
+            2,
+            "once nothing is immune, both classes shrink: {outcome:?}"
+        );
         assert_eq!(outcome.clips.bytes_reclaimed, 1_000);
         assert_eq!(outcome.sessions.bytes_reclaimed, 2_000);
-        assert!(outcome.cap_met(), "both caps are met after the pass: {outcome:?}");
-        assert_eq!(report.last_clips_shortfall, None, "the unsatisfiable condition is gone");
+        assert!(
+            outcome.cap_met(),
+            "both caps are met after the pass: {outcome:?}"
+        );
+        assert_eq!(
+            report.last_clips_shortfall, None,
+            "the unsatisfiable condition is gone"
+        );
         assert_eq!(report.last_sessions_shortfall, None);
         assert!(!clip_path.exists(), "the clip's file went with its row");
-        assert!(!scratch.exists(), "and the session's scratch directory with its row");
+        assert!(
+            !scratch.exists(),
+            "and the session's scratch directory with its row"
+        );
     }
 }

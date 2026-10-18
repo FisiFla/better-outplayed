@@ -58,8 +58,9 @@ pub fn clipboard_command(path: &Path, manager: FileManager) -> Option<ClipboardC
 
 /// Run [`clipboard_command`] for this host and wait for it; its failure is the error.
 pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
-    let spec = clipboard_command(path, FileManager::current())
-        .ok_or_else(|| "copying a file to the clipboard is not supported on this platform".to_string())?;
+    let spec = clipboard_command(path, FileManager::current()).ok_or_else(|| {
+        "copying a file to the clipboard is not supported on this platform".to_string()
+    })?;
     let output = localplay_media::sidecar_command(&spec.program)
         .args(&spec.args)
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
@@ -83,13 +84,20 @@ mod tests {
         let path = PathBuf::from(r#"C:\Clips\it's a "quote" $(calc).mp4"#);
         let c = clipboard_command(&path, FileManager::Explorer).unwrap();
         assert_eq!(c.program, "powershell");
-        assert!(c.args.last().unwrap().starts_with("Set-Clipboard -LiteralPath $env:"));
+        assert!(c
+            .args
+            .last()
+            .unwrap()
+            .starts_with("Set-Clipboard -LiteralPath $env:"));
         assert!(
             c.args.iter().all(|a| !a.contains("calc")),
             "the path never appears in script text: {:?}",
             c.args
         );
-        assert_eq!(c.env, vec![(CLIP_PATH_ENV.to_string(), path.display().to_string())]);
+        assert_eq!(
+            c.env,
+            vec![(CLIP_PATH_ENV.to_string(), path.display().to_string())]
+        );
     }
 
     #[test]

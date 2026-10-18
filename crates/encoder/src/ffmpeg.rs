@@ -170,9 +170,14 @@ fn gop_frames(cfg: &EncodeConfig) -> u32 {
 /// re-stamp every frame onto a rigid 1/fps grid and discard the arrival timestamp (see the
 /// module comment).
 pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
-    let mut args: Vec<String> = ["-f", "rawvideo", "-pix_fmt", "bgra"].map(str::to_string).to_vec();
+    let mut args: Vec<String> = ["-f", "rawvideo", "-pix_fmt", "bgra"]
+        .map(str::to_string)
+        .to_vec();
     // `-s` sizes the incoming rawvideo stream, so it must be the SOURCE size, never the output size.
-    args.extend(["-s".to_string(), format!("{}x{}", cfg.source_size.0, cfg.source_size.1)]);
+    args.extend([
+        "-s".to_string(),
+        format!("{}x{}", cfg.source_size.0, cfg.source_size.1),
+    ]);
     // The nominal rate: one number for this argument and the pacer (`localplay_recorder::FpsDecision`).
     args.extend(["-framerate".to_string(), cfg.fps.to_string()]);
     // Timestamps are each frame's arrival time, which keeps `segments * segment_time` real seconds
@@ -290,7 +295,12 @@ pub fn rate_control_args(encoder: &str, bitrate_kbps: u32) -> Vec<String> {
     if encoder.ends_with("_nvenc") || encoder.ends_with("_amf") {
         args.extend(["-rc".to_string(), "cbr".to_string()]);
     }
-    args.extend(["-maxrate".to_string(), rate.clone(), "-bufsize".to_string(), rate]);
+    args.extend([
+        "-maxrate".to_string(),
+        rate.clone(),
+        "-bufsize".to_string(),
+        rate,
+    ]);
     args
 }
 
@@ -327,8 +337,10 @@ fn audio_input_args(
 /// `OsString` because the segment pattern is a real path: a non-UTF-8 `scratch_dir` must reach
 /// ffmpeg as the bytes it is.
 fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Vec<OsString> {
-    let mut args: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    let mut args: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+        .iter()
+        .map(OsString::from)
+        .collect();
     // `-nostdin` keeps ffmpeg from consuming our stdin for interactive commands, which would steal
     // raw video frames; `-loglevel error` is why a failure's reason is read from stderr by `drain_stderr`.
 
@@ -362,9 +374,9 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // Input 2, the microphone, declared and pumped by the same functions as input 1 so the second
     // track cannot invent its own timing conventions; only the numbers come from `MicAudioSpec`.
     if let Some(mic_url) = mic_url {
-        let spec = cfg.mic_audio.expect(
-            "a microphone URL is only ever passed when EncodeConfig::mic_audio is Some",
-        );
+        let spec = cfg
+            .mic_audio
+            .expect("a microphone URL is only ever passed when EncodeConfig::mic_audio is Some");
         args.extend(
             audio_input_args(mic_url, spec.sample_rate, spec.channels, spec.sample_format)
                 .into_iter()
@@ -396,7 +408,11 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // microphone (`Encoder::submit_mic_audio`); a microphone with `game_audio` off would shift them,
     // which is why that combination is refused at spawn.
     if mic_url.is_some() {
-        args.extend(["-map", "0:v", "-map", "1:a", "-map", "2:a"].iter().map(OsString::from));
+        args.extend(
+            ["-map", "0:v", "-map", "1:a", "-map", "2:a"]
+                .iter()
+                .map(OsString::from),
+        );
         // The tag strings come from `localplay-media`, which applies the same names again when it
         // concatenates segments (`-c copy` does not carry per-stream metadata); two literals could drift
         // and leave a track anonymous.
@@ -572,7 +588,9 @@ impl FfmpegEncoder {
             }
             None => None,
         };
-        let mic_url = mic.as_ref().map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
+        let mic_url = mic
+            .as_ref()
+            .map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
 
         let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
         cmd
@@ -605,8 +623,9 @@ impl FfmpegEncoder {
         let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
         // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
-        let mft = (cfg.video == VideoInput::EncodedBitstream)
-            .then(|| crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, cfg.fps, video_tx.clone()));
+        let mft = (cfg.video == VideoInput::EncodedBitstream).then(|| {
+            crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, cfg.fps, video_tx.clone())
+        });
         let video_writer = std::thread::Builder::new()
             .name("ffmpeg-video-in".into())
             .spawn(move || pump(video_rx, video_in))
@@ -696,7 +715,10 @@ fn pump_audio(
     let stream = accept_within(&listener, port, AUDIO_CONNECT_TIMEOUT, what)?;
     // PCM arrives in small blocks (10ms = 1920 bytes at 48kHz stereo s16le) read in real time, so Nagle only adds latency.
     stream.set_nodelay(true).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("disabling Nagle on the {what} input socket: {e}"))
+        std::io::Error::new(
+            e.kind(),
+            format!("disabling Nagle on the {what} input socket: {e}"),
+        )
     })?;
     pump(rx, stream)
 }
@@ -818,7 +840,13 @@ impl Encoder for FfmpegEncoder {
         // wiring mistake, not a full queue (same as `submit_mic_audio`).
         refuse_audio_without_input(self.game_audio)?;
         let queued = match self.audio_tx.as_ref() {
-            Some(tx) => enqueue_audio(tx, audio.data, &self.dropped_audio, &mut self.owed_audio, "audio"),
+            Some(tx) => enqueue_audio(
+                tx,
+                audio.data,
+                &self.dropped_audio,
+                &mut self.owed_audio,
+                "audio",
+            ),
             None => bail!("encoder already finished"),
         };
         queued.map_err(|e| self.explain_dead_writer(e))
@@ -842,8 +870,7 @@ impl Encoder for FfmpegEncoder {
         let spec = self
             .mic_spec
             .expect("a microphone queue exists only when a microphone spec was configured");
-        if audio.format.sample_rate != spec.sample_rate || audio.format.channels != spec.channels
-        {
+        if audio.format.sample_rate != spec.sample_rate || audio.format.channels != spec.channels {
             bail!(
                 "microphone block is {}Hz {}ch but the input was declared as {}Hz {}ch \
                  (EncodeConfig::mic_audio); accepting it would put the microphone track on \
@@ -1225,7 +1252,9 @@ fn wait_bounded(child: &mut Child, budget: Duration) -> Option<std::process::Exi
             }
         }
         if Instant::now() >= deadline {
-            tracing::warn!("ffmpeg did not exit within {budget:?}; killing it so the recording can stop");
+            tracing::warn!(
+                "ffmpeg did not exit within {budget:?}; killing it so the recording can stop"
+            );
             let _ = child.kill();
             // Not a wait: the process is gone, and this only reaps it.
             return child.wait().ok();
@@ -1247,15 +1276,17 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use super::*;
+    use std::process::Command;
 
     /// Constant-bitrate rate control reaches the argument list for every encoder family, with the
     /// vendor-specific switch only where the vendor names one.
     #[test]
     fn rate_control_holds_the_bitrate_for_each_encoder_family() {
         let get = |args: &[String], flag: &str| {
-            args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
         };
         for enc in ["h264_nvenc", "hevc_amf", "h264_qsv", "libx264"] {
             let args = rate_control_args(enc, 20_000);
@@ -1263,8 +1294,14 @@ mod tests {
             assert_eq!(get(&args, "-maxrate").as_deref(), Some("20000k"), "{enc}");
             assert_eq!(get(&args, "-bufsize").as_deref(), Some("20000k"), "{enc}");
         }
-        assert_eq!(get(&rate_control_args("h264_nvenc", 1), "-rc").as_deref(), Some("cbr"));
-        assert_eq!(get(&rate_control_args("hevc_amf", 1), "-rc").as_deref(), Some("cbr"));
+        assert_eq!(
+            get(&rate_control_args("h264_nvenc", 1), "-rc").as_deref(),
+            Some("cbr")
+        );
+        assert_eq!(
+            get(&rate_control_args("hevc_amf", 1), "-rc").as_deref(),
+            Some("cbr")
+        );
         assert_eq!(get(&rate_control_args("h264_qsv", 1), "-rc"), None);
         assert_eq!(get(&rate_control_args("libx264", 1), "-rc"), None);
     }
@@ -1297,8 +1334,16 @@ mod tests {
                     .unwrap_or_else(|| panic!("{flag} missing from {args:?}"));
                 args.get(i + 1).cloned().unwrap_or_default()
             };
-            assert_eq!(at("-framerate"), fps.to_string(), "the declared rate: {args:?}");
-            assert_eq!(at("-s"), "1280x720", "the rawvideo pipe is the SOURCE size: {args:?}");
+            assert_eq!(
+                at("-framerate"),
+                fps.to_string(),
+                "the declared rate: {args:?}"
+            );
+            assert_eq!(
+                at("-s"),
+                "1280x720",
+                "the rawvideo pipe is the SOURCE size: {args:?}"
+            );
             assert!(
                 !args.iter().any(|a| a == "-r"),
                 "`-r` before `-i` re-stamps every frame onto a rigid grid and undoes the \
@@ -1320,7 +1365,14 @@ mod tests {
         let got: Vec<&str> = input.iter().map(String::as_str).collect();
         assert_eq!(
             got,
-            ["-f", "h264", "-use_wallclock_as_timestamps", "1", "-i", "pipe:0"],
+            [
+                "-f",
+                "h264",
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-i",
+                "pipe:0"
+            ],
             "the input is an H.264 elementary stream, stamped on arrival"
         );
         for forbidden in ["-r", "-framerate"] {
@@ -1332,7 +1384,11 @@ mod tests {
 
         let output = video_output_args_bitstream(crate::VideoCodec::H264);
         let got: Vec<&str> = output.iter().map(String::as_str).collect();
-        assert_eq!(got, ["-c:v", "copy"], "the video is copied, not encoded again");
+        assert_eq!(
+            got,
+            ["-c:v", "copy"],
+            "the video is copied, not encoded again"
+        );
         for forbidden in ["-force_key_frames", "-g", "-b:v", "-fps_mode", "-vf"] {
             assert!(
                 !output.iter().any(|a| a == forbidden),
@@ -1372,10 +1428,14 @@ mod tests {
         cfg.video = VideoInput::EncodedBitstream;
 
         let args = ffmpeg_args(&cfg, "tcp://127.0.0.1:1", None);
-        let text: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(text.windows(2).any(|w| w == ["-f", "h264"]), "{text:?}");
         assert!(
-            text.windows(2).any(|w| w == ["-use_wallclock_as_timestamps", "1"]),
+            text.windows(2)
+                .any(|w| w == ["-use_wallclock_as_timestamps", "1"]),
             "an elementary stream carries no timestamps of its own: {text:?}"
         );
         assert!(text.windows(2).any(|w| w == ["-c:v", "copy"]), "{text:?}");
@@ -1386,8 +1446,14 @@ mod tests {
                  {text:?}"
             );
         }
-        assert!(text.windows(2).any(|w| w == ["-c:a", "aac"]), "audio is unchanged: {text:?}");
-        assert!(text.windows(2).any(|w| w == ["-f", "segment"]), "so is the output: {text:?}");
+        assert!(
+            text.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "audio is unchanged: {text:?}"
+        );
+        assert!(
+            text.windows(2).any(|w| w == ["-f", "segment"]),
+            "so is the output: {text:?}"
+        );
 
         // A scaled output is refused before anything is launched; the binary named here does not exist.
         cfg.source_size = (1280, 720);
@@ -1420,7 +1486,10 @@ mod tests {
         let mut scaled = args_cfg(30, 1000);
         scaled.output_size = (1920, 1080);
         let args = video_output_args(&scaled);
-        let vf = args.iter().position(|a| a == "-vf").expect("a scale filter");
+        let vf = args
+            .iter()
+            .position(|a| a == "-vf")
+            .expect("a scale filter");
         assert_eq!(args[vf + 1], "scale=1920:1080");
         assert!(args.contains(&"-c:v".to_string()));
 
@@ -1500,7 +1569,8 @@ mod tests {
             "the refusal must name the configuration key: {err}"
         );
         assert!(
-            err.to_string().contains("refused rather than silently dropped"),
+            err.to_string()
+                .contains("refused rather than silently dropped"),
             "and say what it did with the block: {err}"
         );
         // The other direction, so this cannot pass by refusing everything.
@@ -1510,7 +1580,9 @@ mod tests {
     /// The argument list as the os-string vector `Command::args` receives it. Every element is
     /// ASCII except the segment pattern path, which is derived the same way on both sides.
     fn strings(args: &[OsString]) -> Vec<String> {
-        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// With `mic_audio: None` the child is spawned with exactly the one-track arguments.
@@ -1525,24 +1597,73 @@ mod tests {
 
         let got = strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", None));
         let mut expected: Vec<String> = vec![
-            "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
             // Input 0: raw BGRA video on stdin, at the declared rate, timed from arrival.
-            "-f", "rawvideo", "-pix_fmt", "bgra", "-s", "1280x720", "-framerate", "30",
-            "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            "1280x720",
+            "-framerate",
+            "30",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            "pipe:0",
             // Input 1: raw s16le PCM over loopback TCP.
-            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            "tcp://127.0.0.1:41234",
             // The video encoder: passthrough frame-rate mode, codec, bitrate, GOP and forced keyframes.
-            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
-            "-force_key_frames", "expr:gte(t,n_forced*1)",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-b:v",
+            "20000k",
+            "-maxrate",
+            "20000k",
+            "-bufsize",
+            "20000k",
+            "-g",
+            "30",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
             // The audio codec, then the segment muxer and its numbering.
-            "-c:a", "aac", "-b:a", "128k", "-f", "segment", "-segment_time", "1",
-            "-segment_format", "mp4", "-reset_timestamps", "1", "-segment_start_number", "0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-f",
+            "segment",
+            "-segment_time",
+            "1",
+            "-segment_format",
+            "mp4",
+            "-reset_timestamps",
+            "1",
+            "-segment_start_number",
+            "0",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
         // The one real path, built the way the encoder builds it, so the comparison does not depend on the path separator.
-        expected.push(cfg.scratch_dir.join("seg-%06d.mp4").to_string_lossy().into_owned());
+        expected.push(
+            cfg.scratch_dir
+                .join("seg-%06d.mp4")
+                .to_string_lossy()
+                .into_owned(),
+        );
 
         assert_eq!(
             got, expected,
@@ -1569,31 +1690,99 @@ mod tests {
             sample_format: SampleFormat::S16Le,
         });
 
-        let got =
-            strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", Some("tcp://127.0.0.1:43210")));
+        let got = strings(&ffmpeg_args(
+            &cfg,
+            "tcp://127.0.0.1:41234",
+            Some("tcp://127.0.0.1:43210"),
+        ));
         let mut expected: Vec<String> = vec![
-            "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-f", "rawvideo", "-pix_fmt", "bgra", "-s", "1280x720", "-framerate", "30",
-            "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
-            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "tcp://127.0.0.1:41234",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            "1280x720",
+            "-framerate",
+            "30",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            "tcp://127.0.0.1:41234",
             // Input 2, from the configuration's spec.
-            "-f", "s16le", "-ar", "44100", "-ac", "1", "-i", "tcp://127.0.0.1:43210",
-            "-fps_mode", "passthrough", "-c:v", "libx264", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "20000k", "-g", "30",
-            "-force_key_frames", "expr:gte(t,n_forced*1)",
-            "-c:a", "aac", "-b:a", "128k",
+            "-f",
+            "s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-i",
+            "tcp://127.0.0.1:43210",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-b:v",
+            "20000k",
+            "-maxrate",
+            "20000k",
+            "-bufsize",
+            "20000k",
+            "-g",
+            "30",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
             // What a second audio input needs: both streams mapped explicitly (without maps ffmpeg picks one) and tagged.
-            "-map", "0:v", "-map", "1:a", "-map", "2:a",
-            "-metadata:s:a:0", "title=Game Audio",
-            "-metadata:s:a:1", "title=Microphone",
-            "-f", "segment", "-segment_time", "1", "-segment_format", "mp4",
-            "-reset_timestamps", "1", "-segment_start_number", "0",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "2:a",
+            "-metadata:s:a:0",
+            "title=Game Audio",
+            "-metadata:s:a:1",
+            "title=Microphone",
+            "-f",
+            "segment",
+            "-segment_time",
+            "1",
+            "-segment_format",
+            "mp4",
+            "-reset_timestamps",
+            "1",
+            "-segment_start_number",
+            "0",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
-        expected.push(cfg.scratch_dir.join("seg-%06d.mp4").to_string_lossy().into_owned());
+        expected.push(
+            cfg.scratch_dir
+                .join("seg-%06d.mp4")
+                .to_string_lossy()
+                .into_owned(),
+        );
 
-        assert_eq!(got, expected, "the microphone adds its input, its mapping and its tags");
+        assert_eq!(
+            got, expected,
+            "the microphone adds its input, its mapping and its tags"
+        );
     }
 
     #[test]
@@ -1610,7 +1799,10 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), vec![1; 4]);
         // Room again: the debt goes first (silence), and the block that follows waits its turn.
         enqueue_audio(&tx, vec![4; 4], &dropped, &mut owed, "audio").unwrap();
-        assert_eq!(owed, 4, "the new block did not fit behind the silence, so it is owed too");
+        assert_eq!(
+            owed, 4,
+            "the new block did not fit behind the silence, so it is owed too"
+        );
         assert_eq!(rx.try_recv().unwrap(), vec![0; 12]);
         enqueue_audio(&tx, vec![5; 4], &dropped, &mut owed, "audio").unwrap();
         assert_eq!(rx.try_recv().unwrap(), vec![0; 4]);
@@ -1639,13 +1831,20 @@ mod tests {
         enqueue_or_drop(&tx, 2, &dropped, "video").expect("a full queue drops, it does not fail");
         enqueue_or_drop(&tx, 3, &dropped, "video").expect("a full queue drops, it does not fail");
 
-        assert_eq!(dropped.load(Ordering::Relaxed), 2, "both refused payloads are counted");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            2,
+            "both refused payloads are counted"
+        );
         assert_eq!(
             rx.try_recv().expect("the queued payload is still there"),
             1,
             "the queued payload is untouched"
         );
-        assert!(rx.try_recv().is_err(), "the dropped payloads were not smuggled in behind it");
+        assert!(
+            rx.try_recv().is_err(),
+            "the dropped payloads were not smuggled in behind it"
+        );
     }
 
     #[test]
@@ -1660,7 +1859,11 @@ mod tests {
             err.to_string().contains("video writer thread has stopped"),
             "the error must name the dead writer: {err}"
         );
-        assert_eq!(dropped.load(Ordering::Relaxed), 0, "a failure is not a drop");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "a failure is not a drop"
+        );
     }
 
     /// A pipe can be read once but two reports want ffmpeg's words (the writer failure and the
@@ -1705,9 +1908,15 @@ mod tests {
         encoder.child.wait().unwrap();
 
         let first = encoder.drain_stderr(Duration::from_secs(1));
-        assert!(first.contains("DLL amfrt64.dll failed to open"), "got: {first:?}");
+        assert!(
+            first.contains("DLL amfrt64.dll failed to open"),
+            "got: {first:?}"
+        );
         let second = encoder.drain_stderr(Duration::from_secs(1));
-        assert_eq!(second, first, "the second report gets the same words, not nothing");
+        assert_eq!(
+            second, first,
+            "the second report gets the same words, not nothing"
+        );
     }
 
     /// A budget that runs out before the words arrive must not be mistaken for a child that said nothing.
@@ -1732,7 +1941,10 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
         let cfg = EncodeConfig::for_tests_software(
             crate::VideoCodec::H264,
             64,
@@ -1752,7 +1964,10 @@ mod tests {
              {late:?}"
         );
         let again = encoder.drain_stderr(Duration::from_secs(3));
-        assert_eq!(again, late, "and they are remembered rather than drained a second time");
+        assert_eq!(
+            again, late,
+            "and they are remembered rather than drained a second time"
+        );
     }
 
     /// A shutdown is bounded: a child that will not exit is killed rather than waited for.
@@ -1819,8 +2034,8 @@ mod tests {
     /// desync that appears seconds later pointing at nothing in this function.
     #[test]
     fn a_frame_without_pixels_is_refused_rather_than_written_as_nothing() {
-        use localplay_capture::{Frame, PixelFormat};
         use crate::VideoCodec;
+        use localplay_capture::{Frame, PixelFormat};
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = EncodeConfig::for_tests_software(
@@ -1859,7 +2074,9 @@ mod tests {
             format: PixelFormat::Bgra8,
             texture: None,
         };
-        encoder.submit_video(honest).expect("a frame with pixels is accepted");
+        encoder
+            .submit_video(honest)
+            .expect("a frame with pixels is accepted");
         encoder.finish().expect("flush the encoder");
     }
 
@@ -1880,9 +2097,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("ffmpeg");
-        std::fs::write(&stub, "#!/bin/sh\necho 'DLL amfrt64.dll failed to open' >&2\nexit 1\n").unwrap();
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'DLL amfrt64.dll failed to open' >&2\nexit 1\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
         let cfg = EncodeConfig::for_tests_software(
             VideoCodec::H264,
             64,
@@ -1919,12 +2143,18 @@ mod tests {
         }
 
         let err = failure.expect("a payload cannot be encoded once the writer thread is gone");
-        assert!(err.contains("video writer thread has stopped"), "the symptom survives: {err}");
+        assert!(
+            err.contains("video writer thread has stopped"),
+            "the symptom survives: {err}"
+        );
         assert!(
             err.contains("DLL amfrt64.dll failed to open"),
             "ffmpeg's own words are the point, and they were only in its stderr: {err}"
         );
-        assert!(err.contains("exit status"), "and so is its exit status: {err}");
+        assert!(
+            err.contains("exit status"),
+            "and so is its exit status: {err}"
+        );
     }
 
     /// On macOS and other BSD-derived platforms the socket `accept()` returns inherits the
@@ -1954,18 +2184,33 @@ mod tests {
 
         let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
-        let port = listener.local_addr().expect("the listener's address").port();
+        let port = listener
+            .local_addr()
+            .expect("the listener's address")
+            .port();
 
         let mut client = localplay_media::sidecar_command(&bin.ffmpeg)
             .args([
-                "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
                 // Real-time pacing: the reader cannot drain a burst faster than the socket buffers allow.
                 "-re",
                 // A small receive buffer keeps the burst decisively larger than the socket's capacity.
-                "-recv_buffer_size", "32768",
-                "-f", "s16le", "-ar", "48000", "-ac", "2",
-                "-i", &format!("tcp://127.0.0.1:{port}"),
-                "-f", "null", "-",
+                "-recv_buffer_size",
+                "32768",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                &format!("tcp://127.0.0.1:{port}"),
+                "-f",
+                "null",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2036,7 +2281,10 @@ mod tests {
         // stream, but some players refuse `hev1`, and these clips get played on a Mac. H.264 must not
         // get it: `hvc1` on an AVC track misstates the codec.
         let hevc_out = video_output_args_bitstream(crate::VideoCodec::Hevc);
-        assert!(hevc_out.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "{hevc_out:?}");
+        assert!(
+            hevc_out.windows(2).any(|w| w == ["-tag:v", "hvc1"]),
+            "{hevc_out:?}"
+        );
         assert_eq!(
             video_output_args_bitstream(crate::VideoCodec::H264),
             vec!["-c:v".to_string(), "copy".to_string()],

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 pub mod platform;
-pub mod target;
 pub mod stub;
+pub mod target;
 
 pub mod audio_devices;
 
@@ -18,11 +18,11 @@ pub use wasapi_mic::StubMicrophone;
 
 // Cross-platform so its tests run off Windows; only the WASAPI loopback backend uses it.
 #[cfg_attr(not(windows), allow(dead_code))]
-mod audio_timeline;
-#[cfg_attr(not(windows), allow(dead_code))]
 mod audio_recovery;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod audio_target;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod audio_timeline;
 pub use audio_target::{GameAudioSource, GameFinder};
 
 #[cfg(windows)]
@@ -81,7 +81,11 @@ impl Clone for GpuTexture {
     fn clone(&self) -> Self {
         use windows::core::Interface;
 
-        Self(self.0.cast().expect("a texture's own interface cannot refuse to be AddRef'd"))
+        Self(
+            self.0
+                .cast()
+                .expect("a texture's own interface cannot refuse to be AddRef'd"),
+        )
     }
 }
 
@@ -162,7 +166,10 @@ pub struct AudioFormat {
 impl Default for AudioFormat {
     fn default() -> Self {
         // Fixed at 48kHz stereo so the audio timeline is exactly derivable from the byte count.
-        Self { sample_rate: 48_000, channels: 2 }
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+        }
     }
 }
 
@@ -372,7 +379,11 @@ mod tests {
     use super::*;
 
     fn native(sample_rate: u32, channels: u16, encoding: SampleEncoding) -> NativeAudioFormat {
-        NativeAudioFormat { sample_rate, channels, encoding }
+        NativeAudioFormat {
+            sample_rate,
+            channels,
+            encoding,
+        }
     }
 
     #[test]
@@ -406,7 +417,10 @@ mod tests {
         // One second short of the threshold: a silent splash screen is not a broken converter.
         let mut watch = ConvertedSilenceWatch::new(true);
         for _ in 0..CONVERTED_SILENCE_THRESHOLD.as_secs() - 1 {
-            assert!(!watch.observe(secs(1), true), "under the threshold: no warning");
+            assert!(
+                !watch.observe(secs(1), true),
+                "under the threshold: no warning"
+            );
         }
         assert!(!watch.has_warned());
     }
@@ -421,7 +435,10 @@ mod tests {
                 warnings += 1;
             }
         }
-        assert_eq!(warnings, 1, "warn once per session, not once per 10ms block");
+        assert_eq!(
+            warnings, 1,
+            "warn once per session, not once per 10ms block"
+        );
         assert!(watch.has_warned());
     }
 
@@ -432,7 +449,11 @@ mod tests {
         for second in 0..CONVERTED_SILENCE_THRESHOLD.as_secs() {
             let warned = watch.observe(secs(1), true);
             if second + 1 < CONVERTED_SILENCE_THRESHOLD.as_secs() {
-                assert!(!warned, "second {} is still under the threshold", second + 1);
+                assert!(
+                    !warned,
+                    "second {} is still under the threshold",
+                    second + 1
+                );
             } else {
                 assert!(warned, "the crossing second must warn");
             }
@@ -444,7 +465,10 @@ mod tests {
         // Already 48kHz stereo s16: no conversion to blame, so a muted game is never flagged.
         let mut watch = ConvertedSilenceWatch::new(false);
         for _ in 0..10_000 {
-            assert!(!watch.observe(Duration::from_millis(10), true), "nothing to blame");
+            assert!(
+                !watch.observe(Duration::from_millis(10), true),
+                "nothing to blame"
+            );
         }
         assert!(!watch.has_warned());
     }
@@ -459,9 +483,16 @@ mod tests {
         }
         assert_eq!(watch.silent_run(), secs(20), "the run accumulated");
         assert!(!watch.observe(secs(1), false), "real audio must never warn");
-        assert_eq!(watch.silent_run(), Duration::ZERO, "the run resets on real audio");
+        assert_eq!(
+            watch.silent_run(),
+            Duration::ZERO,
+            "the run resets on real audio"
+        );
         for _ in 0..120 {
-            assert!(!watch.observe(secs(1), true), "audio was heard; silence is now benign");
+            assert!(
+                !watch.observe(secs(1), true),
+                "audio was heard; silence is now benign"
+            );
         }
         assert!(!watch.has_warned());
     }
@@ -473,7 +504,11 @@ mod tests {
         watch.observe(secs(5), false); // real audio
         watch.observe(secs(3), true); //  silence begins
         assert_eq!(watch.elapsed(), secs(8), "elapsed spans the whole session");
-        assert_eq!(watch.silent_run(), secs(3), "only the trailing run is silent");
+        assert_eq!(
+            watch.silent_run(),
+            secs(3),
+            "only the trailing run is silent"
+        );
         assert!(!watch.has_warned());
     }
 

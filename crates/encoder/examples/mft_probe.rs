@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     // Unfiltered, so "no encoder for this codec" is distinguishable from "the filter is wrong".
     match localplay_encoder::mft::list_hardware_video_encoders() {
         Ok(names) => {
-            println!("--- every hardware video encoder MFT here, unfiltered: {} ---", names.len());
+            println!(
+                "--- every hardware video encoder MFT here, unfiltered: {} ---",
+                names.len()
+            );
             for name in names {
                 println!("  {name}");
             }
@@ -120,7 +123,9 @@ fn main() -> anyhow::Result<()> {
             size,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
         );
-        match nv12.and_then(|texture| localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS, FPS)) {
+        match nv12.and_then(|texture| {
+            localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS, FPS)
+        }) {
             Ok(encoder) => println!(
                 "an NV12 texture opens: {} taking {}",
                 encoder.encoder_name, encoder.input_format
@@ -129,7 +134,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         println!("\n--- which GPU ---");
-        for (index, name) in localplay_encoder::mft::describe_adapters().into_iter().enumerate() {
+        for (index, name) in localplay_encoder::mft::describe_adapters()
+            .into_iter()
+            .enumerate()
+        {
             let note = if index == 0 {
                 "   <- what a null-adapter device gets (the default)"
             } else {
@@ -156,17 +164,19 @@ fn main() -> anyhow::Result<()> {
                     encoder.input_format,
                     localplay_encoder::mft::adapter_description(encoder.device())
                 );
-                if !encoder.input_format.starts_with("RGB32") && !encoder.input_format.starts_with("ARGB32") {
+                if !encoder.input_format.starts_with("RGB32")
+                    && !encoder.input_format.starts_with("ARGB32")
+                {
                     println!(
                         "  NOTE: that is not the format capture delivers, so this chain needs a \
                          GPU-side conversion to reach it"
                     );
                 }
                 let texture = fake_frame(
-                      encoder.device(),
-                      size,
-                      windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                  )?;
+                    encoder.device(),
+                    size,
+                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                )?;
                 encoder.start()?;
                 // Feed it a second of frames and collect the output: H.264 bytes must exist, i.e. a captured
                 // texture reaches the encoder with no CPU copy and the encoder makes a stream of it.
@@ -183,7 +193,11 @@ fn main() -> anyhow::Result<()> {
                 let seconds = 3;
                 for index in 0..(30 * seconds) {
                     let at = std::time::Instant::now();
-                    match encoder.encode_texture(&texture, index * 33, std::time::Duration::from_secs(2)) {
+                    match encoder.encode_texture(
+                        &texture,
+                        index * 33,
+                        std::time::Duration::from_secs(2),
+                    ) {
                         Ok(bytes) => {
                             total += bytes.len();
                             stream.extend_from_slice(&bytes);
@@ -205,10 +219,7 @@ fn main() -> anyhow::Result<()> {
                     Err(err) => println!("drain failed: {err:#}"),
                 }
                 println!("{frames} frames submitted, {total} bytes of H.264 out");
-                println!(
-                    "the stream starts {:02x?}",
-                    &stream[..stream.len().min(8)]
-                );
+                println!("the stream starts {:02x?}", &stream[..stream.len().min(8)]);
                 // Whether what ffmpeg makes of the bare bitstream is the fragmented MP4 the ring parses; an
                 // elementary stream carries no timestamps, so this is asked rather than assumed.
                 println!("\n--- the bitstream into ffmpeg ---");
@@ -310,7 +321,9 @@ impl FfmpegSink {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.stdin.write_all(bytes).context("writing the bitstream")?;
+        self.stdin
+            .write_all(bytes)
+            .context("writing the bitstream")?;
         // Flushed per access unit: buffering would turn the frames back into a batch.
         self.stdin.flush().context("flushing to ffmpeg")
     }
@@ -354,7 +367,7 @@ fn fake_frame(
         ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
     let description = D3D11_TEXTURE2D_DESC {
         Width: size.0,
@@ -362,7 +375,10 @@ fn fake_frame(
         MipLevels: 1,
         ArraySize: 1,
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,

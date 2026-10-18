@@ -132,15 +132,25 @@ pub fn integration_cfg_dota(port: u16, token: &str) -> String {
 /// The file both of the above are built from. The `//` comments are legal KeyValues (Valve's
 /// own `gamestate_integration_consolesample.cfg` uses them) and explain the file to the user,
 /// who installs it by hand.
-fn cfg_text(game: &str, install_path: &str, port: u16, token: &str, data: &[(&str, &str)]) -> String {
+fn cfg_text(
+    game: &str,
+    install_path: &str,
+    port: u16,
+    token: &str,
+    data: &[(&str, &str)],
+) -> String {
     let mut out = String::new();
-    out.push_str(&format!("// localplay — {game} Game State Integration (generated)\n"));
+    out.push_str(&format!(
+        "// localplay — {game} Game State Integration (generated)\n"
+    ));
     out.push_str("// Install this file as:\n");
     out.push_str(&format!("//   {install_path}\n"));
     out.push_str("// localplay listens on loopback only; nothing here leaves this machine.\n");
     out.push('\n');
     out.push_str("\"localplay\"\n{\n");
-    out.push_str(&format!("    \"uri\"       \"http://127.0.0.1:{port}{DEFAULT_PATH}\"\n"));
+    out.push_str(&format!(
+        "    \"uri\"       \"http://127.0.0.1:{port}{DEFAULT_PATH}\"\n"
+    ));
     // timeout/buffer/throttle are Valve's recommended local values. The heartbeat keeps payloads
     // arriving through a quiet stretch, so heartbeat-based derivation (the bomb timer) is not
     // waiting on a state change that never comes.
@@ -196,7 +206,11 @@ mod tests {
         let token = generate_token().expect("the OS provides randomness");
         assert_eq!(token.len(), TOKEN_BYTES * 2);
         assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "got {token}");
-        assert_eq!(token, token.to_lowercase(), "lower-case hex, so two spellings of one value cannot both exist");
+        assert_eq!(
+            token,
+            token.to_lowercase(),
+            "lower-case hex, so two spellings of one value cannot both exist"
+        );
     }
 
     #[test]
@@ -217,18 +231,35 @@ mod tests {
             "the uri must name loopback and the configured port:\n{text}"
         );
         // The token exactly once: a file with it twice would leak it.
-        assert_eq!(text.matches(token).count(), 1, "the token appears once:\n{text}");
-        assert!(text.contains("\"auth\"\n    {\n"), "in the auth block:\n{text}");
+        assert_eq!(
+            text.matches(token).count(),
+            1,
+            "the token appears once:\n{text}"
+        );
+        assert!(
+            text.contains("\"auth\"\n    {\n"),
+            "in the auth block:\n{text}"
+        );
         // The key structure Valve parses.
-        assert!(text.starts_with("//"), "it explains itself to the user:\n{text}");
-        assert!(text.contains("\"localplay\"\n{"), "the block is named:\n{text}");
+        assert!(
+            text.starts_with("//"),
+            "it explains itself to the user:\n{text}"
+        );
+        assert!(
+            text.contains("\"localplay\"\n{"),
+            "the block is named:\n{text}"
+        );
         assert!(text.trim_end().ends_with('}'), "and closed:\n{text}");
         assert_eq!(
             text.matches('{').count(),
             text.matches('}').count(),
             "every block is closed:\n{text}"
         );
-        assert_eq!(text.matches('"').count() % 2, 0, "quotes are balanced:\n{text}");
+        assert_eq!(
+            text.matches('"').count() % 2,
+            0,
+            "quotes are balanced:\n{text}"
+        );
         // Only loopback appears, and no other host is named anywhere in the file.
         assert!(text.contains("127.0.0.1"), "loopback only:\n{text}");
         assert!(!text.contains("0.0.0.0"), "never every interface:\n{text}");
@@ -249,7 +280,10 @@ mod tests {
         ] {
             let pad = " ".repeat((20 - (name.len() + 2)).max(1));
             let expected = format!("        \"{name}\"{pad}\"{value}\"");
-            assert!(text.contains(&expected), "expected the line {expected:?} in:\n{text}");
+            assert!(
+                text.contains(&expected),
+                "expected the line {expected:?} in:\n{text}"
+            );
         }
     }
 
@@ -306,7 +340,10 @@ mod tests {
     fn the_dota_cfg_subscribes_dotas_blocks() {
         let token = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let text = integration_cfg_dota(45671, token);
-        assert!(text.contains("\"uri\"       \"http://127.0.0.1:45671/gsi\""), "got:\n{text}");
+        assert!(
+            text.contains("\"uri\"       \"http://127.0.0.1:45671/gsi\""),
+            "got:\n{text}"
+        );
         assert_eq!(text.matches(token).count(), 1);
         for block in ["\"provider\"", "\"map\"", "\"player\"", "\"hero\""] {
             assert!(text.contains(block), "Dota needs {block}:\n{text}");
@@ -337,7 +374,10 @@ mod tests {
         let first = load_or_create_token(&path).expect("the first run generates one");
         assert_eq!(first.len(), TOKEN_BYTES * 2);
         let second = load_or_create_token(&path).expect("the second run reads the same one");
-        assert_eq!(first, second, "a token that changed would break the installed cfg");
+        assert_eq!(
+            first, second,
+            "a token that changed would break the installed cfg"
+        );
         assert!(path.is_file(), "and it is kept for the next run");
     }
 
@@ -357,14 +397,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gsi-token.txt");
 
-        for content in ["", "hunter2", "0123456789abcdef", &"a".repeat(65), &"z".repeat(64)] {
+        for content in [
+            "",
+            "hunter2",
+            "0123456789abcdef",
+            &"a".repeat(65),
+            &"z".repeat(64),
+        ] {
             std::fs::write(&path, content).unwrap();
             let err = load_or_create_token(&path).expect_err("not a token");
             assert!(
                 format!("{err:#}").contains("delete it"),
                 "the error must say what to do: {err:#}"
             );
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), content, "and change nothing");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                content,
+                "and change nothing"
+            );
         }
     }
 

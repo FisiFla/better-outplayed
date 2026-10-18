@@ -1,10 +1,10 @@
 //! The settings the window shows and edits (`config.toml`).
 
+use super::*;
 use crate::config::{EngineOptionsConfig, SettingEdit};
 use localplay_recorder::RecorderOptions;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use super::*;
 
 // ---------------------------------------------------------------------------------------
 // Settings
@@ -221,7 +221,12 @@ pub fn update_settings_file(
         )
     });
 
-    Ok(UpdateSettingsOutcome { settings: after, applied, restart_required, restart_reason })
+    Ok(UpdateSettingsOutcome {
+        settings: after,
+        applied,
+        restart_required,
+        restart_reason,
+    })
 }
 
 /// Resolve the clips directory a configuration names, and create it on disk.
@@ -236,7 +241,10 @@ pub fn prepare_clips_dir(app_data_dir: &Path, clips_dir: &str) -> Result<AppPath
     std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
         CommandError::new(
             ErrorCode::Io,
-            format!("could not create the clips directory {}: {e}", paths.clips_dir.display()),
+            format!(
+                "could not create the clips directory {}: {e}",
+                paths.clips_dir.display()
+            ),
         )
     })?;
     Ok(paths)
@@ -270,7 +278,6 @@ pub fn update_settings_and_prepare(
     Ok((outcome, prepared))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,8 +297,12 @@ mod tests {
         let (dir, path) = settings_case();
         let dto = read_settings(dir.path(), &path).unwrap();
         let dto_value = serde_json::to_value(&dto).unwrap();
-        let mut keys: Vec<&str> =
-            dto_value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = dto_value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
@@ -332,7 +343,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort();
-        assert_eq!(keys, ["applied", "restart_reason", "restart_required", "settings"]);
+        assert_eq!(
+            keys,
+            ["applied", "restart_reason", "restart_required", "settings"]
+        );
     }
 
     #[test]
@@ -343,7 +357,11 @@ mod tests {
         let outcome = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(60), mic_enabled: Some(true), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(60),
+                mic_enabled: Some(true),
+                ..Default::default()
+            },
             false,
         )
         .unwrap();
@@ -383,14 +401,23 @@ mod tests {
         );
         assert_eq!(outcome.settings.bitrate_kbps, 40_000);
         assert_eq!(outcome.settings.quality, "high");
-        assert_eq!((outcome.settings.capture_monitor, outcome.settings.capture_window.as_str()), (1, "Game"));
+        assert_eq!(
+            (
+                outcome.settings.capture_monitor,
+                outcome.settings.capture_window.as_str()
+            ),
+            (1, "Game")
+        );
         assert!(outcome.restart_required);
 
         // Re-applying the same preset is not a change.
         let again = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { quality: Some("high".into()), ..Default::default() },
+            &SettingsUpdate {
+                quality: Some("high".into()),
+                ..Default::default()
+            },
             true,
         )
         .unwrap();
@@ -408,7 +435,10 @@ mod tests {
         let idle = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(30), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(30),
+                ..Default::default()
+            },
             false,
         )
         .unwrap();
@@ -418,13 +448,20 @@ mod tests {
         let running = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(60), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(60),
+                ..Default::default()
+            },
             true,
         )
         .unwrap();
         assert!(running.restart_required);
         assert!(
-            running.restart_reason.as_deref().unwrap().contains("encode.fps"),
+            running
+                .restart_reason
+                .as_deref()
+                .unwrap()
+                .contains("encode.fps"),
             "the reason names the key: {:?}",
             running.restart_reason
         );
@@ -439,11 +476,18 @@ mod tests {
         let same = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(60), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(60),
+                ..Default::default()
+            },
             true,
         )
         .unwrap();
-        assert_eq!(same.applied, vec!["encode.fps"], "applied still says what was written");
+        assert_eq!(
+            same.applied,
+            vec!["encode.fps"],
+            "applied still says what was written"
+        );
         assert!(!same.restart_required, "same value: no restart to demand");
     }
 
@@ -456,7 +500,10 @@ mod tests {
         let err = update_settings_file(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(0), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(0),
+                ..Default::default()
+            },
             false,
         )
         .unwrap_err();
@@ -477,7 +524,10 @@ mod tests {
         assert_eq!(outcome.settings.clips_dir, "/tmp/clips");
         assert_eq!(outcome.settings.clips_dir_resolved, "/tmp/clips");
 
-        let reset = SettingsUpdate { clips_dir: Some(String::new()), ..Default::default() };
+        let reset = SettingsUpdate {
+            clips_dir: Some(String::new()),
+            ..Default::default()
+        };
         let outcome = update_settings_file(dir.path(), &path, &reset, false).unwrap();
         assert_eq!(outcome.settings.clips_dir, "");
         assert_eq!(
@@ -508,13 +558,20 @@ mod tests {
         let err = update_settings_and_prepare(
             dir.path(),
             &path,
-            &SettingsUpdate { clips_dir: Some(wanted.clone()), ..Default::default() },
+            &SettingsUpdate {
+                clips_dir: Some(wanted.clone()),
+                ..Default::default()
+            },
             false,
         )
         .unwrap_err();
 
         assert_eq!(err.code, ErrorCode::Io);
-        assert!(err.message.contains("a-file"), "the path is named: {}", err.message);
+        assert!(
+            err.message.contains("a-file"),
+            "the path is named: {}",
+            err.message
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             before,
@@ -554,7 +611,10 @@ mod tests {
         let (outcome, prepared) = update_settings_and_prepare(
             dir.path(),
             &path,
-            &SettingsUpdate { fps: Some(30), ..Default::default() },
+            &SettingsUpdate {
+                fps: Some(30),
+                ..Default::default()
+            },
             false,
         )
         .unwrap();
@@ -573,31 +633,46 @@ mod tests {
         let (_, prepared) = update_settings_and_prepare(
             dir.path(),
             &path,
-            &SettingsUpdate { clips_dir: Some(String::new()), ..Default::default() },
+            &SettingsUpdate {
+                clips_dir: Some(String::new()),
+                ..Default::default()
+            },
             false,
         )
         .unwrap();
 
         let paths = prepared.expect("a clips_dir moved");
         assert_eq!(paths.clips_dir, dir.path().join("clips"));
-        assert!(paths.clips_dir.is_dir(), "the default directory was created");
+        assert!(
+            paths.clips_dir.is_dir(),
+            "the default directory was created"
+        );
     }
 
     #[test]
     fn a_start_is_built_with_the_files_microphone_and_watcher() {
         // The options a start is built with come from the file, not `RecorderOptions::default()` (no
         // mic, nothing watched).
-        let engine = EngineOptionsConfig::from_toml(
-            "[mic]\nenabled = true\n[games]\nauto_record = true\n",
-        )
-        .unwrap();
+        let engine =
+            EngineOptionsConfig::from_toml("[mic]\nenabled = true\n[games]\nauto_record = true\n")
+                .unwrap();
 
         let opts = recorder_options(&engine);
 
-        assert!(opts.mic.enabled, "the configured microphone is passed through");
+        assert!(
+            opts.mic.enabled,
+            "the configured microphone is passed through"
+        );
         assert!(opts.games.auto_record, "and the configured watcher");
-        assert!(opts.game.is_none(), "a person starting a recording is no detected game");
-        assert_eq!(opts.mode.as_str(), "buffer", "the window has no mode switch");
+        assert!(
+            opts.game.is_none(),
+            "a person starting a recording is no detected game"
+        );
+        assert_eq!(
+            opts.mode.as_str(),
+            "buffer",
+            "the window has no mode switch"
+        );
     }
 
     #[test]
@@ -607,12 +682,28 @@ mod tests {
         // reachable from the webview.
         let dir = PathBuf::from("/app-data/localplay");
         let paths = AppPaths::resolve(&dir, "");
-        assert_eq!(paths.asset_roots(), [Path::new("/app-data/localplay/clips"), Path::new("/app-data/localplay/thumbnails")]);
-        assert_eq!(paths.db_path, dir.join("localplay.db"), "the same index file the CLI uses");
+        assert_eq!(
+            paths.asset_roots(),
+            [
+                Path::new("/app-data/localplay/clips"),
+                Path::new("/app-data/localplay/thumbnails")
+            ]
+        );
+        assert_eq!(
+            paths.db_path,
+            dir.join("localplay.db"),
+            "the same index file the CLI uses"
+        );
 
         // A configured clips directory is honoured, and is still the first asset root.
         let custom = AppPaths::resolve(&dir, "/mnt/games/localplay-clips");
-        assert_eq!(custom.clips_dir, PathBuf::from("/mnt/games/localplay-clips"));
-        assert_eq!(custom.asset_roots()[0], Path::new("/mnt/games/localplay-clips"));
+        assert_eq!(
+            custom.clips_dir,
+            PathBuf::from("/mnt/games/localplay-clips")
+        );
+        assert_eq!(
+            custom.asset_roots()[0],
+            Path::new("/mnt/games/localplay-clips")
+        );
     }
 }

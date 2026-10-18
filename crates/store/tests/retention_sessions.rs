@@ -36,7 +36,10 @@ fn now_ms() -> i64 {
 fn temp_dir() -> tempfile::TempDir {
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("target"),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target"),
     };
     std::fs::create_dir_all(&target).expect("create the target directory");
     // Canonicalised so a failure message names `<workspace>/target/...` rather than a `../..` walk.
@@ -98,7 +101,13 @@ impl Fixture {
         let db_path = root.join("localplay.db");
         let store = Store::open(&db_path).expect("open the index");
         store.migrate().expect("migrate the index");
-        Self { _dir: dir, root, db_path, store, sessions: 0 }
+        Self {
+            _dir: dir,
+            root,
+            db_path,
+            store,
+            sessions: 0,
+        }
     }
 
     /// Write a session's bytes to disk and index the row as a session recorder does: segments in a
@@ -112,11 +121,24 @@ impl Fixture {
     ) -> SessionFiles {
         let (id, scratch_dir, final_path, bytes_on_disk) =
             self.write_session(started_at_ms, segments, final_bytes);
-        let final_path_arg = final_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let final_path_arg = final_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         self.store
-            .end_session(id, started_at_ms + 60_000, final_path_arg.as_deref(), bytes_on_disk as i64, 0)
+            .end_session(
+                id,
+                started_at_ms + 60_000,
+                final_path_arg.as_deref(),
+                bytes_on_disk as i64,
+                0,
+            )
             .expect("end the session");
-        SessionFiles { id, scratch_dir, final_path, bytes_on_disk }
+        SessionFiles {
+            id,
+            scratch_dir,
+            final_path,
+            bytes_on_disk,
+        }
     }
 
     /// A session still recording: no `ended_at`, segments on disk, and the running size a recorder
@@ -124,11 +146,19 @@ impl Fixture {
     fn add_running_session(&mut self, started_at_ms: i64, segments: &[usize]) -> SessionFiles {
         let (id, scratch_dir, final_path, bytes_on_disk) =
             self.write_session(started_at_ms, segments, 0);
-        assert!(final_path.is_none(), "a running session has no final file yet");
+        assert!(
+            final_path.is_none(),
+            "a running session has no final file yet"
+        );
         self.store
             .set_session_size(id, bytes_on_disk as i64)
             .expect("keep the running size current");
-        SessionFiles { id, scratch_dir, final_path, bytes_on_disk }
+        SessionFiles {
+            id,
+            scratch_dir,
+            final_path,
+            bytes_on_disk,
+        }
     }
 
     fn write_session(
@@ -142,8 +172,11 @@ impl Fixture {
         let scratch_dir = self.root.join("scratch").join(&name);
         std::fs::create_dir_all(&scratch_dir).expect("create the scratch dir");
         for (i, bytes) in segments.iter().enumerate() {
-            std::fs::write(scratch_dir.join(format!("seg-{i:03}.mkv")), vec![0u8; *bytes])
-                .expect("write a segment");
+            std::fs::write(
+                scratch_dir.join(format!("seg-{i:03}.mkv")),
+                vec![0u8; *bytes],
+            )
+            .expect("write a segment");
         }
 
         let final_path =
@@ -186,7 +219,9 @@ impl Fixture {
     }
 
     fn favourite_session(&self, id: i64) {
-        self.store.set_session_favourite(id, true).expect("favourite the session");
+        self.store
+            .set_session_favourite(id, true)
+            .expect("favourite the session");
     }
 
     /// Age a clip as an operator would with `sqlite3`: `clips.created_at` is stamped by the store with
@@ -237,15 +272,25 @@ impl Fixture {
     /// Clip ids, sorted: `list_clips` orders by `started_at`, which a fixture indexing every clip at
     /// the same instant cannot break ties with.
     fn clip_ids(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> =
-            self.store.list_clips().expect("clips").iter().map(|c| c.id).collect();
+        let mut ids: Vec<i64> = self
+            .store
+            .list_clips()
+            .expect("clips")
+            .iter()
+            .map(|c| c.id)
+            .collect();
         ids.sort_unstable();
         ids
     }
 
     fn session_ids(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> =
-            self.store.list_sessions().expect("sessions").iter().map(|s| s.id).collect();
+        let mut ids: Vec<i64> = self
+            .store
+            .list_sessions()
+            .expect("sessions")
+            .iter()
+            .map(|s| s.id)
+            .collect();
         ids.sort_unstable();
         ids
     }
@@ -257,11 +302,17 @@ fn policy(clips: RetentionRules, sessions: RetentionRules) -> RetentionPolicy {
 
 /// A cap nothing reaches and an age nothing exceeds, so the class not under study stays out of the way.
 fn generous() -> RetentionRules {
-    RetentionRules { max_total_bytes: u64::MAX, max_age_days: 3_650 }
+    RetentionRules {
+        max_total_bytes: u64::MAX,
+        max_age_days: 3_650,
+    }
 }
 
 fn rules(max_total_bytes: u64, max_age_days: u32) -> RetentionRules {
-    RetentionRules { max_total_bytes, max_age_days }
+    RetentionRules {
+        max_total_bytes,
+        max_age_days,
+    }
 }
 
 #[test]
@@ -270,9 +321,18 @@ fn a_capped_session_is_evicted_as_a_unit_with_its_scratch_tree_and_its_final_fil
     let old = fx.add_session(now_ms() - 3 * DAY_MS, &[400, 300], 500);
     let recent = fx.add_session(now_ms() - DAY_MS, &[200, 200], 0);
 
-    let store_bytes = fx.store.total_session_bytes().expect("the session store's bytes");
-    assert_eq!(old.bytes_on_disk, 1_200, "400 + 300 in the scratch tree, 500 in the final file");
-    assert_eq!(recent.bytes_on_disk, 400, "200 + 200, and no final file of its own");
+    let store_bytes = fx
+        .store
+        .total_session_bytes()
+        .expect("the session store's bytes");
+    assert_eq!(
+        old.bytes_on_disk, 1_200,
+        "400 + 300 in the scratch tree, 500 in the final file"
+    );
+    assert_eq!(
+        recent.bytes_on_disk, 400,
+        "200 + 200, and no final file of its own"
+    );
     assert_eq!(store_bytes, 1_600);
     println!(
         "retention: the session store indexes {store_bytes} bytes: {} really on disk across \
@@ -290,10 +350,20 @@ fn a_capped_session_is_evicted_as_a_unit_with_its_scratch_tree_and_its_final_fil
         old.bytes_on_disk,
         plan.sessions.bytes_after
     );
-    assert_eq!(plan.sessions.ids(), vec![old.id], "the oldest session, and only it");
-    assert_eq!(plan.sessions.bytes_after, 400, "the recent session's bytes are what is left");
+    assert_eq!(
+        plan.sessions.ids(),
+        vec![old.id],
+        "the oldest session, and only it"
+    );
+    assert_eq!(
+        plan.sessions.bytes_after, 400,
+        "the recent session's bytes are what is left"
+    );
     assert!(plan.sessions.cap_met(), "400 is at or under 500");
-    assert!(plan.clips.deletions.is_empty(), "no clip was touched to make room");
+    assert!(
+        plan.clips.deletions.is_empty(),
+        "no clip was touched to make room"
+    );
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
@@ -312,16 +382,32 @@ fn a_capped_session_is_evicted_as_a_unit_with_its_scratch_tree_and_its_final_fil
         outcome.sessions.bytes_reclaimed, 1_200,
         "the bytes the tree and the final file really held, measured as they went"
     );
-    assert_eq!(outcome.sessions.bytes_after, 400, "re-read from the store after the pass");
+    assert_eq!(
+        outcome.sessions.bytes_after, 400,
+        "re-read from the store after the pass"
+    );
     assert!(outcome.sessions.cap_met);
-    assert!(outcome.sessions.orphaned.is_empty(), "both removal targets were where the row said");
+    assert!(
+        outcome.sessions.orphaned.is_empty(),
+        "both removal targets were where the row said"
+    );
     assert!(outcome.sessions.already_missing.is_empty());
     assert!(outcome.sessions.refused.is_empty());
 
     assert_eq!(fx.session_ids(), vec![recent.id], "the row is gone");
-    assert!(old.none_exist(), "the whole session went: scratch tree and final file");
-    assert!(recent.all_exist(), "the other session's files are untouched");
-    assert_eq!(real_bytes(&fx.root.join("sessions")), 0, "no final file is left behind");
+    assert!(
+        old.none_exist(),
+        "the whole session went: scratch tree and final file"
+    );
+    assert!(
+        recent.all_exist(),
+        "the other session's files are untouched"
+    );
+    assert_eq!(
+        real_bytes(&fx.root.join("sessions")),
+        0,
+        "no final file is left behind"
+    );
 }
 
 #[test]
@@ -377,15 +463,24 @@ fn the_two_classes_never_evict_each_other() {
         plan.sessions.ids()
     );
     assert_eq!(plan.clips.ids(), vec![clip_a, clip_b]);
-    assert!(plan.sessions.deletions.is_empty(), "a clip cap is not a session cap");
+    assert!(
+        plan.sessions.deletions.is_empty(),
+        "a clip cap is not a session cap"
+    );
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     assert_eq!(outcome.clips.deleted, 2);
     assert_eq!(outcome.sessions.deleted, 0);
     assert_eq!(outcome.clips.bytes_reclaimed, 200);
     assert!(!path_a.exists() && !path_b.exists());
-    assert!(path_c.exists(), "the clip the cap did not need is still there");
-    assert!(session.all_exist(), "and the session and its files are untouched");
+    assert!(
+        path_c.exists(),
+        "the clip the cap did not need is still there"
+    );
+    assert!(
+        session.all_exist(),
+        "and the session and its files are untouched"
+    );
     assert_eq!(fx.clip_ids(), vec![clip_c]);
 
     // And the other direction: a sessions cap of 0 with clips still over their own cap.
@@ -396,13 +491,19 @@ fn the_two_classes_never_evict_each_other() {
         plan.clips.ids(),
         plan.sessions.ids()
     );
-    assert!(plan.clips.deletions.is_empty(), "a session cap is not a clip cap");
+    assert!(
+        plan.clips.deletions.is_empty(),
+        "a session cap is not a clip cap"
+    );
     assert_eq!(plan.sessions.ids(), vec![session.id]);
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     assert_eq!(outcome.sessions.deleted, 1);
     assert_eq!(outcome.clips.deleted, 0);
-    assert_eq!(outcome.sessions.bytes_reclaimed, 4_000, "one 4_000 byte segment");
+    assert_eq!(
+        outcome.sessions.bytes_reclaimed, 4_000,
+        "one 4_000 byte segment"
+    );
     assert!(path_c.exists(), "the surviving clip is still on disk");
     assert!(session.none_exist(), "and the session's tree is gone");
     assert_eq!(fx.clip_ids(), vec![clip_c]);
@@ -433,8 +534,14 @@ fn a_favourite_session_is_immune_to_both_rules_and_its_shortfall_is_reported() {
         "the non-favourite that is over age goes; the favourite is not evicted for a cap it \
          breaks"
     );
-    assert_eq!(plan.sessions.over_cap_by_bytes, 1_000, "1_500 bytes of favourite against 500");
-    assert!(!plan.sessions.cap_met(), "and the shortfall is reported, not paid for");
+    assert_eq!(
+        plan.sessions.over_cap_by_bytes, 1_000,
+        "1_500 bytes of favourite against 500"
+    );
+    assert!(
+        !plan.sessions.cap_met(),
+        "and the shortfall is reported, not paid for"
+    );
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
@@ -444,10 +551,19 @@ fn a_favourite_session_is_immune_to_both_rules_and_its_shortfall_is_reported() {
         outcome.sessions.bytes_after,
         outcome.sessions.cap_met
     );
-    assert!(favourite.all_exist(), "a favourited session is never deleted, files included");
+    assert!(
+        favourite.all_exist(),
+        "a favourited session is never deleted, files included"
+    );
     assert!(plain.none_exist(), "the aged non-favourite went");
-    assert!(!outcome.sessions.cap_met, "the outcome reports the cap as unmet too");
-    assert_eq!(outcome.sessions.bytes_after, 1_500, "the favourite's bytes are still indexed");
+    assert!(
+        !outcome.sessions.cap_met,
+        "the outcome reports the cap as unmet too"
+    );
+    assert_eq!(
+        outcome.sessions.bytes_after, 1_500,
+        "the favourite's bytes are still indexed"
+    );
 }
 
 #[test]
@@ -465,8 +581,14 @@ fn a_favourite_clip_is_immune_to_both_rules_under_the_new_entry_point_too() {
 
     let clips = fx.store.list_clips().expect("clips");
     let plan = fx.plan(&policy(rules(10, 1), generous()));
-    let flat =
-        plan_cleanup(&clips, &CleanupPolicy { max_total_bytes: 10, max_age_days: 1 }, now_ms());
+    let flat = plan_cleanup(
+        &clips,
+        &CleanupPolicy {
+            max_total_bytes: 10,
+            max_age_days: 1,
+        },
+        now_ms(),
+    );
 
     println!(
         "retention: {} clips holding {} bytes, 1_000 of them favourited, against a 10 byte cap \
@@ -476,13 +598,25 @@ fn a_favourite_clip_is_immune_to_both_rules_under_the_new_entry_point_too() {
         plan.clips.ids(),
         flat.ids()
     );
-    assert_eq!(plan.clips.ids(), Vec::<i64>::new(), "nothing can be deleted for this cap");
-    assert_eq!(plan.clips.ids(), flat.ids(), "and the two entry points agree exactly");
+    assert_eq!(
+        plan.clips.ids(),
+        Vec::<i64>::new(),
+        "nothing can be deleted for this cap"
+    );
+    assert_eq!(
+        plan.clips.ids(),
+        flat.ids(),
+        "and the two entry points agree exactly"
+    );
     assert_eq!(plan.clips.over_cap_by_bytes, 990);
     assert!(!plan.clips.cap_met());
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
-    assert_eq!(outcome.deleted(), 0, "a pass with nothing to do deletes nothing");
+    assert_eq!(
+        outcome.deleted(),
+        0,
+        "a pass with nothing to do deletes nothing"
+    );
     for path in [&ancient_path, &big_path, &plain_path] {
         assert!(path.is_file(), "{} must survive", path.display());
     }
@@ -524,15 +658,31 @@ fn a_session_that_is_still_recording_is_never_evicted_and_its_bytes_are_counted(
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
 
     assert_eq!(outcome.sessions.deleted, 1);
-    assert_eq!(outcome.sessions.failed, 0, "the planner never names a recording, so nothing fails");
-    assert!(live.all_exist(), "the recording's scratch tree is exactly where it was");
     assert_eq!(
-        fx.store.get_session(live.id).expect("read").expect("still there").ended_at_ms,
+        outcome.sessions.failed, 0,
+        "the planner never names a recording, so nothing fails"
+    );
+    assert!(
+        live.all_exist(),
+        "the recording's scratch tree is exactly where it was"
+    );
+    assert_eq!(
+        fx.store
+            .get_session(live.id)
+            .expect("read")
+            .expect("still there")
+            .ended_at_ms,
         None,
         "and it is still recording"
     );
-    assert_eq!(outcome.sessions.bytes_after, 3_000, "the recording's bytes are still indexed");
-    assert!(!outcome.sessions.cap_met, "reported unmet rather than made true by eviction");
+    assert_eq!(
+        outcome.sessions.bytes_after, 3_000,
+        "the recording's bytes are still indexed"
+    );
+    assert!(
+        !outcome.sessions.cap_met,
+        "reported unmet rather than made true by eviction"
+    );
 }
 
 #[test]
@@ -551,7 +701,10 @@ fn a_session_left_running_by_a_crash_is_evicted_once_it_is_ended_explicitly() {
     assert!(crashed.scratch_dir.is_dir(), "its tree is untouched");
 
     let plan = fx.plan(&policy(generous(), rules(u64::MAX, 7)));
-    assert!(plan.sessions.deletions.is_empty(), "and the planner will not name it either");
+    assert!(
+        plan.sessions.deletions.is_empty(),
+        "and the planner will not name it either"
+    );
 
     // The recovery pass, in one call: the session is over, with no final file to name.
     fx.store
@@ -565,12 +718,19 @@ fn a_session_left_running_by_a_crash_is_evicted_once_it_is_ended_explicitly() {
         (now_ms() - (now_ms() - 90 * DAY_MS)) / DAY_MS,
         plan.sessions.ids()
     );
-    assert_eq!(plan.sessions.ids(), vec![crashed.id], "now it is an ordinary aged session");
+    assert_eq!(
+        plan.sessions.ids(),
+        vec![crashed.id],
+        "now it is an ordinary aged session"
+    );
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     assert_eq!(outcome.sessions.deleted, 1);
     assert_eq!(outcome.sessions.bytes_reclaimed, 700);
-    assert!(!crashed.scratch_dir.exists(), "the scratch tree went with the row");
+    assert!(
+        !crashed.scratch_dir.exists(),
+        "the scratch tree went with the row"
+    );
     assert!(fx.session_ids().is_empty());
 }
 
@@ -593,7 +753,11 @@ fn deleting_a_session_leaves_the_clip_extracted_from_it_and_its_events_alone() {
 
     let plan = fx.plan(&policy(generous(), rules(u64::MAX, 7)));
     assert_eq!(plan.sessions.ids(), vec![session.id]);
-    assert_eq!(plan.deletions(), 1, "the session is deleted as a unit, and no clip is planned");
+    assert_eq!(
+        plan.deletions(),
+        1,
+        "the session is deleted as a unit, and no clip is planned"
+    );
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
@@ -602,8 +766,14 @@ fn deleting_a_session_leaves_the_clip_extracted_from_it_and_its_events_alone() {
     );
 
     assert_eq!(outcome.sessions.deleted, 1);
-    assert_eq!(outcome.clips.deleted, 0, "a session's clips are not the session");
-    assert!(session.none_exist(), "the session's own files are gone: 900 + 300 bytes reclaimed");
+    assert_eq!(
+        outcome.clips.deleted, 0,
+        "a session's clips are not the session"
+    );
+    assert!(
+        session.none_exist(),
+        "the session's own files are gone: 900 + 300 bytes reclaimed"
+    );
     assert_eq!(outcome.sessions.bytes_reclaimed, 1_200);
     assert!(clip_path.is_file(), "the extracted clip's file survives");
     let clips = fx.store.list_clips().expect("clips");
@@ -624,9 +794,20 @@ fn deleting_a_session_leaves_the_clip_extracted_from_it_and_its_events_alone() {
     let events = fx.store.list_events().expect("events");
     assert_eq!(events.len(), 1, "the event survives as history");
     assert_eq!(events[0].id, event);
-    assert_eq!(events[0].session_id, None, "detached from the session that is gone");
-    assert_eq!(events[0].clip_id, Some(clip), "and still naming the clip it produced");
-    assert!(fx.store.events_for_session(session.id).expect("timeline").is_empty());
+    assert_eq!(
+        events[0].session_id, None,
+        "detached from the session that is gone"
+    );
+    assert_eq!(
+        events[0].clip_id,
+        Some(clip),
+        "and still naming the clip it produced"
+    );
+    assert!(fx
+        .store
+        .events_for_session(session.id)
+        .expect("timeline")
+        .is_empty());
 }
 
 #[test]
@@ -655,13 +836,21 @@ fn deletions_run_oldest_first_in_both_classes() {
         vec![oldest.id, middle.id],
         "oldest started first, and on until the class is at or under its cap"
     );
-    assert_eq!(plan.clips.ids(), vec![clip_first, clip_second], "oldest created first");
+    assert_eq!(
+        plan.clips.ids(),
+        vec![clip_first, clip_second],
+        "oldest created first"
+    );
     assert_eq!(
         plan.sessions.deletions[0].subject,
         Subject::Session(oldest.id),
         "a deletion says which class it belongs to"
     );
-    assert!(plan.clips.deletions.iter().all(|d| matches!(d.subject, Subject::Clip(_))));
+    assert!(plan
+        .clips
+        .deletions
+        .iter()
+        .all(|d| matches!(d.subject, Subject::Clip(_))));
 
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
@@ -676,15 +865,28 @@ fn deletions_run_oldest_first_in_both_classes() {
     );
 
     assert_eq!(outcome.deleted(), 4);
-    assert_eq!(fx.session_ids(), vec![newest.id], "the newest session is the survivor");
+    assert_eq!(
+        fx.session_ids(),
+        vec![newest.id],
+        "the newest session is the survivor"
+    );
     assert!(newest.all_exist());
-    assert!(oldest.none_exist() && middle.none_exist(), "both older sessions went, files too");
+    assert!(
+        oldest.none_exist() && middle.none_exist(),
+        "both older sessions went, files too"
+    );
     assert!(!path_first.exists(), "the first-created clip went first");
     assert!(!path_second.exists(), "and the second with it");
-    assert!(path_third.exists(), "the third-created clip is the one that survives");
+    assert!(
+        path_third.exists(),
+        "the third-created clip is the one that survives"
+    );
     assert_eq!(fx.clip_ids(), vec![clip_third]);
     assert_eq!(outcome.clips.bytes_after, 500, "one 500 byte clip remains");
-    assert_eq!(outcome.sessions.bytes_after, 500, "one 500 byte session remains");
+    assert_eq!(
+        outcome.sessions.bytes_after, 500,
+        "one 500 byte session remains"
+    );
     assert!(outcome.cap_met(), "both classes ended under their own caps");
 }
 
@@ -718,18 +920,22 @@ fn a_scratch_directory_that_is_a_symlink_is_refused_and_reported_not_followed() 
     println!(
         "retention: session {} deleted; refused {:?}, reclaimed {} bytes (its 200 byte final \
          file only)",
-        session.id,
-        outcome.sessions.refused,
-        outcome.sessions.bytes_reclaimed
+        session.id, outcome.sessions.refused, outcome.sessions.bytes_reclaimed
     );
 
-    assert_eq!(outcome.sessions.deleted, 1, "the row goes: it is the row's own bookkeeping");
+    assert_eq!(
+        outcome.sessions.deleted, 1,
+        "the row goes: it is the row's own bookkeeping"
+    );
     assert_eq!(
         outcome.sessions.refused,
         vec![link.clone()],
         "and the path that is not a plain directory is reported, not recursed into"
     );
-    assert!(outcome.sessions.orphaned.is_empty(), "a refusal is not an orphan");
+    assert!(
+        outcome.sessions.orphaned.is_empty(),
+        "a refusal is not an orphan"
+    );
     assert!(outcome.sessions.already_missing.is_empty());
     assert_eq!(
         outcome.sessions.bytes_reclaimed, 200,
@@ -747,16 +953,17 @@ fn a_scratch_directory_that_is_a_symlink_is_refused_and_reported_not_followed() 
 fn a_final_file_that_is_already_gone_is_reported_and_the_scratch_tree_still_goes() {
     let mut fx = Fixture::new();
     let session = fx.add_session(now_ms() - 30 * DAY_MS, &[250], 150);
-    let final_path = session.final_path.clone().expect("a session with a final file");
+    let final_path = session
+        .final_path
+        .clone()
+        .expect("a session with a final file");
     std::fs::remove_file(&final_path).expect("a file that disappeared behind the index");
 
     let plan = fx.plan(&policy(generous(), rules(0, 3_650)));
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
         "retention: session {} deleted; already_missing {:?}, reclaimed {} bytes",
-        session.id,
-        outcome.sessions.already_missing,
-        outcome.sessions.bytes_reclaimed
+        session.id, outcome.sessions.already_missing, outcome.sessions.bytes_reclaimed
     );
 
     assert_eq!(outcome.sessions.deleted, 1);
@@ -765,9 +972,15 @@ fn a_final_file_that_is_already_gone_is_reported_and_the_scratch_tree_still_goes
         vec![final_path],
         "a row pointing at nothing is reported, not swallowed"
     );
-    assert!(outcome.sessions.orphaned.is_empty(), "there was no file to orphan");
+    assert!(
+        outcome.sessions.orphaned.is_empty(),
+        "there was no file to orphan"
+    );
     assert!(outcome.sessions.refused.is_empty());
-    assert_eq!(outcome.sessions.bytes_reclaimed, 250, "the scratch tree's bytes, and only those");
+    assert_eq!(
+        outcome.sessions.bytes_reclaimed, 250,
+        "the scratch tree's bytes, and only those"
+    );
     assert!(!session.scratch_dir.exists(), "the tree went");
 }
 
@@ -792,14 +1005,25 @@ fn a_final_path_that_cannot_be_unlinked_is_reported_as_an_orphan() {
     let outcome = execute_retention(&fx.store, &plan).expect("execute the pass");
     println!(
         "retention: session {} deleted; orphaned {:?}, reclaimed {} bytes",
-        session.id,
-        outcome.sessions.orphaned,
-        outcome.sessions.bytes_reclaimed
+        session.id, outcome.sessions.orphaned, outcome.sessions.bytes_reclaimed
     );
 
-    assert_eq!(outcome.sessions.deleted, 1, "the row goes first, and it stays gone");
-    assert_eq!(outcome.sessions.orphaned, vec![in_the_way.clone()], "reported with its path");
-    assert!(in_the_way.join("inside.bin").is_file(), "and nothing reached inside it");
-    assert_eq!(outcome.sessions.bytes_reclaimed, 100, "only the scratch tree was removed");
+    assert_eq!(
+        outcome.sessions.deleted, 1,
+        "the row goes first, and it stays gone"
+    );
+    assert_eq!(
+        outcome.sessions.orphaned,
+        vec![in_the_way.clone()],
+        "reported with its path"
+    );
+    assert!(
+        in_the_way.join("inside.bin").is_file(),
+        "and nothing reached inside it"
+    );
+    assert_eq!(
+        outcome.sessions.bytes_reclaimed, 100,
+        "only the scratch tree was removed"
+    );
     assert!(!session.scratch_dir.exists());
 }

@@ -14,10 +14,10 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
-use localplay_recorder::{pump_until_span_on, FramePacer};
 use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
+use localplay_recorder::{pump_until_span_on, FramePacer};
 use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
 use localplay_store::Store;
 use std::time::Duration;
@@ -54,10 +54,16 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     );
     encode.output = EncodeOutput::FragmentedStream;
 
-    let mut capture = StubCapture::new(StubConfig { width: WIDTH, height: HEIGHT, fps: FPS });
+    let mut capture = StubCapture::new(StubConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
+    });
     let mut audio = StubAudio::new(AudioFormat::default());
     let mut encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn the encoder");
-    let stream = encoder.take_output_stream().expect("the stream mode exposes its pipe");
+    let stream = encoder
+        .take_output_stream()
+        .expect("the stream mode exposes its pipe");
     let mut ring = MemoryRing::start(
         stream,
         RingSetup {
@@ -92,7 +98,9 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     .expect("the post-roll must be reachable");
 
     // The same call the hotkey branch makes.
-    let clip = ring.trigger(trigger_ms, "indexed-clip").expect("splice the clip");
+    let clip = ring
+        .trigger(trigger_ms, "indexed-clip")
+        .expect("splice the clip");
     assert!(clip.path.is_file(), "the clip must exist on disk");
     assert_eq!(clip.encoder, "libx264");
 
@@ -104,13 +112,17 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     // The window's start on the ring's own clock. An in-memory ring starts at zero every run, so
     // the trigger instant and the footage are already on the same timeline.
     let started_at_ms = trigger_ms.saturating_sub(PRE_MS);
-    let id = localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
+    let id =
+        localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
 
     let rows = store.list_clips().expect("list the indexed clips");
     assert_eq!(rows.len(), 1, "one clip, one row");
     let row = &rows[0];
     assert_eq!(row.id, id);
-    assert_eq!(row.path, clip.path, "the row names the file that was written");
+    assert_eq!(
+        row.path, clip.path,
+        "the row names the file that was written"
+    );
     assert_eq!(
         row.size_bytes,
         std::fs::metadata(&clip.path).expect("stat the clip").len(),
@@ -119,10 +131,16 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     assert_eq!(row.size_bytes, clip.size_bytes);
     assert_eq!(row.duration_ms, clip.duration_ms);
     assert!(row.duration_ms > 0, "the clip has a duration");
-    assert_eq!(row.codec, "libx264", "the encoder that actually produced the file");
+    assert_eq!(
+        row.codec, "libx264",
+        "the encoder that actually produced the file"
+    );
     assert_eq!(row.started_at_ms, started_at_ms);
     assert!(!row.favourite);
-    assert!(row.created_at_ms > 0, "the wall-clock creation time was stamped");
+    assert!(
+        row.created_at_ms > 0,
+        "the wall-clock creation time was stamped"
+    );
     assert_eq!(store.total_bytes().expect("sum the index"), row.size_bytes);
     eprintln!(
         "indexed clip #{id}: {} (media t={}ms, {}ms, {} bytes, {})",
@@ -135,15 +153,25 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
 
     // A zero cap makes every non-favourited clip evictable, and the just-indexed clip is the only
     // one there is.
-    let policy = CleanupPolicy { max_total_bytes: 0, max_age_days: 3_650 };
+    let policy = CleanupPolicy {
+        max_total_bytes: 0,
+        max_age_days: 3_650,
+    };
     let plan = plan_cleanup(&store.list_clips().expect("list"), &policy, now_ms());
-    assert_eq!(plan.ids(), vec![id], "the policy selects the clip the hotkey produced");
+    assert_eq!(
+        plan.ids(),
+        vec![id],
+        "the policy selects the clip the hotkey produced"
+    );
     let outcome = execute_cleanup(&store, &plan).expect("execute the plan");
     assert_eq!(outcome.deleted, 1);
     assert_eq!(outcome.bytes_reclaimed, clip.size_bytes);
     assert!(outcome.cap_met, "with no favourites left, the cap is met");
     assert_eq!(outcome.bytes_after, 0);
-    assert!(store.list_clips().expect("list").is_empty(), "the row is gone");
+    assert!(
+        store.list_clips().expect("list").is_empty(),
+        "the row is gone"
+    );
     assert!(
         !clip.path.exists(),
         "and the file went with it — unlinked only after the row delete committed"

@@ -252,7 +252,9 @@ mod tests {
     }
 
     fn encode_section(text: &str) -> EncodeSection {
-        toml::from_str::<File>(text).expect("the section parses").encode
+        toml::from_str::<File>(text)
+            .expect("the section parses")
+            .encode
     }
 
     const MINIMAL: &str = "\
@@ -268,7 +270,10 @@ output_size = \"\"
     #[test]
     fn the_example_config_asks_for_adaptation() {
         let section = encode_section(include_str!("../../../config.example.toml"));
-        assert!(section.adapt_fps, "config.example.toml must enable adaptation");
+        assert!(
+            section.adapt_fps,
+            "config.example.toml must enable adaptation"
+        );
     }
 
     /// A `[buffer]` section written before `ram_cap_bytes` existed must still parse; it is the one key
@@ -331,7 +336,10 @@ output_size = \"\"
     fn an_unknown_mode_is_refused() {
         let err = toml::from_str::<RecorderFile>("[recorder]\nmode = \"everything\"\n")
             .expect_err("only the two known modes are accepted");
-        assert!(err.to_string().contains("mode"), "the error names the key: {err}");
+        assert!(
+            err.to_string().contains("mode"),
+            "the error names the key: {err}"
+        );
     }
 
     /// The config's `"session"` must be the store's `SESSION_MODE_SESSION`, or a row and the config would disagree.
@@ -342,8 +350,14 @@ output_size = \"\"
             assert_eq!(mode.to_string(), mode.store_mode());
             assert_eq!(mode.as_str().parse::<RecordingMode>().unwrap(), mode);
         }
-        assert_eq!(RecordingMode::FullSession.store_mode(), localplay_store::SESSION_MODE_SESSION);
-        assert_eq!(RecordingMode::ReplayBuffer.store_mode(), localplay_store::SESSION_MODE_BUFFER);
+        assert_eq!(
+            RecordingMode::FullSession.store_mode(),
+            localplay_store::SESSION_MODE_SESSION
+        );
+        assert_eq!(
+            RecordingMode::ReplayBuffer.store_mode(),
+            localplay_store::SESSION_MODE_BUFFER
+        );
     }
 
     /// The microphone is opt-in, and the section's absence is the same answer as `false`.
@@ -375,7 +389,11 @@ output_size = \"\"
         .expect("a pre-Phase-5 [storage] table must keep parsing");
         assert_eq!(old.storage.max_total_bytes, 1_000);
         assert_eq!(old.storage.max_age_days, 3);
-        assert_eq!(old.storage.sessions, SessionStorageRules::default(), "the default rules");
+        assert_eq!(
+            old.storage.sessions,
+            SessionStorageRules::default(),
+            "the default rules"
+        );
         assert!(old.storage.sessions.max_total_bytes > old.storage.max_total_bytes);
 
         let extended: File = toml::from_str(
@@ -385,8 +403,14 @@ output_size = \"\"
         .expect("the session table");
         assert_eq!(extended.storage.sessions.max_total_bytes, 500);
         assert_eq!(extended.storage.sessions.max_age_days, 1);
-        assert_eq!(extended.storage.sessions.sessions_dir, "", "empty means the default");
-        assert_eq!(extended.storage.max_total_bytes, 1_000, "the clips rule is untouched");
+        assert_eq!(
+            extended.storage.sessions.sessions_dir, "",
+            "empty means the default"
+        );
+        assert_eq!(
+            extended.storage.max_total_bytes, 1_000,
+            "the clips rule is untouched"
+        );
     }
 }
 
@@ -428,6 +452,10 @@ impl Default for SessionStorageRules {
     /// 200 GiB and a week. Generous because a session is one file the user recorded deliberately end
     /// to end; users who record a lot should raise it.
     fn default() -> Self {
-        Self { sessions_dir: String::new(), max_total_bytes: 214_748_364_800, max_age_days: 7 }
+        Self {
+            sessions_dir: String::new(),
+            max_total_bytes: 214_748_364_800,
+            max_age_days: 7,
+        }
     }
 }

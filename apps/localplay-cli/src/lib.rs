@@ -47,13 +47,11 @@ use config::Config;
 #[cfg(feature = "test-encoders")]
 use localplay_capture::stub::StubConfig;
 use localplay_events::hotkey;
-use localplay_recorder::event_driver::{act_on_burst, start_event_sources, EventSources, Policy};
 use localplay_media::FfmpegBinaries;
-use localplay_recorder::{
-    Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources,
-};
+use localplay_recorder::event_driver::{act_on_burst, start_event_sources, EventSources, Policy};
 #[cfg(feature = "test-encoders")]
 use localplay_recorder::STUB_CAPTURE_SIZE;
+use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -183,7 +181,9 @@ pub fn parse_buffer_args(args: &[String]) -> Result<BufferArgs> {
             other => match other.strip_prefix("--self-test-clip-after=") {
                 Some(value) => parsed.self_test_clip_after = Some(parse_self_test_seconds(value)?),
                 None => match other.strip_prefix("--mode=") {
-                    Some(value) => parsed.mode = Some(value.parse::<RecordingMode>().context("--mode")?),
+                    Some(value) => {
+                        parsed.mode = Some(value.parse::<RecordingMode>().context("--mode")?)
+                    }
                     None => bail!("unexpected argument {other:?}\n\n{}", help()),
                 },
             },
@@ -236,7 +236,19 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     } else {
         Config::from_toml(include_str!("../../../config.example.toml"))?
     };
-    let Config { recorder, buffer, encode, capture, audio, storage, mic, hotkeys, events, games, .. } = cfg;
+    let Config {
+        recorder,
+        buffer,
+        encode,
+        capture,
+        audio,
+        storage,
+        mic,
+        hotkeys,
+        events,
+        games,
+        ..
+    } = cfg;
     // `[audio] enabled = false` is carried to the engine rather than interpreted here: it asks for
     // a video-only recording, with no audio input declared, no loopback listener and no audio
     // stream. (Microphone on with game audio off, whose one-track container would be labelled
@@ -284,7 +296,12 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
             sources: choose_sources(stub_sources, encode_fps)?,
             dev_software_encoder: dev_software,
         },
-        RecorderOptions { mode, mic, games, game: None },
+        RecorderOptions {
+            mode,
+            mic,
+            games,
+            game: None,
+        },
     )?;
 
     // From here the engine is capturing, or with `[games] auto_record` on, armed and waiting for a
@@ -305,7 +322,11 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     } else {
         tracing::info!(
             "{} {pre_seconds}s pre / {post_seconds}s post at {}fps; press {} to clip",
-            if mode.is_full_session() { "recording the whole session," } else { "buffering" },
+            if mode.is_full_session() {
+                "recording the whole session,"
+            } else {
+                "buffering"
+            },
             status.effective_fps,
             hotkey
         );
@@ -325,7 +346,12 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
                  exactly one clip)"
             );
             let (_sink, events) = mpsc::channel();
-            EventSources { events, _lol: None, _gsi: None, reports: Vec::new() }
+            EventSources {
+                events,
+                _lol: None,
+                _gsi: None,
+                reports: Vec::new(),
+            }
         }
         None => start_event_sources(&data_dir, &events),
     };
@@ -507,17 +533,24 @@ mod tests {
         assert_eq!(parsed.self_test_clip_after, None);
         assert!(!parsed.dev_software_encoder);
         assert_eq!(parsed.mode, None, "the file's [recorder] mode decides");
-        assert!(!parsed.stub_sources, "the synthetic sources are never implicit");
+        assert!(
+            !parsed.stub_sources,
+            "the synthetic sources are never implicit"
+        );
     }
 
     #[test]
     fn the_self_test_flag_parses_seconds_in_either_form() {
         assert_eq!(
-            parse_buffer_args(&args(&["--self-test-clip-after", "45"])).expect("spaced form").self_test_clip_after,
+            parse_buffer_args(&args(&["--self-test-clip-after", "45"]))
+                .expect("spaced form")
+                .self_test_clip_after,
             Some(45)
         );
         assert_eq!(
-            parse_buffer_args(&args(&["--self-test-clip-after=45"])).expect("= form").self_test_clip_after,
+            parse_buffer_args(&args(&["--self-test-clip-after=45"]))
+                .expect("= form")
+                .self_test_clip_after,
             Some(45)
         );
         // The two forms are one setting: the last one wins, and an unrelated flag is unaffected.
@@ -537,17 +570,24 @@ mod tests {
     #[test]
     fn the_mode_flag_parses_and_overrides_the_file() {
         assert_eq!(
-            parse_buffer_args(&args(&["--mode", "session"])).expect("the spaced form").mode,
+            parse_buffer_args(&args(&["--mode", "session"]))
+                .expect("the spaced form")
+                .mode,
             Some(RecordingMode::FullSession)
         );
         assert_eq!(
-            parse_buffer_args(&args(&["--mode=buffer"])).expect("the = form").mode,
+            parse_buffer_args(&args(&["--mode=buffer"]))
+                .expect("the = form")
+                .mode,
             Some(RecordingMode::ReplayBuffer)
         );
         let err = parse_buffer_args(&args(&["--mode", "everything"]))
             .expect_err("an unknown mode must be refused")
             .to_string();
-        assert!(err.contains("mode"), "the error names the flag and the setting: {err}");
+        assert!(
+            err.contains("mode"),
+            "the error names the flag and the setting: {err}"
+        );
     }
 
     /// The stub-sources flag exists only in a build carrying the software-encoder feature, the same
@@ -557,12 +597,18 @@ mod tests {
         if cfg!(feature = "test-encoders") {
             let sources = choose_sources(true, 60).expect("with the feature it is selectable");
             assert!(matches!(sources, Sources::Stub(_)));
-            assert!(matches!(choose_sources(false, 60).unwrap(), Sources::Platform));
+            assert!(matches!(
+                choose_sources(false, 60).unwrap(),
+                Sources::Platform
+            ));
         } else {
             let err = choose_sources(true, 60)
                 .expect_err("without the feature the flag must be refused")
                 .to_string();
-            assert!(err.contains("test-encoders"), "the error names the gate: {err}");
+            assert!(
+                err.contains("test-encoders"),
+                "the error names the gate: {err}"
+            );
         }
     }
 
@@ -591,7 +637,10 @@ mod tests {
         let err = parse_buffer_args(&args(&["--clip-after", "5"]))
             .expect_err("an unknown flag must be refused")
             .to_string();
-        assert!(err.contains("--clip-after"), "must name the bad argument: {err}");
+        assert!(
+            err.contains("--clip-after"),
+            "must name the bad argument: {err}"
+        );
         assert!(err.contains("usage:"), "must show the usage: {err}");
     }
 
@@ -605,7 +654,10 @@ mod tests {
         // And the mode flags are documented where a user looks for them.
         assert!(help.contains("--mode <buffer|session>"));
         assert!(help.contains("--dev-stub-sources"));
-        assert!(help.contains("Nothing real is captured"), "the stub flag says what it costs");
+        assert!(
+            help.contains("Nothing real is captured"),
+            "the stub flag says what it costs"
+        );
     }
 
     #[test]

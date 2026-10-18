@@ -1,12 +1,14 @@
 //! Session commands: timeline, matches, extraction and deletion.
 
+use super::clips::{
+    free_output_path, index_new_clip, inherit_metadata, session_artifact_ok, validate_range,
+};
+use super::*;
 use localplay_media::edit::trim_lossless;
 use localplay_media::probe::MediaInfo;
 use localplay_store::Session;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use super::*;
-use super::clips::{free_output_path, index_new_clip, inherit_metadata, session_artifact_ok, validate_range};
 
 // ---------------------------------------------------------------------------------------
 // Sessions
@@ -88,12 +90,16 @@ pub struct MatchDto {
 impl From<&localplay_store::matches::MatchSegment> for MatchDto {
     fn from(m: &localplay_store::matches::MatchSegment) -> Self {
         let parse = |p: &Option<String>| {
-            p.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            p.as_deref()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
         };
         let start = parse(&m.start_payload);
         let end = parse(&m.end_payload);
         let text = |v: &Option<serde_json::Value>, key: &str| {
-            v.as_ref().and_then(|v| v.get(key)).and_then(|v| v.as_str()).map(str::to_owned)
+            v.as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
         };
         let scoreboard = end
             .as_ref()
@@ -140,7 +146,10 @@ pub fn extract_match(
     let Some(m) = matches.get(match_index) else {
         return Err(CommandError::new(
             ErrorCode::InvalidInput,
-            format!("session #{session_id} has no match #{match_index} ({} found)", matches.len()),
+            format!(
+                "session #{session_id} has no match #{match_index} ({} found)",
+                matches.len()
+            ),
         ));
     };
     let session = load_session(deps, session_id)?;
@@ -273,24 +282,28 @@ pub fn delete_session(
                  gone, the file is untouched",
                 final_path.display()
             );
-            outcome.orphaned.push(final_path.to_string_lossy().into_owned());
+            outcome
+                .orphaned
+                .push(final_path.to_string_lossy().into_owned());
         } else {
-        let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(&final_path) {
-            Ok(()) => {
-                outcome.final_file_removed = true;
-                outcome.bytes_reclaimed += size;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                tracing::error!(
-                    "session #{session_id} was deleted from the index but its recorded file \
+            let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&final_path) {
+                Ok(()) => {
+                    outcome.final_file_removed = true;
+                    outcome.bytes_reclaimed += size;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::error!(
+                        "session #{session_id} was deleted from the index but its recorded file \
                      could not be removed: {} ({err})",
-                    final_path.display()
-                );
-                outcome.orphaned.push(final_path.to_string_lossy().into_owned());
+                        final_path.display()
+                    );
+                    outcome
+                        .orphaned
+                        .push(final_path.to_string_lossy().into_owned());
+                }
             }
-        }
         }
     }
 
@@ -302,7 +315,9 @@ pub fn delete_session(
              directory is untouched",
             scratch_dir.display()
         );
-        outcome.orphaned.push(scratch_dir.to_string_lossy().into_owned());
+        outcome
+            .orphaned
+            .push(scratch_dir.to_string_lossy().into_owned());
         return Ok(outcome);
     }
     let scratch = dir_size(&scratch_dir);
@@ -324,7 +339,9 @@ pub fn delete_session(
                  could not be removed: {} ({err})",
                 scratch_dir.display()
             );
-            outcome.orphaned.push(scratch_dir.to_string_lossy().into_owned());
+            outcome
+                .orphaned
+                .push(scratch_dir.to_string_lossy().into_owned());
         }
     }
 
@@ -452,7 +469,6 @@ pub(super) fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +484,12 @@ mod tests {
         let (session_id, _) = f.add_finished_session(2, 1_000);
 
         let dto = serde_json::to_value(session_detail(&f.deps(), session_id).unwrap()).unwrap();
-        let mut keys: Vec<&str> = dto.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = dto
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
@@ -503,17 +524,34 @@ mod tests {
             .unwrap();
         let events = session_events(&f.deps(), session_id).unwrap();
         let event = serde_json::to_value(&events[0]).unwrap();
-        let mut keys: Vec<&str> = event.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = event
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(keys, ["clip_id", "id", "kind", "offset_ms", "payload"]);
 
         let outcome = delete_session(&f.deps(), session_id).unwrap();
         let value = serde_json::to_value(&outcome).unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
-            ["bytes_reclaimed", "final_file_removed", "id", "orphaned", "row_deleted", "scratch_removed"]
+            [
+                "bytes_reclaimed",
+                "final_file_removed",
+                "id",
+                "orphaned",
+                "row_deleted",
+                "scratch_removed"
+            ]
         );
     }
 
@@ -538,7 +576,10 @@ mod tests {
 
         let events = session_events(&f.deps(), session_id).unwrap();
         assert_eq!(
-            events.iter().map(|e| (e.kind.as_str(), e.offset_ms)).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|e| (e.kind.as_str(), e.offset_ms))
+                .collect::<Vec<_>>(),
             vec![("kill", 200), ("death", 3_000)],
             "offset = at - media_epoch_ms (1000ms), not at - the wall start"
         );
@@ -560,7 +601,13 @@ mod tests {
     fn a_session_splits_into_matches_carrying_the_scoreboard_and_result() {
         let f = Fixture::new();
         let (session_id, _) = f.add_finished_session(4, 1_000);
-        add_event(&f, session_id, "game_start", 1_500, Some("{\"game_mode\":\"CLASSIC\",\"map\":\"Map11\"}"));
+        add_event(
+            &f,
+            session_id,
+            "game_start",
+            1_500,
+            Some("{\"game_mode\":\"CLASSIC\",\"map\":\"Map11\"}"),
+        );
         add_event(&f, session_id, "kill", 2_000, None);
         add_event(
             &f,
@@ -589,17 +636,34 @@ mod tests {
         };
         assert_eq!(
             keys,
-            ["complete", "end_ms", "events", "game_mode", "index", "map", "result", "scoreboard", "start_inferred", "start_ms"]
+            [
+                "complete",
+                "end_ms",
+                "events",
+                "game_mode",
+                "index",
+                "map",
+                "result",
+                "scoreboard",
+                "start_inferred",
+                "start_ms"
+            ]
         );
     }
 
     #[test]
     fn matches_of_a_missing_session_or_a_missing_match_are_refused() {
         let f = Fixture::new();
-        assert_eq!(session_matches(&f.deps(), 9_999).unwrap_err().code, ErrorCode::SessionNotFound);
+        assert_eq!(
+            session_matches(&f.deps(), 9_999).unwrap_err().code,
+            ErrorCode::SessionNotFound
+        );
         let (session_id, _) = f.add_finished_session(1, 0);
         assert!(session_matches(&f.deps(), session_id).unwrap().is_empty());
-        assert_eq!(extract_match(&f.deps(), session_id, 0).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(
+            extract_match(&f.deps(), session_id, 0).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
     }
 
     #[test]
@@ -610,7 +674,11 @@ mod tests {
         add_event(&f, session_id, "game_end", 3_000, None);
         let clip = extract_match(&f.deps(), session_id, 0).expect("the match is extracted");
         assert!(PathBuf::from(&clip.path).is_file());
-        assert!((1_000..=3_000).contains(&clip.duration_ms), "got {}ms", clip.duration_ms);
+        assert!(
+            (1_000..=3_000).contains(&clip.duration_ms),
+            "got {}ms",
+            clip.duration_ms
+        );
     }
 
     #[test]
@@ -623,9 +691,14 @@ mod tests {
 
         let err = session_events(&f.deps(), 9_999).expect_err("no such session");
         assert_eq!(err.code, ErrorCode::SessionNotFound);
-        assert_eq!(session_detail(&f.deps(), 9_999).unwrap_err().code, ErrorCode::SessionNotFound);
         assert_eq!(
-            set_session_favourite(&f.deps(), 9_999, true).unwrap_err().code,
+            session_detail(&f.deps(), 9_999).unwrap_err().code,
+            ErrorCode::SessionNotFound
+        );
+        assert_eq!(
+            set_session_favourite(&f.deps(), 9_999, true)
+                .unwrap_err()
+                .code,
             ErrorCode::SessionNotFound
         );
     }
@@ -636,10 +709,21 @@ mod tests {
         let (session_id, _) = f.add_finished_session(1, 0);
         assert!(!list_sessions(&f.deps()).unwrap()[0].favourite);
 
-        assert!(set_session_favourite(&f.deps(), session_id, true).unwrap().favourite);
-        assert!(list_sessions(&f.deps()).unwrap()[0].favourite, "the list reflects it");
+        assert!(
+            set_session_favourite(&f.deps(), session_id, true)
+                .unwrap()
+                .favourite
+        );
+        assert!(
+            list_sessions(&f.deps()).unwrap()[0].favourite,
+            "the list reflects it"
+        );
 
-        assert!(!set_session_favourite(&f.deps(), session_id, false).unwrap().favourite);
+        assert!(
+            !set_session_favourite(&f.deps(), session_id, false)
+                .unwrap()
+                .favourite
+        );
     }
 
     #[test]
@@ -656,7 +740,10 @@ mod tests {
         // Deleting it is refused for the same reason, and by the same code.
         let err = delete_session(&f.deps(), id).expect_err("a running session is not deletable");
         assert_eq!(err.code, ErrorCode::SessionStillRecording);
-        assert!(f.store.get_session(id).unwrap().is_some(), "and the row is untouched");
+        assert!(
+            f.store.get_session(id).unwrap().is_some(),
+            "and the row is untouched"
+        );
     }
 
     #[test]
@@ -681,7 +768,11 @@ mod tests {
         let (session_id, _) = f.add_finished_session(4, 1_000);
 
         let clip = extract_clip(&f.deps(), session_id, 1_000, 2_000).expect("the extract");
-        assert!(PathBuf::from(&clip.path).is_file(), "the clip is on disk: {}", clip.path);
+        assert!(
+            PathBuf::from(&clip.path).is_file(),
+            "the clip is on disk: {}",
+            clip.path
+        );
         assert!(clip.size_bytes > 0);
         assert!(
             (500..=1_500).contains(&clip.duration_ms),
@@ -691,9 +782,16 @@ mod tests {
         );
         // The new row is placed on the session's media timeline, so a clip extracted at a marker sits
         // at that marker: epoch 1000 + start 1000.
-        assert_eq!(clip.started_at_ms, 2_000, "positioned on the session's own timeline");
         assert_eq!(
-            list_clips(&f.deps()).unwrap().iter().filter(|c| c.id == clip.id).count(),
+            clip.started_at_ms, 2_000,
+            "positioned on the session's own timeline"
+        );
+        assert_eq!(
+            list_clips(&f.deps())
+                .unwrap()
+                .iter()
+                .filter(|c| c.id == clip.id)
+                .count(),
             1,
             "and it is in the library, not merely on disk"
         );
@@ -706,7 +804,11 @@ mod tests {
 
         let err = extract_clip(&f.deps(), session_id, 500, 500).expect_err("an empty range");
         assert_eq!(err.code, ErrorCode::InvalidRange);
-        assert!(err.message.contains("session #"), "the message names what it refused: {}", err.message);
+        assert!(
+            err.message.contains("session #"),
+            "the message names what it refused: {}",
+            err.message
+        );
 
         let err = extract_clip(&f.deps(), session_id, 1_500, 900_000).expect_err("past the end");
         assert_eq!(err.code, ErrorCode::OutOfRange);
@@ -724,11 +826,21 @@ mod tests {
         assert!(outcome.row_deleted);
         assert!(outcome.scratch_removed, "the segments go");
         assert!(outcome.final_file_removed, "and the recorded file");
-        assert!(outcome.orphaned.is_empty(), "nothing was left behind: {:?}", outcome.orphaned);
+        assert!(
+            outcome.orphaned.is_empty(),
+            "nothing was left behind: {:?}",
+            outcome.orphaned
+        );
         assert!(!scratch.exists());
         assert!(!final_path.exists());
-        assert!(outcome.bytes_reclaimed > 0, "the bytes that were freed are reported");
-        assert!(f.store.get_session(id).unwrap().is_none(), "the row is gone");
+        assert!(
+            outcome.bytes_reclaimed > 0,
+            "the bytes that were freed are reported"
+        );
+        assert!(
+            f.store.get_session(id).unwrap().is_none(),
+            "the row is gone"
+        );
 
         // A second delete is not an error: it says nothing was deleted, so a UI racing a retention
         // pass can refresh truthfully (as `delete_clip`).
@@ -742,10 +854,22 @@ mod tests {
     fn add_session_row(f: &Fixture, scratch: &Path, final_path: Option<&Path>) -> i64 {
         let id = f
             .store
-            .start_session(None, localplay_store::SESSION_MODE_SESSION, WALL_START_MS, &scratch.to_string_lossy(), 0)
+            .start_session(
+                None,
+                localplay_store::SESSION_MODE_SESSION,
+                WALL_START_MS,
+                &scratch.to_string_lossy(),
+                0,
+            )
             .unwrap();
         f.store
-            .end_session(id, WALL_START_MS + 1_000, final_path.map(|p| p.to_string_lossy()).as_deref(), 0, 1_000)
+            .end_session(
+                id,
+                WALL_START_MS + 1_000,
+                final_path.map(|p| p.to_string_lossy()).as_deref(),
+                0,
+                1_000,
+            )
             .unwrap();
         id
     }
@@ -766,7 +890,12 @@ mod tests {
         let outcome = delete_session(&f.deps(), id).unwrap();
         assert!(outcome.row_deleted);
         assert!(!outcome.scratch_removed && !outcome.final_file_removed);
-        assert_eq!(outcome.orphaned.len(), 2, "both are reported, not removed: {:?}", outcome.orphaned);
+        assert_eq!(
+            outcome.orphaned.len(),
+            2,
+            "both are reported, not removed: {:?}",
+            outcome.orphaned
+        );
         assert!(precious_dir.join("thesis.txt").is_file());
         assert!(precious_file.is_file());
     }
@@ -779,7 +908,10 @@ mod tests {
 
         let outcome = delete_session(&f.deps(), id).unwrap();
         assert!(!outcome.scratch_removed);
-        assert!(f.paths.clips_dir.is_dir() && app_data.is_dir(), "the library survives");
+        assert!(
+            f.paths.clips_dir.is_dir() && app_data.is_dir(),
+            "the library survives"
+        );
     }
 
     #[test]
@@ -792,7 +924,10 @@ mod tests {
         let id = add_session_row(&f, &scratch, None);
 
         let outcome = delete_session(&f.deps(), id).unwrap();
-        assert!(outcome.scratch_removed, "a configured sessions_dir keeps working");
+        assert!(
+            outcome.scratch_removed,
+            "a configured sessions_dir keeps working"
+        );
         assert!(!scratch.exists());
     }
 

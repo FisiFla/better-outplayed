@@ -119,14 +119,20 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
     let mut remaining: u64 = clips.iter().map(|c| c.size_bytes).sum();
     for (i, clip) in ordered.iter().enumerate() {
         if !clip.favourite && now_ms.saturating_sub(clip.created_at_ms) > max_age_ms {
-            marked[i] = Some(DeletionReasons { too_old: true, over_cap: false });
+            marked[i] = Some(DeletionReasons {
+                too_old: true,
+                over_cap: false,
+            });
             remaining = remaining.saturating_sub(clip.size_bytes);
         }
     }
 
     // Is the cap reachable at all? Only while the favourite bytes are within it.
-    let favourite_bytes: u64 =
-        clips.iter().filter(|c| c.favourite).map(|c| c.size_bytes).sum();
+    let favourite_bytes: u64 = clips
+        .iter()
+        .filter(|c| c.favourite)
+        .map(|c| c.size_bytes)
+        .sum();
     let over_cap_by_bytes = favourite_bytes.saturating_sub(policy.max_total_bytes);
 
     if over_cap_by_bytes == 0 {
@@ -144,7 +150,10 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
             match &mut marked[i] {
                 Some(reasons) => reasons.over_cap = true,
                 None => {
-                    marked[i] = Some(DeletionReasons { too_old: false, over_cap: true });
+                    marked[i] = Some(DeletionReasons {
+                        too_old: false,
+                        over_cap: true,
+                    });
                     remaining = remaining.saturating_sub(clip.size_bytes);
                 }
             }
@@ -229,7 +238,10 @@ pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutco
                 continue;
             }
             Err(err) => {
-                tracing::warn!("cleanup: could not delete the row for clip #{}: {err:#}", entry.id);
+                tracing::warn!(
+                    "cleanup: could not delete the row for clip #{}: {err:#}",
+                    entry.id
+                );
                 outcome.failed += 1;
                 continue;
             }
@@ -300,7 +312,10 @@ mod tests {
     }
 
     fn policy(max_total_bytes: u64, max_age_days: u64) -> CleanupPolicy {
-        CleanupPolicy { max_total_bytes, max_age_days }
+        CleanupPolicy {
+            max_total_bytes,
+            max_age_days,
+        }
     }
 
     /// A cap nothing reaches and an age nothing exceeds: the plan must be a no-op.
@@ -311,14 +326,20 @@ mod tests {
     #[test]
     fn a_library_within_both_rules_plans_nothing() {
         let now = 10 * DAY;
-        let clips = vec![clip(1, now - 2 * DAY, 1_000, false), clip(2, now - DAY, 500, true)];
+        let clips = vec![
+            clip(1, now - 2 * DAY, 1_000, false),
+            clip(2, now - DAY, 500, true),
+        ];
 
         let plan = plan_cleanup(&clips, &generous(), now);
 
         assert!(plan.deletions.is_empty(), "nothing is over age or over cap");
         assert!(plan.cap_met());
         assert_eq!(plan.over_cap_by_bytes, 0);
-        assert_eq!(plan.bytes_after, 1_500, "an empty plan leaves the library as it was");
+        assert_eq!(
+            plan.bytes_after, 1_500,
+            "an empty plan leaves the library as it was"
+        );
     }
 
     #[test]
@@ -326,7 +347,10 @@ mod tests {
         let plan = plan_cleanup(&[], &policy(0, 0), 5 * DAY);
 
         assert!(plan.deletions.is_empty());
-        assert!(plan.cap_met(), "0 bytes against a 0 byte cap is exactly at the cap");
+        assert!(
+            plan.cap_met(),
+            "0 bytes against a 0 byte cap is exactly at the cap"
+        );
         assert_eq!(plan.bytes_after, 0);
     }
 
@@ -369,9 +393,19 @@ mod tests {
 
         let plan = plan_cleanup(&clips, &policy(u64::MAX, 7), now);
 
-        assert_eq!(plan.ids(), vec![1, 2], "only the non-favourites older than 7 days");
-        assert!(plan.deletions.iter().all(|d| d.reasons.too_old && !d.reasons.over_cap));
-        assert_eq!(plan.bytes_after, 280, "310 bytes of library less the 30 deleted");
+        assert_eq!(
+            plan.ids(),
+            vec![1, 2],
+            "only the non-favourites older than 7 days"
+        );
+        assert!(plan
+            .deletions
+            .iter()
+            .all(|d| d.reasons.too_old && !d.reasons.over_cap));
+        assert_eq!(
+            plan.bytes_after, 280,
+            "310 bytes of library less the 30 deleted"
+        );
         assert!(plan.cap_met());
     }
 
@@ -382,7 +416,10 @@ mod tests {
             clip(1, now - DAY, 1, false), // age exactly one day, limit one day -> kept
             clip(2, now, 1, false),       // created this very millisecond -> kept
         ];
-        assert_eq!(plan_cleanup(&clips, &policy(u64::MAX, 1), now).ids(), Vec::<i64>::new());
+        assert_eq!(
+            plan_cleanup(&clips, &policy(u64::MAX, 1), now).ids(),
+            Vec::<i64>::new()
+        );
 
         // One millisecond past the limit, it goes.
         let clips = vec![clip(1, now - DAY - 1, 1, false)];
@@ -418,7 +455,10 @@ mod tests {
         let plan = plan_cleanup(&clips, &policy(200, 3_650), now);
         assert_eq!(plan.ids(), vec![1]);
         assert!(plan.deletions[0].reasons.over_cap && !plan.deletions[0].reasons.too_old);
-        assert_eq!(plan.bytes_after, 200, "200 is at the cap, which is not over it");
+        assert_eq!(
+            plan.bytes_after, 200,
+            "200 is at the cap, which is not over it"
+        );
         assert!(plan.cap_met());
 
         // 300 -> 90 bytes: three clips go, oldest first, and it stops at the cap.
@@ -431,7 +471,10 @@ mod tests {
         let plan = plan_cleanup(&clips, &policy(0, 3_650), now);
         assert_eq!(plan.ids(), vec![1, 2, 3, 4]);
         assert_eq!(plan.bytes_after, 0);
-        assert!(plan.cap_met(), "with no favourites, 0 bytes meets a 0 byte cap");
+        assert!(
+            plan.cap_met(),
+            "with no favourites, 0 bytes meets a 0 byte cap"
+        );
     }
 
     #[test]
@@ -446,9 +489,16 @@ mod tests {
         // 180 -> 60: with #1 exempt, #2 and #3 are both needed to reach the cap.
         let plan = plan_cleanup(&clips, &policy(60, 3_650), now);
 
-        assert_eq!(plan.ids(), vec![2, 3], "favourites are not eviction candidates");
+        assert_eq!(
+            plan.ids(),
+            vec![2, 3],
+            "favourites are not eviction candidates"
+        );
         assert_eq!(plan.bytes_after, 60);
-        assert!(plan.cap_met(), "the favourites are within the cap, so it is reachable");
+        assert!(
+            plan.cap_met(),
+            "the favourites are within the cap, so it is reachable"
+        );
     }
 
     #[test]
@@ -486,10 +536,17 @@ mod tests {
         // the size rule runs and reaches #1 first.
         let plan = plan_cleanup(&clips, &policy(10, 7), now);
 
-        assert_eq!(plan.ids(), vec![1, 2], "one entry per clip, #1 not one per rule");
+        assert_eq!(
+            plan.ids(),
+            vec![1, 2],
+            "one entry per clip, #1 not one per rule"
+        );
         assert_eq!(
             plan.deletions[0].reasons,
-            DeletionReasons { too_old: true, over_cap: true },
+            DeletionReasons {
+                too_old: true,
+                over_cap: true
+            },
             "#1 was selected by both rules, and the plan records both reasons"
         );
         assert_eq!(
@@ -516,26 +573,42 @@ mod tests {
             plan.ids()
         );
         assert!(!plan.cap_met());
-        assert_eq!(plan.over_cap_by_bytes, 100, "600 bytes of favourites against 500");
-        assert_eq!(plan.bytes_after, 700, "the projection still counts the non-favourites");
+        assert_eq!(
+            plan.over_cap_by_bytes, 100,
+            "600 bytes of favourites against 500"
+        );
+        assert_eq!(
+            plan.bytes_after, 700,
+            "the projection still counts the non-favourites"
+        );
     }
 
     #[test]
     fn an_unsatisfiable_cap_does_not_suspend_the_age_rule() {
         let now = 1_000 * DAY;
         let clips = vec![
-            clip(1, now - 30 * DAY, 200, true),  // ancient favourite: kept regardless
+            clip(1, now - 30 * DAY, 200, true), // ancient favourite: kept regardless
             clip(2, now - 30 * DAY, 400, false), // ancient non-favourite: the age rule's job
             clip(3, now - DAY, 100, false),
         ];
 
         let plan = plan_cleanup(&clips, &policy(10, 7), now);
 
-        assert_eq!(plan.ids(), vec![2], "the age rule is independent of the cap");
+        assert_eq!(
+            plan.ids(),
+            vec![2],
+            "the age rule is independent of the cap"
+        );
         assert!(plan.deletions[0].reasons.too_old && !plan.deletions[0].reasons.over_cap);
         assert!(!plan.cap_met());
-        assert_eq!(plan.over_cap_by_bytes, 190, "200 bytes of favourites against a 10 byte cap");
-        assert_eq!(plan.bytes_after, 300, "what is left after the aged clip is gone");
+        assert_eq!(
+            plan.over_cap_by_bytes, 190,
+            "200 bytes of favourites against a 10 byte cap"
+        );
+        assert_eq!(
+            plan.bytes_after, 300,
+            "what is left after the aged clip is gone"
+        );
     }
 
     #[test]
@@ -555,6 +628,9 @@ mod tests {
 
         let mut shuffled = clips.clone();
         shuffled.reverse();
-        assert_eq!(plan_cleanup(&shuffled, &policy(u64::MAX, 7), now).ids(), first.ids());
+        assert_eq!(
+            plan_cleanup(&shuffled, &policy(u64::MAX, 7), now).ids(),
+            first.ids()
+        );
     }
 }

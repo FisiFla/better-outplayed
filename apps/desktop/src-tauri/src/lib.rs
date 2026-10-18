@@ -21,7 +21,7 @@ use background::{
 };
 use commands::{
     AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, ErrorCode,
-    RecorderHost, RecordedClipDto, RecordingStatusDto, SessionDto, SessionEventDto,
+    RecordedClipDto, RecorderHost, RecordingStatusDto, SessionDto, SessionEventDto,
     StorageConfigView, StorageStats, ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
@@ -95,20 +95,29 @@ impl AppState {
         std::fs::create_dir_all(&paths.clips_dir).map_err(|e| {
             CommandError::new(
                 ErrorCode::Io,
-                format!("could not create the clips directory {}: {e}", paths.clips_dir.display()),
+                format!(
+                    "could not create the clips directory {}: {e}",
+                    paths.clips_dir.display()
+                ),
             )
         })?;
 
         let store = Store::open(&paths.db_path).map_err(|e| {
             CommandError::new(
                 ErrorCode::Store,
-                format!("could not open the clip index {}: {e:#}", paths.db_path.display()),
+                format!(
+                    "could not open the clip index {}: {e:#}",
+                    paths.db_path.display()
+                ),
             )
         })?;
         store.migrate().map_err(|e| {
             CommandError::new(
                 ErrorCode::Store,
-                format!("could not migrate the clip index {}: {e:#}", paths.db_path.display()),
+                format!(
+                    "could not migrate the clip index {}: {e:#}",
+                    paths.db_path.display()
+                ),
             )
         })?;
 
@@ -170,7 +179,13 @@ impl AppState {
     pub fn asset_roots(&self) -> Vec<PathBuf> {
         self.paths
             .lock()
-            .map(|paths| paths.asset_roots().iter().map(|p| p.to_path_buf()).collect())
+            .map(|paths| {
+                paths
+                    .asset_roots()
+                    .iter()
+                    .map(|p| p.to_path_buf())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -191,11 +206,20 @@ impl AppState {
         &self,
         run: impl FnOnce(&Deps<'_>) -> Result<T, CommandError>,
     ) -> Result<T, CommandError> {
-        let store = self.store.lock().map_err(|_| Self::poisoned("the store lock"))?;
-        let paths = self.paths.lock().map_err(|_| Self::poisoned("the paths lock"))?;
-        let storage = StorageConfigView::from(&*self.storage.lock().map_err(|_| {
-            Self::poisoned("the storage lock")
-        })?);
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| Self::poisoned("the store lock"))?;
+        let paths = self
+            .paths
+            .lock()
+            .map_err(|_| Self::poisoned("the paths lock"))?;
+        let storage = StorageConfigView::from(
+            &*self
+                .storage
+                .lock()
+                .map_err(|_| Self::poisoned("the storage lock"))?,
+        );
         let deps = Deps {
             store: &store,
             bins: self.bins.as_ref(),
@@ -271,7 +295,12 @@ fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> 
         .args(&args)
         .spawn()
         .map(drop)
-        .map_err(|err| CommandError::new(commands::ErrorCode::Io, format!("could not run {program}: {err}")))
+        .map_err(|err| {
+            CommandError::new(
+                commands::ErrorCode::Io,
+                format!("could not run {program}: {err}"),
+            )
+        })
 }
 
 /// Begin a native drag of the clip's file out of the window (to Explorer, Discord, a browser
@@ -358,10 +387,7 @@ fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionDto>, CommandE
 
 /// One session's row, for the detail panel.
 #[tauri::command(rename_all = "snake_case")]
-fn session_detail(
-    state: State<'_, AppState>,
-    session_id: i64,
-) -> Result<SessionDto, CommandError> {
+fn session_detail(state: State<'_, AppState>, session_id: i64) -> Result<SessionDto, CommandError> {
     state.with_deps(|deps| commands::session_detail(deps, session_id))
 }
 
@@ -477,7 +503,12 @@ fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
 fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError> {
     let status = state.recorder.raw_status();
     let log_path = state.app_data_dir.join("logs").join("better-outplayed.log");
-    let clips_dir = state.paths.lock().map_err(|_| AppState::poisoned("the paths lock"))?.clips_dir.clone();
+    let clips_dir = state
+        .paths
+        .lock()
+        .map_err(|_| AppState::poisoned("the paths lock"))?
+        .clips_dir
+        .clone();
     Ok(health::HealthDto {
         recorder_state: health::recorder_state(&status),
         recorder_error: status.error.clone(),
@@ -512,7 +543,9 @@ fn install_gsi_cfg(
                 format!("{} was not found in any Steam library", game.label()),
             )
         })?;
-    let port = config::EngineOptionsConfig::load(&state.config_path())?.events.gsi_port;
+    let port = config::EngineOptionsConfig::load(&state.config_path())?
+        .events
+        .gsi_port;
     health::install_gsi_cfg(game, &install, &state.app_data_dir, port)
 }
 
@@ -582,10 +615,19 @@ fn commit_clips_dir(
     paths: AppPaths,
     clips_dir: &str,
 ) -> Result<(), CommandError> {
-    *state.paths.lock().map_err(|_| AppState::poisoned("the paths lock"))? = paths.clone();
-    state.storage.lock().map_err(|_| AppState::poisoned("the storage lock"))?.clips_dir =
-        clips_dir.to_string();
-    if let Err(err) = app.asset_protocol_scope().allow_directory(&paths.clips_dir, true) {
+    *state
+        .paths
+        .lock()
+        .map_err(|_| AppState::poisoned("the paths lock"))? = paths.clone();
+    state
+        .storage
+        .lock()
+        .map_err(|_| AppState::poisoned("the storage lock"))?
+        .clips_dir = clips_dir.to_string();
+    if let Err(err) = app
+        .asset_protocol_scope()
+        .allow_directory(&paths.clips_dir, true)
+    {
         tracing::warn!(
             "the asset protocol was not scoped to {}: {err}. Clips in that directory will \
              not play.",
@@ -644,7 +686,10 @@ pub fn run() {
         Err(err) => (
             HotkeyStatus::not_installed(
                 "(none)",
-                format!("the config file could not be read, so no hotkey is installed: {}", err.message),
+                format!(
+                    "the config file could not be read, so no hotkey is installed: {}",
+                    err.message
+                ),
             ),
             None,
         ),
@@ -731,7 +776,8 @@ pub fn run() {
                 }
             }
 
-            if let Err(err) = wire_background(app.handle().clone(), hotkey_status.clone(), presses) {
+            if let Err(err) = wire_background(app.handle().clone(), hotkey_status.clone(), presses)
+            {
                 // A shell with no tray and no hotkey is still a review window, so this is a warning, not a
                 // refusal to start, but never silent.
                 tracing::error!("the tray and the hotkey thread were not installed: {err}");
@@ -787,9 +833,15 @@ fn log_from_frontend(level: String, message: String, detail: Option<String>) {
     let detail = detail.unwrap_or_default();
     let detail = detail.trim();
     match level.as_str() {
-        "error" => tracing::error!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
-        "warn" => tracing::warn!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
-        _ => tracing::info!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " }),
+        "error" => {
+            tracing::error!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+        }
+        "warn" => {
+            tracing::warn!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+        }
+        _ => {
+            tracing::info!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+        }
     }
 }
 
@@ -844,8 +896,10 @@ fn wire_background(
                             wiring.set_last_press(outcome.describe());
                         }
                         background::HotkeyAction::ToggleRecording => {
-                            let outcome =
-                                background::dispatch(background::MenuAction::ToggleRecording, &shell);
+                            let outcome = background::dispatch(
+                                background::MenuAction::ToggleRecording,
+                                &shell,
+                            );
                             tracing::info!("the recording hotkey: {}", outcome.describe());
                             wiring.set_last_press(outcome.describe());
                         }
@@ -922,7 +976,10 @@ impl AppShell {
 
     /// Whether `config.toml` exists; the tray's "open config" label says which it opens.
     fn config_exists(&self) -> bool {
-        self.app.try_state::<AppState>().map(|state| state.config_path().is_file()).unwrap_or(false)
+        self.app
+            .try_state::<AppState>()
+            .map(|state| state.config_path().is_file())
+            .unwrap_or(false)
     }
 }
 
@@ -935,11 +992,16 @@ impl Shell for AppShell {
     }
 
     fn show_window(&self) -> Result<(), String> {
-        let window = self.window().ok_or_else(|| "the window is gone".to_string())?;
+        let window = self
+            .window()
+            .ok_or_else(|| "the window is gone".to_string())?;
         // Unminimise first: a window restored from the taskbar is minimised as often as hidden, and
         // `show` alone would leave it in the tray area.
         let _ = window.unminimize();
-        window.show().and_then(|()| window.set_focus()).map_err(|err| err.to_string())
+        window
+            .show()
+            .and_then(|()| window.set_focus())
+            .map_err(|err| err.to_string())
     }
 
     fn hide_window(&self) -> Result<(), String> {
@@ -1106,7 +1168,10 @@ impl TrayWiring {
     }
 
     fn set_last_press(&self, line: String) {
-        *self.last_press.lock().unwrap_or_else(|err| err.into_inner()) = Some(line);
+        *self
+            .last_press
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(line);
     }
 
     /// Re-derive the tray from the shell and apply what changed.
@@ -1114,11 +1179,18 @@ impl TrayWiring {
         let status = match shell.status() {
             Ok(status) => status,
             Err(err) => {
-                tracing::warn!("the tray could not read the recorder's status: {}", err.message);
+                tracing::warn!(
+                    "the tray could not read the recorder's status: {}",
+                    err.message
+                );
                 return;
             }
         };
-        let last_press = self.last_press.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let last_press = self
+            .last_press
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
         let view = TrayView {
             status: &status,
             hotkey,
@@ -1244,7 +1316,11 @@ mod tests {
             ("recording", &icons.recording),
             ("attention", &icons.attention),
         ] {
-            assert_eq!((image.width(), image.height()), (32, 32), "the {state} icon is 32x32");
+            assert_eq!(
+                (image.width(), image.height()),
+                (32, 32),
+                "the {state} icon is 32x32"
+            );
             assert_eq!(
                 image.rgba().len(),
                 32 * 32 * 4,
@@ -1260,7 +1336,11 @@ mod tests {
 
         // The state badge is the point: three identical icons would make "recording" a claim the
         // taskbar cannot back up.
-        assert_ne!(icons.idle.rgba(), icons.recording.rgba(), "idle and recording differ");
+        assert_ne!(
+            icons.idle.rgba(),
+            icons.recording.rgba(),
+            "idle and recording differ"
+        );
         assert_ne!(
             icons.recording.rgba(),
             icons.attention.rgba(),
@@ -1277,8 +1357,13 @@ mod tests {
         let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
 
         assert_eq!(state.config_path(), app_dir.join("config.toml"));
-        assert!(!state.config_path().is_file(), "nothing has written it in this test");
-        assert!(state.asset_roots().contains(&state.paths.lock().unwrap().clips_dir));
+        assert!(
+            !state.config_path().is_file(),
+            "nothing has written it in this test"
+        );
+        assert!(state
+            .asset_roots()
+            .contains(&state.paths.lock().unwrap().clips_dir));
     }
 
     /// The half of the packaging contract that `crates/media` cannot check by itself.
@@ -1300,7 +1385,11 @@ mod tests {
         let resources = config["bundle"]["resources"]
             .as_object()
             .expect("bundle.resources is a path-to-destination map");
-        assert_eq!(resources.len(), 1, "exactly one mapping rule, the sidecar directory");
+        assert_eq!(
+            resources.len(),
+            1,
+            "exactly one mapping rule, the sidecar directory"
+        );
         let (source, destination) = resources.iter().next().unwrap();
         let destination = destination.as_str().expect("the destination is a string");
 
@@ -1343,10 +1432,16 @@ mod tests {
             config["mainBinaryName"], "localplay",
             "the installed exe is localplay, as the crates and the CLI are"
         );
-        assert_eq!(config["version"], "0.1.0", "in step with the workspace version");
+        assert_eq!(
+            config["version"], "0.1.0",
+            "in step with the workspace version"
+        );
 
         let identifier = config["identifier"].as_str().expect("identifier");
-        assert_ne!(identifier, "com.tauri.dev", "Tauri refuses to bundle the placeholder id");
+        assert_ne!(
+            identifier, "com.tauri.dev",
+            "Tauri refuses to bundle the placeholder id"
+        );
         assert!(
             identifier.matches('.').count() >= 2
                 && identifier
@@ -1355,11 +1450,22 @@ mod tests {
             "identifier must be a reverse-DNS id: {identifier}"
         );
 
-        for key in ["publisher", "copyright", "category", "homepage", "shortDescription"] {
-            let value = bundle[key].as_str().unwrap_or_else(|| panic!("bundle.{key} is set"));
+        for key in [
+            "publisher",
+            "copyright",
+            "category",
+            "homepage",
+            "shortDescription",
+        ] {
+            let value = bundle[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("bundle.{key} is set"));
             assert!(!value.trim().is_empty(), "bundle.{key} is empty");
         }
-        assert_eq!(bundle["publisher"], "FisiFla", "the copyright holder in LICENSE-MIT");
+        assert_eq!(
+            bundle["publisher"], "FisiFla",
+            "the copyright holder in LICENSE-MIT"
+        );
 
         let icons = bundle["icon"].as_array().expect("bundle.icon is a list");
         assert!(!icons.is_empty(), "a bundle needs at least one icon");
@@ -1399,8 +1505,14 @@ mod tests {
 
         let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
 
-        assert!(app_dir.join("localplay.db").is_file(), "the index is created");
-        assert!(app_dir.join("clips").is_dir(), "and so is the clips directory");
+        assert!(
+            app_dir.join("localplay.db").is_file(),
+            "the index is created"
+        );
+        assert!(
+            app_dir.join("clips").is_dir(),
+            "and so is the clips directory"
+        );
         assert!(state.bins.is_some(), "ffmpeg is on PATH on this host");
         assert!(state.warnings.is_empty());
 
@@ -1446,7 +1558,10 @@ mod tests {
         let app_dir = dir.path().join("localplay");
         let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
 
-        assert_eq!(state.asset_roots(), vec![app_dir.join("clips"), app_dir.join("thumbnails")]);
+        assert_eq!(
+            state.asset_roots(),
+            vec![app_dir.join("clips"), app_dir.join("thumbnails")]
+        );
     }
 
     #[test]
@@ -1454,14 +1569,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
         let elsewhere = dir.path().join("on-another-drive").join("clips");
-        let configured =
-            StorageConfig { clips_dir: elsewhere.to_string_lossy().into_owned(), ..storage() };
+        let configured = StorageConfig {
+            clips_dir: elsewhere.to_string_lossy().into_owned(),
+            ..storage()
+        };
 
         let state = AppState::open(&app_dir, configured, hotkey_status()).unwrap();
 
         assert!(elsewhere.is_dir(), "the configured directory is created");
-        assert_eq!(state.asset_roots()[0], elsewhere, "and it is what playback is scoped to");
-        assert_eq!(state.paths.lock().unwrap().db_path, app_dir.join("localplay.db"), "the index stays put");
+        assert_eq!(
+            state.asset_roots()[0],
+            elsewhere,
+            "and it is what playback is scoped to"
+        );
+        assert_eq!(
+            state.paths.lock().unwrap().db_path,
+            app_dir.join("localplay.db"),
+            "the index stays put"
+        );
     }
 
     #[test]
@@ -1481,6 +1606,9 @@ mod tests {
         let storage = StorageConfig::load(&app_dir.join("config.toml")).unwrap();
         let state = AppState::open(&app_dir, storage, hotkey_status()).unwrap();
 
-        assert_eq!(state.with_deps(commands::storage_stats).unwrap().cap_bytes, 2048);
+        assert_eq!(
+            state.with_deps(commands::storage_stats).unwrap().cap_bytes,
+            2048
+        );
     }
 }

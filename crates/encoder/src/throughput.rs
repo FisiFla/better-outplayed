@@ -134,7 +134,10 @@ fn measure_with_drain(
         .spawn()
         .with_context(|| format!("spawning {} to measure {describe}", bin.ffmpeg.display()))?;
 
-    let sink = child.stdin.take().context("the probe child's stdin is unavailable")?;
+    let sink = child
+        .stdin
+        .take()
+        .context("the probe child's stdin is unavailable")?;
     let frame = probe_frame(cfg.source_size);
     // One row of the frame in bytes: how far the pattern is rotated between frames.
     let stride = (cfg.source_size.0 as usize * 4).max(1);
@@ -147,9 +150,13 @@ fn measure_with_drain(
     // The whole call is bounded by the feeding window plus the drain ceiling. On expiry the child is
     // killed and reaped, which breaks the writer's blocked write so the join below cannot park.
     let waited = wait_with_deadline(&mut child, budget + drain);
-    let fed = writer.join().map_err(|_| anyhow::anyhow!("the probe's writer thread panicked"))?;
+    let fed = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("the probe's writer thread panicked"))?;
     let (frames, window) = fed;
-    let output = child.wait_with_output().context("collecting the probe child's output")?;
+    let output = child
+        .wait_with_output()
+        .context("collecting the probe child's output")?;
 
     if let Err(_timeout) = waited {
         bail!(
@@ -312,7 +319,10 @@ mod tests {
     #[test]
     fn a_rate_is_frames_over_the_window_that_elapsed() {
         assert_eq!(frames_per_second(30, Duration::from_secs(1)), Some(30.0));
-        assert_eq!(frames_per_second(45, Duration::from_millis(1500)), Some(30.0));
+        assert_eq!(
+            frames_per_second(45, Duration::from_millis(1500)),
+            Some(30.0)
+        );
         // 100 frames in 4s is 25/s, not 100/1.
         assert_eq!(frames_per_second(100, Duration::from_secs(4)), Some(25.0));
     }
@@ -324,9 +334,16 @@ mod tests {
         assert_eq!(frames_per_second(30, Duration::ZERO), None);
         assert_eq!(frames_per_second(30, Duration::from_nanos(1)), None);
         assert_eq!(frames_per_second(30, Duration::from_micros(999)), None);
-        assert_eq!(frames_per_second(0, Duration::from_secs(1)), None, "no frames is not 0fps");
+        assert_eq!(
+            frames_per_second(0, Duration::from_secs(1)),
+            None,
+            "no frames is not 0fps"
+        );
         // At the floor the arithmetic is ordinary again.
-        assert_eq!(frames_per_second(3, Duration::from_millis(1)), Some(3_000.0));
+        assert_eq!(
+            frames_per_second(3, Duration::from_millis(1)),
+            Some(3_000.0)
+        );
     }
 
     // ---- the probe against a real ffmpeg ----------------------------------------------
@@ -337,7 +354,11 @@ mod tests {
     fn the_probe_frame_is_deterministic_and_has_detail_in_it() {
         let frame = probe_frame((16, 4));
         assert_eq!(frame.len(), 16 * 4 * 4);
-        assert_eq!(frame, probe_frame((16, 4)), "the same size always yields the same bytes");
+        assert_eq!(
+            frame,
+            probe_frame((16, 4)),
+            "the same size always yields the same bytes"
+        );
         let distinct: std::collections::HashSet<u8> = frame.iter().copied().collect();
         assert!(
             distinct.len() > 16,
@@ -354,10 +375,15 @@ mod tests {
         let frame = probe_frame((16, 4));
         let stride = 16 * 4;
         let mut sink: Vec<u8> = Vec::new();
-        let (accepted, window) =
-            feed(&mut sink, &frame, stride, Duration::from_millis(2));
-        assert!(accepted >= 1, "a sink that always accepts must yield a count: {accepted}");
-        assert!(window >= Duration::from_millis(2), "the window is the budget: {window:?}");
+        let (accepted, window) = feed(&mut sink, &frame, stride, Duration::from_millis(2));
+        assert!(
+            accepted >= 1,
+            "a sink that always accepts must yield a count: {accepted}"
+        );
+        assert!(
+            window >= Duration::from_millis(2),
+            "the window is the budget: {window:?}"
+        );
         assert_eq!(
             sink.len() % frame.len(),
             0,
@@ -366,7 +392,10 @@ mod tests {
             frame.len()
         );
         let frames = sink.len() / frame.len();
-        assert!(frames as u64 > accepted, "the warm-up frame was written too: {frames}");
+        assert!(
+            frames as u64 > accepted,
+            "the warm-up frame was written too: {frames}"
+        );
         // Consecutive frames differ: the second one starts `stride` bytes into the pattern.
         let first = &sink[..frame.len()];
         let second = &sink[frame.len()..2 * frame.len()];
@@ -400,14 +429,24 @@ mod tests {
             m.fps, m.frames, m.window, m.source_size.0, m.source_size.1
         );
 
-        assert!(m.fps > 0.0, "a real encoder must yield a positive rate: {m:?}");
+        assert!(
+            m.fps > 0.0,
+            "a real encoder must yield a positive rate: {m:?}"
+        );
         assert!(
             m.fps < 100_000.0,
             "64x48 libx264 cannot be anywhere near this fast, so the arithmetic is wrong: {m:?}"
         );
-        assert_eq!(m.source_size, (64, 48), "the rate is about the size that was measured");
+        assert_eq!(
+            m.source_size,
+            (64, 48),
+            "the rate is about the size that was measured"
+        );
         assert_eq!(m.output_size, (64, 48), "and where it was written");
-        assert!(m.frames > 0, "the frames that were counted are reported: {m:?}");
+        assert!(
+            m.frames > 0,
+            "the frames that were counted are reported: {m:?}"
+        );
         // The window is the budget, within the one frame that may overrun it.
         assert!(
             m.window >= budget && m.window <= budget + Duration::from_millis(500),
@@ -433,7 +472,10 @@ mod tests {
         std::fs::write(&stub, "#!/bin/sh\nexec sleep 120\n").expect("writing the stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("making the stub executable");
-        let bin = FfmpegBinaries { ffmpeg: stub.clone(), ffprobe: stub };
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
 
         let budget = Duration::from_millis(100);
         let drain = Duration::from_millis(300);
@@ -459,7 +501,13 @@ mod tests {
         let err = measure_sustainable_fps(&ffmpeg(), &cfg, Duration::from_millis(200))
             .expect_err("a missing encoder cannot be measured");
         let msg = format!("{err:#}");
-        assert!(msg.contains("definitely_not_an_encoder"), "ffmpeg's words are kept: {msg}");
-        assert!(msg.contains("adapt_fps = false"), "the way out is named: {msg}");
+        assert!(
+            msg.contains("definitely_not_an_encoder"),
+            "ffmpeg's words are kept: {msg}"
+        );
+        assert!(
+            msg.contains("adapt_fps = false"),
+            "the way out is named: {msg}"
+        );
     }
 }

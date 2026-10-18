@@ -49,12 +49,20 @@ pub struct HotkeyStatus {
 impl HotkeyStatus {
     /// A listener that is installed and holding the chord.
     pub fn installed(chord: impl Into<String>) -> Self {
-        Self { chord: chord.into(), installed: true, error: None }
+        Self {
+            chord: chord.into(),
+            installed: true,
+            error: None,
+        }
     }
 
     /// A chord nothing is listening for, and the reason.
     pub fn not_installed(chord: impl Into<String>, error: impl Into<String>) -> Self {
-        Self { chord: chord.into(), installed: false, error: Some(error.into()) }
+        Self {
+            chord: chord.into(),
+            installed: false,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -146,7 +154,10 @@ pub fn install_hotkey(
             match forwarder {
                 Ok(_) => (HotkeyStatus::installed(chord), Some(rx)),
                 Err(err) => (
-                    HotkeyStatus::not_installed(chord, format!("the hotkey thread did not start: {err}")),
+                    HotkeyStatus::not_installed(
+                        chord,
+                        format!("the hotkey thread did not start: {err}"),
+                    ),
                     None,
                 ),
             }
@@ -269,7 +280,10 @@ impl TrayView<'_> {
             ),
             TrayState::Attention => format!(
                 "better-outplayed — the recorder stopped: {}",
-                self.status.error.as_deref().unwrap_or("no reason was reported")
+                self.status
+                    .error
+                    .as_deref()
+                    .unwrap_or("no reason was reported")
             ),
             TrayState::Recording => format!(
                 "better-outplayed — recording. Press {} to take a clip.",
@@ -776,20 +790,17 @@ impl FileManager {
 /// Pure, so a test pins the shape for every platform on any host. `tauri-plugin-opener` would
 /// add a dependency, a JavaScript package and a capability for the same two lines.
 pub fn reveal_command(path: &Path, manager: FileManager) -> (String, Vec<String>) {
-    let folder = || {
-        path.parent()
-            .unwrap_or(path)
-            .display()
-            .to_string()
-    };
+    let folder = || path.parent().unwrap_or(path).display().to_string();
     match (manager, path.is_file()) {
-        (FileManager::Explorer, true) => {
-            ("explorer".to_string(), vec![format!("/select,\"{}\"", path.display())])
-        }
+        (FileManager::Explorer, true) => (
+            "explorer".to_string(),
+            vec![format!("/select,\"{}\"", path.display())],
+        ),
         (FileManager::Explorer, false) => ("explorer".to_string(), vec![folder()]),
-        (FileManager::MacOs, true) => {
-            ("open".to_string(), vec!["-R".to_string(), path.display().to_string()])
-        }
+        (FileManager::MacOs, true) => (
+            "open".to_string(),
+            vec!["-R".to_string(), path.display().to_string()],
+        ),
         (FileManager::MacOs, false) => ("open".to_string(), vec![folder()]),
         // The generic case has nothing to select with: the folder is what a user can act on.
         (FileManager::XdgOpen, _) => ("xdg-open".to_string(), vec![folder()]),
@@ -828,7 +839,13 @@ mod tests {
         hotkey: &'a HotkeyStatus,
         window_visible: bool,
     ) -> TrayView<'a> {
-        TrayView { status, hotkey, window_visible, config_exists: true, last_press: None }
+        TrayView {
+            status,
+            hotkey,
+            window_visible,
+            config_exists: true,
+            last_press: None,
+        }
     }
 
     /// A `Shell` that records what it was asked to do, and can be told to fail.
@@ -866,7 +883,10 @@ mod tests {
 
     impl FakeShell {
         fn recording() -> Self {
-            Self { running: true, ..Self::default() }
+            Self {
+                running: true,
+                ..Self::default()
+            }
         }
 
         fn calls(&self) -> Vec<&'static str> {
@@ -946,11 +966,23 @@ mod tests {
         let (hotkey, presses) = install_hotkey("Ctrl+Shift", &[]);
 
         assert!(!hotkey.installed);
-        assert!(presses.is_none(), "nothing is listening when the chord does not parse");
-        assert_eq!(hotkey.chord, "Ctrl+Shift", "the chord the user wrote is kept for display");
+        assert!(
+            presses.is_none(),
+            "nothing is listening when the chord does not parse"
+        );
+        assert_eq!(
+            hotkey.chord, "Ctrl+Shift",
+            "the chord the user wrote is kept for display"
+        );
         let error = hotkey.error.expect("a failure carries its reason");
-        assert!(error.contains("Ctrl+Shift"), "the reason names the chord: {error}");
-        assert!(error.contains("Ctrl+F8"), "and shows the shape it wants: {error}");
+        assert!(
+            error.contains("Ctrl+Shift"),
+            "the reason names the chord: {error}"
+        );
+        assert!(
+            error.contains("Ctrl+F8"),
+            "and shows the shape it wants: {error}"
+        );
     }
 
     #[test]
@@ -961,7 +993,10 @@ mod tests {
             assert!(!hotkey.installed);
             assert!(presses.is_none(), "a half-working set is worse than none");
             let error = hotkey.error.expect("a failure carries its reason");
-            assert!(error.contains("bookmark"), "the reason names the key: {error}");
+            assert!(
+                error.contains("bookmark"),
+                "the reason names the key: {error}"
+            );
         }
     }
 
@@ -972,7 +1007,10 @@ mod tests {
         // can produce: registering a real chord needs Windows.
         let (hotkey, presses) = install_hotkey("ctrl+f8", &[]);
 
-        assert_eq!(hotkey.chord, "Ctrl+F8", "the chord is normalised, as the CLI prints it");
+        assert_eq!(
+            hotkey.chord, "Ctrl+F8",
+            "the chord is normalised, as the CLI prints it"
+        );
         if hotkey::supported() {
             assert!(hotkey.installed, "on Windows the example chord registers");
             assert!(presses.is_some());
@@ -982,7 +1020,10 @@ mod tests {
             assert!(presses.is_none());
             let error = hotkey.error.expect("not installing a hotkey has a reason");
             assert!(error.contains("Windows"), "the reason says why: {error}");
-            assert!(error.contains("tray menu"), "and what to use instead: {error}");
+            assert!(
+                error.contains("tray menu"),
+                "and what to use instead: {error}"
+            );
         }
     }
 
@@ -991,11 +1032,20 @@ mod tests {
         // `src/lib/types.ts` mirrors this struct by hand. Without this test a rename on either side is
         // found by a user staring at a panel that says nothing about the key they press.
         let value = serde_json::to_value(HotkeyStatus::installed("Ctrl+F8")).unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(keys, ["chord", "error", "installed"]);
         assert_eq!(value["installed"], true);
-        assert_eq!(value["error"], serde_json::Value::Null, "None is null, not a missing key");
+        assert_eq!(
+            value["error"],
+            serde_json::Value::Null,
+            "None is null, not a missing key"
+        );
 
         let app = serde_json::to_value(AppStatus {
             hotkey: HotkeyStatus::installed("Ctrl+F8"),
@@ -1004,10 +1054,21 @@ mod tests {
             close_hint: CLOSE_HINT.to_string(),
         })
         .unwrap();
-        let mut keys: Vec<&str> = app.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = app
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
-        assert_eq!(keys, ["close_hint", "config_exists", "config_path", "hotkey"]);
-        assert_eq!(app["hotkey"]["chord"], "Ctrl+F8", "the nested status crosses the wire too");
+        assert_eq!(
+            keys,
+            ["close_hint", "config_exists", "config_path", "hotkey"]
+        );
+        assert_eq!(
+            app["hotkey"]["chord"], "Ctrl+F8",
+            "the nested status crosses the wire too"
+        );
     }
 
     // -- what the window shows about the background half ---------------------------------
@@ -1032,11 +1093,19 @@ mod tests {
 
         let broken_hotkey = view(&idle, &missing, true).rendering();
         assert_ne!(base, broken_hotkey);
-        assert!(broken_hotkey.tooltip.contains("NOT installed"), "{}", broken_hotkey.tooltip);
+        assert!(
+            broken_hotkey.tooltip.contains("NOT installed"),
+            "{}",
+            broken_hotkey.tooltip
+        );
 
         let mut pressed = view(&idle, &hotkey, true);
         pressed.last_press = Some("saved clip-1.mp4");
-        assert_ne!(pressed.rendering(), base, "a press result moves the tooltip");
+        assert_ne!(
+            pressed.rendering(),
+            base,
+            "a press result moves the tooltip"
+        );
     }
 
     // -- revealing the config file --------------------------------------------------------
@@ -1054,16 +1123,26 @@ mod tests {
         let (program, args) = reveal_command(&file, FileManager::Explorer);
         assert_eq!(program, "explorer");
         assert_eq!(args, vec![format!("/select,\"{}\"", file.display())]);
-        assert_eq!(reveal_command(&missing, FileManager::Explorer).1, vec![folder.clone()]);
+        assert_eq!(
+            reveal_command(&missing, FileManager::Explorer).1,
+            vec![folder.clone()]
+        );
 
         let (program, args) = reveal_command(&file, FileManager::MacOs);
         assert_eq!(program, "open");
         assert_eq!(args, vec!["-R".to_string(), file.display().to_string()]);
-        assert_eq!(reveal_command(&missing, FileManager::MacOs).1, vec![folder.clone()]);
+        assert_eq!(
+            reveal_command(&missing, FileManager::MacOs).1,
+            vec![folder.clone()]
+        );
 
         let (program, args) = reveal_command(&file, FileManager::XdgOpen);
         assert_eq!(program, "xdg-open");
-        assert_eq!(args, vec![folder], "the generic case has nothing to select with");
+        assert_eq!(
+            args,
+            vec![folder],
+            "the generic case has nothing to select with"
+        );
     }
 
     // -- one press, one clip -------------------------------------------------------------
@@ -1099,7 +1178,11 @@ mod tests {
 
         assert_eq!(*calls.borrow(), 1, "a failed press is not retried");
         assert!(!outcome.saved_a_clip());
-        assert!(outcome.describe().contains("nothing is recording"), "{}", outcome.describe());
+        assert!(
+            outcome.describe().contains("nothing is recording"),
+            "{}",
+            outcome.describe()
+        );
     }
 
     // -- the tray menu -------------------------------------------------------------------
@@ -1134,15 +1217,24 @@ mod tests {
 
         let recording = view(&running, &hotkey, true);
         assert_eq!(MenuAction::ToggleRecording.label(&shown), "Start recording");
-        assert_eq!(MenuAction::ToggleRecording.label(&recording), "Stop recording");
+        assert_eq!(
+            MenuAction::ToggleRecording.label(&recording),
+            "Stop recording"
+        );
 
         assert_eq!(MenuAction::SaveClip.label(&recording), "Save clip now");
         let mut no_file = view(&idle, &hotkey, true);
         no_file.config_exists = false;
         assert_eq!(MenuAction::OpenConfig.label(&shown), "Open config file");
-        assert_eq!(MenuAction::OpenConfig.label(&no_file), "Open the config folder");
+        assert_eq!(
+            MenuAction::OpenConfig.label(&no_file),
+            "Open the config folder"
+        );
         assert_eq!(MenuAction::Quit.label(&shown), "Quit better-outplayed");
-        assert!(MenuAction::Quit.separator_before(), "quit is set apart from the rest");
+        assert!(
+            MenuAction::Quit.separator_before(),
+            "quit is set apart from the rest"
+        );
         assert!(!MenuAction::SaveClip.separator_before());
     }
 
@@ -1171,7 +1263,10 @@ mod tests {
         let hotkey = HotkeyStatus::installed("Ctrl+F8");
         let missing = HotkeyStatus::not_installed("Ctrl+F8", "another application owns it");
 
-        assert_eq!(view(&status(false, None), &hotkey, true).tray_state(), TrayState::Idle);
+        assert_eq!(
+            view(&status(false, None), &hotkey, true).tray_state(),
+            TrayState::Idle
+        );
         assert_eq!(
             view(&status(true, None), &hotkey, true).tray_state(),
             TrayState::Recording
@@ -1209,7 +1304,10 @@ mod tests {
         assert!(stopped.contains("the encoder exited"), "{stopped}");
 
         let not_installed = view(&idle, &missing, true).tooltip();
-        assert!(not_installed.contains("Ctrl+F8"), "the chord that failed: {not_installed}");
+        assert!(
+            not_installed.contains("Ctrl+F8"),
+            "the chord that failed: {not_installed}"
+        );
         assert!(not_installed.contains("NOT installed"), "{not_installed}");
     }
 
@@ -1220,7 +1318,10 @@ mod tests {
         let mut with_press = view(&recording, &hotkey, true);
         with_press.last_press = Some("saved clip-2026-09-23_19-31-02_saved_from_the_window.mp4");
         let tooltip = with_press.tooltip();
-        assert!(tooltip.contains("Last press: saved clip-2026-09-23_19-31-02"), "{tooltip}");
+        assert!(
+            tooltip.contains("Last press: saved clip-2026-09-23_19-31-02"),
+            "{tooltip}"
+        );
         assert!(tooltip.chars().count() <= TOOLTIP_LIMIT, "{tooltip}");
 
         // A pathological reason cannot push it past the limit either — and the cut says so.
@@ -1230,30 +1331,51 @@ mod tests {
         noisy.last_press = Some(&long_press);
         let tooltip = noisy.tooltip();
         assert_eq!(tooltip.chars().count(), TOOLTIP_LIMIT, "{tooltip}");
-        assert!(tooltip.ends_with('…'), "a truncated tooltip is marked: {tooltip}");
+        assert!(
+            tooltip.ends_with('…'),
+            "a truncated tooltip is marked: {tooltip}"
+        );
     }
 
     // -- dispatch: the menu action → the shell calls -------------------------------------
 
     #[test]
     fn showing_and_hiding_follows_what_is_on_screen() {
-        let shell = FakeShell { visible: true, ..FakeShell::default() };
-        assert_eq!(dispatch(MenuAction::ShowHideWindow, &shell), Outcome::WindowHidden);
+        let shell = FakeShell {
+            visible: true,
+            ..FakeShell::default()
+        };
+        assert_eq!(
+            dispatch(MenuAction::ShowHideWindow, &shell),
+            Outcome::WindowHidden
+        );
         assert_eq!(shell.calls(), ["window_visible", "hide_window"]);
 
-        let shell = FakeShell { visible: false, ..FakeShell::default() };
-        assert_eq!(dispatch(MenuAction::ShowHideWindow, &shell), Outcome::WindowShown);
+        let shell = FakeShell {
+            visible: false,
+            ..FakeShell::default()
+        };
+        assert_eq!(
+            dispatch(MenuAction::ShowHideWindow, &shell),
+            Outcome::WindowShown
+        );
         assert_eq!(shell.calls(), ["window_visible", "show_window"]);
     }
 
     #[test]
     fn the_recording_item_starts_or_stops_according_to_the_engine() {
         let idle = FakeShell::default();
-        assert_eq!(dispatch(MenuAction::ToggleRecording, &idle), Outcome::RecordingStarted);
+        assert_eq!(
+            dispatch(MenuAction::ToggleRecording, &idle),
+            Outcome::RecordingStarted
+        );
         assert_eq!(idle.calls(), ["status", "start_recording"]);
 
         let running = FakeShell::recording();
-        assert_eq!(dispatch(MenuAction::ToggleRecording, &running), Outcome::RecordingStopped);
+        assert_eq!(
+            dispatch(MenuAction::ToggleRecording, &running),
+            Outcome::RecordingStopped
+        );
         assert_eq!(running.calls(), ["status", "stop_recording"]);
     }
 
@@ -1270,8 +1392,15 @@ mod tests {
             outcome,
             Outcome::Refused("ffmpeg was not found, so a recording cannot be started".to_string())
         );
-        assert_eq!(outcome.describe(), "ffmpeg was not found, so a recording cannot be started");
-        assert_eq!(shell.calls(), ["status", "start_recording"], "and it does not try again");
+        assert_eq!(
+            outcome.describe(),
+            "ffmpeg was not found, so a recording cannot be started"
+        );
+        assert_eq!(
+            shell.calls(),
+            ["status", "start_recording"],
+            "and it does not try again"
+        );
     }
 
     #[test]
@@ -1279,9 +1408,16 @@ mod tests {
         let shell = FakeShell::recording();
         let outcome = dispatch(MenuAction::SaveClip, &shell);
 
-        assert_eq!(outcome, Outcome::ClipSaved("C:\\clips\\clip-1.mp4".to_string()));
+        assert_eq!(
+            outcome,
+            Outcome::ClipSaved("C:\\clips\\clip-1.mp4".to_string())
+        );
         assert_eq!(outcome.describe(), "saved clip-1.mp4");
-        assert_eq!(shell.calls(), ["clip_now"], "the tray's clip is the same call as the button's");
+        assert_eq!(
+            shell.calls(),
+            ["clip_now"],
+            "the tray's clip is the same call as the button's"
+        );
     }
 
     #[test]
@@ -1308,7 +1444,11 @@ mod tests {
 
         let outcome = dispatch(MenuAction::OpenConfig, &shell);
         assert_eq!(outcome, Outcome::ConfigOpened(shell.config_path.clone()));
-        assert!(outcome.describe().contains("config.toml"), "{}", outcome.describe());
+        assert!(
+            outcome.describe().contains("config.toml"),
+            "{}",
+            outcome.describe()
+        );
         assert_eq!(shell.calls(), ["open_config"]);
     }
 
@@ -1320,23 +1460,36 @@ mod tests {
         let outcome = dispatch(MenuAction::Quit, &shell);
 
         assert_eq!(outcome, Outcome::Quitting);
-        assert_eq!(shell.calls(), ["stop_recording", "quit"], "stop first, then exit");
+        assert_eq!(
+            shell.calls(),
+            ["stop_recording", "quit"],
+            "stop first, then exit"
+        );
     }
 
     #[test]
     fn a_quit_still_quits_when_the_stop_fails() {
         // The stop is best-effort: a failure to flush must not leave a process running that the user
         // cannot see. Logged, not swallowed.
-        let shell =
-            FakeShell { stop_fails: Some("the encoder refused to flush"), ..FakeShell::recording() };
+        let shell = FakeShell {
+            stop_fails: Some("the encoder refused to flush"),
+            ..FakeShell::recording()
+        };
 
         assert_eq!(dispatch(MenuAction::Quit, &shell), Outcome::Quitting);
-        assert_eq!(shell.calls(), ["stop_recording", "quit"], "it flushed first, then left");
+        assert_eq!(
+            shell.calls(),
+            ["stop_recording", "quit"],
+            "it flushed first, then left"
+        );
     }
 
     #[test]
     fn a_quit_that_the_process_refuses_is_reported() {
-        let shell = FakeShell { quit_fails: true, ..FakeShell::recording() };
+        let shell = FakeShell {
+            quit_fails: true,
+            ..FakeShell::recording()
+        };
         let outcome = dispatch(MenuAction::Quit, &shell);
 
         assert!(
@@ -1353,7 +1506,11 @@ mod tests {
         // The rule this file exists for: a clipper that exits on window close ends the recording every
         // time the user tidies their screen.
         assert_eq!(close_action(), CloseAction::Hide);
-        assert_eq!(close_action(), CloseAction::Hide, "and it is not conditional");
+        assert_eq!(
+            close_action(),
+            CloseAction::Hide,
+            "and it is not conditional"
+        );
     }
 
     // -- autostart -----------------------------------------------------------------------
@@ -1387,7 +1544,10 @@ mod tests {
             vec!["delete", RUN_KEY, "/v", "localplay", "/f"]
         );
 
-        assert!(RUN_KEY.contains(r"HKCU\"), "per-user, so it needs no elevation: {RUN_KEY}");
+        assert!(
+            RUN_KEY.contains(r"HKCU\"),
+            "per-user, so it needs no elevation: {RUN_KEY}"
+        );
         assert!(RUN_KEY.ends_with(r"\Run"), "{RUN_KEY}");
     }
 
@@ -1400,7 +1560,10 @@ mod tests {
 
     impl FakeReg {
         fn new(present: Option<&str>) -> Self {
-            Self { present: present.map(str::to_string), calls: RefCell::new(Vec::new()) }
+            Self {
+                present: present.map(str::to_string),
+                calls: RefCell::new(Vec::new()),
+            }
         }
 
         fn runner(&self) -> impl FnMut(&[String]) -> Result<String, String> + '_ {
@@ -1437,7 +1600,11 @@ mod tests {
         let outcome = sync_autostart(true, exe, &mut run).unwrap();
 
         assert_eq!(outcome, AutostartOutcome::Enabled);
-        assert_eq!(reg.commands(), ["query", "add"], "it reads first, then writes");
+        assert_eq!(
+            reg.commands(),
+            ["query", "add"],
+            "it reads first, then writes"
+        );
     }
 
     #[test]
@@ -1450,7 +1617,11 @@ mod tests {
         let outcome = sync_autostart(true, exe, &mut run).unwrap();
 
         assert_eq!(outcome, AutostartOutcome::Unchanged);
-        assert_eq!(reg.commands(), ["query"], "nothing is written when nothing changed");
+        assert_eq!(
+            reg.commands(),
+            ["query"],
+            "nothing is written when nothing changed"
+        );
     }
 
     #[test]
@@ -1461,7 +1632,10 @@ mod tests {
         let reg = FakeReg::new(Some(r#""C:\old\localplay.exe""#));
         let mut run = reg.runner();
 
-        assert_eq!(sync_autostart(true, exe, &mut run).unwrap(), AutostartOutcome::Enabled);
+        assert_eq!(
+            sync_autostart(true, exe, &mut run).unwrap(),
+            AutostartOutcome::Enabled
+        );
         assert_eq!(reg.commands(), ["query", "add"]);
     }
 
@@ -1485,7 +1659,10 @@ mod tests {
         let reg = FakeReg::new(None);
         let mut run = reg.runner();
 
-        assert_eq!(sync_autostart(false, exe, &mut run).unwrap(), AutostartOutcome::Unchanged);
+        assert_eq!(
+            sync_autostart(false, exe, &mut run).unwrap(),
+            AutostartOutcome::Unchanged
+        );
         assert_eq!(reg.commands(), ["query"]);
     }
 

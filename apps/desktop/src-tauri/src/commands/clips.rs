@@ -1,11 +1,11 @@
 //! Clip commands: list, metadata, trim, thumbnail, delete, and the path helpers they share.
 
+use super::*;
 use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
 use localplay_media::probe::MediaInfo;
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::{Clip, NewClip, Store};
 use std::path::{Path, PathBuf};
-use super::*;
 
 // ---------------------------------------------------------------------------------------
 // Commands
@@ -43,7 +43,10 @@ struct LiveClips {
 /// `created_at` is also what the storage policy evicts by, so the list the user sees and the
 /// order the manager deletes in agree. Ties are broken by id, so the order is total and stable.
 fn clips_on_disk(deps: &Deps<'_>) -> Result<LiveClips, CommandError> {
-    let mut clips = deps.store.list_clips().map_err(|e| CommandError::store("listing clips", e))?;
+    let mut clips = deps
+        .store
+        .list_clips()
+        .map_err(|e| CommandError::store("listing clips", e))?;
     clips.sort_by_key(|clip| std::cmp::Reverse((clip.created_at_ms, clip.id)));
 
     let mut missing = Vec::new();
@@ -64,7 +67,10 @@ pub fn list_clips(deps: &Deps<'_>) -> Result<Vec<ClipDto>, CommandError> {
     // Reported here rather than in `clips_on_disk`, so a refresh that is not a listing cannot double
     // the log. `debug!` because it repeats on every refresh.
     for (id, path) in &missing {
-        tracing::debug!("skipping clip #{id} from the listing: {} is gone", path.display());
+        tracing::debug!(
+            "skipping clip #{id} from the listing: {} is gone",
+            path.display()
+        );
     }
     if !missing.is_empty() {
         tracing::warn!(
@@ -143,7 +149,10 @@ pub fn set_favourite(deps: &Deps<'_>, id: i64, favourite: bool) -> Result<ClipDt
 /// disk is deliberately not renamed — see `localplay_store::V5_CLIP_COLUMNS`.
 pub fn set_clip_title(deps: &Deps<'_>, id: i64, title: &str) -> Result<ClipDto, CommandError> {
     let updated = deps.store.set_clip_title(id, title).map_err(|e| {
-        CommandError::new(ErrorCode::InvalidInput, format!("could not set the title: {e:#}"))
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("could not set the title: {e:#}"),
+        )
     })?;
     if !updated {
         return Err(CommandError::clip_not_found(id));
@@ -155,7 +164,10 @@ pub fn set_clip_title(deps: &Deps<'_>, id: i64, title: &str) -> Result<ClipDto, 
 /// changes.
 pub fn set_clip_tags(deps: &Deps<'_>, id: i64, tags: &[String]) -> Result<ClipDto, CommandError> {
     let updated = deps.store.set_clip_tags(id, tags).map_err(|e| {
-        CommandError::new(ErrorCode::InvalidInput, format!("could not set the tags: {e:#}"))
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("could not set the tags: {e:#}"),
+        )
     })?;
     if !updated {
         return Err(CommandError::clip_not_found(id));
@@ -171,7 +183,10 @@ pub fn clip_file(deps: &Deps<'_>, id: i64) -> Result<PathBuf, CommandError> {
     if !clip.path.is_file() {
         return Err(CommandError::new(
             ErrorCode::Io,
-            format!("clip #{id} is indexed at {} but that file is not on disk", clip.path.display()),
+            format!(
+                "clip #{id} is indexed at {} but that file is not on disk",
+                clip.path.display()
+            ),
         ));
     }
     if !is_inside_library(&clip.path, deps.paths) {
@@ -206,7 +221,9 @@ pub(super) fn inherit_metadata(
             tracing::warn!("clip #{}: could not inherit the tags: {err:#}", new.id);
         }
     }
-    find_clip(deps.store, new.id).map(|c| ClipDto::from(&c)).unwrap_or(new)
+    find_clip(deps.store, new.id)
+        .map(|c| ClipDto::from(&c))
+        .unwrap_or(new)
 }
 
 /// Cut `[start_ms, end_ms)` out of clip `id` into a new file next to the original, and index the
@@ -259,7 +276,12 @@ pub fn trim_clip(
         start_ms,
         end_ms,
     )?;
-    Ok(inherit_metadata(deps, new, clip.game.as_deref(), &clip.tags))
+    Ok(inherit_metadata(
+        deps,
+        new,
+        clip.game.as_deref(),
+        &clip.tags,
+    ))
 }
 
 /// Describe a newly written file and add it to the index.
@@ -387,7 +409,10 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
     }
 
     let bins = deps.binaries()?;
-    let dst = deps.paths.thumbnails_dir.join(thumbnail_file_name(id, at_ms));
+    let dst = deps
+        .paths
+        .thumbnails_dir
+        .join(thumbnail_file_name(id, at_ms));
     if dst.is_file() {
         return Ok(ThumbnailRef {
             clip_id: id,
@@ -396,8 +421,13 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
             cached: true,
         });
     }
-    std::fs::create_dir_all(&deps.paths.thumbnails_dir)
-        .map_err(|e| CommandError::io("creating the thumbnails directory", &deps.paths.thumbnails_dir, e))?;
+    std::fs::create_dir_all(&deps.paths.thumbnails_dir).map_err(|e| {
+        CommandError::io(
+            "creating the thumbnails directory",
+            &deps.paths.thumbnails_dir,
+            e,
+        )
+    })?;
 
     ffmpeg_thumbnail(bins, &clip.path, at_ms, &dst).map_err(|e| {
         CommandError::media(
@@ -513,7 +543,10 @@ pub(super) fn is_inside_library(path: &Path, paths: &AppPaths) -> bool {
 
 /// The directories the shell owns: the clips directory and the application data directory.
 pub(super) fn library_roots(paths: &AppPaths) -> Vec<&Path> {
-    [Some(paths.clips_dir.as_path()), paths.db_path.parent()].into_iter().flatten().collect()
+    [Some(paths.clips_dir.as_path()), paths.db_path.parent()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Whether a session's recorded file or scratch directory read from the index may be removed or
@@ -531,8 +564,7 @@ pub(super) fn session_artifact_ok(
         paths.db_path.parent(),
     ];
     let protected: Vec<&Path> = protected.into_iter().flatten().collect();
-    crate::paths::ensure_session_artifact(path, file, &library_roots(paths), &protected)
-        .map(|_| ())
+    crate::paths::ensure_session_artifact(path, file, &library_roots(paths), &protected).map(|_| ())
 }
 
 pub(super) fn find_clip(store: &Store, id: i64) -> Result<Clip, CommandError> {
@@ -681,7 +713,6 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,7 +734,10 @@ mod tests {
         let clips = list_clips(&f.deps()).unwrap();
 
         assert_eq!(clips.len(), 2);
-        assert_eq!(clips[0].id, newer_row, "the most recently indexed clip is first");
+        assert_eq!(
+            clips[0].id, newer_row,
+            "the most recently indexed clip is first"
+        );
         assert_eq!(clips[1].id, older_row);
     }
 
@@ -756,19 +790,25 @@ mod tests {
         let stats = storage_stats(&f.deps()).unwrap();
 
         assert_eq!(clips.len(), 2);
-        assert_eq!(stats.clip_count, clips.len(), "the two panels agree on the count");
+        assert_eq!(
+            stats.clip_count,
+            clips.len(),
+            "the two panels agree on the count"
+        );
         assert_eq!(
             stats.total_bytes, 10_000,
             "and on the bytes: only what is on disk, not what the rows claim"
         );
-        assert_eq!(stats.missing_count, 1, "the hidden row is named, not silently dropped");
+        assert_eq!(
+            stats.missing_count, 1,
+            "the hidden row is named, not silently dropped"
+        );
         assert_eq!(
             f.store.list_clips().unwrap().len(),
             3,
             "still skipped rather than deleted — a file can be temporarily unavailable"
         );
     }
-
 
     // -- trim_clip -----------------------------------------------------------------------
 
@@ -789,7 +829,11 @@ mod tests {
         }
 
         // Rejected before ffmpeg ran: no file was written and no row was added.
-        assert_eq!(list_clips(&f.deps()).unwrap().len(), 1, "nothing was indexed");
+        assert_eq!(
+            list_clips(&f.deps()).unwrap().len(),
+            1,
+            "nothing was indexed"
+        );
         assert_eq!(
             std::fs::read_dir(&f.paths.clips_dir).unwrap().count(),
             1,
@@ -807,7 +851,11 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::OutOfRange);
         assert!(err.message.contains("2001ms"), "got: {}", err.message);
-        assert!(err.message.contains("2000ms"), "the message names the real duration: {}", err.message);
+        assert!(
+            err.message.contains("2000ms"),
+            "the message names the real duration: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -827,17 +875,33 @@ mod tests {
 
         let expected = f.paths.clips_dir.join("game.trim-1500-3000.mp4");
         assert_eq!(trimmed.path, expected.to_string_lossy());
-        assert_eq!(expected.parent(), src.parent(), "the new clip sits beside the original");
+        assert_eq!(
+            expected.parent(),
+            src.parent(),
+            "the new clip sits beside the original"
+        );
         assert!(expected.is_file(), "the file must really be on disk");
-        assert!(trimmed.duration_ms > 0, "the duration is probed from the file that was written");
-        assert_eq!(trimmed.size_bytes, std::fs::metadata(&expected).unwrap().len());
-        assert_eq!(trimmed.started_at_ms, 1_500, "its position on the parent's timeline");
+        assert!(
+            trimmed.duration_ms > 0,
+            "the duration is probed from the file that was written"
+        );
+        assert_eq!(
+            trimmed.size_bytes,
+            std::fs::metadata(&expected).unwrap().len()
+        );
+        assert_eq!(
+            trimmed.started_at_ms, 1_500,
+            "its position on the parent's timeline"
+        );
         assert!(!trimmed.favourite);
 
         let clips = list_clips(&f.deps()).unwrap();
         assert_eq!(clips.len(), 2, "the trim is a clip of its own");
         assert_eq!(clips[0].id, trimmed.id, "and it is the newest row");
-        assert!(clips.iter().any(|c| c.id == id), "the parent is still indexed");
+        assert!(
+            clips.iter().any(|c| c.id == id),
+            "the parent is still indexed"
+        );
 
         // The original is untouched: a trim never modifies the clip it came from.
         assert_eq!(std::fs::metadata(&src).unwrap().len(), src_size);
@@ -852,24 +916,49 @@ mod tests {
 
         let renamed = set_clip_title(&f.deps(), id, "  Triple kill  ").unwrap();
         assert_eq!(renamed.title.as_deref(), Some("Triple kill"));
-        assert!(f.paths.clips_dir.join("raw-name.mp4").exists(), "the file keeps its name");
+        assert!(
+            f.paths.clips_dir.join("raw-name.mp4").exists(),
+            "the file keeps its name"
+        );
 
-        let tagged = set_clip_tags(&f.deps(), id, &["Ace".into(), "ace".into(), "funny".into()]).unwrap();
+        let tagged =
+            set_clip_tags(&f.deps(), id, &["Ace".into(), "ace".into(), "funny".into()]).unwrap();
         assert_eq!(tagged.tags, vec!["ace".to_string(), "funny".to_string()]);
-        assert_eq!(tagged.title.as_deref(), Some("Triple kill"), "tags do not disturb the title");
+        assert_eq!(
+            tagged.title.as_deref(),
+            Some("Triple kill"),
+            "tags do not disturb the title"
+        );
 
-        assert_eq!(set_clip_title(&f.deps(), id, "").unwrap().title, None, "blank clears");
+        assert_eq!(
+            set_clip_title(&f.deps(), id, "").unwrap().title,
+            None,
+            "blank clears"
+        );
     }
 
     #[test]
     fn metadata_commands_report_unknown_ids_and_refuse_bad_input() {
         let f = Fixture::new();
         let id = f.add_row("a.mp4", 0, 1_000, 1);
-        assert_eq!(set_clip_title(&f.deps(), id + 9, "x").unwrap_err().code, ErrorCode::ClipNotFound);
-        assert_eq!(set_clip_tags(&f.deps(), id + 9, &[]).unwrap_err().code, ErrorCode::ClipNotFound);
-        assert_eq!(set_clip_tags(&f.deps(), id, &["  ".into()]).unwrap_err().code, ErrorCode::InvalidInput);
         assert_eq!(
-            set_clip_title(&f.deps(), id, &"x".repeat(500)).unwrap_err().code,
+            set_clip_title(&f.deps(), id + 9, "x").unwrap_err().code,
+            ErrorCode::ClipNotFound
+        );
+        assert_eq!(
+            set_clip_tags(&f.deps(), id + 9, &[]).unwrap_err().code,
+            ErrorCode::ClipNotFound
+        );
+        assert_eq!(
+            set_clip_tags(&f.deps(), id, &["  ".into()])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            set_clip_title(&f.deps(), id, &"x".repeat(500))
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidInput
         );
     }
@@ -878,7 +967,10 @@ mod tests {
     fn clip_file_resolves_library_files_and_refuses_missing_or_outside_ones() {
         let f = Fixture::new();
         let id = f.add_row("in.mp4", 0, 1_000, 1);
-        assert_eq!(clip_file(&f.deps(), id).unwrap(), f.paths.clips_dir.join("in.mp4"));
+        assert_eq!(
+            clip_file(&f.deps(), id).unwrap(),
+            f.paths.clips_dir.join("in.mp4")
+        );
 
         std::fs::remove_file(f.paths.clips_dir.join("in.mp4")).unwrap();
         assert_eq!(clip_file(&f.deps(), id).unwrap_err().code, ErrorCode::Io);
@@ -896,8 +988,14 @@ mod tests {
                 codec: "mpeg4".into(),
             })
             .unwrap();
-        assert_eq!(clip_file(&f.deps(), rogue).unwrap_err().code, ErrorCode::InvalidInput);
-        assert_eq!(clip_file(&f.deps(), rogue + 9).unwrap_err().code, ErrorCode::ClipNotFound);
+        assert_eq!(
+            clip_file(&f.deps(), rogue).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            clip_file(&f.deps(), rogue + 9).unwrap_err().code,
+            ErrorCode::ClipNotFound
+        );
     }
 
     #[test]
@@ -922,8 +1020,17 @@ mod tests {
         let first = trim_clip(&f.deps(), id, 1_000, 2_000).unwrap();
         let second = trim_clip(&f.deps(), id, 1_000, 2_000).unwrap();
 
-        assert_ne!(first.path, second.path, "the second trim must not clobber the first");
-        assert_eq!(second.path, f.paths.clips_dir.join("twice.trim-1000-2000-2.mp4").to_string_lossy());
+        assert_ne!(
+            first.path, second.path,
+            "the second trim must not clobber the first"
+        );
+        assert_eq!(
+            second.path,
+            f.paths
+                .clips_dir
+                .join("twice.trim-1000-2000-2.mp4")
+                .to_string_lossy()
+        );
         assert!(Path::new(&first.path).is_file());
         assert_eq!(list_clips(&f.deps()).unwrap().len(), 3);
     }
@@ -973,7 +1080,13 @@ mod tests {
 
         let trimmed = trim_clip(&f.deps(), id, 0, 2_000).unwrap();
 
-        assert_eq!(trimmed.path, f.paths.clips_dir.join("whole.trim-0-2000.mp4").to_string_lossy());
+        assert_eq!(
+            trimmed.path,
+            f.paths
+                .clips_dir
+                .join("whole.trim-0-2000.mp4")
+                .to_string_lossy()
+        );
         assert!(trimmed.duration_ms > 0);
     }
 
@@ -988,14 +1101,21 @@ mod tests {
         let marked = set_favourite(&f.deps(), id, true).unwrap();
         assert_eq!(marked.id, id);
         assert!(marked.favourite);
-        assert!(list_clips(&f.deps()).unwrap()[0].favourite, "the flag is persisted");
+        assert!(
+            list_clips(&f.deps()).unwrap()[0].favourite,
+            "the flag is persisted"
+        );
 
         let cleared = set_favourite(&f.deps(), id, false).unwrap();
         assert!(!cleared.favourite);
         assert!(!list_clips(&f.deps()).unwrap()[0].favourite);
 
         let err = set_favourite(&f.deps(), id + 1, true).unwrap_err();
-        assert_eq!(err.code, ErrorCode::ClipNotFound, "a no-op update must not look like success");
+        assert_eq!(
+            err.code,
+            ErrorCode::ClipNotFound,
+            "a no-op update must not look like success"
+        );
     }
 
     // -- storage_stats -------------------------------------------------------------------
@@ -1041,8 +1161,14 @@ mod tests {
         let stats = storage_stats(&f.deps()).unwrap();
 
         assert!(!stats.cap_met);
-        assert_eq!(stats.over_cap_by_bytes, 300, "800 bytes of favourites against a 500 cap");
-        assert_eq!(stats.planned_deletions, 0, "evicting everything else cannot reach this cap");
+        assert_eq!(
+            stats.over_cap_by_bytes, 300,
+            "800 bytes of favourites against a 500 cap"
+        );
+        assert_eq!(
+            stats.planned_deletions, 0,
+            "evicting everything else cannot reach this cap"
+        );
     }
 
     #[test]
@@ -1057,8 +1183,14 @@ mod tests {
         let stats = storage_stats(&f.deps()).unwrap();
 
         assert_eq!(stats.total_bytes, 1_200);
-        assert!(stats.cap_met, "with no favourites in the way the cap is reachable");
-        assert_eq!(stats.planned_deletions, 1, "one eviction brings 1200 bytes under the cap");
+        assert!(
+            stats.cap_met,
+            "with no favourites in the way the cap is reachable"
+        );
+        assert_eq!(
+            stats.planned_deletions, 1,
+            "one eviction brings 1200 bytes under the cap"
+        );
         assert_eq!(stats.bytes_after, 600);
     }
 
@@ -1072,12 +1204,21 @@ mod tests {
         let now = now_ms();
 
         let fresh = storage_stats_at(&f.deps(), now).unwrap();
-        assert_eq!(fresh.planned_deletions, 0, "a clip indexed just now is not a week old");
+        assert_eq!(
+            fresh.planned_deletions, 0,
+            "a clip indexed just now is not a week old"
+        );
 
         let day = 24 * 60 * 60 * 1_000;
         let later = storage_stats_at(&f.deps(), now + 30 * day).unwrap();
-        assert_eq!(later.planned_deletions, 1, "30 days on, the 7 day limit selects it");
-        assert!(later.cap_met, "the age rule does not make the cap unreachable");
+        assert_eq!(
+            later.planned_deletions, 1,
+            "30 days on, the 7 day limit selects it"
+        );
+        assert!(
+            later.cap_met,
+            "the age rule does not make the cap unreachable"
+        );
         assert_eq!(later.bytes_after, 0);
     }
 
@@ -1105,24 +1246,42 @@ mod tests {
         assert_eq!(first.at_ms, 1_000);
         assert_eq!(first.clip_id, id);
         let path = PathBuf::from(&first.path);
-        assert_eq!(path.parent().unwrap(), f.paths.thumbnails_dir, "the cache, not the clips dir");
+        assert_eq!(
+            path.parent().unwrap(),
+            f.paths.thumbnails_dir,
+            "the cache, not the clips dir"
+        );
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             format!("clip-{id}-1000.jpg")
         );
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF], "a JPEG starts with FFD8FF");
-        assert!(bytes.len() > 200, "and is not an empty file: {} bytes", bytes.len());
+        assert_eq!(
+            &bytes[..3],
+            &[0xFF, 0xD8, 0xFF],
+            "a JPEG starts with FFD8FF"
+        );
+        assert!(
+            bytes.len() > 200,
+            "and is not an empty file: {} bytes",
+            bytes.len()
+        );
 
         let second = thumbnail(&f.deps(), id, 1_000).unwrap();
-        assert!(second.cached, "the second request is answered from the cache, not ffmpeg");
+        assert!(
+            second.cached,
+            "the second request is answered from the cache, not ffmpeg"
+        );
         assert_eq!(first.path, second.path);
 
         // A different frame is a different cache entry.
         let other = thumbnail(&f.deps(), id, 2_000).unwrap();
         assert!(!other.cached);
         assert_ne!(other.path, first.path);
-        assert_eq!(std::fs::read_dir(&f.paths.thumbnails_dir).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(&f.paths.thumbnails_dir).unwrap().count(),
+            2
+        );
     }
 
     #[test]
@@ -1144,7 +1303,10 @@ mod tests {
     #[test]
     fn thumbnail_reports_an_unknown_clip() {
         let f = Fixture::new();
-        assert_eq!(thumbnail(&f.deps(), 7, 0).unwrap_err().code, ErrorCode::ClipNotFound);
+        assert_eq!(
+            thumbnail(&f.deps(), 7, 0).unwrap_err().code,
+            ErrorCode::ClipNotFound
+        );
     }
 
     #[test]
@@ -1208,12 +1370,25 @@ mod tests {
         let id = f.add_row("no-ffmpeg.mp4", 0, 1_000, 10);
         let deps = f.deps_without_ffmpeg();
 
-        assert_eq!(trim_clip(&deps, id, 0, 500).unwrap_err().code, ErrorCode::FfmpegUnavailable);
-        assert_eq!(thumbnail(&deps, id, 100).unwrap_err().code, ErrorCode::FfmpegUnavailable);
+        assert_eq!(
+            trim_clip(&deps, id, 0, 500).unwrap_err().code,
+            ErrorCode::FfmpegUnavailable
+        );
+        assert_eq!(
+            thumbnail(&deps, id, 100).unwrap_err().code,
+            ErrorCode::FfmpegUnavailable
+        );
 
-        assert_eq!(list_clips(&deps).unwrap().len(), 1, "listing needs no ffmpeg");
+        assert_eq!(
+            list_clips(&deps).unwrap().len(),
+            1,
+            "listing needs no ffmpeg"
+        );
         assert_eq!(storage_stats(&deps).unwrap().clip_count, 1);
-        assert!(set_favourite(&deps, id, true).is_ok(), "nor does favouriting");
+        assert!(
+            set_favourite(&deps, id, true).is_ok(),
+            "nor does favouriting"
+        );
     }
 
     // -- delete_clip ---------------------------------------------------------------------
@@ -1232,7 +1407,10 @@ mod tests {
         assert!(!outcome.already_missing);
         assert_eq!(outcome.bytes_reclaimed, size_bytes);
         assert!(!path.exists(), "the file is unlinked");
-        assert!(list_clips(&f.deps()).unwrap().is_empty(), "and the row is gone");
+        assert!(
+            list_clips(&f.deps()).unwrap().is_empty(),
+            "and the row is gone"
+        );
     }
 
     #[test]
@@ -1257,11 +1435,17 @@ mod tests {
         let outcome = delete_clip(&f.deps(), id).unwrap();
 
         let expected = not_a_file.to_string_lossy().into_owned();
-        assert!(outcome.row_deleted, "the row delete is committed before the unlink is tried");
+        assert!(
+            outcome.row_deleted,
+            "the row delete is committed before the unlink is tried"
+        );
         assert!(!outcome.file_removed);
         assert_eq!(outcome.orphaned_path.as_deref(), Some(expected.as_str()));
         assert_eq!(outcome.bytes_reclaimed, 0);
-        assert!(not_a_file.exists(), "the orphaned path is reported, not hidden");
+        assert!(
+            not_a_file.exists(),
+            "the orphaned path is reported, not hidden"
+        );
         assert!(
             list_clips(&f.deps()).unwrap().is_empty(),
             "the row went first and stayed gone: that ordering is the property"
@@ -1313,7 +1497,10 @@ mod tests {
             outcome.orphaned_path.as_deref(),
             Some(outside.to_string_lossy().as_ref())
         );
-        assert!(outside.exists(), "a file outside the library is never unlinked");
+        assert!(
+            outside.exists(),
+            "a file outside the library is never unlinked"
+        );
     }
 
     #[test]
@@ -1329,7 +1516,10 @@ mod tests {
             sneaky.push("..");
         }
         sneaky.push(outside.strip_prefix("/").unwrap_or(&outside));
-        assert_eq!(std::fs::canonicalize(&sneaky).unwrap(), std::fs::canonicalize(&outside).unwrap());
+        assert_eq!(
+            std::fs::canonicalize(&sneaky).unwrap(),
+            std::fs::canonicalize(&outside).unwrap()
+        );
         let id = f
             .store
             .insert_clip(&NewClip {
@@ -1353,7 +1543,11 @@ mod tests {
         // any file of that name where it is.
         let f = Fixture::new();
         let stray = f.paths.clips_dir.join("stray.mp4");
-        std::fs::write(&stray, b"not indexed, and therefore not this command's to delete").unwrap();
+        std::fs::write(
+            &stray,
+            b"not indexed, and therefore not this command's to delete",
+        )
+        .unwrap();
 
         let outcome = delete_clip(&f.deps(), 999).unwrap();
 
@@ -1371,14 +1565,23 @@ mod tests {
         assert!(thumb_path.is_file());
 
         // Another clip's cache entry, whose id shares a prefix with this one's.
-        let neighbour = f.paths.thumbnails_dir.join(thumbnail_file_name(id + 100, 1_000));
+        let neighbour = f
+            .paths
+            .thumbnails_dir
+            .join(thumbnail_file_name(id + 100, 1_000));
         std::fs::write(&neighbour, b"another clip's frame").unwrap();
 
         let outcome = delete_clip(&f.deps(), id).unwrap();
 
         assert_eq!(outcome.thumbnails_removed, 1);
-        assert!(!thumb_path.exists(), "the deleted clip's cache entry goes with it");
-        assert!(neighbour.is_file(), "a neighbouring clip's cache entry stays");
+        assert!(
+            !thumb_path.exists(),
+            "the deleted clip's cache entry goes with it"
+        );
+        assert!(
+            neighbour.is_file(),
+            "a neighbouring clip's cache entry stays"
+        );
     }
 
     // -- pure helpers --------------------------------------------------------------------
@@ -1417,7 +1620,11 @@ mod tests {
             free_output_path(candidate.clone()).unwrap(),
             f.paths.clips_dir.join("taken.trim-0-1000-3.mp4")
         );
-        assert_eq!(std::fs::read(&chosen).unwrap(), b"and another", "nothing was clobbered");
+        assert_eq!(
+            std::fs::read(&chosen).unwrap(),
+            b"and another",
+            "nothing was clobbered"
+        );
     }
 
     #[test]

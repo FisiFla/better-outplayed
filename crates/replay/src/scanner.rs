@@ -21,7 +21,10 @@ pub fn newly_complete(observed: &[u64], highest_known: Option<u64>) -> Vec<u64> 
 /// The sequence number in a `seg-%06d.mp4` filename, if it is one. Anything else in the scratch
 /// directory (a ledger, a concat list, a stray file) yields `None`.
 pub fn segment_seq(name: &str) -> Option<u64> {
-    name.strip_prefix("seg-")?.strip_suffix(".mp4")?.parse().ok()
+    name.strip_prefix("seg-")?
+        .strip_suffix(".mp4")?
+        .parse()
+        .ok()
 }
 
 /// The sequence number a fresh encoder must start writing at, given the seqs in the adopted
@@ -45,7 +48,10 @@ pub fn segment_seq(name: &str) -> Option<u64> {
 /// directory and parses names (or uses [`segment_seq`]). An empty ledger and directory give 0.
 pub fn next_segment_number<S: AsRef<str>>(ledger_seqs: &[u64], observed_names: &[S]) -> u64 {
     let from_ledger = ledger_seqs.iter().copied().max();
-    let from_disk = observed_names.iter().filter_map(|n| segment_seq(n.as_ref())).max();
+    let from_disk = observed_names
+        .iter()
+        .filter_map(|n| segment_seq(n.as_ref()))
+        .max();
     match from_ledger.max(from_disk) {
         Some(highest) => highest + 1,
         None => 0,

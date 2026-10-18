@@ -20,9 +20,9 @@
 
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_recorder::{pump_once, pump_once_counted, FramePacer};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::{pump_once, pump_once_counted, FramePacer};
 
 /// What the encoder's rawvideo pipe is declared as (`-s 32x24`).
 const PIPE: (u32, u32) = (32, 24);
@@ -55,13 +55,21 @@ impl Fixture {
             scratch.path().to_path_buf(),
             SEGMENT_MS,
         );
-        let mut capture =
-            StubCapture::new(StubConfig { width: frame.0, height: frame.1, fps: FPS });
+        let mut capture = StubCapture::new(StubConfig {
+            width: frame.0,
+            height: frame.1,
+            fps: FPS,
+        });
         let mut audio = StubAudio::new(AudioFormat::default());
         capture.start().expect("start the capture stub");
         audio.start().expect("start the audio stub");
         let encoder = FfmpegEncoder::spawn(&bin, &encode).expect("spawn encoder");
-        Self { _scratch: scratch, capture, audio, encoder }
+        Self {
+            _scratch: scratch,
+            capture,
+            audio,
+            encoder,
+        }
     }
 }
 
@@ -76,9 +84,13 @@ fn a_frame_that_disagrees_with_the_declared_pipe_size_is_refused_by_name() {
     );
 
     let mut pacer = FramePacer::new(FPS);
-    let err = pump_once(&mut pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder).expect_err(
-        "a 64x48 frame on a pipe declared 32x24 must fail, not be fed to ffmpeg",
-    );
+    let err = pump_once(
+        &mut pacer,
+        &mut fx.capture,
+        Some(&mut fx.audio),
+        &mut fx.encoder,
+    )
+    .expect_err("a 64x48 frame on a pipe declared 32x24 must fail, not be fed to ffmpeg");
     let msg = format!("{err:#}");
     eprintln!("refused: {msg}");
 
@@ -92,7 +104,10 @@ fn a_frame_that_disagrees_with_the_declared_pipe_size_is_refused_by_name() {
         "the error must name the configured source size of the pipe: {msg}"
     );
     // ...and what is actually at stake.
-    assert!(msg.contains("pipe"), "the error must say which link is broken: {msg}");
+    assert!(
+        msg.contains("pipe"),
+        "the error must say which link is broken: {msg}"
+    );
     assert!(
         msg.contains("mis-read"),
         "the error must say what would have happened to the bytes: {msg}"
@@ -107,9 +122,17 @@ fn a_frame_that_matches_the_declared_pipe_size_is_still_submitted() {
     // The pacer admits the first frame immediately, so the frame's own guard is exercised, not the
     // rate limiter.
     let mut pacer = FramePacer::new(FPS);
-    let counts = pump_once_counted(&mut pacer, &mut fx.capture, Some(&mut fx.audio), &mut fx.encoder)
-        .expect("a frame the pipe was declared for must be submitted");
-    assert_eq!(counts.submitted, 1, "the matching frame must reach the encoder");
+    let counts = pump_once_counted(
+        &mut pacer,
+        &mut fx.capture,
+        Some(&mut fx.audio),
+        &mut fx.encoder,
+    )
+    .expect("a frame the pipe was declared for must be submitted");
+    assert_eq!(
+        counts.submitted, 1,
+        "the matching frame must reach the encoder"
+    );
     assert_eq!(
         counts.skipped, 0,
         "a pacer with an unused slot must take the frame it is due, not skip it"

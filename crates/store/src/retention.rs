@@ -254,7 +254,10 @@ fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> C
     let mut remaining: u64 = sessions.iter().map(bytes).sum();
     for (i, session) in ordered.iter().enumerate() {
         if !exempt(session) && now_ms.saturating_sub(session.started_at_ms) > max_age_ms {
-            marked[i] = Some(DeletionReasons { too_old: true, over_cap: false });
+            marked[i] = Some(DeletionReasons {
+                too_old: true,
+                over_cap: false,
+            });
             remaining = remaining.saturating_sub(bytes(session));
         }
     }
@@ -274,7 +277,10 @@ fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> C
             match &mut marked[i] {
                 Some(reasons) => reasons.over_cap = true,
                 None => {
-                    marked[i] = Some(DeletionReasons { too_old: false, over_cap: true });
+                    marked[i] = Some(DeletionReasons {
+                        too_old: false,
+                        over_cap: true,
+                    });
                     remaining = remaining.saturating_sub(bytes(session));
                 }
             }
@@ -452,10 +458,20 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
 
         if let Some(final_path) = paths.final_path.as_deref() {
             let final_path = PathBuf::from(final_path);
-            record(&mut outcome.sessions, &final_path, unlink(&final_path), entry.size_bytes);
+            record(
+                &mut outcome.sessions,
+                &final_path,
+                unlink(&final_path),
+                entry.size_bytes,
+            );
         }
         let scratch = PathBuf::from(&paths.scratch_dir);
-        record(&mut outcome.sessions, &scratch, remove_scratch_dir(&scratch), entry.size_bytes);
+        record(
+            &mut outcome.sessions,
+            &scratch,
+            remove_scratch_dir(&scratch),
+            entry.size_bytes,
+        );
     }
 
     outcome.clips.bytes_after = store.total_bytes()?;
@@ -627,7 +643,10 @@ mod tests {
     const DAY: i64 = MS_PER_DAY;
 
     fn rules(max_total_bytes: u64, max_age_days: u32) -> RetentionRules {
-        RetentionRules { max_total_bytes, max_age_days }
+        RetentionRules {
+            max_total_bytes,
+            max_age_days,
+        }
     }
 
     /// A policy whose clips and sessions halves are set independently, which every independence test varies.
@@ -720,7 +739,10 @@ mod tests {
             RetentionDeletion {
                 subject: Subject::Clip(1),
                 size_bytes: 100,
-                reasons: DeletionReasons { too_old: true, over_cap: true },
+                reasons: DeletionReasons {
+                    too_old: true,
+                    over_cap: true
+                },
             },
             "the reasons travel with the deletion, both of them"
         );
@@ -735,12 +757,18 @@ mod tests {
         // A sessions cap of zero must not evict a clip, however small the clips library.
         let plan = plan_retention(&clips, &sessions, &policy(generous(), rules(0, 3_650)), now);
         assert_eq!(plan.sessions.ids(), vec![7]);
-        assert!(plan.clips.deletions.is_empty(), "a session cap is not a clip cap");
+        assert!(
+            plan.clips.deletions.is_empty(),
+            "a session cap is not a clip cap"
+        );
 
         // And a clips cap of zero must not evict a session.
         let plan = plan_retention(&clips, &sessions, &policy(rules(0, 3_650), generous()), now);
         assert_eq!(plan.clips.ids(), vec![1]);
-        assert!(plan.sessions.deletions.is_empty(), "a clip cap is not a session cap");
+        assert!(
+            plan.sessions.deletions.is_empty(),
+            "a clip cap is not a session cap"
+        );
     }
 
     #[test]
@@ -779,13 +807,23 @@ mod tests {
             session(2, now - 6 * DAY, 100, false),
         ];
 
-        let plan =
-            plan_retention(&[], &sessions, &policy(generous(), rules(150, 3_650)), now);
+        let plan = plan_retention(&[], &sessions, &policy(generous(), rules(150, 3_650)), now);
 
-        assert_eq!(plan.sessions.ids(), vec![1, 2], "oldest started first, until under the cap");
-        assert_eq!(plan.sessions.bytes_after, 100, "100 bytes is at the cap, not over it");
+        assert_eq!(
+            plan.sessions.ids(),
+            vec![1, 2],
+            "oldest started first, until under the cap"
+        );
+        assert_eq!(
+            plan.sessions.bytes_after, 100,
+            "100 bytes is at the cap, not over it"
+        );
         assert!(plan.cap_met());
-        assert!(plan.sessions.deletions.iter().all(|d| d.reasons.over_cap && !d.reasons.too_old));
+        assert!(plan
+            .sessions
+            .deletions
+            .iter()
+            .all(|d| d.reasons.over_cap && !d.reasons.too_old));
     }
 
     #[test]
@@ -802,9 +840,15 @@ mod tests {
         assert_eq!(plan.sessions.ids(), vec![1, 2], "one entry per session");
         assert_eq!(
             plan.sessions.deletions[0].reasons,
-            DeletionReasons { too_old: true, over_cap: true }
+            DeletionReasons {
+                too_old: true,
+                over_cap: true
+            }
         );
-        assert_eq!(plan.sessions.bytes_after, 5, "bytes counted once, however selected");
+        assert_eq!(
+            plan.sessions.bytes_after, 5,
+            "bytes counted once, however selected"
+        );
     }
 
     #[test]
@@ -830,10 +874,17 @@ mod tests {
             Vec::<i64>::new(),
             "no clip is evicted for a cap it cannot meet"
         );
-        assert_eq!(plan.sessions.ids(), Vec::<i64>::new(), "and no session either");
+        assert_eq!(
+            plan.sessions.ids(),
+            Vec::<i64>::new(),
+            "and no session either"
+        );
         assert_eq!(plan.clips.over_cap_by_bytes, 9_990);
         assert_eq!(plan.sessions.over_cap_by_bytes, 9_990);
-        assert!(!plan.cap_met(), "and both shortfalls are reported rather than paid for");
+        assert!(
+            !plan.cap_met(),
+            "and both shortfalls are reported rather than paid for"
+        );
         assert_eq!(plan.clips.bytes_after, 10_100);
         assert_eq!(plan.sessions.bytes_after, 10_100);
     }
@@ -842,9 +893,9 @@ mod tests {
     fn a_session_that_is_still_recording_is_immune_to_both_rules() {
         let now = 1_000 * DAY;
         let sessions = vec![
-            running(1, now - 90 * DAY, 100),    // ancient, huge, and recording
+            running(1, now - 90 * DAY, 100), // ancient, huge, and recording
             session(2, now - 90 * DAY, 10_000, true), // an ancient favourite
-            session(3, now - DAY, 100, false),  // recent and small: nothing wants it
+            session(3, now - DAY, 100, false), // recent and small: nothing wants it
         ];
 
         // Every rule violated as hard as it can be: 1 day of age, 10 bytes of cap.
@@ -867,17 +918,24 @@ mod tests {
     fn an_unsatisfiable_session_cap_does_not_suspend_the_age_rule() {
         let now = 1_000 * DAY;
         let sessions = vec![
-            running(1, now - 90 * DAY, 200),           // recording: exempt
-            session(2, now - 30 * DAY, 400, false),    // ancient, finished: the age rule's job
+            running(1, now - 90 * DAY, 200),        // recording: exempt
+            session(2, now - 30 * DAY, 400, false), // ancient, finished: the age rule's job
             session(3, now - DAY, 100, false),
         ];
 
         let plan = plan_retention(&[], &sessions, &policy(generous(), rules(10, 7)), now);
 
-        assert_eq!(plan.sessions.ids(), vec![2], "the age rule is independent of the cap");
+        assert_eq!(
+            plan.sessions.ids(),
+            vec![2],
+            "the age rule is independent of the cap"
+        );
         assert!(plan.sessions.deletions[0].reasons.too_old);
         assert!(!plan.cap_met());
-        assert_eq!(plan.sessions.over_cap_by_bytes, 190, "200 of running session against 10");
+        assert_eq!(
+            plan.sessions.over_cap_by_bytes, 190,
+            "200 of running session against 10"
+        );
         assert_eq!(plan.sessions.bytes_after, 300);
     }
 
@@ -885,14 +943,20 @@ mod tests {
     fn a_negative_size_counts_as_zero_rather_than_underflowing_the_total() {
         let now = 1_000 * DAY;
         let sessions = vec![
-            Session { size_bytes: -5, ..session(1, now - 40 * DAY, 0, false) },
+            Session {
+                size_bytes: -5,
+                ..session(1, now - 40 * DAY, 0, false)
+            },
             session(2, now - 39 * DAY, 100, false),
         ];
 
         let plan = plan_retention(&[], &sessions, &policy(generous(), rules(0, 3_650)), now);
 
         assert_eq!(plan.sessions.ids(), vec![1, 2]);
-        assert_eq!(plan.sessions.bytes_after, 0, "a corrupt size never subtracts from the total");
+        assert_eq!(
+            plan.sessions.bytes_after, 0,
+            "a corrupt size never subtracts from the total"
+        );
     }
 
     #[test]
@@ -923,14 +987,19 @@ mod tests {
         let session_id = store
             .start_session(None, SESSION_MODE_BUFFER, 0, "/scratch/keep", 0)
             .expect("open a session");
-        store.end_session(session_id, 1, None, 0, 0).expect("end it");
+        store
+            .end_session(session_id, 1, None, 0, 0)
+            .expect("end it");
 
         let plan = RetentionPlan {
             clips: ClassPlan {
                 deletions: vec![RetentionDeletion {
                     subject: Subject::Session(session_id),
                     size_bytes: 0,
-                    reasons: DeletionReasons { too_old: true, over_cap: false },
+                    reasons: DeletionReasons {
+                        too_old: true,
+                        over_cap: false,
+                    },
                 }],
                 cap_bytes: 0,
                 bytes_after: 0,
@@ -942,8 +1011,14 @@ mod tests {
         let outcome = execute_retention(&store, &plan).expect("the pass completes");
 
         assert_eq!(outcome.clips.deleted, 0);
-        assert_eq!(outcome.clips.failed, 1, "the mis-classed entry is counted, not obeyed");
-        assert!(store.get_session(session_id).expect("read").is_some(), "the session survives");
+        assert_eq!(
+            outcome.clips.failed, 1,
+            "the mis-classed entry is counted, not obeyed"
+        );
+        assert!(
+            store.get_session(session_id).expect("read").is_some(),
+            "the session survives"
+        );
     }
 
     #[test]
@@ -952,7 +1027,13 @@ mod tests {
         // session started) must still not be a way to lose a recording.
         let store = store();
         let running_id = store
-            .start_session(Some("League of Legends"), SESSION_MODE_SESSION, 1_000, "/scratch/live", 0)
+            .start_session(
+                Some("League of Legends"),
+                SESSION_MODE_SESSION,
+                1_000,
+                "/scratch/live",
+                0,
+            )
             .expect("open a session");
 
         let plan = RetentionPlan {
@@ -961,7 +1042,10 @@ mod tests {
                 deletions: vec![RetentionDeletion {
                     subject: Subject::Session(running_id),
                     size_bytes: 0,
-                    reasons: DeletionReasons { too_old: true, over_cap: false },
+                    reasons: DeletionReasons {
+                        too_old: true,
+                        over_cap: false,
+                    },
                 }],
                 cap_bytes: u64::MAX,
                 bytes_after: 0,
@@ -972,8 +1056,14 @@ mod tests {
         let outcome = execute_retention(&store, &plan).expect("the pass completes");
 
         assert_eq!(outcome.sessions.deleted, 0);
-        assert_eq!(outcome.sessions.failed, 1, "the refusal is reported, not swallowed");
-        assert_eq!(outcome.sessions.bytes_reclaimed, 0, "and nothing was removed");
+        assert_eq!(
+            outcome.sessions.failed, 1,
+            "the refusal is reported, not swallowed"
+        );
+        assert_eq!(
+            outcome.sessions.bytes_reclaimed, 0,
+            "and nothing was removed"
+        );
         assert!(
             store.get_session(running_id).expect("read").is_some(),
             "the recording's row is still there"
@@ -994,19 +1084,28 @@ mod tests {
                 deletions: vec![RetentionDeletion {
                     subject: Subject::Session(id),
                     size_bytes: 0,
-                    reasons: DeletionReasons { too_old: true, over_cap: false },
+                    reasons: DeletionReasons {
+                        too_old: true,
+                        over_cap: false,
+                    },
                 }],
                 cap_bytes: u64::MAX,
                 bytes_after: 0,
                 over_cap_by_bytes: 0,
             },
         };
-        assert!(store.delete_session_returning_paths(id).expect("delete it").is_some());
+        assert!(store
+            .delete_session_returning_paths(id)
+            .expect("delete it")
+            .is_some());
 
         let outcome = execute_retention(&store, &plan).expect("the pass completes");
 
         assert_eq!(outcome.sessions.deleted, 0);
-        assert_eq!(outcome.sessions.failed, 0, "a row already gone is not a failure");
+        assert_eq!(
+            outcome.sessions.failed, 0,
+            "a row already gone is not a failure"
+        );
         assert!(outcome.sessions.already_missing.is_empty());
         assert!(outcome.sessions.orphaned.is_empty());
         assert!(outcome.sessions.refused.is_empty());
@@ -1019,10 +1118,7 @@ mod tests {
         // These paths make `remove_dir_all` a catastrophe; the guard is why this module can hold a path from a TEXT column at all.
         for path in ["", ".", "..", "/"] {
             assert!(
-                matches!(
-                    remove_scratch_dir(Path::new(path)),
-                    Removal::Refused(_)
-                ),
+                matches!(remove_scratch_dir(Path::new(path)), Removal::Refused(_)),
                 "{path:?} must be refused, never recursed into"
             );
         }
@@ -1032,12 +1128,25 @@ mod tests {
     fn relative_and_dotdot_paths_are_refused_for_files_and_directories_alike() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let dotdot = dir.path().join("sub").join("..").join("x");
-        for path in [Path::new("clips/a.mp4"), Path::new("a.mp4"), dotdot.as_path()] {
-            assert!(matches!(unlink(path), Removal::Refused(_)), "{path:?} (file)");
-            assert!(matches!(remove_scratch_dir(path), Removal::Refused(_)), "{path:?} (dir)");
+        for path in [
+            Path::new("clips/a.mp4"),
+            Path::new("a.mp4"),
+            dotdot.as_path(),
+        ] {
+            assert!(
+                matches!(unlink(path), Removal::Refused(_)),
+                "{path:?} (file)"
+            );
+            assert!(
+                matches!(remove_scratch_dir(path), Removal::Refused(_)),
+                "{path:?} (dir)"
+            );
         }
         // An absolute, clean path that is merely absent is still just Missing.
-        assert!(matches!(unlink(&dir.path().join("gone.mp4")), Removal::Missing));
+        assert!(matches!(
+            unlink(&dir.path().join("gone.mp4")),
+            Removal::Missing
+        ));
     }
 
     #[test]
@@ -1069,7 +1178,10 @@ mod tests {
             Removal::Refused(reason) => assert!(reason.contains("symlink"), "{reason}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
-        assert!(elsewhere.join("keep.bin").is_file(), "the tree it pointed at is untouched");
+        assert!(
+            elsewhere.join("keep.bin").is_file(),
+            "the tree it pointed at is untouched"
+        );
     }
 
     #[test]
@@ -1088,10 +1200,17 @@ mod tests {
         std::fs::write(scratch.join("nested").join("seg-2.mkv"), vec![0u8; 300]).expect("segment");
 
         // What is really on disk, read back file by file: the measurement is checked against the files written, not a number the code produced.
-        let seg_1 = std::fs::metadata(scratch.join("seg-1.mkv")).expect("stat").len();
-        let seg_2 =
-            std::fs::metadata(scratch.join("nested").join("seg-2.mkv")).expect("stat").len();
-        assert_eq!(seg_1 + seg_2, 700, "the fixture wrote 700 bytes into the tree");
+        let seg_1 = std::fs::metadata(scratch.join("seg-1.mkv"))
+            .expect("stat")
+            .len();
+        let seg_2 = std::fs::metadata(scratch.join("nested").join("seg-2.mkv"))
+            .expect("stat")
+            .len();
+        assert_eq!(
+            seg_1 + seg_2,
+            700,
+            "the fixture wrote 700 bytes into the tree"
+        );
 
         match remove_scratch_dir(&scratch) {
             Removal::Removed(bytes) => {
@@ -1111,7 +1230,10 @@ mod tests {
         let file = dir.path().join("clip.mp4");
         std::fs::write(&file, vec![0u8; 123]).expect("write the clip");
         let removed = unlink(&file);
-        assert!(matches!(removed, Removal::Removed(123)), "the bytes it really held: {removed:?}");
+        assert!(
+            matches!(removed, Removal::Removed(123)),
+            "the bytes it really held: {removed:?}"
+        );
         assert!(!file.exists());
 
         // A directory where a file was expected: `remove_file` refuses it, and the caller reports an orphan rather than recursively deleting something it never indexed.
@@ -1119,6 +1241,9 @@ mod tests {
         std::fs::create_dir_all(&as_dir).expect("create the directory");
         std::fs::write(as_dir.join("inside.bin"), b"still here").expect("write into it");
         assert!(matches!(unlink(&as_dir), Removal::Failed(_)));
-        assert!(as_dir.join("inside.bin").is_file(), "nothing was reached inside it");
+        assert!(
+            as_dir.join("inside.bin").is_file(),
+            "nothing was reached inside it"
+        );
     }
 }

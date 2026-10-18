@@ -219,8 +219,7 @@ fn exe(stem: &str) -> String {
 /// Directory containing `ffmpeg` on `PATH`, if any.
 fn which_dir(binary: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .find(|dir| dir.join(exe(binary)).is_file())
+    std::env::split_paths(&path).find(|dir| dir.join(exe(binary)).is_file())
 }
 
 /// Run a child with stdin closed and a hard timeout, capturing stdout/stderr.
@@ -295,8 +294,14 @@ mod tests {
         // executable is called. So assert the parent and the stem, not one literal path: on Windows
         // the resolved path is `/custom/dir\ffmpeg.exe`, and the `.exe` is a legitimate difference
         // (measured on the Windows test machine).
-        assert_eq!(found.ffmpeg.parent(), Some(std::path::Path::new("/custom/dir")));
-        assert_eq!(found.ffmpeg.file_stem().and_then(|s| s.to_str()), Some("ffmpeg"));
+        assert_eq!(
+            found.ffmpeg.parent(),
+            Some(std::path::Path::new("/custom/dir"))
+        );
+        assert_eq!(
+            found.ffmpeg.file_stem().and_then(|s| s.to_str()),
+            Some("ffmpeg")
+        );
         assert_eq!(
             found.ffmpeg.extension().and_then(|s| s.to_str()),
             if cfg!(windows) { Some("exe") } else { None },
@@ -307,14 +312,20 @@ mod tests {
             found.ffmpeg.parent(),
             "and ffprobe resolves beside it, not from PATH"
         );
-        assert_eq!(found.ffprobe.file_stem().and_then(|s| s.to_str()), Some("ffprobe"));
+        assert_eq!(
+            found.ffprobe.file_stem().and_then(|s| s.to_str()),
+            Some("ffprobe")
+        );
     }
 
     #[test]
     fn the_error_reports_every_searched_location() {
         let err = FfmpegBinaries::discover_from(None, &[]).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("sidecar"), "error must name the sidecar dir: {msg}");
+        assert!(
+            msg.contains("sidecar"),
+            "error must name the sidecar dir: {msg}"
+        );
         assert!(msg.contains("PATH"), "error must name PATH: {msg}");
         assert!(
             msg.contains("binaries"),
@@ -328,7 +339,10 @@ mod tests {
 
         let err = FfmpegBinaries::discover_from(
             None,
-            &[PathBuf::from("/nowhere/next-to-exe"), PathBuf::from("/nowhere/checkout")],
+            &[
+                PathBuf::from("/nowhere/next-to-exe"),
+                PathBuf::from("/nowhere/checkout"),
+            ],
         )
         .expect_err("neither directory has the binaries");
         let msg = err.to_string();
@@ -440,7 +454,12 @@ mod tests {
         write_sidecar_pair(&checkout);
         assert_eq!(
             search_candidates(&exe_dir, Some(PathBuf::from("/usr/bin"))),
-            vec![exe_dir.join(SIDECAR_DIR_NAME), resources, checkout, PathBuf::from("/usr/bin")],
+            vec![
+                exe_dir.join(SIDECAR_DIR_NAME),
+                resources,
+                checkout,
+                PathBuf::from("/usr/bin")
+            ],
             "order is: next to the executable, then the bundle's resources, then the \
              checkout, then PATH"
         );
@@ -457,9 +476,11 @@ mod tests {
         let on_path = tmp.path().join("on-path");
         write_sidecar_pair(&on_path);
 
-        let found =
-            FfmpegBinaries::discover_from(None, &search_candidates(&exe_dir, Some(on_path.clone())))
-                .expect("one of the four sources has the pair");
+        let found = FfmpegBinaries::discover_from(
+            None,
+            &search_candidates(&exe_dir, Some(on_path.clone())),
+        )
+        .expect("one of the four sources has the pair");
 
         assert_eq!(
             found.ffmpeg,
@@ -478,9 +499,11 @@ mod tests {
         let on_path = tmp.path().join("on-path");
         write_sidecar_pair(&on_path);
 
-        let found =
-            FfmpegBinaries::discover_from(None, &search_candidates(&exe_dir, Some(on_path.clone())))
-                .expect("the checkout pair is found");
+        let found = FfmpegBinaries::discover_from(
+            None,
+            &search_candidates(&exe_dir, Some(on_path.clone())),
+        )
+        .expect("the checkout pair is found");
 
         assert_eq!(found.ffmpeg, checkout.join(exe("ffmpeg")));
         assert_ne!(found.ffmpeg, on_path.join(exe("ffmpeg")));
@@ -550,7 +573,10 @@ mod tests {
 
         assert_eq!(
             found.ffmpeg,
-            app.join("Contents").join("Resources").join(SIDECAR_DIR_NAME).join(exe("ffmpeg"))
+            app.join("Contents")
+                .join("Resources")
+                .join(SIDECAR_DIR_NAME)
+                .join(exe("ffmpeg"))
         );
         assert!(found.ffprobe.is_file(), "{:?} exists too", found.ffprobe);
     }

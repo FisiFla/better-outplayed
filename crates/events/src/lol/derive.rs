@@ -102,7 +102,11 @@ impl Tracker {
                     self.in_game = false;
                     self.seen.clear();
                     let result = entry.result.clone();
-                    return vec![end_event(snapshot.game_time(), snapshot.scoreboard(), result)];
+                    return vec![end_event(
+                        snapshot.game_time(),
+                        snapshot.scoreboard(),
+                        result,
+                    )];
                 }
                 name => {
                     self.seen.insert(key);
@@ -126,9 +130,7 @@ impl Tracker {
         /// Seconds of backwards movement that cannot be jitter within one game.
         const BACKWARDS_S: f64 = 5.0;
         let now = snapshot.game_time();
-        now != 0.0
-            && self.last_game_time != 0.0
-            && now < self.last_game_time - BACKWARDS_S
+        now != 0.0 && self.last_game_time != 0.0 && now < self.last_game_time - BACKWARDS_S
     }
 
     /// Whether a game is being played, as of the last observation.
@@ -166,7 +168,11 @@ impl Tracker {
         self.seen.clear();
         self.adopted_on_attach = 0;
         self.attached_map.clear();
-        let event = end_event(self.last_game_time, std::mem::take(&mut self.last_scoreboard), None);
+        let event = end_event(
+            self.last_game_time,
+            std::mem::take(&mut self.last_scoreboard),
+            None,
+        );
         self.last_game_time = 0.0;
         vec![event]
     }
@@ -242,10 +248,18 @@ fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind
                 // Nothing to compare against: the kill is real, so report it with both names in the payload.
                 return Some(EventKind::Kill);
             }
-            if entry.killer_name.as_deref().is_some_and(|k| names.contains(&k)) {
+            if entry
+                .killer_name
+                .as_deref()
+                .is_some_and(|k| names.contains(&k))
+            {
                 return Some(EventKind::Kill);
             }
-            if entry.victim_name.as_deref().is_some_and(|v| names.contains(&v)) {
+            if entry
+                .victim_name
+                .as_deref()
+                .is_some_and(|v| names.contains(&v))
+            {
                 return Some(EventKind::Death);
             }
             if entry.assisters.iter().any(|a| names.contains(&a.as_str())) {
@@ -328,7 +342,11 @@ fn stream_event(
     kind: EventKind,
     snapshot: &GameSnapshot,
 ) -> GameEvent {
-    GameEvent::new(Source::Lol, kind, event_payload("lol", name, entry, snapshot.game_time()))
+    GameEvent::new(
+        Source::Lol,
+        kind,
+        event_payload("lol", name, entry, snapshot.game_time()),
+    )
 }
 
 /// The `GameStart` payload: which game, and how much of it was already over.
@@ -338,11 +356,11 @@ fn start_event(snapshot: &GameSnapshot, adopted: u64) -> GameEvent {
     map.insert("event".into(), json!("GameStart"));
     map.insert("game_mode".into(), json!(snapshot.game_data.game_mode));
     map.insert("map".into(), json!(snapshot.game_data.map_name));
-    map.insert("game_time_s".into(), json!(round_tenth(snapshot.game_time())));
     map.insert(
-        "adopted_in_progress_events".into(),
-        json!(adopted),
+        "game_time_s".into(),
+        json!(round_tenth(snapshot.game_time())),
     );
+    map.insert("adopted_in_progress_events".into(), json!(adopted));
     GameEvent::new(Source::Lol, EventKind::GameStart, Value::Object(map))
 }
 
@@ -353,7 +371,11 @@ fn start_event(snapshot: &GameSnapshot, adopted: u64) -> GameEvent {
 /// its own `GameEnd` line) ride along so the match keeps its end-of-game scoreboard; `result` is
 /// `null` rather than guessed when the endpoint merely went quiet.
 fn end_event(last_game_time: f64, scoreboard: Value, result: Option<String>) -> GameEvent {
-    let scoreboard = if scoreboard.is_null() { json!([]) } else { scoreboard };
+    let scoreboard = if scoreboard.is_null() {
+        json!([])
+    } else {
+        scoreboard
+    };
     GameEvent::new(
         Source::Lol,
         EventKind::GameEnd,
@@ -408,12 +430,23 @@ mod tests {
         let mut tracker = Tracker::default();
         let first = tracker.observe(snapshot(IN_PROGRESS).as_ref());
 
-        assert_eq!(kinds(&first), vec![EventKind::GameStart], "one event, not seven");
-        assert_eq!(tracker.adopted_on_attach(), 6, "the whole history is adopted as seen");
+        assert_eq!(
+            kinds(&first),
+            vec![EventKind::GameStart],
+            "one event, not seven"
+        );
+        assert_eq!(
+            tracker.adopted_on_attach(),
+            6,
+            "the whole history is adopted as seen"
+        );
         assert!(tracker.in_game());
         assert_eq!(tracker.attached_map(), "Map11");
         let payload = first[0].payload.as_deref().unwrap();
-        assert!(payload.contains("\"adopted_in_progress_events\":6"), "got {payload}");
+        assert!(
+            payload.contains("\"adopted_in_progress_events\":6"),
+            "got {payload}"
+        );
         assert!(payload.contains("\"map\":\"Map11\""), "got {payload}");
     }
 
@@ -435,20 +468,22 @@ mod tests {
         let mut tracker = Tracker::default();
 
         // 1. A game with no events yet: attach.
-        let start = crate::lol::payload::parse(
-            br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#,
-        )
-        .unwrap();
-        assert_eq!(kinds(&tracker.observe(start.as_ref())), vec![EventKind::GameStart]);
+        let start =
+            crate::lol::payload::parse(br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#)
+                .unwrap();
+        assert_eq!(
+            kinds(&tracker.observe(start.as_ref())),
+            vec![EventKind::GameStart]
+        );
 
         // 2. The full history arrives in one document.
         let full = tracker.observe(snapshot(IN_PROGRESS).as_ref());
         assert_eq!(
             kinds(&full),
             vec![
-                EventKind::Kill,       // EventID 2, the player's kill
-                EventKind::Death,      // EventID 3, the player died
-                EventKind::Dragon,     // EventID 5, a dragon
+                EventKind::Kill,   // EventID 2, the player's kill
+                EventKind::Death,  // EventID 3, the player died
+                EventKind::Dragon, // EventID 5, a dragon
             ],
             "the player's kills/deaths and the objectives, in the document's order — and \
              nothing for EventID 4, which involved nobody the document names as the player"
@@ -460,7 +495,10 @@ mod tests {
 
         // 3. MinionsSpawning (id 1) and GameStart (id 0) are adopted without a clip.
         let payload = payload_of(&full, EventKind::Kill);
-        assert!(payload.contains("\"killer\":\"TestPlayer#EUW\""), "got {payload}");
+        assert!(
+            payload.contains("\"killer\":\"TestPlayer#EUW\""),
+            "got {payload}"
+        );
         assert!(payload.contains("\"victim\":\"ZedMain\""), "got {payload}");
 
         // 4. The same document again: nothing.
@@ -498,13 +536,23 @@ mod tests {
         let ended = tracker.observe(None);
         assert_eq!(kinds(&ended), vec![EventKind::GameEnd]);
         assert!(!tracker.in_game());
-        assert_eq!(tracker.attached_map(), "", "the game is over; there is no map");
+        assert_eq!(
+            tracker.attached_map(),
+            "",
+            "the game is over; there is no map"
+        );
         let payload = ended[0].payload.as_deref().unwrap();
-        assert!(payload.contains("\"last_game_time_s\":730.2"), "got {payload}");
+        assert!(
+            payload.contains("\"last_game_time_s\":730.2"),
+            "got {payload}"
+        );
 
         // And every later no-game poll is silent.
         for _ in 0..3 {
-            assert!(tracker.observe(None).is_empty(), "the falling edge fires once");
+            assert!(
+                tracker.observe(None).is_empty(),
+                "the falling edge fires once"
+            );
         }
     }
 
@@ -515,8 +563,14 @@ mod tests {
 
         // `null` is a documented way for the endpoint to say "no game"; an empty object is
         // a client that is up with nothing to report. Both end the game, once.
-        assert_eq!(kinds(&tracker.observe(snapshot(NONE).as_ref())), vec![EventKind::GameEnd]);
-        assert!(tracker.observe(snapshot(EMPTY).as_ref()).is_empty(), "already ended");
+        assert_eq!(
+            kinds(&tracker.observe(snapshot(NONE).as_ref())),
+            vec![EventKind::GameEnd]
+        );
+        assert!(
+            tracker.observe(snapshot(EMPTY).as_ref()).is_empty(),
+            "already ended"
+        );
     }
 
     #[test]
@@ -544,11 +598,9 @@ mod tests {
         let mut tracker = Tracker::default();
         // Attach on a game that has happened to report no events yet …
         tracker.observe(
-            crate::lol::payload::parse(
-                br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#,
-            )
-            .unwrap()
-            .as_ref(),
+            crate::lol::payload::parse(br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#)
+                .unwrap()
+                .as_ref(),
         );
         // … and then the document that names no player but does report a kill.
         let events = tracker.observe(snapshot(NO_IDENTITY).as_ref());
@@ -578,20 +630,30 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             );
-            let events = tracker.observe(crate::lol::payload::parse(body.as_bytes()).unwrap().as_ref());
+            let events = tracker.observe(
+                crate::lol::payload::parse(body.as_bytes())
+                    .unwrap()
+                    .as_ref(),
+            );
             kinds(&events)
         };
 
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"TestPlayer#EUW","VictimName":"ZedMain"}"#),
+            with_player(
+                r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"TestPlayer#EUW","VictimName":"ZedMain"}"#
+            ),
             vec![EventKind::Kill]
         );
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"TestPlayer#EUW"}"#),
+            with_player(
+                r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"TestPlayer#EUW"}"#
+            ),
             vec![EventKind::Death]
         );
         assert_eq!(
-            with_player(r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"EnemyTop","Assisters":["TestPlayer#EUW"]}"#),
+            with_player(
+                r#"{"EventID":2,"EventName":"ChampionKill","EventTime":100.0,"KillerName":"ZedMain","VictimName":"EnemyTop","Assisters":["TestPlayer#EUW"]}"#
+            ),
             vec![EventKind::Assist]
         );
         assert!(
@@ -629,12 +691,28 @@ mod tests {
             ("SRU_RiftHerald", EventKind::Herald),
             ("Horde", EventKind::Objective),
         ] {
-            let entry = StreamEvent { monster_type: Some(monster.into()), ..StreamEvent::default() };
-            assert_eq!(classify("EpicMonsterKill", &entry, &["me"]), Some(kind), "{monster}");
+            let entry = StreamEvent {
+                monster_type: Some(monster.into()),
+                ..StreamEvent::default()
+            };
+            assert_eq!(
+                classify("EpicMonsterKill", &entry, &["me"]),
+                Some(kind),
+                "{monster}"
+            );
         }
         // Pacing and lifecycle events never come out of the table.
-        for name in ["MinionsSpawning", "GameStart", "GameEnd", "SomethingFromAPatch"] {
-            assert_eq!(classify(name, &StreamEvent::default(), &["me"]), None, "{name}");
+        for name in [
+            "MinionsSpawning",
+            "GameStart",
+            "GameEnd",
+            "SomethingFromAPatch",
+        ] {
+            assert_eq!(
+                classify(name, &StreamEvent::default(), &["me"]),
+                None,
+                "{name}"
+            );
         }
     }
 
@@ -656,8 +734,14 @@ mod tests {
             .unwrap()
             .as_ref(),
         );
-        assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::Dragon]);
-        assert!(tracker.observe(document.as_ref()).is_empty(), "the same line again");
+        assert_eq!(
+            kinds(&tracker.observe(document.as_ref())),
+            vec![EventKind::Dragon]
+        );
+        assert!(
+            tracker.observe(document.as_ref()).is_empty(),
+            "the same line again"
+        );
 
         // A different id-less event is emitted: the key is content, not "any id-less event".
         let other = crate::lol::payload::parse(
@@ -667,7 +751,10 @@ mod tests {
                                      {"EventName":"BaronKill","EventTime":108.9,"MonsterType":"BARON_NASHOR"}]}}"#,
         )
         .unwrap();
-        assert_eq!(kinds(&tracker.observe(other.as_ref())), vec![EventKind::Baron]);
+        assert_eq!(
+            kinds(&tracker.observe(other.as_ref())),
+            vec![EventKind::Baron]
+        );
     }
 
     #[test]
@@ -681,9 +768,15 @@ mod tests {
 
         let mut tracker = Tracker::default();
         tracker.observe(snapshot(IN_PROGRESS).as_ref());
-        assert_eq!(kinds(&tracker.observe(document.as_ref())), vec![EventKind::GameEnd]);
+        assert_eq!(
+            kinds(&tracker.observe(document.as_ref())),
+            vec![EventKind::GameEnd]
+        );
         assert!(!tracker.in_game());
-        assert!(tracker.observe(None).is_empty(), "the endpoint going quiet is not a second end");
+        assert!(
+            tracker.observe(None).is_empty(),
+            "the endpoint going quiet is not a second end"
+        );
     }
 
     #[test]
@@ -700,7 +793,10 @@ mod tests {
         assert_eq!(rows[0]["cs"], 142);
         assert_eq!(rows[0]["is_local"], true);
         assert_eq!(rows[1]["is_local"], false);
-        assert!(value["result"].is_null(), "no result is guessed from an absence");
+        assert!(
+            value["result"].is_null(),
+            "no result is guessed from an absence"
+        );
     }
 
     #[test]

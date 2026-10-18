@@ -112,6 +112,9 @@ pub struct StorageConfigView {
 
 impl From<&crate::config::StorageConfig> for StorageConfigView {
     fn from(cfg: &crate::config::StorageConfig) -> Self {
-        Self { max_total_bytes: cfg.max_total_bytes, max_age_days: cfg.max_age_days }
+        Self {
+            max_total_bytes: cfg.max_total_bytes,
+            max_age_days: cfg.max_age_days,
+        }
     }
 }

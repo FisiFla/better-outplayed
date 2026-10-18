@@ -81,7 +81,11 @@ pub fn split_matches(events: &[SessionEvent], media_length_ms: i64) -> Vec<Match
                 if let Some(o) = open.take() {
                     prev_end = close(&mut out, o, e.offset_ms, false, None);
                 }
-                open = Some(Open { start_ms: e.offset_ms, inferred: false, payload: e.payload.clone() });
+                open = Some(Open {
+                    start_ms: e.offset_ms,
+                    inferred: false,
+                    payload: e.payload.clone(),
+                });
             }
             GAME_END => {
                 let o = open.take().unwrap_or(Open {
@@ -96,7 +100,11 @@ pub fn split_matches(events: &[SessionEvent], media_length_ms: i64) -> Vec<Match
     }
     if let Some(o) = open.take() {
         let last = events.last().map_or(o.start_ms, |e| e.offset_ms);
-        let end = if media_length_ms > o.start_ms { media_length_ms } else { last };
+        let end = if media_length_ms > o.start_ms {
+            media_length_ms
+        } else {
+            last
+        };
         close(&mut out, o, end, false, None);
     }
 
@@ -115,7 +123,13 @@ mod tests {
     use super::*;
 
     fn ev(id: i64, kind: &str, at: i64) -> SessionEvent {
-        SessionEvent { id, kind: kind.into(), offset_ms: at, payload: None, clip_id: None }
+        SessionEvent {
+            id,
+            kind: kind.into(),
+            offset_ms: at,
+            payload: None,
+            clip_id: None,
+        }
     }
 
     #[test]
@@ -135,7 +149,15 @@ mod tests {
         ];
         let m = split_matches(&events, 20_000);
         assert_eq!(m.len(), 1);
-        assert_eq!((m[0].start_ms, m[0].end_ms, m[0].complete, m[0].start_inferred), (1_000, 9_000, true, false));
+        assert_eq!(
+            (
+                m[0].start_ms,
+                m[0].end_ms,
+                m[0].complete,
+                m[0].start_inferred
+            ),
+            (1_000, 9_000, true, false)
+        );
         let ids: Vec<_> = m[0].events.iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![2, 3, 4]);
     }
@@ -149,12 +171,21 @@ mod tests {
             ev(4, GAME_END, 12_000),
         ];
         let m = split_matches(&events, 12_000);
-        assert_eq!(m.iter().map(|s| (s.index, s.start_ms, s.end_ms)).collect::<Vec<_>>(), vec![(0, 0, 5_000), (1, 8_000, 12_000)]);
+        assert_eq!(
+            m.iter()
+                .map(|s| (s.index, s.start_ms, s.end_ms))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 5_000), (1, 8_000, 12_000)]
+        );
     }
 
     #[test]
     fn a_start_with_no_end_closes_at_the_next_start_and_is_incomplete() {
-        let events = [ev(1, GAME_START, 1_000), ev(2, GAME_START, 6_000), ev(3, GAME_END, 9_000)];
+        let events = [
+            ev(1, GAME_START, 1_000),
+            ev(2, GAME_START, 6_000),
+            ev(3, GAME_END, 9_000),
+        ];
         let m = split_matches(&events, 0);
         assert_eq!(m.len(), 2);
         assert_eq!((m[0].end_ms, m[0].complete), (6_000, false));
@@ -176,9 +207,16 @@ mod tests {
         let m = split_matches(&[ev(1, GAME_END, 4_000)], 10_000);
         assert_eq!((m[0].start_ms, m[0].start_inferred), (0, true));
 
-        let events = [ev(1, GAME_START, 1_000), ev(2, GAME_END, 4_000), ev(3, GAME_END, 7_000)];
+        let events = [
+            ev(1, GAME_START, 1_000),
+            ev(2, GAME_END, 4_000),
+            ev(3, GAME_END, 7_000),
+        ];
         let m = split_matches(&events, 10_000);
-        assert_eq!((m[1].start_ms, m[1].end_ms, m[1].start_inferred), (4_000, 7_000, true));
+        assert_eq!(
+            (m[1].start_ms, m[1].end_ms, m[1].start_inferred),
+            (4_000, 7_000, true)
+        );
     }
 
     #[test]

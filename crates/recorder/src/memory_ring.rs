@@ -273,7 +273,10 @@ fn read_until_eof(
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 // The child died or the pipe broke. Not worth failing the recording over, but the buffer is dead and a clip request must say so.
-                record_failure(&failure, format!("reading the encoder's stream failed: {err}"));
+                record_failure(
+                    &failure,
+                    format!("reading the encoder's stream failed: {err}"),
+                );
                 return;
             }
         };

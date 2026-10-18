@@ -29,16 +29,31 @@ fn ring_of_stub_capture(seconds: u64) -> (MemoryRingBuffer, tempfile::TempDir) {
     let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
     let dir = tempfile::tempdir().expect("a temp dir");
     let out = std::process::Command::new(&bin.ffmpeg)
-        .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30"])
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=30",
+        ])
         .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
         .args(["-t", &seconds.to_string()])
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "30"])
         .args(["-force_key_frames", "expr:gte(t,n_forced*1)"])
         .args(["-c:a", "aac", "-f", "mp4"])
-        .args(["-movflags", "empty_moov+frag_keyframe+default_base_moof", "pipe:1"])
+        .args([
+            "-movflags",
+            "empty_moov+frag_keyframe+default_base_moof",
+            "pipe:1",
+        ])
         .output()
         .expect("spawn ffmpeg");
-    assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut ring = MemoryRingBuffer::new(256 * 1024 * 1024, 120_000);
     ring.push(&out.stdout).expect("the ring ingests the stream");
@@ -95,7 +110,10 @@ fn a_clip_saved_from_ram_is_playable_and_leaves_the_scratch_directory_empty() {
     let info = MediaInfo::probe(&bin, &out).expect("probing the clip");
     let video = info.video.as_ref().expect("the clip must carry video");
     let audio = info.audio.as_ref().expect("and audio");
-    assert_eq!(video.codec, "h264", "a lossless copy keeps the codec it was given");
+    assert_eq!(
+        video.codec, "h264",
+        "a lossless copy keeps the codec it was given"
+    );
     assert_eq!(audio.codec, "aac", "for both streams");
 
     // THE constraint: recording into a RAM ring writes nothing to the scratch directory, and
@@ -114,7 +132,11 @@ fn a_clip_saved_from_ram_is_playable_and_leaves_the_scratch_directory_empty() {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(clips.len(), 1, "saving writes the clip and nothing else: {clips:?}");
+    assert_eq!(
+        clips.len(),
+        1,
+        "saving writes the clip and nothing else: {clips:?}"
+    );
 }
 
 #[test]
@@ -194,9 +216,14 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
     cfg.output = EncodeOutput::FragmentedStream;
 
     let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder");
-    let stream = enc.take_output_stream().expect("the stream mode exposes its pipe");
+    let stream = enc
+        .take_output_stream()
+        .expect("the stream mode exposes its pipe");
 
-    let ring = Arc::new(Mutex::new(MemoryRingBuffer::new(256 * 1024 * 1024, 120_000)));
+    let ring = Arc::new(Mutex::new(MemoryRingBuffer::new(
+        256 * 1024 * 1024,
+        120_000,
+    )));
     let reader = {
         let ring = Arc::clone(&ring);
         std::thread::spawn(move || {
@@ -218,7 +245,11 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
         })
     };
 
-    let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 30 });
+    let mut video = StubCapture::new(StubConfig {
+        width: 64,
+        height: 48,
+        fps: 30,
+    });
     let mut audio = StubAudio::new(AudioFormat::default());
     video.start().expect("start the capture stub");
     audio.start().expect("start the audio stub");
@@ -226,7 +257,10 @@ fn a_live_stream_is_ingested_as_it_arrives_without_stalling_the_pipeline() {
     let until = Instant::now() + Duration::from_secs(4);
     let mut frames = 0u32;
     while Instant::now() < until {
-        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+        if let Some(frame) = video
+            .next_frame(Duration::from_millis(5))
+            .expect("next frame")
+        {
             enc.submit_video(frame).expect("submit video");
             frames += 1;
         }

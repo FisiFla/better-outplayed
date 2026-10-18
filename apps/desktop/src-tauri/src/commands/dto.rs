@@ -208,11 +208,10 @@ pub struct DeleteOutcome {
     pub thumbnails_removed: usize,
 }
 
-
 #[cfg(test)]
 mod tests {
-    use crate::commands::{list_clips, storage_stats};
     use crate::commands::test_support::*;
+    use crate::commands::{list_clips, storage_stats};
 
     #[test]
     fn a_clip_dto_carries_every_field_the_frontend_reads() {
@@ -223,13 +222,19 @@ mod tests {
         let clip = &clips[0];
 
         assert_eq!(clip.id, id);
-        assert_eq!(clip.path, f.paths.clips_dir.join("fields.mp4").to_string_lossy());
+        assert_eq!(
+            clip.path,
+            f.paths.clips_dir.join("fields.mp4").to_string_lossy()
+        );
         assert_eq!(clip.started_at_ms, 1_234);
         assert_eq!(clip.duration_ms, 5_678);
         assert_eq!(clip.size_bytes, 9_101);
         assert_eq!(clip.codec, "mpeg4");
         assert!(!clip.favourite, "clips are not favourites by default");
-        assert!(clip.created_at_ms > 0, "the store stamps a wall-clock creation instant");
+        assert!(
+            clip.created_at_ms > 0,
+            "the store stamps a wall-clock creation instant"
+        );
     }
 
     #[test]
@@ -240,8 +245,12 @@ mod tests {
         f.add_row("shape.mp4", 1, 2, 3);
 
         let clip = serde_json::to_value(&list_clips(&f.deps()).unwrap()[0]).unwrap();
-        let mut keys: Vec<&str> =
-            clip.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = clip
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
@@ -261,8 +270,12 @@ mod tests {
         );
 
         let stats = serde_json::to_value(storage_stats(&f.deps()).unwrap()).unwrap();
-        let mut keys: Vec<&str> =
-            stats.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = stats
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort();
         assert_eq!(
             keys,

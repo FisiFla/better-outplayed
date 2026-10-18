@@ -26,7 +26,10 @@ impl CaptureTarget {
     /// Build from the config strings: an empty or whitespace-only window means "no window".
     pub fn from_config(monitor: usize, window: &str) -> Self {
         let window = window.trim();
-        Self { monitor, window: (!window.is_empty()).then(|| window.to_string()) }
+        Self {
+            monitor,
+            window: (!window.is_empty()).then(|| window.to_string()),
+        }
     }
 }
 
@@ -86,7 +89,10 @@ mod tests {
     #[test]
     fn blank_window_means_no_window() {
         assert_eq!(CaptureTarget::from_config(0, "  ").window, None);
-        assert_eq!(CaptureTarget::from_config(0, " Game ").window.as_deref(), Some("Game"));
+        assert_eq!(
+            CaptureTarget::from_config(0, " Game ").window.as_deref(),
+            Some("Game")
+        );
     }
 
     #[test]
@@ -104,7 +110,10 @@ mod tests {
 
     #[test]
     fn exact_title_beats_an_earlier_substring_and_case_is_ignored() {
-        let w = vec![(1, "Notepad++ - notes".to_string()), (2, "NOTEPAD".to_string())];
+        let w = vec![
+            (1, "Notepad++ - notes".to_string()),
+            (2, "NOTEPAD".to_string()),
+        ];
         assert_eq!(pick_window(&w, "notepad").unwrap(), 2);
         assert_eq!(pick_window(&w, "notes").unwrap(), 1);
     }

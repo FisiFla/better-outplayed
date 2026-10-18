@@ -4,7 +4,7 @@
 //! a burst of stubbed frames encodes as a few milliseconds of media.
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, FfmpegEncoder, Encoder, VideoCodec};
+use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use localplay_media::FfmpegBinaries;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,11 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     );
 
     let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
-    let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 30 });
+    let mut video = StubCapture::new(StubConfig {
+        width: 64,
+        height: 48,
+        fps: 30,
+    });
     let mut audio = StubAudio::new(AudioFormat::default());
     video.start().unwrap();
     audio.start().unwrap();
@@ -34,7 +38,10 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
     let until = Instant::now() + Duration::from_secs(3);
     let mut frames = 0u64;
     while Instant::now() < until {
-        if let Some(frame) = video.next_frame(Duration::from_millis(5)).expect("next frame") {
+        if let Some(frame) = video
+            .next_frame(Duration::from_millis(5))
+            .expect("next frame")
+        {
             enc.submit_video(frame).expect("submit video");
             frames += 1;
         }
@@ -42,7 +49,10 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
             enc.submit_audio(block).expect("submit audio");
         }
     }
-    assert!(frames >= 60, "30fps for 3s must deliver ~90 frames, got {frames}");
+    assert!(
+        frames >= 60,
+        "30fps for 3s must deliver ~90 frames, got {frames}"
+    );
     enc.finish().expect("flush encoder");
 
     let mut segments: Vec<_> = std::fs::read_dir(dir.path())
@@ -52,7 +62,11 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         .filter(|p| p.extension().is_some_and(|e| e == "mp4"))
         .collect();
     segments.sort();
-    assert!(segments.len() >= 2, "expected >=2 segments, got {}", segments.len());
+    assert!(
+        segments.len() >= 2,
+        "expected >=2 segments, got {}",
+        segments.len()
+    );
 
     let info = localplay_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
     assert!(info.video.is_some(), "segment must contain video");
@@ -87,7 +101,11 @@ fn the_encoder_starts_segment_numbering_at_start_number() {
     cfg.start_number = 7;
 
     let mut enc = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
-    let mut video = StubCapture::new(StubConfig { width: 64, height: 48, fps: 30 });
+    let mut video = StubCapture::new(StubConfig {
+        width: 64,
+        height: 48,
+        fps: 30,
+    });
     let mut audio = StubAudio::new(AudioFormat::default());
     video.start().expect("start the capture stub");
     audio.start().expect("start the audio stub");

@@ -106,15 +106,25 @@ pub fn migrate_with(
     current: u32,
     steps: &[Migration],
 ) -> Result<u32, SchemaError> {
-    debug_assert_eq!(steps.len() as u32, current - 1, "one migration per version step");
+    debug_assert_eq!(
+        steps.len() as u32,
+        current - 1,
+        "one migration per version step"
+    );
     let from = declared_version(table)?;
     if from > current {
-        return Err(SchemaError::TooNew { found: from, supported: current });
+        return Err(SchemaError::TooNew {
+            found: from,
+            supported: current,
+        });
     }
     for step in &steps[(from - 1) as usize..] {
         step(table);
     }
-    table.insert(SCHEMA_VERSION_KEY.into(), toml::Value::Integer(i64::from(current)));
+    table.insert(
+        SCHEMA_VERSION_KEY.into(),
+        toml::Value::Integer(i64::from(current)),
+    );
     Ok(from)
 }
 
@@ -161,7 +171,10 @@ mod tests {
 
     #[test]
     fn a_newer_version_is_refused_not_half_read() {
-        let mut t = table(&format!("schema_version = {}\n", CURRENT_SCHEMA_VERSION + 1));
+        let mut t = table(&format!(
+            "schema_version = {}\n",
+            CURRENT_SCHEMA_VERSION + 1
+        ));
         let err = migrate(&mut t).unwrap_err();
         assert_eq!(
             err,
@@ -207,10 +220,17 @@ mod tests {
 
         let mut from_v2 = table("schema_version = 2\nnew_name = 7\n");
         assert_eq!(migrate_with(&mut from_v2, 3, steps), Ok(2));
-        assert_eq!(from_v2["added"].as_bool(), Some(true), "only the remaining step ran");
+        assert_eq!(
+            from_v2["added"].as_bool(),
+            Some(true),
+            "only the remaining step ran"
+        );
 
         let mut v4 = table("schema_version = 4\n");
-        assert!(matches!(migrate_with(&mut v4, 3, steps), Err(SchemaError::TooNew { .. })));
+        assert!(matches!(
+            migrate_with(&mut v4, 3, steps),
+            Err(SchemaError::TooNew { .. })
+        ));
     }
 
     #[test]
@@ -221,15 +241,24 @@ mod tests {
         }
         assert_eq!(parse::<S>("x = 4\n").unwrap().x, 4);
         assert_eq!(parse::<S>("schema_version = 1\nx = 5\n").unwrap().x, 5);
-        assert!(matches!(parse::<S>("x = \"no\"\n"), Err(ParseError::Toml(_))));
+        assert!(matches!(
+            parse::<S>("x = \"no\"\n"),
+            Err(ParseError::Toml(_))
+        ));
         assert!(matches!(parse::<S>("x ="), Err(ParseError::Toml(_))));
-        assert!(matches!(parse::<S>("schema_version = 2\nx = 5\n"), Err(ParseError::Schema(_))));
+        assert!(matches!(
+            parse::<S>("schema_version = 2\nx = 5\n"),
+            Err(ParseError::Schema(_))
+        ));
     }
 
     #[test]
     fn the_example_config_declares_the_current_version() {
         let example = include_str!("../../../config.example.toml");
         let t = table(example);
-        assert_eq!(t[SCHEMA_VERSION_KEY].as_integer(), Some(i64::from(CURRENT_SCHEMA_VERSION)));
+        assert_eq!(
+            t[SCHEMA_VERSION_KEY].as_integer(),
+            Some(i64::from(CURRENT_SCHEMA_VERSION))
+        );
     }
 }

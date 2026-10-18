@@ -70,19 +70,18 @@ pub mod session;
 mod tests;
 
 pub use config::{
-    BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, RecordingMode, SessionStorageRules,
-    StorageSection,
+    BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, RecordingMode,
+    SessionStorageRules, StorageSection,
 };
 pub use fps::FpsDecision;
 pub use index::{
     cleanup_pass, clip_chapters, index_bookmark, index_clip, index_event, now_ms, open_clip_index,
-    unix_millis,
-    CleanupReport, BOOKMARK_KIND,
+    unix_millis, CleanupReport, BOOKMARK_KIND,
 };
 pub use pump::{
-    guard_frame_size, pump_once, pump_once_counted, pump_once_counted_with_mic,
-    pump_until_span_on, FramePacer, MediaRing, PumpCounts, RateMeter, FRAME_POLL,
-    PACER_RESYNC_AFTER_INTERVALS, POST_ROLL_MARGIN, POST_ROLL_SCAN_INTERVAL, RATE_WINDOW,
+    guard_frame_size, pump_once, pump_once_counted, pump_once_counted_with_mic, pump_until_span_on,
+    FramePacer, MediaRing, PumpCounts, RateMeter, FRAME_POLL, PACER_RESYNC_AFTER_INTERVALS,
+    POST_ROLL_MARGIN, POST_ROLL_SCAN_INTERVAL, RATE_WINDOW,
 };
 
 use anyhow::{bail, Context, Result};
@@ -187,7 +186,11 @@ impl RecorderConfig {
     ///
     /// Its own directory, not a corner of `scratch/`: nothing drops segments out of it while recording.
     pub fn sessions_dir(&self) -> PathBuf {
-        resolve_dir(&self.app_data_dir, "sessions", &self.storage.sessions.sessions_dir)
+        resolve_dir(
+            &self.app_data_dir,
+            "sessions",
+            &self.storage.sessions.sessions_dir,
+        )
     }
 
     /// The clip index both this engine and the desktop shell open.
@@ -357,7 +360,10 @@ pub struct ClipWindow {
 
 impl ClipWindow {
     pub const fn new(pre_seconds: u64, post_seconds: u64) -> Self {
-        Self { pre_seconds: Some(pre_seconds), post_seconds: Some(post_seconds) }
+        Self {
+            pre_seconds: Some(pre_seconds),
+            post_seconds: Some(post_seconds),
+        }
     }
 
     /// The effective `(pre_ms, post_ms)`: the request (or `default_*`) clamped to `max_*`. An empty
@@ -369,9 +375,14 @@ impl ClipWindow {
         max_pre_ms: u64,
         max_post_ms: u64,
     ) -> (u64, u64) {
-        let pre = self.pre_seconds.map_or(default_pre_ms, |s| s.saturating_mul(1000)).min(max_pre_ms);
-        let post =
-            self.post_seconds.map_or(default_post_ms, |s| s.saturating_mul(1000)).min(max_post_ms);
+        let pre = self
+            .pre_seconds
+            .map_or(default_pre_ms, |s| s.saturating_mul(1000))
+            .min(max_pre_ms);
+        let post = self
+            .post_seconds
+            .map_or(default_post_ms, |s| s.saturating_mul(1000))
+            .min(max_post_ms);
         if pre + post == 0 {
             (0, 1000)
         } else {
@@ -417,10 +428,17 @@ pub struct Recorder {
 /// A request from a caller on another thread to the pump loop.
 enum Command {
     /// Take a clip now, for this reason. The reply is the clip, or why there is none.
-    Clip { reason: ClipReason, window: ClipWindow, reply: Sender<Result<RecordedClip>> },
+    Clip {
+        reason: ClipReason,
+        window: ClipWindow,
+        reply: Sender<Result<RecordedClip>>,
+    },
     /// Record an event that did not ask for a clip (a game or round boundary). The reply is
     /// the `events` row's id, so a caller can tell that it landed.
-    Note { event: GameEvent, reply: Sender<Result<i64>> },
+    Note {
+        event: GameEvent,
+        reply: Sender<Result<i64>>,
+    },
     /// Flush the encoder and end the loop.
     Stop,
 }
@@ -517,18 +535,27 @@ impl SharedStatus {
 
     /// Publish the per-recording numbers: the two rates and the microphone's port.
     fn publish_recording(&self, configured_fps: u32, effective_fps: u32, mic_port: Option<u16>) {
-        self.configured_fps.store(u64::from(configured_fps), Ordering::Relaxed);
-        self.effective_fps.store(u64::from(effective_fps), Ordering::Relaxed);
-        self.mic_port.store(u64::from(mic_port.unwrap_or(0)), Ordering::Relaxed);
+        self.configured_fps
+            .store(u64::from(configured_fps), Ordering::Relaxed);
+        self.effective_fps
+            .store(u64::from(effective_fps), Ordering::Relaxed);
+        self.mic_port
+            .store(u64::from(mic_port.unwrap_or(0)), Ordering::Relaxed);
         self.dropped_mic.store(0, Ordering::Relaxed);
     }
 
     fn set_game(&self, game: Option<String>) {
-        *self.game.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = game;
+        *self
+            .game
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = game;
     }
 
     fn game(&self) -> Option<String> {
-        self.game.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        self.game
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -697,7 +724,11 @@ impl Recorder {
     /// What the engine is doing right now. Never blocks the recording loop.
     pub fn status(&self) -> RecorderStatus {
         let status = &self.status;
-        let error = status.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let error = status
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         RecorderStatus {
             running: status.running.load(Ordering::Relaxed),
             frames: status.frames.load(Ordering::Relaxed),
@@ -723,7 +754,11 @@ impl Recorder {
             drift_ms: status.drift_ms.load(Ordering::Relaxed),
             clips: status.clips.load(Ordering::Relaxed),
             error,
-            encoder: status.encoder.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            encoder: status
+                .encoder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 
@@ -752,7 +787,11 @@ impl Recorder {
     pub fn clip_now_in(&self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
-            .send(Command::Clip { reason, window, reply })
+            .send(Command::Clip {
+                reason,
+                window,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?;
         // Cannot hang: if the loop stops first its receiver drops this command and reply, giving a disconnection error.
         answer
@@ -780,7 +819,10 @@ impl Recorder {
     /// Stopped and armed-and-waiting ([`Recorder::is_armed`]) are different states with different
     /// messages; both mean there is no footage to clip.
     fn command_sender(&self) -> Result<Sender<Command>> {
-        let guard = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
             Some(sender) => Ok(sender.clone()),
             None if self.is_armed() => Err(anyhow::anyhow!(
@@ -801,17 +843,28 @@ impl Recorder {
     pub fn stop(&self) -> Result<()> {
         // Supervisor first: it stops a game-driven recording and joins that thread. Take the handle
         // under the lock and join outside it so two concurrent stops wait on the same join.
-        let supervisor = self.supervisor.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let supervisor = self
+            .supervisor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         if let Some(supervisor) = supervisor {
             supervisor.shutdown();
         }
 
         // Then a recording this `Recorder` started itself. The guard is held across the join so a
         // concurrent stop cannot see the handle and return before the thread is gone.
-        let mut guard = self.thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(thread) = guard.take() {
             // A disconnected loop has already stopped; `send` failing is not an error.
-            let command = self.commands.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let command = self
+                .commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             if let Some(sender) = command {
                 let _ = sender.send(Command::Stop);
             }
@@ -915,17 +968,22 @@ impl Prepared {
             self.scratch_dir.clone()
         };
         // A new recording's failure state is its own: the last game's error must not make this one look failed.
-        *status.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *status
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         // Create the microphone before the capture backend: creating the video backend opens a WGC
         // session on the user's monitor, and a recording that cannot start its microphone must not touch
         // the display first. This is the fail-loud half of `[mic] enabled`: a mic input nothing feeds
         // would record a silent voice track.
         let mut mic = if self.opts.mic.enabled {
-            Some(build_microphone(cfg.sources, &self.opts.mic.device).with_context(|| {
-                "mic.enabled = true, but the microphone backend could not be created; \
+            Some(
+                build_microphone(cfg.sources, &self.opts.mic.device).with_context(|| {
+                    "mic.enabled = true, but the microphone backend could not be created; \
                  disable the microphone or fix the capture device"
-            })?)
+                })?,
+            )
         } else {
             None
         };
@@ -946,11 +1004,17 @@ impl Prepared {
                  video-only recording, or leave `[audio] enabled = true`."
             );
         }
-        let (mut capture, mut audio) =
-            build_sources(cfg.sources, &cfg.capture, &self.opts.games.watch, cfg.encode.fps, game_audio)?;
+        let (mut capture, mut audio) = build_sources(
+            cfg.sources,
+            &cfg.capture,
+            &self.opts.games.watch,
+            cfg.encode.fps,
+            game_audio,
+        )?;
         let native = capture.native_size();
 
-        let mut encode_cfg = build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
+        let mut encode_cfg =
+            build_encode_config(&cfg, &segment_dir, self.codec, self.vendor, native)?;
         if microphone {
             // Enable the encoder's second audio input; the default spec is the same 48kHz stereo s16le as
             // `MICROPHONE_FORMAT` and the game-audio input.
@@ -1002,7 +1066,9 @@ impl Prepared {
                         ram_cap_bytes: cfg.buffer.ram_cap_bytes,
                         // The duration cap is what a trigger can ask for: the window plus one segment, so an unlucky
                         // fragment boundary cannot truncate a clip. The buffer's length is the user's `pre_seconds`.
-                        cap_ms: cfg.buffer.max_pre_ms() + cfg.buffer.max_post_ms() + buffer_cfg.segment_ms,
+                        cap_ms: cfg.buffer.max_pre_ms()
+                            + cfg.buffer.max_post_ms()
+                            + buffer_cfg.segment_ms,
                         pre_ms: buffer_cfg.pre_ms,
                         post_ms: buffer_cfg.post_ms,
                         encoder: encode_cfg.encoder_name().to_string(),
@@ -1094,7 +1160,11 @@ impl Prepared {
                 None => String::new(),
             },
             segment_dir.display(),
-            if mode.is_full_session() { " (the scratch cap does not apply)" } else { "" }
+            if mode.is_full_session() {
+                " (the scratch cap does not apply)"
+            } else {
+                ""
+            }
         );
 
         // Start the sources: microphone first (its failure is invisible in the picture), then the
@@ -1267,7 +1337,9 @@ fn spawn_supervisor(
                         }
                     }
                     Ok(PresenceChange::Stopped(game)) => {
-                        let Some((name, thread)) = running.take() else { continue };
+                        let Some((name, thread)) = running.take() else {
+                            continue;
+                        };
                         if name != game.name {
                             // A game other than the recorded one stopped; keep recording.
                             running = Some((name, thread));
@@ -1314,7 +1386,10 @@ fn spawn_supervisor(
             status.running.store(false, Ordering::SeqCst);
         })
         .context("spawning the game supervisor thread")?;
-    Ok(Supervisor { stop, thread: Mutex::new(Some(thread)) })
+    Ok(Supervisor {
+        stop,
+        thread: Mutex::new(Some(thread)),
+    })
 }
 
 /// The microphone backend for the configured sources.
@@ -1324,7 +1399,10 @@ fn spawn_supervisor(
 /// [`StubMicrophone`] for tests, CI and `--dev-stub-sources`.
 fn build_microphone(sources: Sources, device: &str) -> Result<Box<dyn AudioBackend>> {
     match sources {
-        Sources::Stub(_) => Ok(Box::new(StubMicrophone::new(MICROPHONE_FORMAT, MIC_BLOCK_MS))),
+        Sources::Stub(_) => Ok(Box::new(StubMicrophone::new(
+            MICROPHONE_FORMAT,
+            MIC_BLOCK_MS,
+        ))),
         Sources::Platform => localplay_capture::wasapi_mic::microphone_backend(device),
     }
 }
@@ -1522,7 +1600,13 @@ impl Ledger {
     }
 
     /// Splice a clip around `trigger_ms` out of this ledger's footage.
-    fn trigger(&self, trigger_ms: u64, stem: &str, pre_ms: u64, post_ms: u64) -> Result<ClipMetadata> {
+    fn trigger(
+        &self,
+        trigger_ms: u64,
+        stem: &str,
+        pre_ms: u64,
+        post_ms: u64,
+    ) -> Result<ClipMetadata> {
         match self {
             Ledger::Memory(ring) => ring.trigger_window(trigger_ms, stem, pre_ms, post_ms),
             Ledger::Session(session) => session.trigger_window(trigger_ms, stem, pre_ms, post_ms),
@@ -1540,7 +1624,8 @@ impl Engine {
         // Tell capture what the encoder accepts (textures or pixels) before it starts; capture remembers
         // the answer for the session it builds. One question with one answer: a mismatch leaves an
         // encoder with pixels it refuses or a texture it cannot use.
-        self.capture.deliver_textures(self.encoder.accepts_textures());
+        self.capture
+            .deliver_textures(self.encoder.accepts_textures());
 
         let mut last_scan = Instant::now();
         // Next storage-policy pass, in wall clock from the last one.
@@ -1549,7 +1634,11 @@ impl Engine {
         loop {
             match commands.try_recv() {
                 Ok(Command::Stop) => break,
-                Ok(Command::Clip { reason, window, reply }) => {
+                Ok(Command::Clip {
+                    reason,
+                    window,
+                    reply,
+                }) => {
                     let taken = self.take_clip(reason, window);
                     // The caller may have given up (window closed, test finished); not the loop's business.
                     let _ = reply.send(taken);
@@ -1776,7 +1865,11 @@ impl Engine {
         let id = index_clip(&self.store, &clip, started_at_ms);
         // The clip carries its recording session's game so the library can filter without a join. Best effort.
         if let Some(id) = id {
-            if let Ok(Some(game)) = self.store.get_session(self.session).map(|s| s.and_then(|s| s.game)) {
+            if let Ok(Some(game)) = self
+                .store
+                .get_session(self.session)
+                .map(|s| s.and_then(|s| s.game))
+            {
                 if let Err(err) = self.store.set_clip_game(id, Some(&game)) {
                     tracing::warn!("could not record the game on clip #{id}: {err:#}");
                 }
@@ -1799,7 +1892,11 @@ impl Engine {
         }
 
         self.status.clips.fetch_add(1, Ordering::Relaxed);
-        Ok(RecordedClip { metadata: clip, id, started_at_ms })
+        Ok(RecordedClip {
+            metadata: clip,
+            id,
+            started_at_ms,
+        })
     }
 
     /// Mark the clip's game events as MP4 chapters. Best effort: the clip is already saved, so a
@@ -1814,7 +1911,10 @@ impl Engine {
         trigger: Option<(&str, u64)>,
     ) {
         let end_ms = started_at_ms.saturating_add(clip.duration_ms);
-        let events = match self.store.events_in_range(self.session, started_at_ms, end_ms) {
+        let events = match self
+            .store
+            .events_in_range(self.session, started_at_ms, end_ms)
+        {
             Ok(events) => events,
             Err(err) => {
                 let path = clip.path.display();
@@ -1831,7 +1931,11 @@ impl Engine {
                 if let Ok(meta) = std::fs::metadata(&clip.path) {
                     clip.size_bytes = meta.len();
                 }
-                tracing::info!("marked {} chapters in {}", chapters.len(), clip.path.display());
+                tracing::info!(
+                    "marked {} chapters in {}",
+                    chapters.len(),
+                    clip.path.display()
+                );
             }
             Err(err) => tracing::warn!(
                 "could not add chapters to {} ({err:#}); the clip is kept without them",
@@ -1888,7 +1992,9 @@ impl Engine {
         // Frames that reached ffmpeg: submitted minus what the bounded queue dropped. This, not `frames=`,
         // is the achieved rate. The count is cumulative, so only new drops come out of the meter.
         let dropped = self.encoder.dropped_frames();
-        let reached = counts.submitted.saturating_sub(dropped.saturating_sub(self.last_counted_dropped));
+        let reached = counts
+            .submitted
+            .saturating_sub(dropped.saturating_sub(self.last_counted_dropped));
         self.last_counted_dropped = dropped;
         let now = Instant::now();
         self.achieved = self.rate.record(reached, now);
@@ -1901,7 +2007,8 @@ impl Engine {
             self.drift_ms(),
         );
         // The mic's drop counter shares the status surface: a voice track quietly losing blocks must be visible.
-        self.status.publish_mic(self.encoder.dropped_mic_audio_blocks());
+        self.status
+            .publish_mic(self.encoder.dropped_mic_audio_blocks());
     }
 
     /// Wall clock minus media time, in ms.
@@ -1919,7 +2026,9 @@ impl Engine {
         // The encoder first: its last segment must be closed before the ledger is scanned, or it is never indexed.
         let flushed = self.encoder.finish().context("flushing the encoder");
         let scanned = if flushed.is_ok() {
-            self.ledger.scan().context("scanning for new segments at shutdown")
+            self.ledger
+                .scan()
+                .context("scanning for new segments at shutdown")
         } else {
             Ok(())
         };
@@ -1942,7 +2051,13 @@ impl Engine {
             None => Ok(()),
         };
         let session = self.finish_session();
-        flushed.and(scanned).and(ledger).and(audio).and(capture).and(mic).and(session)
+        flushed
+            .and(scanned)
+            .and(ledger)
+            .and(audio)
+            .and(capture)
+            .and(mic)
+            .and(session)
     }
 
     /// Close this recording's `sessions` row, concatenating a full session first.
@@ -2010,21 +2125,16 @@ impl Engine {
                     return Ok(());
                 }
 
-                let meta = session::finalise(
-                    &bin,
-                    &out,
-                    &segments,
-                    &self.encoder_name,
-                    self.microphone,
-                )
-                .with_context(|| {
-                    format!(
-                        "finalising session #{} ({} segment(s), {bytes} bytes, in {})",
-                        self.session,
-                        segments.len(),
-                        directory.display()
-                    )
-                })?;
+                let meta =
+                    session::finalise(&bin, &out, &segments, &self.encoder_name, self.microphone)
+                        .with_context(|| {
+                        format!(
+                            "finalising session #{} ({} segment(s), {bytes} bytes, in {})",
+                            self.session,
+                            segments.len(),
+                            directory.display()
+                        )
+                    })?;
 
                 self.store
                     .end_session(
@@ -2055,8 +2165,11 @@ impl Engine {
     fn fail(&mut self, err: anyhow::Error) {
         let message = format!("{err:#}");
         tracing::error!("the recorder stopped: {message}");
-        *self.status.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(message);
+        *self
+            .status
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
     }
 }
 
@@ -2162,7 +2275,8 @@ fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) 
 }
 
 /// The video codec the config asks for; machine-independent, so resolved before any capture backend exists.
-pub fn parse_codec(spec: &str) -> Result<VideoCodec> {    match spec {
+pub fn parse_codec(spec: &str) -> Result<VideoCodec> {
+    match spec {
         "h264" => Ok(VideoCodec::H264),
         "hevc" => Ok(VideoCodec::Hevc),
         other => bail!("unsupported encode.codec: {other}"),
@@ -2207,7 +2321,11 @@ fn build_sources(
     match sources {
         // Real WGC/WASAPI capture on Windows, synthetic stubs elsewhere. On Windows a missing backend is a hard error, with no stub fallback.
         Sources::Platform => {
-            let stub = StubConfig { width: STUB_CAPTURE_SIZE.0, height: STUB_CAPTURE_SIZE.1, fps };
+            let stub = StubConfig {
+                width: STUB_CAPTURE_SIZE.0,
+                height: STUB_CAPTURE_SIZE.1,
+                fps,
+            };
             let capture = default_video_backend(stub, &capture_section.target())?;
             let audio: Option<Box<dyn AudioBackend>> = if game_audio {
                 // The same snapshot the game watcher takes, so the audio follows the game it detects.
@@ -2303,8 +2421,9 @@ fn build_encode_config(
 
     // The game track's bitrate: `[audio] bitrate_kbps` (CLI) or the default (desktop shell). Set on
     // every path so the file records what the config says.
-    encode_cfg.audio_bitrate_kbps =
-        cfg.audio_bitrate_kbps.unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
+    encode_cfg.audio_bitrate_kbps = cfg
+        .audio_bitrate_kbps
+        .unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
 
     // Whether the game-audio track exists, from the same rule the capture backends used
     // (`RecorderConfig::game_audio`): `false` declares no audio input and no loopback listener.
@@ -2322,7 +2441,12 @@ fn build_encode_config(
     // record no video.
     #[cfg(windows)]
     let openable = vendor.is_some()
-        && localplay_encoder::mft::can_encode_with_textures(codec, native_size, cfg.encode.bitrate_kbps, cfg.encode.fps);
+        && localplay_encoder::mft::can_encode_with_textures(
+            codec,
+            native_size,
+            cfg.encode.bitrate_kbps,
+            cfg.encode.fps,
+        );
     #[cfg(not(windows))]
     let openable = false;
 
@@ -2415,7 +2539,11 @@ fn spawn_encoder(
         encode_cfg.source_size.1,
         encode_cfg.output_size.0,
         encode_cfg.output_size.1,
-        if encode_cfg.source_size == encode_cfg.output_size { "" } else { " (scaled)" }
+        if encode_cfg.source_size == encode_cfg.output_size {
+            ""
+        } else {
+            " (scaled)"
+        }
     );
     let name = encoder.active_encoder().to_string();
     Ok((Box::new(encoder), name))
