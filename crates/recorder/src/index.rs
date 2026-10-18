@@ -22,11 +22,14 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Wall-clock now in whole seconds since the Unix epoch; stamps clip file names (`clip-<ts>.mp4`).
-pub fn unix_seconds() -> u64 {
+/// Wall-clock now in milliseconds since the Unix epoch; stamps clip file names (`clip-<ts>.mp4`).
+///
+/// Milliseconds, not seconds: two clips asked for within one second (a double press, or an event
+/// right after a hotkey) must not share a file name, or the second overwrites the first.
+pub fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
