@@ -23,6 +23,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     capture_window: '',
     mic_device: '',
     output_device: '',
+    save_session: false,
     watch_titles: ['League of Legends'],
     defaulted: [],
     config_exists: true,

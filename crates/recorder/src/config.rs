@@ -22,6 +22,9 @@ use serde::Deserialize;
 pub struct RecorderSection {
     /// [`RecordingMode::ReplayBuffer`] (the default) or [`RecordingMode::FullSession`].
     pub mode: RecordingMode,
+    /// In [`RecordingMode::ReplayBuffer`], also write the whole recording to a session file, off the
+    /// same encoder (`false` by default). Ignored in full-session mode, which records a session already.
+    pub save_session: bool,
 }
 
 /// What the engine records.

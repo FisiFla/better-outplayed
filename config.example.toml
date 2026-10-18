@@ -31,6 +31,12 @@ schema_version = 1
 #
 # The CLI can override this per run with `--mode session` (or `--mode buffer`).
 mode = "buffer"
+# In "buffer" mode, also write the whole recording to a session file while the replay
+# buffer keeps serving clips, from the same single encode (no extra GPU or CPU). The file
+# is written as you play, so a crash loses about a second; when recording stops it becomes
+# an ordinary `session-<timestamp>.mp4` under `sessions/`. A disk that cannot keep up ends
+# the session file early with a warning and never the replay buffer. Ignored in "session" mode.
+save_session = false
 
 [buffer]
 # How much footage before the trigger instant is written into the clip.

@@ -61,6 +61,7 @@
   let fpsText = $state('60');
   let outputSize = $state('');
   let micEnabled = $state(false);
+  let saveSession = $state(false);
   let autoRecord = $state(false);
   let quality = $state('balanced');
   let monitorText = $state('0');
@@ -74,6 +75,7 @@
     fpsText = String(settings.fps);
     outputSize = settings.output_size;
     micEnabled = settings.mic_enabled;
+    saveSession = settings.save_session;
     autoRecord = settings.auto_record;
     quality = settings.quality;
     monitorText = String(settings.capture_monitor);
@@ -118,6 +120,7 @@
       fps,
       output_size: outputSize,
       mic_enabled: micEnabled,
+      save_session: saveSession,
       ...captureUpdate(settings, {
         quality,
         monitor,
@@ -331,6 +334,20 @@
         Desktop audio is the output whose sound is recorded when the whole desktop is captured. A
         game's own audio is captured from the game itself, whichever device it plays on. A chosen
         device that is unplugged at start refuses the recording.
+      </p>
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={saveSession}
+          onchange={(event) => (saveSession = event.currentTarget.checked)}
+          disabled={busy}
+        />
+        <span>Also save the full session {#if isDefault('recorder.save_session')}<span class="muted">(default)</span>{/if}</span>
+      </label>
+      <p class="muted footnote">
+        Writes the whole recording to a session file while the replay buffer keeps serving clips,
+        from the same encode. Needs disk space; if the disk cannot keep up, the session file ends
+        early and clips are unaffected.
       </p>
       {#if recordingNow}
         <p class="muted footnote">Takes effect on the next recording.</p>

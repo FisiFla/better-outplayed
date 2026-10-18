@@ -262,6 +262,8 @@ export interface SettingsDto {
   mic_device: string;
   /** `[capture] output_device` — an output endpoint id; empty is the Windows default output. */
   output_device: string;
+  /** `[recorder] save_session` — also keep the whole recording as a session file. */
+  save_session: boolean;
   /** `[games] auto_record`. */
   auto_record: boolean;
   /** `[encode] bitrate_kbps`. */
@@ -290,6 +292,7 @@ export interface SettingsUpdate {
   mic_enabled?: boolean;
   mic_device?: string;
   output_device?: string;
+  save_session?: boolean;
   auto_record?: boolean;
   /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
   quality?: string;

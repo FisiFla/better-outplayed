@@ -216,6 +216,8 @@ fn resolve_dir(app_data_dir: &Path, default_name: &str, setting: &str) -> PathBu
 pub struct RecorderOptions {
     /// What to record: the rolling buffer, or the whole session (see [`RecordingMode`]).
     pub mode: RecordingMode,
+    /// In replay-buffer mode, also keep the whole recording as a session file ([`RecorderSection::save_session`]).
+    pub save_session: bool,
     /// The optional microphone track ([`MicSection`]; off by default).
     pub mic: MicSection,
     /// `[games]`: whether a watched game starting is itself a reason to record, and which titles count.
@@ -962,7 +964,10 @@ impl Prepared {
         // in the same second cannot mix footage. `now_ms()` is read once and decides the row's
         // `started_at`, the directory name and the final file's name.
         let session_started_ms = now_ms();
-        let segment_dir = if mode.is_full_session() {
+        // A replay buffer that also saves the session keeps a directory of its own for the session file.
+        let save_session = self.opts.save_session && !mode.is_full_session();
+        let own_dir = mode.is_full_session() || save_session;
+        let segment_dir = if own_dir {
             session::create_session_dir(&self.sessions_dir, session_started_ms)?
         } else {
             self.scratch_dir.clone()
@@ -1072,6 +1077,8 @@ impl Prepared {
                         pre_ms: buffer_cfg.pre_ms,
                         post_ms: buffer_cfg.post_ms,
                         encoder: encode_cfg.encoder_name().to_string(),
+                        session_part: save_session
+                            .then(|| segment_dir.join(memory_ring::SESSION_PART)),
                     },
                 )?);
                 encoder = enc;
@@ -1138,7 +1145,11 @@ impl Prepared {
         let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()?) as i64;
         let session = match store.start_session(
             game.as_deref(),
-            mode.store_mode(),
+            if save_session {
+                RecordingMode::FullSession.store_mode()
+            } else {
+                mode.store_mode()
+            },
             session_started_ms,
             &segment_dir.display().to_string(),
             media_epoch_ms,
@@ -1146,7 +1157,7 @@ impl Prepared {
             Ok(id) => id,
             Err(err) => {
                 // Nothing was captured; remove the directory created for it.
-                if mode.is_full_session() {
+                if own_dir {
                     session::remove_session_dir(&segment_dir);
                 }
                 return Err(err).context("opening the session row");
@@ -1160,7 +1171,7 @@ impl Prepared {
                 None => String::new(),
             },
             segment_dir.display(),
-            if mode.is_full_session() {
+            if own_dir {
                 " (the scratch cap does not apply)"
             } else {
                 ""
@@ -1188,7 +1199,7 @@ impl Prepared {
                 let _ = audio.stop();
             }
             let _ = store.end_session(session, now_ms(), None, 0, 0);
-            if mode.is_full_session() {
+            if own_dir {
                 session::remove_session_dir(&segment_dir);
             }
             return Err(err);
@@ -1213,6 +1224,7 @@ impl Prepared {
             encoder,
             ledger,
             mode,
+            session_dir: save_session.then(|| segment_dir.clone()),
             session,
             session_started_ms,
             sessions_dir: self.sessions_dir.clone(),
@@ -1451,6 +1463,9 @@ struct Engine {
     ledger: Ledger,
     /// The mode this recording runs in ([`RecordingMode`]).
     mode: RecordingMode,
+    /// The directory holding the session file a replay buffer is also saving; `None` for a buffer alone
+    /// and for full-session mode (whose directory is the ledger's).
+    session_dir: Option<PathBuf>,
     /// The `sessions` row this recording opened; footage without a row could not be managed.
     session: i64,
     /// Session start on the wall clock (`sessions.started_at`), an i64 ms epoch.
@@ -2079,6 +2094,9 @@ impl Engine {
     /// * the error is returned, so `stop()` and a CLI's exit code report it.
     fn finish_session(&mut self) -> Result<()> {
         match self.mode {
+            RecordingMode::ReplayBuffer if self.session_dir.is_some() => {
+                self.finish_saved_session()
+            }
             RecordingMode::ReplayBuffer => {
                 let stats = self.ledger.stats()?;
                 // `size_bytes` stays 0: it is a disk claim and a RAM buffer occupies none. The held bytes go to the log.
@@ -2159,6 +2177,76 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// Close the row of a replay buffer that was also saving its session: remux the file written beside the ring
+    /// ([`session::finalise_part`]), name it on the row and remove the directory.
+    ///
+    /// A remux that fails leaves the row running and the part in place, like a failed concatenation, so the
+    /// next start's recovery finishes it. A file that stopped growing early (a disk that could not keep up) is
+    /// still finalised, with a warning: what it holds is real footage.
+    fn finish_saved_session(&mut self) -> Result<()> {
+        let dir = self
+            .session_dir
+            .clone()
+            .context("a saved session has no directory: this is a bug in the recorder")?;
+        let bin = match &self.ledger {
+            Ledger::Memory(ring) => ring.bin().clone(),
+            Ledger::Session(_) => bail!(
+                "a replay buffer saving its session has a segment store: this is a bug in the \
+                 recorder (mode and ledger disagree)"
+            ),
+        };
+        if let Ledger::Memory(ring) = &self.ledger {
+            if let Some(why) = ring.session_file_failure() {
+                tracing::warn!(
+                    "session #{} ends early: its file stopped growing ({why})",
+                    self.session
+                );
+            }
+        }
+        let part = dir.join(memory_ring::SESSION_PART);
+        let out = session::session_file_path(&self.sessions_dir, self.session_started_ms);
+        let meta = session::finalise_part(&bin, &part, &out, &self.encoder_name, self.microphone)
+            .with_context(|| {
+            format!(
+                "finalising the saved session #{} in {}",
+                self.session,
+                dir.display()
+            )
+        })?;
+        match meta {
+            None => {
+                self.store
+                    .end_session(self.session, now_ms(), None, 0, 0)
+                    .with_context(|| format!("closing empty session #{}", self.session))?;
+                session::remove_session_dir(&dir);
+                tracing::info!(
+                    "session #{} recorded nothing; closed with no file",
+                    self.session
+                );
+            }
+            Some(meta) => {
+                self.store
+                    .end_session(
+                        self.session,
+                        now_ms(),
+                        Some(&meta.path.display().to_string()),
+                        meta.size_bytes as i64,
+                        meta.duration_ms as i64,
+                    )
+                    .with_context(|| format!("closing session #{}", self.session))?;
+                session::remove_session_dir(&dir);
+                tracing::info!(
+                    "session #{} saved: {} ({}ms, {} bytes), written beside the replay buffer",
+                    self.session,
+                    meta.path.display(),
+                    meta.duration_ms,
+                    meta.size_bytes
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Record a failure and let the loop end. Logged and kept in the status for front-ends that only poll `status()`.

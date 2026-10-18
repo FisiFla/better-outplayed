@@ -144,6 +144,40 @@ pub fn remux_stream_lossless(
     Ok(())
 }
 
+/// Remux a fragmented MP4 *file* into an ordinary seekable one, without re-encoding.
+///
+/// The file twin of [`remux_stream_lossless`]: a session recorded off the replay buffer's encoder is
+/// written as the fragments arrive, so it is a file by the time it is finished. The audio tracks are
+/// re-named from [`audio_titles`] for the same reason (`-c copy` carries no per-stream names), and
+/// the budget is derived from the file's size like a concatenation's.
+pub fn remux_file_lossless_titled(
+    bin: &FfmpegBinaries,
+    src: &Path,
+    dst: &Path,
+    audio_streams: usize,
+) -> Result<()> {
+    let bytes = src
+        .metadata()
+        .with_context(|| format!("statting {}", src.display()))?
+        .len();
+    if bytes == 0 {
+        bail!(
+            "refusing to remux an empty file: {} holds no footage",
+            src.display()
+        );
+    }
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
+    cmd.args(["-v", "error", "-y", "-i"])
+        .arg(src)
+        .args(["-map", "0", "-c", "copy"]);
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(dst);
+    expect_success(cmd, "remux", dst, copy_budget(bytes))
+}
+
 /// One chapter mark: a named position in a clip, in ms from its first frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chapter {

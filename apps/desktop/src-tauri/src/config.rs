@@ -36,7 +36,7 @@
 use crate::commands::{CommandError, ErrorCode};
 use localplay_events::process::{default_watch, GamesSection};
 use localplay_recorder::config::{
-    BufferSection, CaptureSection, EncodeSection, MicSection, StorageSection,
+    BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
 };
 use localplay_recorder::config_schema;
 use localplay_recorder::event_driver::EventsSection;
@@ -278,6 +278,8 @@ impl BackgroundConfig {
 /// mis-typed section is an error naming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineOptionsConfig {
+    /// `[recorder]`; the window records a replay buffer, so only `save_session` is read from it.
+    pub recorder: RecorderSection,
     pub mic: MicSection,
     pub games: GamesSection,
     /// Which game-event sources to run. Absent means the example's values (League polling on,
@@ -294,6 +296,8 @@ impl EngineOptionsConfig {
         #[derive(Deserialize)]
         struct File {
             #[serde(default)]
+            recorder: RecorderSection,
+            #[serde(default)]
             mic: MicSection,
             #[serde(default)]
             games: GamesSection,
@@ -302,6 +306,7 @@ impl EngineOptionsConfig {
         }
         config_schema::parse::<File>(text)
             .map(|f| Self {
+                recorder: f.recorder,
                 mic: f.mic,
                 games: f.games,
                 events: f.events,
@@ -310,7 +315,7 @@ impl EngineOptionsConfig {
                 CommandError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "the config file's [mic], [games] or [events] section could not be read: \
+                        "the config file's [recorder], [mic], [games] or [events] section could not be read: \
                          {err}"
                     ),
                 )
@@ -362,6 +367,8 @@ pub enum SettingEdit {
     MicDevice(String),
     /// `[capture] output_device`: an output endpoint id. Empty is the Windows default output.
     OutputDevice(String),
+    /// `[recorder] save_session`: also keep the whole recording as a session file.
+    SaveSession(bool),
     /// `[games] auto_record`.
     AutoRecord(bool),
     /// A quality preset ([`QUALITY_PRESETS`]), written as `[encode] bitrate_kbps`.
@@ -404,6 +411,7 @@ impl SettingEdit {
             SettingEdit::MicEnabled(_) => "mic.enabled",
             SettingEdit::MicDevice(_) => "mic.device",
             SettingEdit::OutputDevice(_) => "capture.output_device",
+            SettingEdit::SaveSession(_) => "recorder.save_session",
             SettingEdit::AutoRecord(_) => "games.auto_record",
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
@@ -431,6 +439,8 @@ pub struct EffectiveSettings {
     pub mic_device: String,
     /// `[capture] output_device`; empty is the Windows default output.
     pub output_device: String,
+    /// `[recorder] save_session`.
+    pub save_session: bool,
     pub auto_record: bool,
     /// `[encode] bitrate_kbps`; [`quality_for_bitrate`] names it.
     pub bitrate_kbps: u32,
@@ -461,7 +471,7 @@ fn mistyped(key: &'static str) -> CommandError {
                 | "mic.device"
                 | "capture.output_device" => "string",
                 "encode.fps" | "encode.bitrate_kbps" | "capture.monitor" => "integer",
-                "mic.enabled" | "games.auto_record" => "true/false value",
+                "mic.enabled" | "games.auto_record" | "recorder.save_session" => "true/false value",
                 "games.watch" => "list of [[games.watch]] tables",
                 _ => "value of the shape this key takes",
             },
@@ -639,7 +649,9 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
         SettingEdit::ClipsDir(dir) => validate_clips_dir(dir),
         SettingEdit::Fps(fps) => validate_fps(*fps),
         SettingEdit::OutputSize(size) => validate_output_size(size),
-        SettingEdit::MicEnabled(_) | SettingEdit::AutoRecord(_) => Ok(()),
+        SettingEdit::MicEnabled(_) | SettingEdit::AutoRecord(_) | SettingEdit::SaveSession(_) => {
+            Ok(())
+        }
         SettingEdit::Quality(name) => preset_bitrate(name).map(|_| ()).ok_or_else(|| {
             CommandError::new(
                 ErrorCode::InvalidInput,
@@ -833,6 +845,15 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             String::new()
         }
     };
+    let save_session = match get_bool(&doc, "recorder", "save_session", "recorder.save_session")? {
+        Some(enabled) => enabled,
+        None => {
+            if config_exists {
+                defaulted.push("recorder.save_session");
+            }
+            false
+        }
+    };
     let watch_titles = read_watch_titles(&doc)?;
 
     Ok(EffectiveSettings {
@@ -842,6 +863,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         mic_enabled,
         mic_device,
         output_device,
+        save_session,
         auto_record,
         bitrate_kbps,
         capture_monitor,
@@ -942,6 +964,7 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::MicEnabled(_) => ("mic", "enabled", "mic"),
             SettingEdit::MicDevice(_) => ("mic", "device", "mic"),
             SettingEdit::OutputDevice(_) => ("capture", "output_device", "capture"),
+            SettingEdit::SaveSession(_) => ("recorder", "save_session", "recorder"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
             SettingEdit::CaptureMonitor(_) => ("capture", "monitor", "capture"),
@@ -967,6 +990,7 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
             SettingEdit::MicDevice(id) | SettingEdit::OutputDevice(id) => {
                 toml_edit::value(id.clone())
             }
+            SettingEdit::SaveSession(save) => toml_edit::value(*save),
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
             // Validated above, so the preset exists; the fallback is the balanced rate.
             SettingEdit::Quality(name) => {
@@ -1280,6 +1304,7 @@ mod tests {
              [encode]\nfps = 30\nbitrate_kbps = 8000\noutput_size = \"1280x720\"\n\n\
              [capture]\nmonitor = 0\nwindow = \"\"\noutput_device = \"\"\n\n\
              [mic]\nenabled = true\ndevice = \"\"\n\n\
+             [recorder]\nsave_session = false\n\n\
              [games]\nauto_record = true\n\
              [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n",
         )
@@ -1425,6 +1450,28 @@ mod tests {
         // Empty goes back to the Windows default.
         write_settings(&path, &[SettingEdit::MicDevice(String::new())]).unwrap();
         assert_eq!(read_effective_settings(&path).unwrap().mic_device, "");
+    }
+
+    #[test]
+    fn save_session_is_written_and_read_by_both_parsers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_settings(&path, &[SettingEdit::SaveSession(true)]).unwrap();
+        assert!(read_effective_settings(&path).unwrap().save_session);
+        assert!(
+            EngineOptionsConfig::load(&path)
+                .unwrap()
+                .recorder
+                .save_session
+        );
+        write_settings(&path, &[SettingEdit::SaveSession(false)]).unwrap();
+        assert!(!read_effective_settings(&path).unwrap().save_session);
+        assert!(
+            !EngineOptionsConfig::example()
+                .unwrap()
+                .recorder
+                .save_session
+        );
     }
 
     #[test]

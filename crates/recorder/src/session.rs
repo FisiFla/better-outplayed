@@ -391,6 +391,52 @@ pub fn finalise(
     })
 }
 
+/// Make the file a replay buffer wrote alongside itself ([`crate::memory_ring::SESSION_PART`], fragmented MP4 as
+/// the encoder produced it) into an ordinary, seekable session file at `out`.
+///
+/// `None` when the part is missing or empty: a recording that never produced a fragment has no session
+/// to name. A part cut short by a crash or a full disk is still read up to its last whole fragment,
+/// which is why recovery uses this too. The audio tracks are named from the part's own stream count, so
+/// a recovered session needs no word from the row about its microphone.
+pub fn finalise_part(
+    bin: &FfmpegBinaries,
+    part: &Path,
+    out: &Path,
+    encoder: &str,
+    multitrack: bool,
+) -> Result<Option<ClipMetadata>> {
+    if part.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    let audio = audio_stream_count(bin, part);
+    if let Err(e) = edit::remux_file_lossless_titled(bin, part, out, audio.unwrap_or(1)) {
+        // A partial file is not a session and occupies the space the retry needs.
+        let _ = std::fs::remove_file(out);
+        return Err(e)
+            .with_context(|| format!("remuxing {} into {}", part.display(), out.display()));
+    }
+    let info = MediaInfo::probe(bin, out)
+        .with_context(|| format!("probing the saved session {}", out.display()))?;
+    if info.video.is_none() {
+        tracing::warn!(
+            "{} has no video stream: the remux produced a file ffprobe cannot see a picture in",
+            out.display()
+        );
+    }
+    if multitrack && audio.is_some_and(|count| count < 2) {
+        tracing::warn!(
+            "{} has fewer than two audio streams but this session recorded a microphone",
+            out.display()
+        );
+    }
+    Ok(Some(ClipMetadata {
+        path: out.to_path_buf(),
+        duration_ms: info.duration_ms,
+        size_bytes: info.size_bytes,
+        encoder: encoder.to_string(),
+    }))
+}
+
 /// How many audio streams `path` carries, or `None` when ffprobe cannot say.
 ///
 /// A second probe because [`MediaInfo`] reports only the first video and first audio stream and
@@ -567,6 +613,57 @@ fn recover_session_row(
         }
     };
     let running = row.ended_at_ms.is_none();
+
+    // A replay buffer that was also saving its session leaves one fragmented file instead of segments.
+    let part = dir.join(crate::memory_ring::SESSION_PART);
+    if running && segments.is_empty() && part.is_file() {
+        let out = session_file_path(sessions_dir, row.started_at_ms);
+        match finalise_part(bin, &part, &out, encoder, true) {
+            Ok(meta) => {
+                let (path, size, duration) = match &meta {
+                    Some(m) => (
+                        Some(m.path.display().to_string()),
+                        m.size_bytes as i64,
+                        m.duration_ms as i64,
+                    ),
+                    None => (None, 0, 0),
+                };
+                match store.end_session(row.id, now_ms(), path.as_deref(), size, duration) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "recovered session #{} left by a previous run: {}",
+                            row.id,
+                            path.as_deref()
+                                .unwrap_or("it recorded nothing; closed with no file")
+                        );
+                        remove_session_dir(&dir);
+                        if meta.is_some() {
+                            report.recovered.push(row.id);
+                        } else {
+                            report.closed_empty.push(row.id);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "recovered session #{} but could not close its row: {err:#}",
+                            row.id
+                        );
+                        report.unfinalised.push(row.id);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    "could not recover session #{} left by a previous run: {err:#}. Its file is \
+                     kept in {}, the row is left running, and the next start tries again.",
+                    row.id,
+                    dir.display()
+                );
+                report.unfinalised.push(row.id);
+            }
+        }
+        return;
+    }
 
     if segments.is_empty() {
         if running {

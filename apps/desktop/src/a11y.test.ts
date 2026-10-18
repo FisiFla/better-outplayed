@@ -28,7 +28,7 @@ const stats: StorageStats = {
 };
 const settings: SettingsDto = {
   clips_dir: '/c', clips_dir_resolved: '/c', fps: 60, output_size: '1080p', mic_enabled: false,
-  mic_device: '', output_device: '',
+  mic_device: '', output_device: '', save_session: false,
   auto_record: true, watch_titles: ['VALORANT'], defaulted: [], config_exists: true,
   config_path: '/cfg/config.toml', bitrate_kbps: 8000, quality: 'balanced', capture_monitor: 0,
   capture_window: '',

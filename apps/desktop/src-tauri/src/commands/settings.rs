@@ -36,6 +36,8 @@ pub struct SettingsDto {
     pub mic_device: String,
     /// `[capture] output_device` — an output endpoint id; empty is the Windows default output.
     pub output_device: String,
+    /// `[recorder] save_session` — also keep the whole recording as a session file.
+    pub save_session: bool,
     /// `[games] auto_record`.
     pub auto_record: bool,
     /// `[encode] bitrate_kbps`.
@@ -67,6 +69,7 @@ pub struct SettingsUpdate {
     pub mic_enabled: Option<bool>,
     pub mic_device: Option<String>,
     pub output_device: Option<String>,
+    pub save_session: Option<bool>,
     pub auto_record: Option<bool>,
     /// A preset name; sets `[encode] bitrate_kbps`.
     pub quality: Option<String>,
@@ -99,6 +102,7 @@ pub struct UpdateSettingsOutcome {
 pub(super) fn recorder_options(engine: &EngineOptionsConfig) -> RecorderOptions {
     RecorderOptions {
         mode: Default::default(),
+        save_session: engine.recorder.save_session,
         mic: engine.mic.clone(),
         games: engine.games.clone(),
         game: None,
@@ -119,6 +123,7 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         mic_enabled: effective.mic_enabled,
         mic_device: effective.mic_device,
         output_device: effective.output_device,
+        save_session: effective.save_session,
         auto_record: effective.auto_record,
         quality: crate::config::quality_for_bitrate(effective.bitrate_kbps).to_string(),
         bitrate_kbps: effective.bitrate_kbps,
@@ -164,6 +169,9 @@ pub fn update_settings_file(
     if let Some(id) = &update.output_device {
         edits.push(SettingEdit::OutputDevice(id.clone()));
     }
+    if let Some(save) = update.save_session {
+        edits.push(SettingEdit::SaveSession(save));
+    }
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
     }
@@ -200,6 +208,9 @@ pub fn update_settings_file(
     }
     if update.output_device.is_some() && after.output_device != before.output_device {
         engine_changed.push("capture.output_device");
+    }
+    if update.save_session.is_some() && after.save_session != before.save_session {
+        engine_changed.push("recorder.save_session");
     }
     if update.auto_record.is_some() && after.auto_record != before.auto_record {
         engine_changed.push("games.auto_record");
@@ -322,6 +333,7 @@ mod tests {
                 "output_device",
                 "output_size",
                 "quality",
+                "save_session",
                 "watch_titles"
             ]
         );

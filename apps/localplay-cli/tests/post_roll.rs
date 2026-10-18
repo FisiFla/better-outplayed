@@ -100,6 +100,7 @@ impl Fixture {
                 pre_ms: PRE_MS,
                 post_ms: POST_MS,
                 encoder: "libx264".to_string(),
+                session_part: None,
             },
         )
         .expect("start the in-memory ring");

@@ -723,6 +723,7 @@ use localplay_store::SESSION_MODE_SESSION;
 fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
     RecorderOptions {
         mode,
+        save_session: false,
         mic: MicSection {
             enabled: mic,
             device: String::new(),
@@ -1351,6 +1352,135 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
     let file = PathBuf::from(other.final_path.clone().expect("with its session file"));
     assert!(file.is_file(), "{file:?} exists");
     assert_eq!(stream_counts(&file, &bin), (1, 1));
+}
+
+#[test]
+fn a_replay_buffer_can_also_save_the_whole_session_off_the_same_encode() {
+    let (_tmp, app_data_dir) = application_data_dir("buffer-plus-session");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.save_session = true;
+
+    let recorder = Recorder::start_with_options(cfg, opts).expect("the recorder starts");
+    let wanted_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= wanted_ms + 2_000,
+    );
+
+    // The session file grows while recording, in a directory of its own.
+    let (dirs, files) = sessions_on_disk(&app_data_dir);
+    assert_eq!(dirs.len(), 1, "one session directory: {dirs:?}");
+    assert!(files.is_empty(), "no finished file until stop: {files:?}");
+    assert!(
+        dirs[0]
+            .join(crate::memory_ring::SESSION_PART)
+            .metadata()
+            .unwrap()
+            .len()
+            > 0,
+        "the part file holds footage"
+    );
+
+    // And the buffer still serves clips.
+    let clip = recorder.clip_now().expect("a clip out of the ring");
+    assert!(clip.metadata.path.is_file());
+    recorder.stop().expect("stop must succeed");
+
+    let row = wait_for_finished_session(&bin, &db_path);
+    assert_eq!(row.mode, SESSION_MODE_SESSION);
+    let session = PathBuf::from(
+        row.final_path
+            .clone()
+            .expect("the row names the session file"),
+    );
+    assert!(session.is_file(), "{session:?} exists");
+    assert_eq!(stream_counts(&session, &bin), (1, 1));
+    let info = localplay_media::probe::MediaInfo::probe(&bin, &session).expect("probing it");
+    assert!(
+        info.duration_ms >= wanted_ms,
+        "the session file covers the whole recording, not the buffer's window: {}ms",
+        info.duration_ms
+    );
+    assert!(
+        info.duration_ms > clip.metadata.duration_ms,
+        "and is longer than the clip"
+    );
+    let (dirs, files) = sessions_on_disk(&app_data_dir);
+    assert!(
+        dirs.is_empty(),
+        "the part file's directory is removed: {dirs:?}"
+    );
+    assert_eq!(files, vec![session]);
+}
+
+#[test]
+fn a_session_saved_off_the_buffer_is_recovered_after_a_crash_cut_it_short() {
+    let (_tmp, app_data_dir) = application_data_dir("buffer-session-crash");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+    let sessions_dir = cfg.sessions_dir();
+    let session_dir = sessions_dir.join("session-1700000000");
+    std::fs::create_dir_all(&session_dir).expect("the crashed session's directory");
+
+    // What the encoder streams: fragmented MP4. Cut mid-fragment, as a killed process leaves it.
+    let part = session_dir.join(crate::memory_ring::SESSION_PART);
+    let made = std::process::Command::new(&bin.ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("testsrc=size=64x48:rate=10:duration=3")
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+        .args(["-c:v", "libx264", "-g", "10", "-c:a", "aac", "-f", "mp4"])
+        .args(["-movflags", "frag_keyframe+empty_moov+default_base_moof"])
+        .arg(&part)
+        .status()
+        .expect("running ffmpeg");
+    assert!(made.success());
+    let whole = std::fs::metadata(&part).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+    file.set_len(whole - 200).unwrap();
+    drop(file);
+
+    let id = {
+        let store = open_clip_index(&db_path).expect("the index opens");
+        store
+            .start_session(
+                None,
+                SESSION_MODE_SESSION,
+                1_700_000_000_000,
+                &session_dir.display().to_string(),
+                0,
+            )
+            .expect("the row the crash left behind")
+    };
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    recorder.stop().expect("stop must succeed");
+
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let row = store.get_session(id).unwrap().expect("the row exists");
+    assert!(row.ended_at_ms.is_some(), "closed: {row:?}");
+    let out = PathBuf::from(row.final_path.expect("and names the recovered file"));
+    assert!(out.is_file());
+    assert_eq!(stream_counts(&out, &bin), (1, 1));
+    assert!(
+        row.duration_ms >= 1_000,
+        "most of it survived: {}ms",
+        row.duration_ms
+    );
+    assert!(!session_dir.exists(), "the part file's directory is gone");
 }
 
 #[test]

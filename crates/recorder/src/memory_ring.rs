@@ -22,14 +22,99 @@ use anyhow::{bail, Context, Result};
 use localplay_media::FfmpegBinaries;
 use localplay_replay::splice::ClipSplicer;
 use localplay_replay::{MemoryRingBuffer, MemoryStats};
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ChildStdout;
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 /// How much is read from the pipe at a time: several fragments on a busy stream, bounding the thread's allocation to 256KiB.
 const READ_CHUNK: usize = 256 * 1024;
+
+/// The file a session recorded off the ring's stream is written to, inside the session directory.
+/// Fragmented MP4 as the encoder produced it; [`crate::session::finalise_part`] makes it an ordinary file.
+pub const SESSION_PART: &str = "recording.part";
+
+/// Chunks the session writer may be behind by before the file is given up on: 256 reads of at most
+/// [`READ_CHUNK`], so 64MiB of RAM at worst.
+const SINK_QUEUE_CHUNKS: usize = 256;
+
+/// The reader's hand-off to the session file's writer thread.
+///
+/// The reader must never wait on the disk: it is the only thing emptying the encoder's pipe, so a
+/// stalled write would stall ffmpeg and the recording with it, and the ring exists to keep clips
+/// working. So a chunk is queued, never written inline, and a queue that fills (a disk that cannot
+/// keep up, an antivirus scan holding the file) or a write that fails ends the *file*, loudly, and
+/// leaves the ring running.
+struct SinkFeed {
+    tx: Option<SyncSender<Vec<u8>>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl SinkFeed {
+    fn push(&mut self, chunk: &[u8]) {
+        let Some(tx) = &self.tx else { return };
+        match tx.try_send(chunk.to_vec()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                record_sink_failure(
+                    &self.failure,
+                    "the disk could not keep up with the recording".to_string(),
+                );
+                self.tx = None;
+            }
+            // The writer already recorded why it stopped.
+            Err(TrySendError::Disconnected(_)) => self.tx = None,
+        }
+    }
+}
+
+/// Record the first reason the session file stopped growing.
+fn record_sink_failure(slot: &Arc<Mutex<Option<String>>>, why: String) {
+    let mut guard = slot.lock().expect("the sink failure slot");
+    if guard.is_none() {
+        tracing::error!(
+            "the session file stopped growing: {why}. The replay buffer keeps working, but the              saved session will end where it stopped"
+        );
+        *guard = Some(why);
+    }
+}
+
+/// Start the writer thread for `path`; returns what the reader feeds and what the ring joins.
+fn start_sink(
+    path: &Path,
+    capacity: usize,
+) -> Result<(SinkFeed, JoinHandle<()>, Arc<Mutex<Option<String>>>)> {
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("creating the session file {}", path.display()))?;
+    let (tx, rx) = sync_channel::<Vec<u8>>(capacity);
+    let failure = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&failure);
+    let writer = std::thread::Builder::new()
+        .name("localplay-session-writer".into())
+        .spawn(move || {
+            while let Ok(chunk) = rx.recv() {
+                if let Err(err) = file.write_all(&chunk) {
+                    record_sink_failure(&slot, format!("writing the session file failed: {err}"));
+                    return;
+                }
+            }
+            // The stream ended: make what was written durable before the remux reads it.
+            if let Err(err) = file.sync_all() {
+                record_sink_failure(&slot, format!("flushing the session file failed: {err}"));
+            }
+        })
+        .context("spawning the session file's writer thread")?;
+    Ok((
+        SinkFeed {
+            tx: Some(tx),
+            failure: Arc::clone(&failure),
+        },
+        writer,
+        failure,
+    ))
+}
 
 /// Everything a ring needs that is not the stream itself.
 ///
@@ -48,6 +133,8 @@ pub struct RingSetup {
     pub post_ms: u64,
     /// The encoder that actually ran, for the clip's metadata.
     pub encoder: String,
+    /// Also write the stream to this file as it arrives (a saved session); `None` for a buffer alone.
+    pub session_part: Option<PathBuf>,
 }
 
 pub struct MemoryRing {
@@ -61,6 +148,10 @@ pub struct MemoryRing {
     pre_ms: u64,
     post_ms: u64,
     encoder: String,
+    /// The session file's writer thread, while a session is being saved and it has not been joined.
+    sink_writer: Option<JoinHandle<()>>,
+    /// Why the session file stopped growing early.
+    sink_failure: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl MemoryRing {
@@ -78,9 +169,17 @@ impl MemoryRing {
             pre_ms,
             post_ms,
             encoder,
+            session_part,
         } = setup;
         std::fs::create_dir_all(&clips_dir)
             .with_context(|| format!("creating the clips directory {}", clips_dir.display()))?;
+        let (feed, sink_writer, sink_failure) = match &session_part {
+            Some(path) => {
+                let (feed, writer, failure) = start_sink(path, SINK_QUEUE_CHUNKS)?;
+                (Some(feed), Some(writer), Some(failure))
+            }
+            None => (None, None, None),
+        };
 
         let shared = Arc::new(Mutex::new(MemoryRingBuffer::new(ram_cap_bytes, cap_ms)));
         let failure = Arc::new(Mutex::new(None));
@@ -92,7 +191,7 @@ impl MemoryRing {
                 // A panic would otherwise kill this thread silently and show up only as short clips later; catch, name and record it.
                 let hook = Arc::clone(&slot);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    read_until_eof(stream, ring, Arc::clone(&hook))
+                    read_until_eof(stream, ring, Arc::clone(&hook), feed)
                 }));
                 if let Err(panic) = outcome {
                     record_failure(
@@ -111,6 +210,8 @@ impl MemoryRing {
             pre_ms,
             post_ms,
             encoder,
+            sink_writer,
+            sink_failure,
         })
     }
 
@@ -162,10 +263,22 @@ impl MemoryRing {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        // The reader's end of the hand-off is gone with it, so the writer drains what is queued and ends.
+        if let Some(writer) = self.sink_writer.take() {
+            let _ = writer.join();
+        }
         match self.failure.lock().expect("the failure slot").clone() {
             Some(why) => bail!("the in-memory ring's reader stopped early: {why}"),
             None => Ok(()),
         }
+    }
+
+    /// Why the saved session's file stopped growing before the recording ended, if it did. Only
+    /// meaningful after [`MemoryRing::join`].
+    pub fn session_file_failure(&self) -> Option<String> {
+        self.sink_failure
+            .as_ref()
+            .and_then(|failure| failure.lock().ok().and_then(|f| f.clone()))
     }
 
     /// Save a clip around `trigger_ms` out of the footage in RAM: window `[trigger - pre, trigger + post)`,
@@ -263,6 +376,7 @@ fn read_until_eof(
     mut stream: ChildStdout,
     ring: Arc<Mutex<MemoryRingBuffer>>,
     failure: Arc<Mutex<Option<String>>>,
+    mut feed: Option<SinkFeed>,
 ) {
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
@@ -280,6 +394,10 @@ fn read_until_eof(
                 return;
             }
         };
+        // Before the ring's lock: the file gets every byte the ring does, parsed or not.
+        if let Some(feed) = feed.as_mut() {
+            feed.push(&buf[..read]);
+        }
         let Ok(mut guard) = ring.lock() else {
             record_failure(&failure, "the ring's lock was poisoned".to_string());
             return;
@@ -314,5 +432,60 @@ fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
         text.clone()
     } else {
         "a panic with no message".to_string()
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    #[test]
+    fn the_session_file_gets_every_byte_pushed() {
+        let dir = std::env::temp_dir().join(format!("lp-sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_PART);
+        let (mut feed, writer, failure) = start_sink(&path, 8).unwrap();
+        let mut expected = Vec::new();
+        for i in 0..5u8 {
+            let chunk = vec![i; 1000 + i as usize];
+            feed.push(&chunk);
+            expected.extend_from_slice(&chunk);
+        }
+        drop(feed);
+        writer.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert!(failure.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_that_cannot_keep_up_ends_the_file_not_the_feed() {
+        // A queue nobody drains: the second chunk finds it full.
+        let (tx, _rx) = sync_channel::<Vec<u8>>(1);
+        let failure = Arc::new(Mutex::new(None));
+        let mut feed = SinkFeed {
+            tx: Some(tx),
+            failure: Arc::clone(&failure),
+        };
+        feed.push(b"one");
+        assert!(failure.lock().unwrap().is_none());
+        feed.push(b"two");
+        assert!(failure
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("keep up"));
+        // Later pushes are no-ops rather than blocking or panicking.
+        feed.push(b"three");
+        assert!(feed.tx.is_none());
+    }
+
+    #[test]
+    fn a_session_file_that_cannot_be_created_fails_the_start() {
+        let path = std::env::temp_dir()
+            .join("lp-no-such-dir-xyz")
+            .join(SESSION_PART);
+        assert!(start_sink(&path, 1).is_err());
     }
 }

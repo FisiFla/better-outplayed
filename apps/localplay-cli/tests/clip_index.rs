@@ -74,6 +74,7 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
             pre_ms: PRE_MS,
             post_ms: POST_MS,
             encoder: "libx264".to_string(),
+            session_part: None,
         },
     )
     .expect("start the in-memory ring");

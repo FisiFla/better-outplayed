@@ -9,6 +9,12 @@ versions. For what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **Replay buffer plus full session off one encode**: `[recorder] save_session = true` (Settings →
+  "Also save the full session") writes the whole recording to a session file while the buffer keeps
+  serving clips, with no second encoder. The file is written as fragments arrive, so a crash loses
+  about a second and the next start recovers it; on stop it is remuxed into the usual
+  `session-<timestamp>.mp4`. A disk that cannot keep up ends the session file early with a warning and
+  never the buffer. Covered by tests against the software encoder; unverified on hardware.
 - **Audio device selection**: Settings now picks the microphone (`[mic] device`) and the output
   device recorded as desktop audio (`[capture] output_device`) from the active Windows endpoints;
   empty keeps the Windows default. A chosen device that is unplugged at start refuses the

@@ -298,6 +298,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         },
         RecorderOptions {
             mode,
+            save_session: recorder.save_session,
             mic,
             games,
             game: None,
