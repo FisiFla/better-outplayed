@@ -328,11 +328,11 @@ stays manual.
 
 - [x] **Phase 0** — repo, tooling, design spec
 - [x] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC).
-      **Ran on real Windows hardware** and produced correct clips, but two criteria
-      miss: at 4K it sustains ~24 fps against 30 configured (~45% of frames dropped) and
-      costs ~50.8% of a CPU core against a < 5% target (open as
-      [issue #1](https://github.com/FisiFla/better-outplayed/issues/1)). **Re-run on the Windows test machine and
-      still open**: a 2026-09-24 capture held 28fps against 30 at 4K and said so itself.
+      **Ran on real Windows hardware** and produced correct clips. The 4K shortfall found on
+      2026-09-23 ([issue #1](https://github.com/FisiFla/better-outplayed/issues/1), closed) is
+      fixed by the zero-copy path, where captured textures go straight to the hardware encoder:
+      59.6 of 60 fps with no dropped frames and 3.6–4.0% of one core
+      ([`docs/verification-status.md`](docs/verification-status.md) §13–§15).
 - [x] **Phase 2** — Tauri shell, timeline scrubber, clip trim. The window and its
       recording wiring exist, and so do the tray, the global clip hotkey and the
       hide-on-close behaviour that make it a background application; all of it is exercised
