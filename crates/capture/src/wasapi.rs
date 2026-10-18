@@ -120,6 +120,8 @@ const WAVE_FORMAT_PCM: u16 = 0x0001;
 /// s16le with the engine converting (see the module docs).
 pub struct WasapiLoopback {
     mode: GameAudioSource,
+    /// The output endpoint id whole-output capture listens to; empty is the Windows default.
+    output_device: String,
     /// Taken by `start`; a restarted backend captures the whole output.
     find_game: Option<GameFinder>,
     /// The open stream and the timeline it feeds, reopened across device changes.
@@ -178,13 +180,18 @@ impl Drop for Client {
 impl WasapiLoopback {
     /// Whole-output capture.
     pub fn new() -> Result<Self> {
-        Self::with_source(GameAudioSource::System, None)
+        Self::with_source(GameAudioSource::System, None, "")
     }
 
     /// `find_game` names the game process to capture under [`GameAudioSource::App`].
-    pub fn with_source(mode: GameAudioSource, find_game: Option<GameFinder>) -> Result<Self> {
+    pub fn with_source(
+        mode: GameAudioSource,
+        find_game: Option<GameFinder>,
+        output_device: &str,
+    ) -> Result<Self> {
         Ok(Self {
             mode,
+            output_device: output_device.to_owned(),
             find_game,
             source: None,
             watched_generation: 0,
@@ -224,7 +231,7 @@ impl AudioBackend for WasapiLoopback {
             }
             (GameAudioSource::System, _) => None,
         };
-        let opened = WasapiFactory::new().and_then(|factory| {
+        let opened = WasapiFactory::new(&self.output_device).and_then(|factory| {
             let opener = GameAudioOpener::new(factory, find_game);
             RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now)
         });
@@ -326,22 +333,28 @@ impl Drop for WasapiLoopback {
 /// Opens process loopback on a game, or endpoint loopback on whatever the default output is now.
 struct WasapiFactory {
     enumerator: IMMDeviceEnumerator,
+    /// The output endpoint id to loop back; empty follows the Windows default output.
+    output_device: String,
 }
 
 // SAFETY: as for `Client`: only the capture thread uses it, and the enumerator is free-threaded.
 unsafe impl Send for WasapiFactory {}
 
 impl WasapiFactory {
-    fn new() -> Result<Self> {
+    fn new(output_device: &str) -> Result<Self> {
         // SAFETY: the CLSID is the documented one; `None` means no aggregation.
         let enumerator: IMMDeviceEnumerator = unsafe {
             CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
                 .context("CoCreateInstance(MMDeviceEnumerator)")?
         };
-        Ok(Self { enumerator })
+        Ok(Self { enumerator, output_device: output_device.to_owned() })
     }
 
+    /// The configured output endpoint, or the default output when none is configured.
     fn default_device(&self) -> Result<IMMDevice> {
+        if !self.output_device.is_empty() {
+            return crate::audio_devices::windows_impl::device_by_id(&self.enumerator, &self.output_device);
+        }
         // SAFETY: the enumerator is alive; eRender/eConsole is the default output.
         unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
             .context("IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)")

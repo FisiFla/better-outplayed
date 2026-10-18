@@ -602,7 +602,7 @@ use localplay_store::SESSION_MODE_SESSION;
 fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
     RecorderOptions {
         mode,
-        mic: MicSection { enabled: mic },
+        mic: MicSection { enabled: mic, device: String::new() },
         games: GamesSection::default(),
         game: None,
     }

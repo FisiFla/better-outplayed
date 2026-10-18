@@ -76,16 +76,20 @@ const DEFAULT_AMPLITUDE: i16 = 8_000;
 
 /// The platform microphone backend, or a clear error on a platform without one.
 ///
+/// `device` is a WASAPI endpoint id (see [`crate::audio_devices`]); empty means the default
+/// communications capture endpoint.
+///
 /// On Windows this is [`WasapiMicrophone`]. Off Windows it returns an error rather than a
 /// synthetic stand-in, because a stub selected at runtime would make the recorder look like it is
 /// capturing a voice track while recording nothing. [`StubMicrophone`] is the type tests use.
-pub fn microphone_backend() -> anyhow::Result<Box<dyn AudioBackend>> {
+pub fn microphone_backend(device: &str) -> anyhow::Result<Box<dyn AudioBackend>> {
     #[cfg(windows)]
     {
-        Ok(Box::new(WasapiMicrophone::new()?))
+        Ok(Box::new(WasapiMicrophone::new(device)?))
     }
     #[cfg(not(windows))]
     {
+        let _ = device;
         Err(no_microphone_on_this_platform())
     }
 }
@@ -110,7 +114,7 @@ pub struct WasapiMicrophone;
 #[cfg(not(windows))]
 impl WasapiMicrophone {
     /// Always an error off Windows: there is no WASAPI to capture a microphone with.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(_device: &str) -> anyhow::Result<Self> {
         Err(no_microphone_on_this_platform())
     }
 }
@@ -323,6 +327,8 @@ mod wasapi_impl {
     /// WASAPI shared-mode microphone capture, opened as 48kHz stereo s16le with the engine
     /// converting (see the module docs).
     pub struct WasapiMicrophone {
+        /// The endpoint id to open; empty is the default communications capture endpoint.
+        device: String,
         client: Option<Client>,
         /// Places packets by device time, like the game-audio track, and slices 10ms blocks.
         timeline: AudioTimeline,
@@ -388,8 +394,9 @@ mod wasapi_impl {
         /// Construction touches no device (no COM apartment, nothing can fail), which lets the recorder
         /// build its backend selection before deciding to record. Endpoint and format errors therefore
         /// surface from `start`, with the rest of the recording's startup errors.
-        pub fn new() -> Result<Self> {
+        pub fn new(device: &str) -> Result<Self> {
             Ok(Self {
+                device: device.to_owned(),
                 client: None,
                 timeline: AudioTimeline::new(TARGET, Duration::ZERO),
                 com_owned: false,
@@ -414,7 +421,7 @@ mod wasapi_impl {
                 bail!("WASAPI microphone capture is already started");
             }
             self.com_owned = init_com()?;
-            match open_client() {
+            match open_client(&self.device) {
                 Ok(client) => {
                     self.timeline = AudioTimeline::new(TARGET, client.anchor);
                     // A fresh session gets a fresh watch, armed only if the endpoint needed the engine's converter.
@@ -531,7 +538,7 @@ mod wasapi_impl {
 
     /// Open the default communications capture endpoint in shared mode and start it, asking the
     /// engine for the canonical 48kHz stereo s16le format whatever the device's own mix format is.
-    fn open_client() -> Result<Client> {
+    fn open_client(device_id: &str) -> Result<Client> {
         // SAFETY: the CLSID is the documented one; `None` means no aggregation.
         let enumerator: IMMDeviceEnumerator = unsafe {
             CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
@@ -540,13 +547,16 @@ mod wasapi_impl {
         // SAFETY: the enumerator is alive. eCapture is the data flow that has microphones (eRender would
         // be a speaker), and eCommunications is the role Windows gives the device the user talks into,
         // the one a game's voice chat selects. No loopback flag: this is the endpoint itself.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications) }
-            .context(
+        let device = if device_id.is_empty() {
+            unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications) }.context(
                 "IMMDeviceEnumerator::GetDefaultAudioEndpoint(eCapture, eCommunications): this \
                  machine has no default communications microphone. Plug in or enable a \
                  microphone, or pick one as the default input device in Settings > System > \
                  Sound > Input",
-            )?;
+            )?
+        } else {
+            crate::audio_devices::windows_impl::device_by_id(&enumerator, device_id)?
+        };
         // SAFETY: IAudioClient is the capture endpoint's documented client interface.
         let audio: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
             .context("IMMDevice::Activate(IAudioClient)")?;
@@ -905,7 +915,7 @@ mod tests {
     #[cfg(not(windows))]
     fn the_microphone_backend_is_unavailable_on_this_platform_with_a_clear_error() {
         // An Err, not an Ok and not a panic: silent success would make the recorder believe it is capturing a voice track.
-        let err = match microphone_backend() {
+        let err = match microphone_backend("") {
             Ok(_) => panic!("this host has no microphone backend: an Ok would be a silent success"),
             Err(e) => e,
         };

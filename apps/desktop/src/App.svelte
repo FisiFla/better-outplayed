@@ -60,6 +60,7 @@
   import type {
     AppStatus,
     GsiGame,
+    AudioDevices,
     GsiTarget,
     Health,
     RecordingStatus,
@@ -109,6 +110,7 @@
   let health = $state<Health | null>(null);
   /** CS2 / Dota 2 as Steam has them, for the integration installer. */
   let gsiTargets = $state<GsiTarget[]>([]);
+  let audioDevices = $state<AudioDevices>({ inputs: [], outputs: [] });
   /** Clip id → `asset:` URL of its disk-cached thumbnail. */
   let thumbnails = $state<Record<number, string>>({});
   /** Where the window is: a rail destination, or a clip / session opened from one. */
@@ -233,6 +235,15 @@
       gsiTargets = await source.gsiTargets();
     } catch (err) {
       error = errorMessage(err);
+    }
+  }
+
+  /** A failed listing leaves the pickers on "Windows default", which always works. */
+  async function refreshAudioDevices() {
+    try {
+      audioDevices = await source.listAudioDevices();
+    } catch (err) {
+      void source.logFromFrontend('warn', 'audio device listing failed', errorMessage(err));
     }
   }
 
@@ -529,6 +540,7 @@
     void refreshSettings();
     void refreshHealth();
     void refreshGsiTargets();
+    void refreshAudioDevices();
     const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
     const healthPoll = setInterval(() => void refreshHealth(), HEALTH_POLL_MS);
     return () => {
@@ -668,6 +680,8 @@
           {#if settings !== null}
             <SettingsPanel
               {gsiTargets}
+              {audioDevices}
+              onRefreshAudioDevices={refreshAudioDevices}
               onInstallGsi={installGsi}
               {settings}
               {recording}

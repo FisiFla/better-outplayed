@@ -68,11 +68,13 @@ pub fn default_audio_backend(format: AudioFormat) -> Result<Box<dyn AudioBackend
 }
 
 /// The game-audio backend: like [`default_audio_backend`], but under [`GameAudioSource::App`] it
-/// captures only the process `find_game` reports, where Windows supports that.
+/// captures only the process `find_game` reports, where Windows supports that. `output_device` is the
+/// output endpoint id whole-output capture listens to (empty: the Windows default).
 pub fn game_audio_backend(
     format: AudioFormat,
     source: GameAudioSource,
     find_game: GameFinder,
+    output_device: &str,
 ) -> Result<Box<dyn AudioBackend>> {
     #[cfg(windows)]
     {
@@ -84,11 +86,11 @@ pub fn game_audio_backend(
                 AudioFormat::default()
             );
         }
-        Ok(Box::new(crate::wasapi::WasapiLoopback::with_source(source, Some(find_game))?))
+        Ok(Box::new(crate::wasapi::WasapiLoopback::with_source(source, Some(find_game), output_device)?))
     }
     #[cfg(not(windows))]
     {
-        let _ = (source, find_game);
+        let _ = (source, find_game, output_device);
         Ok(Box::new(crate::stub::StubAudio::new(format)))
     }
 }

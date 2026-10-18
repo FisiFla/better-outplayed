@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { captureUpdate, describeSettingsUpdate, monitorIndex } from './settings';
+import { captureUpdate, describeSettingsUpdate, deviceOptions, monitorIndex } from './settings';
 import type { SettingsDto, UpdateSettingsOutcome } from './types';
 
 function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
@@ -21,6 +21,8 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     quality: 'balanced',
     capture_monitor: 0,
     capture_window: '',
+    mic_device: '',
+    output_device: '',
     watch_titles: ['League of Legends'],
     defaulted: [],
     config_exists: true,
@@ -65,14 +67,14 @@ describe('the settings notice', () => {
 
 describe('the capture drafts', () => {
   const saved = settings();
-  const same = { quality: 'balanced', monitor: 0, window: '' };
+  const same = { quality: 'balanced', monitor: 0, window: '', micDevice: '', outputDevice: '' };
 
   it('writes nothing for an untouched panel', () => {
     expect(captureUpdate(saved, same)).toEqual({});
   });
 
   it('sends only the keys that changed, trimming the window title', () => {
-    expect(captureUpdate(saved, { quality: 'high', monitor: 1, window: '  League  ' })).toEqual({
+    expect(captureUpdate(saved, { ...same, quality: 'high', monitor: 1, window: '  League  ' })).toEqual({
       quality: 'high',
       capture_monitor: 1,
       capture_window: 'League',
@@ -81,12 +83,33 @@ describe('the capture drafts', () => {
 
   it('never overwrites a custom bitrate with the placeholder option', () => {
     const custom = settings({ quality: 'custom', bitrate_kbps: 12000 });
-    expect(captureUpdate(custom, { quality: 'custom', monitor: 0, window: '' })).toEqual({});
+    expect(captureUpdate(custom, { ...same, quality: 'custom' })).toEqual({});
   });
 
   it('clears the window with an empty title', () => {
     const windowed = settings({ capture_window: 'Game' });
     expect(captureUpdate(windowed, { ...same, window: '' })).toEqual({ capture_window: '' });
+  });
+
+  it('sends a changed device and clears it back to the Windows default', () => {
+    expect(captureUpdate(saved, { ...same, micDevice: '{mic-1}', outputDevice: '{out-1}' })).toEqual({
+      mic_device: '{mic-1}',
+      output_device: '{out-1}',
+    });
+    const chosen = settings({ mic_device: '{mic-1}' });
+    expect(captureUpdate(chosen, { ...same, micDevice: '' })).toEqual({ mic_device: '' });
+  });
+
+  it('keeps a saved device that is not connected selectable as itself', () => {
+    const device = { id: '{a}', name: 'Blue Yeti', is_default: true };
+    expect(deviceOptions([device], '')).toEqual([
+      { value: '', label: 'Windows default' },
+      { value: '{a}', label: 'Blue Yeti (current default)' },
+    ]);
+    expect(deviceOptions([], '{gone}')).toEqual([
+      { value: '', label: 'Windows default' },
+      { value: '{gone}', label: 'Saved device (not connected)' },
+    ]);
   });
 
   it('parses a monitor index only as a whole non-negative number', () => {

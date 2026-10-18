@@ -523,6 +523,18 @@ fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, Com
     commands::read_settings(&state.app_data_dir, &state.config_path())
 }
 
+/// The active microphones and outputs, for the device pickers. Empty off Windows.
+///
+/// Listed on a thread of its own: enumeration takes a COM apartment, and the UI thread's is not
+/// ours to change.
+#[tauri::command(rename_all = "snake_case")]
+fn list_audio_devices() -> Result<localplay_capture::audio_devices::AudioDevices, CommandError> {
+    std::thread::spawn(localplay_capture::audio_devices::list_audio_devices)
+        .join()
+        .map_err(|_| CommandError::new(ErrorCode::Recording, "listing audio devices panicked"))?
+        .map_err(|e| CommandError::new(ErrorCode::Recording, format!("{e:#}")))
+}
+
 /// Edit settings: validate, prove the clips directory usable, write the file, apply what
 /// applies live.
 ///
@@ -752,6 +764,7 @@ pub fn run() {
             clip_now,
             app_status,
             get_settings,
+            list_audio_devices,
             update_settings,
             health,
             gsi_targets,

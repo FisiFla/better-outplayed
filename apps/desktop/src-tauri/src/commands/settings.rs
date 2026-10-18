@@ -32,6 +32,10 @@ pub struct SettingsDto {
     pub output_size: String,
     /// `[mic] enabled`.
     pub mic_enabled: bool,
+    /// `[mic] device` — a capture endpoint id; empty is the Windows default microphone.
+    pub mic_device: String,
+    /// `[capture] output_device` — an output endpoint id; empty is the Windows default output.
+    pub output_device: String,
     /// `[games] auto_record`.
     pub auto_record: bool,
     /// `[encode] bitrate_kbps`.
@@ -61,6 +65,8 @@ pub struct SettingsUpdate {
     pub fps: Option<u32>,
     pub output_size: Option<String>,
     pub mic_enabled: Option<bool>,
+    pub mic_device: Option<String>,
+    pub output_device: Option<String>,
     pub auto_record: Option<bool>,
     /// A preset name; sets `[encode] bitrate_kbps`.
     pub quality: Option<String>,
@@ -93,7 +99,7 @@ pub struct UpdateSettingsOutcome {
 pub(super) fn recorder_options(engine: &EngineOptionsConfig) -> RecorderOptions {
     RecorderOptions {
         mode: Default::default(),
-        mic: engine.mic,
+        mic: engine.mic.clone(),
         games: engine.games.clone(),
         game: None,
     }
@@ -111,6 +117,8 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         fps: effective.fps,
         output_size: effective.output_size,
         mic_enabled: effective.mic_enabled,
+        mic_device: effective.mic_device,
+        output_device: effective.output_device,
         auto_record: effective.auto_record,
         quality: crate::config::quality_for_bitrate(effective.bitrate_kbps).to_string(),
         bitrate_kbps: effective.bitrate_kbps,
@@ -150,6 +158,12 @@ pub fn update_settings_file(
     if let Some(enabled) = update.mic_enabled {
         edits.push(SettingEdit::MicEnabled(enabled));
     }
+    if let Some(id) = &update.mic_device {
+        edits.push(SettingEdit::MicDevice(id.clone()));
+    }
+    if let Some(id) = &update.output_device {
+        edits.push(SettingEdit::OutputDevice(id.clone()));
+    }
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
     }
@@ -180,6 +194,12 @@ pub fn update_settings_file(
     }
     if update.mic_enabled.is_some() && after.mic_enabled != before.mic_enabled {
         engine_changed.push("mic.enabled");
+    }
+    if update.mic_device.is_some() && after.mic_device != before.mic_device {
+        engine_changed.push("mic.device");
+    }
+    if update.output_device.is_some() && after.output_device != before.output_device {
+        engine_changed.push("capture.output_device");
     }
     if update.auto_record.is_some() && after.auto_record != before.auto_record {
         engine_changed.push("games.auto_record");
@@ -286,7 +306,9 @@ mod tests {
                 "config_path",
                 "defaulted",
                 "fps",
+                "mic_device",
                 "mic_enabled",
+                "output_device",
                 "output_size",
                 "quality",
                 "watch_titles"

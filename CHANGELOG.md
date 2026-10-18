@@ -9,6 +9,11 @@ versions. For what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **Audio device selection**: Settings now picks the microphone (`[mic] device`) and the output
+  device recorded as desktop audio (`[capture] output_device`) from the active Windows endpoints;
+  empty keeps the Windows default. A chosen device that is unplugged at start refuses the
+  recording instead of recording another one. The "Microphone track" checkbox is now "Record
+  microphone". Windows-only paths type-check but are unverified on hardware.
 - **Desktop UI overhaul**: a navigation rail (Library, Sessions, Storage, Health, Settings), a
   clip-card grid, per-view pages, Inter / JetBrains Mono, Lucide icons and a role-named dark
   token set. Polish: view cross-fades, Esc / Alt+Left to leave a clip page, toasts that

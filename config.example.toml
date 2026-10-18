@@ -70,6 +70,11 @@ window = ""
 # child processes), so voice chat and music stay out of the clip; while none runs, and on
 # Windows builds before 20348, everything the speakers play. "system": always everything.
 game_audio = "app"
+# The output device whose audio is recorded when everything the speakers play is captured
+# ("system", or "app" while no game runs). Empty is the Windows default output; otherwise an
+# endpoint id, which Settings > Audio fills in. A game's own audio follows the game whatever
+# device it plays on. A device that is unplugged at start refuses to start.
+output_device = ""
 
 [encode]
 # auto | nvenc | qsv | amf
@@ -205,8 +210,8 @@ max_age_days = 7
 #
 # With it on, every clip and every session file carries TWO audio tracks — the game
 # audio first, the microphone second — and the microphone is the default
-# *communications* capture endpoint (the device Windows assigns to voice chat), which
-# is not configurable. On Windows this needs a capture device; if it cannot be
+# *communications* capture endpoint (the device Windows assigns to voice chat) unless
+# `device` below names another. On Windows this needs a capture device; if it cannot be
 # started, the recording fails at start rather than producing a video with a silent
 # voice track.
 #
@@ -215,6 +220,10 @@ max_age_days = 7
 # with a voice in it would carry that voice under the name of a track it does not have.
 [mic]
 enabled = false
+# The microphone to record: an endpoint id, which Settings > Audio fills in. Empty is the
+# Windows default communications microphone. A device that is unplugged at start refuses to
+# start rather than recording another one.
+device = ""
 
 # --- Game presence, and recording that follows it (Phase 5) ---------------------
 # When `auto_record = true`, localplay watches for the titles below and records one

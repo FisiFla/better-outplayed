@@ -6,6 +6,8 @@ pub mod platform;
 pub mod target;
 pub mod stub;
 
+pub mod audio_devices;
+
 // The microphone backend is cross-platform so the recorder's microphone path is testable off
 // Windows; the real implementation is the `#[cfg(windows)]` half inside it.
 pub mod wasapi_mic;

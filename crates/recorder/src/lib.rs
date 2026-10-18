@@ -922,7 +922,7 @@ impl Prepared {
         // the display first. This is the fail-loud half of `[mic] enabled`: a mic input nothing feeds
         // would record a silent voice track.
         let mut mic = if self.opts.mic.enabled {
-            Some(build_microphone(cfg.sources).with_context(|| {
+            Some(build_microphone(cfg.sources, &self.opts.mic.device).with_context(|| {
                 "mic.enabled = true, but the microphone backend could not be created; \
                  disable the microphone or fix the capture device"
             })?)
@@ -1322,10 +1322,10 @@ fn spawn_supervisor(
 /// [`Sources::Platform`] gives real WASAPI on Windows and an error elsewhere (a synthetic stand-in
 /// would claim to capture a voice track while recording nothing); [`Sources::Stub`] gives
 /// [`StubMicrophone`] for tests, CI and `--dev-stub-sources`.
-fn build_microphone(sources: Sources) -> Result<Box<dyn AudioBackend>> {
+fn build_microphone(sources: Sources, device: &str) -> Result<Box<dyn AudioBackend>> {
     match sources {
         Sources::Stub(_) => Ok(Box::new(StubMicrophone::new(MICROPHONE_FORMAT, MIC_BLOCK_MS))),
-        Sources::Platform => localplay_capture::wasapi_mic::microphone_backend(),
+        Sources::Platform => localplay_capture::wasapi_mic::microphone_backend(device),
     }
 }
 
@@ -2218,7 +2218,12 @@ fn build_sources(
                         None
                     })
                 });
-                Some(game_audio_backend(AudioFormat::default(), capture_section.game_audio, find_game)?)
+                Some(game_audio_backend(
+                    AudioFormat::default(),
+                    capture_section.game_audio,
+                    find_game,
+                    &capture_section.output_device,
+                )?)
             } else {
                 None
             };
