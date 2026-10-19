@@ -1,0 +1,44 @@
+# The gitleaks configuration.
+#
+# The secret scan is the guard behind the "nothing leaves this machine" claim, so it has
+# to stay strict. It is strict by default: every rule gitleaks ships with is on, and the
+# only exceptions are the two below — both of them test fixtures, and both of them written
+# down here rather than left as a fingerprint in `.gitleaksignore`, which goes stale the
+# moment a line moves and says nothing about *why*.
+#
+# `scripts/check-forbidden-apis.sh` guards the other half of the same promise (no process
+# manipulation, no input synthesis) and is a different kind of check: it is about what the
+# code may call, not about what it may contain.
+
+[extend]
+useDefault = true
+
+# The Game State Integration listener and the file it writes for the game both hold fixed
+# hex strings where a real token would go. The gate compares a presented token against a
+# fixed one, so the tests need a literal — and a hex string assigned to a name containing
+# "token" is exactly what a leaked credential looks like to the scanner.
+#
+# These are not credentials: the values are the digits of pi in hex, they are the same in
+# every test, and the real token is generated at run time from the OS entropy source
+# (`getrandom`) and never written into the source tree. The lines themselves also carry
+# `// gitleaks:allow`, so the tree is clean even if this file is not picked up.
+[[allowlists]]
+description = "Game State Integration test fixtures: fixed hex strings, not credentials"
+ruleIDs = ["generic-api-key"]
+paths = [
+  '''^crates/events/src/gsi\.rs$''',
+  '''^crates/events/src/gsi/integration\.rs$''',
+]
+
+# The TLS test chain used to be a committed key. It is generated at test time instead now
+# (commit 911bf5d, "events: pin Riot's root for the Live Client; generate the TLS test
+# chain instead of committing a key"), and the file is gone from the tree — but the commit
+# that carried it is still in this repository's history, so a scan of the whole history
+# still finds it. The path is allowed here so that the weekly full-history scan in
+# `.github/workflows/secret-scan.yml` can pass; the key was never used anywhere but a test.
+[[allowlists]]
+description = "A TLS test key that was committed once and has since been removed"
+ruleIDs = ["private-key"]
+paths = [
+  '''^crates/events/tests/fixtures/tls/''',
+]

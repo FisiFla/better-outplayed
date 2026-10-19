@@ -901,7 +901,10 @@ mod tests {
         // file it read is the one in force: a file replaced while the recording runs is a
         // divergence the shell can only notice if the listener answers.
         let (sink, _rx) = std::sync::mpsc::channel();
-        let token = "0123456789abcdef0123456789abcdef";
+        // A fixed token, not a credential: the digits of pi in hex, the same in every test.
+        // The real one is generated from the OS entropy source at run time. `gitleaks:allow`
+        // because a hex string assigned to a name containing "token" reads as a leak.
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
         let listener = spawn(GsiConfig::new(0, token), sink).expect("the listener starts");
         assert_eq!(listener.port(), listener.local_addr().port());
         assert_ne!(listener.port(), 0, "the OS assigned a real port");

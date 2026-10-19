@@ -98,6 +98,14 @@ versions. For what has and has not been *verified* on real hardware, read
   the webview can no longer widen the asset protocol's read scope to any path it names.
 
 ### Fixed
+- **The secret scan now covers the whole history, not just the commits a push brought.** The
+  per-push gitleaks step narrows its scan to the range the push touched, so a credential
+  committed long ago was never reported — and this repository carried a committed TLS test
+  key from 2026-09-23 to 2026-09-26 without a scan ever mentioning it. A weekly
+  `secret-scan` workflow now sweeps every commit, and the two documented exceptions (fixed
+  hex strings in the Game State Integration tests, and that removed test key) live in
+  `.gitleaks.toml` with the reason written down, instead of in a `.gitleaksignore`
+  fingerprint that goes stale when a line moves.
 - **The webview can no longer forge log lines.** The frontend's own log command flattened its
   input to one line and capped it, and every frontend line is tagged `[webview]`, so a newline
   in the text can no longer end the log line and have the rest of it read as a backend entry.

@@ -2096,7 +2096,8 @@ mod tests {
 
     #[test]
     fn a_frontend_log_line_cannot_smuggle_a_second_line() {
-        let forged = flatten_for_log("clip failed\n2026-10-19 12:00:00 ERROR backend: the disk is full");
+        let forged =
+            flatten_for_log("clip failed\n2026-10-19 12:00:00 ERROR backend: the disk is full");
         assert!(
             !forged.contains('\n') && !forged.contains('\r'),
             "a newline in the webview's text must not end the log line: {forged:?}"
@@ -2105,7 +2106,11 @@ mod tests {
             forged.contains("the disk is full"),
             "but the text itself is kept: {forged:?}"
         );
-        assert_eq!(forged.matches("  ").count(), 0, "and runs of space collapse");
+        assert_eq!(
+            forged.matches("  ").count(),
+            0,
+            "and runs of space collapse"
+        );
     }
 
     #[test]

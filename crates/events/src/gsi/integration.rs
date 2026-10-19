@@ -268,7 +268,10 @@ mod tests {
 
     #[test]
     fn the_counter_strike_cfg_is_the_file_a_user_can_install() {
-        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        // A fixed token, not a credential: the digits of pi in hex, the same in every test.
+        // The real one is generated from the OS entropy source at run time. `gitleaks:allow`
+        // because a hex string assigned to a name containing "token" reads as a leak.
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // gitleaks:allow
         let text = integration_cfg(45671, token);
 
         // The endpoint, which is the one thing that has to be right.
