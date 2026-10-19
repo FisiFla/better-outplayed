@@ -66,8 +66,43 @@ use std::path::Path;
 /// once from a file the app wrote.
 pub const TOKEN_BYTES: usize = 32;
 
-/// The path the GSI listener answers on. One path, so anything else is a 404.
+/// The path the GSI listener answers on when a game is not given one of its own. Anything
+/// else is a 404.
 pub const DEFAULT_PATH: &str = "/gsi";
+
+/// The path Counter-Strike posts to when it has a path of its own.
+pub const CS2_PATH: &str = "/gsi/cs2";
+
+/// The path Dota 2 posts to when it has a path of its own.
+pub const DOTA2_PATH: &str = "/gsi/dota2";
+
+/// Valve's app id for Counter-Strike 2 / CS:GO.
+pub const CS2_APP_ID: u32 = 730;
+
+/// Valve's app id for Dota 2.
+pub const DOTA2_APP_ID: u32 = 570;
+
+/// The path a game posts to.
+///
+/// The name is the game's own: `"cs2"` and `"dota2"` are the two games the GSI integration
+/// serves, and each has a path of its own, so a token lifted from one game's installed
+/// `.cfg` is refused on the other's path. An unknown name gets a path derived from it, so
+/// a caller that names a game this crate does not know still gets a path that is not
+/// another game's.
+pub fn game_path(game: &str) -> String {
+    let name = game.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "cs2" | "csgo" | "counter-strike" | "counter-strike 2" => CS2_PATH.to_string(),
+        "dota2" | "dota" | "dota 2" => DOTA2_PATH.to_string(),
+        other => format!(
+            "/gsi/{}",
+            other
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+        ),
+    }
+}
 
 /// Generate a token from the operating system's randomness.
 pub fn generate_token() -> Result<String> {
@@ -132,6 +167,24 @@ fn restrict_to_owner(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_to_owner(_path: &Path) {}
 
+/// The data blocks Counter-Strike subscribes to.
+const CS2_BLOCKS: &[(&str, &str)] = &[
+    ("provider", "1"),
+    ("map", "1"),
+    ("round", "1"),
+    ("bomb", "1"),
+    ("player_state", "1"),
+    ("player_match_stats", "1"),
+];
+
+/// The data blocks Dota 2 subscribes to.
+const DOTA_BLOCKS: &[(&str, &str)] = &[
+    ("provider", "1"),
+    ("map", "1"),
+    ("player", "1"),
+    ("hero", "1"),
+];
+
 /// The Counter-Strike 2 / CS:GO integration file, ready to install.
 ///
 /// Pure text. The tests assert its contents literally, because a human copies it into a game
@@ -141,38 +194,35 @@ fn restrict_to_owner(_path: &Path) {}
 /// configured one: the file is where the game is told to post, and a port that does not match
 /// the socket is a game that posts into the void.
 pub fn integration_cfg(port: u16, token: &str) -> String {
-    let data = [
-        ("provider", "1"),
-        ("map", "1"),
-        ("round", "1"),
-        ("bomb", "1"),
-        ("player_state", "1"),
-        ("player_match_stats", "1"),
-    ];
-    cfg_text(
-        "Counter-Strike 2 / CS:GO",
-        "...\\Counter-Strike Global Offensive\\game\\csgo\\cfg\\gamestate_integration_localplay.cfg",
-        port,
-        token,
-        &data,
-    )
+    integration_cfg_for(port, DEFAULT_PATH, token, false)
 }
 
 /// The Dota 2 integration file. Its data blocks are Dota's, not Counter-Strike's.
 pub fn integration_cfg_dota(port: u16, token: &str) -> String {
-    let data = [
-        ("provider", "1"),
-        ("map", "1"),
-        ("player", "1"),
-        ("hero", "1"),
-    ];
-    cfg_text(
-        "Dota 2",
-        "...\\dota 2 beta\\game\\dota\\cfg\\gamestate_integration\\gamestate_integration_localplay.cfg",
-        port,
-        token,
-        &data,
-    )
+    integration_cfg_for(port, DEFAULT_PATH, token, true)
+}
+
+/// The integration file for a game, posting to `path`.
+///
+/// The `uri` names the path the game posts to, which is the path the listener serves that
+/// game on: each game has a path of its own, so the token in this file is only good for
+/// this game. `dota` picks the game's data blocks — Dota 2 subscribes `player` and `hero`,
+/// Counter-Strike subscribes `player_state` and `player_match_stats`.
+pub fn integration_cfg_for(port: u16, path: &str, token: &str, dota: bool) -> String {
+    let (game, install_path, data) = if dota {
+        (
+            "Dota 2",
+            "...\\dota 2 beta\\game\\dota\\cfg\\gamestate_integration\\gamestate_integration_localplay.cfg",
+            DOTA_BLOCKS,
+        )
+    } else {
+        (
+            "Counter-Strike 2 / CS:GO",
+            "...\\Counter-Strike Global Offensive\\game\\csgo\\cfg\\gamestate_integration_localplay.cfg",
+            CS2_BLOCKS,
+        )
+    };
+    cfg_text(game, install_path, port, path, token, data)
 }
 
 /// The file both of the above are built from. The `//` comments are legal KeyValues (Valve's
@@ -182,6 +232,7 @@ fn cfg_text(
     game: &str,
     install_path: &str,
     port: u16,
+    path: &str,
     token: &str,
     data: &[(&str, &str)],
 ) -> String {
@@ -195,7 +246,7 @@ fn cfg_text(
     out.push('\n');
     out.push_str("\"localplay\"\n{\n");
     out.push_str(&format!(
-        "    \"uri\"       \"http://127.0.0.1:{port}{DEFAULT_PATH}\"\n"
+        "    \"uri\"       \"http://127.0.0.1:{port}{path}\"\n"
     ));
     // timeout/buffer/throttle are Valve's recommended local values. The heartbeat keeps payloads
     // arriving through a quiet stretch, so heartbeat-based derivation (the bomb timer) is not
@@ -413,6 +464,57 @@ mod tests {
                 "got:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn each_game_posts_to_a_path_of_its_own() {
+        // The path is what scopes a token: the file a game is given names the path it posts
+        // to, and the listener serves that path with that game's token alone.
+        assert_eq!(game_path("cs2"), CS2_PATH);
+        assert_eq!(game_path("dota2"), DOTA2_PATH);
+        assert_eq!(game_path("CS2"), CS2_PATH, "the name is not case-sensitive");
+        assert_eq!(game_path("  dota2  "), DOTA2_PATH, "nor padded");
+        assert_ne!(game_path("cs2"), game_path("dota2"));
+        assert!(
+            game_path("cs2").starts_with('/'),
+            "a path is absolute: {}",
+            game_path("cs2")
+        );
+
+        // A game this crate does not know still gets a path of its own, and not another
+        // game's.
+        let other = game_path("counter-strike 3");
+        assert!(other.starts_with("/gsi/"), "got {other}");
+        assert_ne!(other, CS2_PATH);
+        assert_ne!(other, DOTA2_PATH);
+    }
+
+    #[test]
+    fn the_cfg_names_the_path_the_game_posts_to() {
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
+        for (path, dota) in [(CS2_PATH, false), (DOTA2_PATH, true)] {
+            let text = integration_cfg_for(45671, path, token, dota);
+            assert!(
+                text.contains(&format!("\"uri\"       \"http://127.0.0.1:45671{path}\"")),
+                "the uri must name the path the game posts to:\n{text}"
+            );
+            assert_eq!(
+                text.matches(token).count(),
+                1,
+                "the token appears once:\n{text}"
+            );
+        }
+
+        // The Dota file still subscribes Dota's blocks, and the Counter-Strike file its own.
+        let cs2 = integration_cfg_for(45671, CS2_PATH, token, false);
+        assert!(cs2.contains("\"player_match_stats\""), "got:\n{cs2}");
+        let dota = integration_cfg_for(45671, DOTA2_PATH, token, true);
+        assert!(dota.contains("\"hero\""), "got:\n{dota}");
+        assert!(!dota.contains("player_match_stats"), "got:\n{dota}");
+
+        // The two old files keep their path and their blocks.
+        assert!(integration_cfg(45671, token).contains(DEFAULT_PATH));
+        assert!(integration_cfg_dota(45671, token).contains(DEFAULT_PATH));
     }
 
     #[test]

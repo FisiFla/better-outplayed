@@ -105,6 +105,7 @@ pub use config::{
     BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, RecordingMode,
     SessionStorageRules, StorageSection,
 };
+pub use event_driver::{GsiBinding, GsiGameInfo, GsiHandle};
 pub use fps::FpsDecision;
 pub use index::{
     cleanup_pass, clip_chapters, index_bookmark, index_clip, index_event, now_ms, open_clip_index,

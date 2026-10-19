@@ -12,7 +12,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use localplay_events::gsi::{self, GsiConfig, GsiListener};
+use localplay_events::gsi::integration::{
+    game_path, integration_cfg_for, CS2_APP_ID, DOTA2_APP_ID,
+};
+use localplay_events::gsi::{self, GsiConfig, GsiGameBinding, GsiListener};
 use localplay_events::lol::{self, LolConfig, LolHandle};
 use localplay_events::{EventKind, GameEvent};
 use serde::Deserialize;
@@ -30,6 +33,18 @@ pub struct EventsSection {
     pub lol_poll_enabled: bool,
     /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
     pub gsi_port: u16,
+    /// Let the operating system pick the GSI port instead of binding `gsi_port`.
+    ///
+    /// The generated `.cfg` names the port the listener actually bound either way, but a
+    /// fixed port can be squatted on: another local process binds it before this one starts,
+    /// and the game then posts to that process — the token with it. The ephemeral mode is the
+    /// answer for anyone who does not need a fixed port.
+    ///
+    /// `events.gsi_port = 0` still means "the listener is off", in both modes: this key
+    /// chooses *which* port is bound, not whether it is. The configured `gsi_port` is ignored
+    /// while it is on — the OS picks the port, and the `.cfg` names the one it picked.
+    #[serde(default)]
+    pub gsi_ephemeral_port: bool,
     /// Highlight kinds that must not take a clip (tags from `EventKind::as_tag`, e.g.
     /// `["objective", "assist"]`). A muted kind is still recorded as a marker. Unknown tags are
     /// rejected at load, so a typo cannot silently mute nothing.
@@ -121,6 +136,7 @@ impl Default for EventsSection {
         Self {
             lol_poll_enabled: true,
             gsi_port: 45671,
+            gsi_ephemeral_port: false,
             mute_clips: Vec::new(),
             lol: GameClipSection::default(),
             gsi: GameClipSection::default(),
@@ -137,10 +153,106 @@ pub struct EventSources {
     pub events: Receiver<GameEvent>,
     /// Kept alive (not read): dropping it stops the poller.
     pub _lol: Option<LolHandle>,
-    /// The same for the GSI listener.
-    pub _gsi: Option<GsiListener>,
+    /// The same for the GSI listener, together with the bindings it serves.
+    pub _gsi: Option<GsiHandle>,
     /// What starting each source concluded, for a health readout; empty when assembled by hand.
     pub reports: Vec<SourceReport>,
+}
+
+impl EventSources {
+    /// The games the GSI listener serves right now, with the live port and token.
+    ///
+    /// Empty when the listener is off (`events.gsi_port = 0`) or failed to start: there is
+    /// then nothing serving, so there is nothing to install a `.cfg` for.
+    pub fn gsi_bindings(&self) -> Vec<GsiBinding> {
+        self._gsi
+            .as_ref()
+            .map(|handle| handle.bindings().to_vec())
+            .unwrap_or_default()
+    }
+}
+
+/// The running GSI listener and the bindings it serves.
+///
+/// The listener holds the tokens and does not hand them back out (it only answers whether a
+/// candidate matches), but a caller that writes the game's own `.cfg` needs the token itself.
+/// Keeping the two together is what stops the file and the listener from disagreeing.
+pub struct GsiHandle {
+    listener: GsiListener,
+    bindings: Vec<GsiBinding>,
+}
+
+impl GsiHandle {
+    /// The listener itself, for a caller that wants to stop it or ask which token it accepts.
+    pub fn listener(&self) -> &GsiListener {
+        &self.listener
+    }
+
+    /// The games the listener serves, with the live port and the token in force.
+    pub fn bindings(&self) -> &[GsiBinding] {
+        &self.bindings
+    }
+}
+
+/// A game the GSI listener serves, with everything a caller needs to write the game's cfg.
+///
+/// The token is the one the listener accepts, and this crate writes it to disk anyway (the
+/// `.cfg` in the application's own data directory carries it), so handing it to a caller that
+/// writes the game's own copy is no new exposure. It is never logged, and this struct's
+/// `Debug` redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GsiBinding {
+    /// "cs2" or "dota2" — the game id.
+    pub game: String,
+    /// The path the game posts to.
+    pub path: String,
+    /// The port the listener bound; the one the `.cfg` must name.
+    pub port: u16,
+    /// Valve's app id.
+    pub app_id: u32,
+    /// The token the listener accepts for this game.
+    pub token: String,
+}
+
+impl GsiBinding {
+    /// The game's `.cfg`, ready to install into the game's own directory.
+    ///
+    /// Built from the live port, the game's own path and the token in force, so the file a
+    /// caller installs cannot disagree with the running listener.
+    pub fn cfg(&self) -> String {
+        integration_cfg_for(
+            self.port,
+            &self.path,
+            &self.token,
+            self.game == GSI_GAME_DOTA2,
+        )
+    }
+}
+
+impl std::fmt::Debug for GsiBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GsiBinding")
+            .field("game", &self.game)
+            .field("path", &self.path)
+            .field("port", &self.port)
+            .field("app_id", &self.app_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One game the GSI listener serves, as a health readout shows it.
+///
+/// The port the game must post to is on the report itself
+/// ([`SourceReport::gsi_port`]); this is the per-game half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsiGameInfo {
+    /// "cs2" or "dota2" — the game id, NOT the events crate's name.
+    pub game: String,
+    /// The path the game posts to.
+    pub path: String,
+    /// Valve's app id.
+    pub app_id: u32,
 }
 
 /// How a source came out of startup.
@@ -157,6 +269,13 @@ pub struct SourceReport {
     pub source: &'static str,
     pub state: SourceState,
     pub detail: String,
+    /// The port the GSI listener actually bound, when the source is running.
+    ///
+    /// The live port, not the configured one: an ephemeral bind, or a configured port that
+    /// could not be had, are both ways for the game and the listener to disagree.
+    pub gsi_port: Option<u16>,
+    /// The games the listener serves, with the port and path the game must post to.
+    pub gsi_games: Vec<GsiGameInfo>,
 }
 
 /// Start whatever `[events]` asked for, best effort.
@@ -180,6 +299,8 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
                     source: "League of Legends",
                     state: SourceState::Running,
                     detail: format!("polling {}", handle.endpoint().url()),
+                    gsi_port: None,
+                    gsi_games: Vec::new(),
                 });
                 Some(handle)
             }
@@ -191,6 +312,8 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
                     source: "League of Legends",
                     state: SourceState::Failed,
                     detail: format!("{err:#}"),
+                    gsi_port: None,
+                    gsi_games: Vec::new(),
                 });
                 None
             }
@@ -201,6 +324,8 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
             source: "League of Legends",
             state: SourceState::Disabled,
             detail: "events.lol_poll_enabled = false".into(),
+            gsi_port: None,
+            gsi_games: Vec::new(),
         });
         None
     };
@@ -211,17 +336,36 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
             source: "CS2 / Dota 2",
             state: SourceState::Disabled,
             detail: "events.gsi_port = 0".into(),
+            gsi_port: None,
+            gsi_games: Vec::new(),
         });
         None
     } else {
-        match start_gsi(app_dir, events.gsi_port, sink.clone()) {
-            Ok(listener) => {
+        match start_gsi(
+            app_dir,
+            events.gsi_port,
+            events.gsi_ephemeral_port,
+            sink.clone(),
+        ) {
+            Ok(handle) => {
+                // The port the listener bound, which is the port the game must be told about.
+                let port = handle.listener().port();
                 reports.push(SourceReport {
                     source: "CS2 / Dota 2",
                     state: SourceState::Running,
-                    detail: format!("listening on 127.0.0.1:{}", events.gsi_port),
+                    detail: format!("listening on 127.0.0.1:{port}"),
+                    gsi_port: Some(port),
+                    gsi_games: handle
+                        .bindings()
+                        .iter()
+                        .map(|binding| GsiGameInfo {
+                            game: binding.game.clone(),
+                            path: binding.path.clone(),
+                            app_id: binding.app_id,
+                        })
+                        .collect(),
                 });
-                Some(listener)
+                Some(handle)
             }
             Err(err) => {
                 tracing::warn!("events.gsi_port is set but the listener could not start: {err:#}");
@@ -229,6 +373,8 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
                     source: "CS2 / Dota 2",
                     state: SourceState::Failed,
                     detail: format!("{err:#}"),
+                    gsi_port: None,
+                    gsi_games: Vec::new(),
                 });
                 None
             }
@@ -243,42 +389,171 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
     }
 }
 
-/// Bring up the GSI listener and write out the file the user has to install.
-///
-/// Never writes into a game's installation directory: it generates the file into its own data
-/// directory and says where to copy it (the desktop settings button is the one user-triggered
-/// installer). The token is persisted so the installed file keeps working across runs, and is
-/// never logged.
-fn start_gsi(app_dir: &Path, port: u16, sink: localplay_events::EventSink) -> Result<GsiListener> {
-    let token_path = app_dir.join("gsi-token.txt");
-    let token = gsi::load_or_create_token(&token_path)?;
+/// The name of the file both games read, and the one this crate writes into its own data
+/// directory for the user to install.
+pub const GSI_CFG_NAME: &str = "gamestate_integration_localplay.cfg";
 
-    // One file per game in its own directory: the games subscribe different data blocks but the file name is the same.
-    let dirs = [
-        (
-            "cs2",
-            gsi::integration_cfg(port, &token),
-            "Counter-Strike 2 / CS:GO",
-        ),
-        ("dota2", gsi::integration_cfg_dota(port, &token), "Dota 2"),
-    ];
-    for (game, text, name) in dirs {
-        let dir = app_dir.join("gsi").join(game);
+/// The game id of Counter-Strike 2, as the bindings and the reports name it.
+pub const GSI_GAME_CS2: &str = "cs2";
+
+/// The game id of Dota 2, as the bindings and the reports name it.
+pub const GSI_GAME_DOTA2: &str = "dota2";
+
+/// The token file of the installs that predate per-game tokens: one token for both games.
+const LEGACY_TOKEN_FILE: &str = "gsi-token.txt";
+
+/// One game the GSI listener serves.
+struct GsiGame {
+    /// The game id: the folder under `gsi/`, and the id the path is derived from.
+    id: &'static str,
+    /// The name the log line uses.
+    name: &'static str,
+    /// Valve's app id; the listener refuses a payload that says it is another game.
+    app_id: u32,
+    /// Whether the `.cfg` is Dota's rather than Counter-Strike's.
+    dota: bool,
+}
+
+/// The two games, each with its own token and its own path.
+const GSI_GAMES: [GsiGame; 2] = [
+    GsiGame {
+        id: GSI_GAME_CS2,
+        name: "Counter-Strike 2 / CS:GO",
+        app_id: CS2_APP_ID,
+        dota: false,
+    },
+    GsiGame {
+        id: GSI_GAME_DOTA2,
+        name: "Dota 2",
+        app_id: DOTA2_APP_ID,
+        dota: true,
+    },
+];
+
+/// One game, ready to be served: its path, its token and its id.
+struct GameSetup {
+    id: &'static str,
+    name: &'static str,
+    app_id: u32,
+    dota: bool,
+    path: String,
+    token: String,
+}
+
+/// Bring up the GSI listener and write out the files the user has to install.
+///
+/// Never writes into a game's installation directory: it generates the files into its own data
+/// directory and says where to copy them (the desktop settings button is the one user-triggered
+/// installer). The tokens are persisted so the installed files keep working across runs, and
+/// are never logged.
+///
+/// The order is the point:
+///
+/// 1. each game's token is read (or generated) into a file of its own;
+/// 2. the listener is bound, and the port it bound is the port the game is told about;
+/// 3. only then are the `.cfg` files written, each naming that live port, its own path and
+///    its own token.
+///
+/// A `.cfg` written before the bind names a port nobody may be listening on — a taken port, or
+/// an ephemeral one the OS picked — and the game posts into the void. Writing the files after
+/// the bind is what makes the file and the listener agree.
+fn start_gsi(
+    app_dir: &Path,
+    configured_port: u16,
+    ephemeral: bool,
+    sink: localplay_events::EventSink,
+) -> Result<GsiHandle> {
+    let games: Vec<GameSetup> = GSI_GAMES
+        .iter()
+        .map(|game| {
+            Ok(GameSetup {
+                id: game.id,
+                name: game.name,
+                app_id: game.app_id,
+                dota: game.dota,
+                path: game_path(game.id),
+                token: per_game_token(app_dir, game.id)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Bind FIRST. The port the listener got is the port the game is told about, whether it was
+    // configured, picked by the OS, or the only one left.
+    let bind_port = if ephemeral { 0 } else { configured_port };
+    let listener = gsi::spawn(gsi_config(bind_port, &games), sink)?;
+    let live_port = listener.port();
+
+    // Then the files the user installs: one per game, each with its own token and its own path.
+    let mut bindings = Vec::new();
+    for game in &games {
+        let dir = app_dir.join("gsi").join(game.id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join("gamestate_integration_localplay.cfg");
+        let path = dir.join(GSI_CFG_NAME);
+        let text = integration_cfg_for(live_port, &game.path, &game.token, game.dota);
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         tracing::info!(
-            "{name}: copy {} into the game's cfg directory and restart the game",
+            "{}: copy {} into the game's cfg directory and restart the game",
+            game.name,
             path.display()
         );
+        bindings.push(GsiBinding {
+            game: game.id.to_string(),
+            path: game.path.clone(),
+            port: live_port,
+            app_id: game.app_id,
+            token: game.token.clone(),
+        });
     }
 
-    let listener = gsi::spawn(GsiConfig::new(port, token), sink)?;
     tracing::info!(
-        "the token the game must carry is in {} (never logged, and not in the config file)",
-        token_path.display()
+        "the CS2 / Dota 2 listener is up on 127.0.0.1:{live_port}; the tokens the games must \
+         carry are in {}/gsi-token-<game>.txt (never logged)",
+        app_dir.display()
     );
-    Ok(listener)
+    Ok(GsiHandle { listener, bindings })
+}
+
+/// The listener's configuration: one binding per game, each with its own token and path.
+///
+/// The binding is what scopes a token, so a token lifted from one game's installed `.cfg` is
+/// good for that game's path only.
+fn gsi_config(port: u16, games: &[GameSetup]) -> GsiConfig {
+    GsiConfig {
+        port,
+        games: games
+            .iter()
+            .map(|game| {
+                GsiGameBinding::new(game.path.clone(), game.token.clone(), Some(game.app_id))
+            })
+            .collect(),
+    }
+}
+
+/// The token of one game, in a file of its own.
+///
+/// One token per game: a token lifted from one game's installed `.cfg` must not be able to
+/// forge the other game's events. An install that predates this keeps working — the old single
+/// `gsi-token.txt` is copied into the game's own file, so the token already installed in the
+/// game's folder stays valid. The old file is left where it is: an older build of the
+/// application still finds its token there.
+fn per_game_token(app_dir: &Path, game: &str) -> Result<String> {
+    let path = app_dir.join(format!("gsi-token-{game}.txt"));
+    let legacy = app_dir.join(LEGACY_TOKEN_FILE);
+    if !path.exists() && legacy.is_file() {
+        // The copy keeps the file mode, so the token file stays owner-only.
+        std::fs::copy(&legacy, &path).with_context(|| {
+            format!(
+                "migrating the GSI token from {} into {}",
+                legacy.display(),
+                path.display()
+            )
+        })?;
+        tracing::info!(
+            "the GSI token for {game} was migrated from {} (that file is left in place)",
+            legacy.display()
+        );
+    }
+    gsi::load_or_create_token(&path)
 }
 
 /// Do what a derived event asks for. The only decision, highlight versus marker, is the
@@ -459,6 +734,7 @@ pub type ClipHook = Box<dyn Fn(&RecordedClip) + Send + 'static>;
 /// thread and then the sources.
 pub struct EventDriver {
     reports: Vec<SourceReport>,
+    gsi_bindings: Vec<GsiBinding>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -474,6 +750,9 @@ impl EventDriver {
     ) -> Result<Self> {
         let sources = start_event_sources(app_dir, events);
         let reports = sources.reports.clone();
+        // Taken before the sources move onto the driver thread: the shell that installs the
+        // game's `.cfg` needs the port the listener bound and the token it accepts.
+        let gsi_bindings = sources.gsi_bindings();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
@@ -482,6 +761,7 @@ impl EventDriver {
             .context("spawning the game-event thread")?;
         Ok(Self {
             reports,
+            gsi_bindings,
             stop,
             thread: Some(thread),
         })
@@ -492,6 +772,15 @@ impl EventDriver {
     /// How each source came out of startup, for the health page.
     pub fn reports(&self) -> &[SourceReport] {
         &self.reports
+    }
+
+    /// The games the GSI listener serves, with the live port and the token in force.
+    ///
+    /// The desktop shell writes the game's own `.cfg` from this: the port is the one the
+    /// listener bound and the token is the one it accepts, so the file it installs cannot
+    /// disagree with the running listener. Empty when the listener is off or failed to start.
+    pub fn gsi_bindings(&self) -> Vec<GsiBinding> {
+        self.gsi_bindings.clone()
     }
 }
 
@@ -686,6 +975,7 @@ mod tests {
             EventsSection {
                 lol_poll_enabled: true,
                 gsi_port: 45671,
+                gsi_ephemeral_port: false,
                 mute_clips: Vec::new(),
                 lol: GameClipSection::default(),
                 gsi: GameClipSection::default(),

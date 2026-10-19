@@ -38,6 +38,11 @@ pub mod lol;
 pub mod process;
 pub mod wire;
 
+// The GSI listener's configuration, at the crate root as well as under `gsi`: a caller
+// that serves two games needs the binding type, and the module path is long enough to be
+// worth a shorter name.
+pub use gsi::{GsiConfig, GsiGameBinding, GsiGameInfo, GsiListener};
+
 /// A request to clip. Manual and automatic paths both funnel through this, so the replay
 /// buffer has one entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -76,6 +76,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "the test that drives the loopback listener",
     ),
     (
+        "crates/events/tests/gsi_routing",
+        "the test that drives the loopback listener's per-game routes",
+    ),
+    (
         "crates/encoder/src/ffmpeg.rs",
         "the encoder's audio input: ffmpeg dials a loopback listener to receive the PCM, \
          and the accepted peer is checked to be loopback",
@@ -319,6 +323,7 @@ fn only_the_loopback_modules_talk_to_a_socket_at_all() {
             "crates/events/src/gsi.rs".to_string(),
             "crates/events/src/lol/client.rs".to_string(),
             "crates/events/tests/gsi_listener.rs".to_string(),
+            "crates/events/tests/gsi_routing.rs".to_string(),
             "crates/events/tests/lol_mock.rs".to_string(),
         ],
         "the tree's outbound sockets are the League client and the tests that drive the \

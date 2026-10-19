@@ -10,15 +10,18 @@
 //! 1. Loopback only, by construction. [`bind`] refuses any non-loopback address and the only
 //!    other way in, [`bind_loopback`], takes a port alone. No setting names a bind address, so
 //!    a listener on `0.0.0.0` cannot be expressed.
-//! 2. A token, checked in constant time, and checked *before the body is parsed*. It travels
-//!    in the payload's `auth` block (GSI has no header), and a request with a missing or
-//!    different token is refused with `403` without the body ever being turned into a
-//!    document ([`token_matches`], [`payload::auth_token`]).
+//! 2. A route per game, and a token per game. A game posts to its own path (`/gsi/cs2`,
+//!    `/gsi/dota2`); a path no game serves is a `404`, and the token that is expected on
+//!    that path is that game's alone. The token is checked in constant time, and checked
+//!    *before the body is parsed*. It travels in the payload's `auth` block (GSI has no
+//!    header), and a request with a missing or different token is refused with `403` without
+//!    the body ever being turned into a document ([`token_matches`], [`payload::auth_token`]).
 //! 3. No attacker-controlled content in the log. A refused or unreadable request is counted,
 //!    and the log line says how many and what kind; the body, headers and token are never
 //!    written.
 //!
-//! The game is told apart only by payload (app id, then provider name; see [`derive::Game`]).
+//! The game is told apart by the route first (each game posts to its own path), then by
+//! payload (app id, then provider name; see [`derive::Game`]).
 //! The listener cannot react to the game exiting: a killed process sends no final POST, so
 //! `GameEnd` is only derived from a payload that says so (`map.phase == "gameover"`, Dota's
 //! `POST_GAME`). That is why League's end-of-game signal (the endpoint going quiet) differs.
@@ -47,8 +50,10 @@
 //! the player got a kill, and the recorder cuts a clip of nothing. The token cannot be
 //! hidden — the game has to read it — so the defences are scope and freshness, not secrecy:
 //!
-//! * **Scope.** [`GsiConfig::pinned_to`] pins the listener to one game, so a token lifted
-//!   from a Counter-Strike installation cannot forge Dota events, and the other way round.
+//! * **Scope.** Each game has its own path and its own token ([`GsiGameBinding`]), and a
+//!   binding can be pinned to an app id ([`GsiConfig::pinned_to`]). A token lifted from a
+//!   Counter-Strike installation is refused on Dota 2's path, and a payload that names
+//!   another app id is refused even on the path it was lifted for.
 //! * **Freshness.** A port of `0` is an ephemeral port, chosen by the OS for the session, so
 //!   a token captured from the wire is only good for the session it was captured in and a
 //!   process squatting on the port cannot learn the token at all. The `.cfg` the game is
@@ -67,9 +72,9 @@
 //! the token it started with, the installer writes the new one into the `.cfg`, and every
 //! POST is answered `403` until the application restarts. This crate cannot fix that — the
 //! installer is not its code — but it can make the divergence visible:
-//! [`GsiListener::accepts_token`] answers whether the token in a file is the one in force,
-//! and [`GsiListener::port`] answers the port the game must be told about. The shell should
-//! read both from the running listener rather than from the file.
+//! [`GsiListener::accepts_token`] answers whether the token in a file is one of the tokens in
+//! force, and [`GsiListener::port`] answers the port the game must be told about. The shell
+//! should read both from the running listener rather than from the file.
 
 pub mod derive;
 pub mod http;
@@ -78,15 +83,16 @@ pub mod payload;
 
 pub use derive::{Game, Tracker};
 pub use integration::{
-    generate_token, integration_cfg, integration_cfg_dota, load_or_create_token, DEFAULT_PATH,
-    TOKEN_BYTES,
+    game_path, generate_token, integration_cfg, integration_cfg_dota, load_or_create_token,
+    CS2_APP_ID, DEFAULT_PATH, DOTA2_APP_ID, TOKEN_BYTES,
 };
 pub use payload::{AuthToken, GsiSnapshot};
 
 use crate::wire::write_response;
 use crate::{EventSink, GameEvent};
 use anyhow::{bail, Context, Result};
-use std::io::ErrorKind;
+use std::fmt;
+use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
@@ -185,8 +191,58 @@ impl std::io::Read for DeadlineReader<'_> {
     }
 }
 
-/// Everything the listener needs.
+/// One game the listener serves: the path it posts to, its own token, and the app id
+/// its payloads must carry.
+///
+/// The binding is what scopes a token. The token is written into the game's `cfg`
+/// directory, where any local account that can read the installation can read it, so a
+/// token lifted from one game's file is only ever good for the path it was lifted for —
+/// and, when the binding names an app id, only for that game's payloads.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GsiGameBinding {
+    /// The path the game posts to, e.g. `/gsi/cs2`. Anything else is a 404.
+    pub path: String,
+    /// The token for this game alone. Never logged, never printed.
+    pub token: String,
+    /// Valve's app id: 730 for Counter-Strike, 570 for Dota 2. `None` accepts any.
+    pub app_id: Option<u32>,
+}
+
+impl GsiGameBinding {
+    /// A binding for one game.
+    pub fn new(path: impl Into<String>, token: impl Into<String>, app_id: Option<u32>) -> Self {
+        Self {
+            path: path.into(),
+            token: token.into(),
+            app_id,
+        }
+    }
+}
+
+/// The token is a credential, so it is never printed: the `Debug` of a binding shows the
+/// path and the app id, and says the token is there without saying what it is.
+impl fmt::Debug for GsiGameBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GsiGameBinding")
+            .field("path", &self.path)
+            .field("token", &"<redacted>")
+            .field("app_id", &self.app_id)
+            .finish()
+    }
+}
+
+/// One game a listener serves, as the listener reports it: the path and the app id, and
+/// never the token. The crate does not hand a token back out.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsiGameInfo {
+    /// The path the game posts to.
+    pub path: String,
+    /// The app id the binding is pinned to, if it is pinned to one.
+    pub app_id: Option<u32>,
+}
+
+/// Everything the listener needs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct GsiConfig {
     /// The port from `[events] gsi_port`. Zero means an ephemeral port: the OS picks one
     /// for the session, and the `.cfg` the game is given must name the port the listener
@@ -194,13 +250,19 @@ pub struct GsiConfig {
     /// application starts, and a process squatting on it receives the game's POSTs — and
     /// with them the token.
     pub port: u16,
-    /// The token from the user's `gamestate_integration_localplay.cfg`. Never logged.
-    pub token: String,
-    /// The path the game is told to POST to; anything else is a 404.
-    pub path: String,
-    /// The game this listener serves, when it is pinned to one. `None` serves both, which is
-    /// what a single port for two games means; see [`GsiConfig::pinned_to`].
-    pub app_id: Option<u32>,
+    /// The games this listener serves. Must not be empty.
+    pub games: Vec<GsiGameBinding>,
+}
+
+/// The tokens are credentials, so they are never printed: the `Debug` of a configuration
+/// shows the port and the games, and each game's `Debug` redacts its token.
+impl fmt::Debug for GsiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GsiConfig")
+            .field("port", &self.port)
+            .field("games", &self.games)
+            .finish()
+    }
 }
 
 impl GsiConfig {
@@ -208,9 +270,7 @@ impl GsiConfig {
     pub fn new(port: u16, token: impl Into<String>) -> Self {
         Self {
             port,
-            token: token.into(),
-            path: DEFAULT_PATH.to_string(),
-            app_id: None,
+            games: vec![GsiGameBinding::new(DEFAULT_PATH, token, None)],
         }
     }
 
@@ -219,9 +279,47 @@ impl GsiConfig {
     /// A payload whose `provider.appid` is another game's is refused with `403`, so a token
     /// lifted from one game's installed `.cfg` cannot forge the other's events. The game is
     /// named by Valve's own app id: 730 for Counter-Strike, 570 for Dota 2.
+    ///
+    /// The app id is set on the first (and, in practice, only) binding: a listener serving
+    /// two games is not pinned to one.
     pub fn pinned_to(mut self, app_id: u32) -> Self {
-        self.app_id = Some(app_id);
+        if let Some(first) = self.games.first_mut() {
+            first.app_id = Some(app_id);
+        }
         self
+    }
+
+    /// The same listener, serving exactly one game: the given path, token and app id.
+    ///
+    /// The bindings are replaced rather than added to, so this reads as "this listener
+    /// serves that one game" rather than as an addition to whatever it served before.
+    pub fn with_game(
+        mut self,
+        path: impl Into<String>,
+        token: impl Into<String>,
+        app_id: Option<u32>,
+    ) -> Self {
+        self.games = vec![GsiGameBinding::new(path, token, app_id)];
+        self
+    }
+
+    /// The same listener, serving one more game: the given path, token and app id.
+    pub fn add_game(
+        mut self,
+        path: impl Into<String>,
+        token: impl Into<String>,
+        app_id: Option<u32>,
+    ) -> Self {
+        self.games.push(GsiGameBinding::new(path, token, app_id));
+        self
+    }
+
+    /// The binding that serves `path`, if this listener serves it.
+    ///
+    /// The path is matched exactly: a request for a path no game serves is a 404, and a
+    /// request for one that is served is checked against that game's own token.
+    pub fn game(&self, path: &str) -> Option<&GsiGameBinding> {
+        self.games.iter().find(|game| game.path == path)
     }
 }
 
@@ -272,10 +370,13 @@ pub struct GsiListener {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     addr: SocketAddr,
-    /// The token in force, so that a caller holding a token file can ask whether the file is
-    /// the one this listener accepts. The struct deliberately has no `Debug`: the token is
-    /// never printed.
-    token: String,
+    /// The tokens in force, one per game, so that a caller holding a token file can ask
+    /// whether the file is one this listener accepts. The struct deliberately has no
+    /// `Debug`: the tokens are never printed.
+    tokens: Vec<String>,
+    /// The games this listener serves, without their tokens: the crate never hands a token
+    /// back out, so the paths and the app ids are all a caller can be told.
+    games: Vec<GsiGameInfo>,
 }
 
 impl GsiListener {
@@ -294,7 +395,16 @@ impl GsiListener {
         self.addr.port()
     }
 
-    /// Whether `candidate` is the token this listener accepts.
+    /// The games this listener serves, WITHOUT their tokens: the crate never hands a token
+    /// back out.
+    ///
+    /// A caller that has to write one `.cfg` per game needs the path each game posts to
+    /// and the app id its binding is pinned to; the token it already has.
+    pub fn games(&self) -> Vec<GsiGameInfo> {
+        self.games.clone()
+    }
+
+    /// Whether `candidate` is a token this listener accepts.
     ///
     /// The desktop shell reads the token file on its own to write the `.cfg`, and the
     /// listener read it once when it started. If the file has been replaced since, the two
@@ -302,8 +412,17 @@ impl GsiListener {
     /// shell can notice: it asks, instead of guessing from a file that may be stale. The
     /// comparison is constant time, like every other one of them, and the token is never
     /// handed back out of the crate.
+    ///
+    /// The listener serves one game per path, each with its own token, so the answer is
+    /// "is this the token of any of them".
     pub fn accepts_token(&self, candidate: &str) -> bool {
-        token_equals(&self.token, candidate)
+        // Every token is compared, and the results are combined without an early exit: the
+        // answer must not depend on which game the candidate belongs to.
+        let mut accepted = false;
+        for expected in &self.tokens {
+            accepted |= token_equals(expected, candidate);
+        }
+        accepted
     }
 
     /// Stop accepting and wait for the thread. Idempotent.
@@ -327,10 +446,33 @@ impl Drop for GsiListener {
 
 /// Start the listener. Every derived event goes to `sink` until the handle is dropped.
 pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
-    if config.token.is_empty() {
-        // Refused at startup rather than failing every request later: a listener that cannot
-        // authenticate anything should not be running.
-        bail!("the GSI listener needs a token; generate one and put it in the game's cfg file");
+    if config.games.is_empty() {
+        // A listener that serves nothing answers every request with a 404, and looks like a
+        // broken installation rather than a misconfigured one.
+        bail!("the GSI listener needs at least one game to serve");
+    }
+    for game in &config.games {
+        if game.token.is_empty() {
+            // Refused at startup rather than failing every request later: a listener that cannot
+            // authenticate anything should not be running.
+            bail!(
+                "the GSI listener needs a token for {}; generate one and put it in the game's cfg file",
+                game.path
+            );
+        }
+    }
+    for (n, game) in config.games.iter().enumerate() {
+        if config.games[..n]
+            .iter()
+            .any(|other| other.path == game.path)
+        {
+            // Two games on one path would share a route, and with it a token: the binding is
+            // what scopes a token, so it has to be one game per path.
+            bail!(
+                "the GSI listener serves {} twice; each game needs its own path",
+                game.path
+            );
+        }
     }
     let listener = bind_loopback(config.port)?;
     let addr = listener
@@ -342,12 +484,23 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    tracing::info!(
-        "the GSI listener is up on http://{addr}{} (loopback only)",
-        config.path
-    );
+    let paths = config
+        .games
+        .iter()
+        .map(|game| game.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!("the GSI listener is up on http://{addr} (loopback only), serving {paths}");
 
-    let token = config.token.clone();
+    let tokens = config.games.iter().map(|game| game.token.clone()).collect();
+    let games = config
+        .games
+        .iter()
+        .map(|game| GsiGameInfo {
+            path: game.path.clone(),
+            app_id: game.app_id,
+        })
+        .collect();
     let thread = std::thread::Builder::new()
         .name("localplay-gsi".to_string())
         .spawn(move || serve(listener, &config, &sink, &flag))
@@ -357,7 +510,8 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
         stop,
         thread: Some(thread),
         addr,
-        token,
+        tokens,
+        games,
     })
 }
 
@@ -510,13 +664,69 @@ fn turn_away(stream: &mut TcpStream) {
     }
 }
 
+/// How much is taken from the socket at a time while the route is read.
+///
+/// The same size the HTTP framing takes ([`crate::wire`]). A request that is refused before
+/// its body is read leaves the rest of the body in the socket, and the client sees a reset
+/// instead of the answer; taking the same amount here keeps the socket in the state the
+/// framing would have left it in.
+const ROUTE_CHUNK: usize = 4 * 1024;
+
+/// The request's target, and the bytes read to find it.
+///
+/// The route has to be known before the body is read: the path decides which game's token
+/// the body is checked against. The target is in the request's first line, so the first
+/// line is read here and the bytes taken are replayed to the reader that frames the rest
+/// of the request.
+fn peek_target(stream: &mut impl Read) -> Result<(String, Vec<u8>), http::Reject> {
+    let mut prefix = Vec::new();
+    let mut chunk = [0u8; ROUTE_CHUNK];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|_| http::Reject::Malformed)?;
+        if read == 0 {
+            // The peer closed before the first line was complete.
+            return Err(http::Reject::Malformed);
+        }
+        prefix.extend_from_slice(&chunk[..read]);
+        if let Some(end) = prefix.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&prefix[..end]);
+            let line = line.trim_end_matches('\r');
+            return match request_target(line) {
+                Some(target) => Ok((target, prefix)),
+                None => Err(http::Reject::Malformed),
+            };
+        }
+        if prefix.len() > crate::wire::MAX_HEAD_BYTES {
+            return Err(http::Reject::Malformed);
+        }
+    }
+}
+
+/// The target of a request line, or `None` when the line is not one.
+///
+/// The line is read the way [`crate::wire`] reads it: a method, a target and a version,
+/// separated by single spaces.
+fn request_target(line: &str) -> Option<String> {
+    let mut parts = line.split(' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") {
+        return None;
+    }
+    Some(target.to_string())
+}
+
 /// Serve one connection.
 ///
-/// The order of the gates is the point of this function: the request is framed, the token is
-/// looked for in the raw body, and only a body that carries the right token is ever turned
-/// into a document. A peer that cannot authenticate — a web page in the user's browser can
-/// `POST` here with a `text/plain` content type, which is a CORS "simple request" and is not
-/// preflighted — therefore cannot make the recorder parse megabytes.
+/// The order of the gates is the point of this function: the route is resolved, the request
+/// is framed, the token is looked for in the raw body, and only a body that carries the
+/// right token is ever turned into a document. A peer that cannot authenticate — a web page
+/// in the user's browser can `POST` here with a `text/plain` content type, which is a CORS
+/// "simple request" and is not preflighted — therefore cannot make the recorder parse
+/// megabytes.
 fn serve_one(
     job: Job,
     config: &GsiConfig,
@@ -539,7 +749,27 @@ fn serve_one(
         stream: &mut stream,
         deadline: Instant::now() + REQUEST_DEADLINE,
     };
-    let request = match http::read_request(&mut reader, &config.path) {
+    // The route first: the path says which game is posting, and the game says which token
+    // the body has to carry. A path no game serves is a 404, and the body is not even read.
+    let (target, prefix) = match peek_target(&mut reader) {
+        Ok(peeked) => peeked,
+        Err(reject) => {
+            lock(state).counters.refused(reject);
+            let _ = write_response(&mut stream, reject.status());
+            return;
+        }
+    };
+    // The path is what routes, and nothing in a query is ever read.
+    let path = target.split('?').next().unwrap_or_default();
+    let Some(game) = config.game(path) else {
+        lock(state).counters.refused(http::Reject::NotFound);
+        let _ = write_response(&mut stream, http::Reject::NotFound.status());
+        return;
+    };
+    // The bytes the route was read from are replayed, so the request is framed as it would
+    // have been without the peek.
+    let mut replay = std::io::Cursor::new(prefix).chain(&mut reader);
+    let request = match http::read_request(&mut replay, &game.path) {
         Ok(request) => request,
         Err(reject) => {
             lock(state).counters.refused(reject);
@@ -563,7 +793,7 @@ fn serve_one(
             return;
         }
     };
-    if !token_equals(&config.token, &presented) {
+    if !token_equals(&game.token, &presented) {
         lock(state).counters.refused_token();
         let _ = write_response(&mut stream, 403);
         return;
@@ -584,14 +814,14 @@ fn serve_one(
 
     // The document is the authority on the token, not the look above: a body carrying two
     // `auth` blocks is parsed into the last one, and that is the one that counts.
-    if !token_matches(&config.token, &snapshot) {
+    if !token_matches(&game.token, &snapshot) {
         lock(state).counters.refused_token();
         let _ = write_response(&mut stream, 403);
         return;
     }
-    if let Some(app_id) = config.app_id {
+    if let Some(app_id) = game.app_id {
         if snapshot.provider.appid != app_id {
-            lock(state).counters.refused_game(app_id);
+            lock(state).counters.refused_game(app_id, &game.path);
             let _ = write_response(&mut stream, 403);
             return;
         }
@@ -710,12 +940,12 @@ impl Counters {
 
     /// A payload that authenticated but is another game's: the token was lifted from the
     /// wrong installed file.
-    fn refused_game(&mut self, app_id: u32) {
+    fn refused_game(&mut self, app_id: u32, path: &str) {
         self.refused_games += 1;
         if self.refused_games == 1 {
             tracing::warn!(
-                "the GSI listener rejected a payload for another game: this listener serves \
-                 app id {app_id} only"
+                "the GSI listener rejected a payload for another game: {path} serves app id \
+                 {app_id} only"
             );
         } else {
             tracing::debug!(
@@ -920,5 +1150,160 @@ mod tests {
             !listener.accepts_token(""),
             "and an empty one is not a token"
         );
+    }
+
+    #[test]
+    fn a_listener_serving_two_games_accepts_the_token_of_either_of_them() {
+        // The shell asks whether the token it read is one in force: with a token per game,
+        // the answer is "is it the token of any of them".
+        let (sink, _rx) = std::sync::mpsc::channel();
+        let cs2 = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
+        let dota = "fedcba9876543210fedcba9876543210"; // gitleaks:allow
+        let listener = spawn(
+            GsiConfig::new(0, cs2)
+                .with_game("/gsi/cs2", cs2, Some(730))
+                .add_game("/gsi/dota2", dota, Some(570)),
+            sink,
+        )
+        .expect("the listener starts");
+
+        assert!(listener.accepts_token(cs2), "the first game's token");
+        assert!(listener.accepts_token(dota), "the second game's token");
+        assert!(
+            !listener.accepts_token("0123456789abcdef0123456789abcdee"),
+            "one byte off is not"
+        );
+        assert!(
+            !listener.accepts_token(""),
+            "and an empty one is not a token"
+        );
+    }
+
+    #[test]
+    fn a_configuration_never_prints_a_token() {
+        // The token is a credential, and a `{:?}` ends up in a log line sooner or later.
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
+        let config = GsiConfig::new(45671, token).pinned_to(730);
+
+        let printed = format!("{config:?}");
+        assert!(
+            !printed.contains(token),
+            "the token must not be printed: {printed}"
+        );
+        assert!(
+            printed.contains("<redacted>"),
+            "and it says there is one: {printed}"
+        );
+        assert!(printed.contains("45671"), "the port is printed: {printed}");
+        assert!(
+            printed.contains(DEFAULT_PATH),
+            "the path is printed: {printed}"
+        );
+        assert!(printed.contains("730"), "the app id is printed: {printed}");
+
+        let binding = GsiGameBinding::new("/gsi/cs2", token, Some(730));
+        let printed = format!("{binding:?}");
+        assert!(
+            !printed.contains(token),
+            "a binding prints no token either: {printed}"
+        );
+        assert!(
+            printed.contains("/gsi/cs2"),
+            "the path is printed: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_configuration_serves_the_games_it_was_given() {
+        // The default: one game, on the default path, with no app id to check.
+        let one = GsiConfig::new(45671, "token");
+        assert_eq!(one.port, 45671);
+        assert_eq!(one.games.len(), 1);
+        assert_eq!(one.games[0].path, DEFAULT_PATH);
+        assert_eq!(one.games[0].app_id, None);
+        assert!(one.game(DEFAULT_PATH).is_some());
+        assert!(one.game("/gsi/cs2").is_none());
+
+        // Pinned: the app id of the first (and only) binding.
+        let pinned = one.clone().pinned_to(730);
+        assert_eq!(pinned.games[0].app_id, Some(730));
+        assert_eq!(
+            pinned.game(DEFAULT_PATH).expect("the game").app_id,
+            Some(730)
+        );
+
+        // Two games: one path and one token each.
+        let two = GsiConfig::new(45671, "cs2-token")
+            .with_game("/gsi/cs2", "cs2-token", Some(730))
+            .add_game("/gsi/dota2", "dota-token", Some(570));
+        assert_eq!(two.games.len(), 2);
+        assert_eq!(two.game("/gsi/cs2").expect("cs2").token, "cs2-token");
+        assert_eq!(two.game("/gsi/dota2").expect("dota2").token, "dota-token");
+        assert_eq!(two.game("/gsi/dota2").expect("dota2").app_id, Some(570));
+        assert!(two.game(DEFAULT_PATH).is_none());
+
+        // `with_game` replaces what was there; `add_game` adds to it.
+        let replaced = two.with_game("/gsi/only", "only-token", None);
+        assert_eq!(replaced.games.len(), 1);
+        assert_eq!(replaced.games[0].path, "/gsi/only");
+    }
+
+    #[test]
+    fn a_listener_that_cannot_authenticate_anything_refuses_to_start() {
+        // No games at all: a listener that serves nothing answers every request with a 404.
+        let err = spawn(
+            GsiConfig {
+                port: 0,
+                games: Vec::new(),
+            },
+            std::sync::mpsc::channel().0,
+        )
+        .map(|_| ())
+        .expect_err("no game");
+        assert!(format!("{err:#}").contains("game"), "got: {err:#}");
+
+        // A game without a token: nothing it posts could be authenticated.
+        let err = spawn(
+            GsiConfig::new(0, "token").add_game("/gsi/dota2", "", Some(570)),
+            std::sync::mpsc::channel().0,
+        )
+        .map(|_| ())
+        .expect_err("no token");
+        assert!(format!("{err:#}").contains("token"), "got: {err:#}");
+
+        // Two games on one path: they would share a route, and with it a token.
+        let err = spawn(
+            GsiConfig::new(0, "token").add_game(DEFAULT_PATH, "other-token", Some(730)),
+            std::sync::mpsc::channel().0,
+        )
+        .map(|_| ())
+        .expect_err("one path twice");
+        assert!(format!("{err:#}").contains("path"), "got: {err:#}");
+    }
+
+    #[test]
+    fn the_route_is_the_target_of_the_request_line() {
+        use std::io::Cursor;
+
+        let raw = b"POST /gsi/cs2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{}";
+        let (target, prefix) = peek_target(&mut Cursor::new(raw.to_vec())).expect("a request line");
+        assert_eq!(target, "/gsi/cs2");
+        assert!(
+            prefix.starts_with(b"POST /gsi/cs2 HTTP/1.1\r\n"),
+            "the bytes taken are replayed to the reader that frames the rest: {prefix:?}"
+        );
+
+        // A line that is not a request line is refused rather than guessed at.
+        for raw in [
+            b"POST /gsi\r\n".to_vec(),
+            b"GET\r\n".to_vec(),
+            b"POST  /gsi HTTP/1.1\r\n".to_vec(),
+            b"garbage\r\n".to_vec(),
+        ] {
+            assert!(
+                peek_target(&mut Cursor::new(raw.clone())).is_err(),
+                "{raw:?} is not a request line"
+            );
+        }
     }
 }
