@@ -35,7 +35,16 @@ impl RotatingFile {
     ///
     /// The boolean is `false` when another process holds the lock.
     pub fn open_locked(path: PathBuf, max_bytes: u64, keep: usize) -> io::Result<(Self, bool)> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // `read(true)` is not decoration. On Windows the lock is a `LockFileEx` byte-range lock,
+        // and it refuses a handle that was not opened with the `GENERIC_READ` or `GENERIC_WRITE`
+        // access right: `append(true)` alone opens the file with `FILE_APPEND_DATA` and nothing
+        // else, and the lock then fails with `ERROR_ACCESS_DENIED` — "Access is denied" — rather
+        // than with the "somebody else holds it" the caller is asking about.
+        let file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(&path)?;
         let locked = fs4::fs_std::FileExt::try_lock_exclusive(&file)?;
         let mut this = Self::from_file(file, path, max_bytes, keep)?;
         this.locked = locked;
@@ -79,6 +88,7 @@ impl RotatingFile {
             let _ = fs::rename(&self.path, self.numbered(1));
         }
         self.file = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(&self.path)?;
@@ -153,6 +163,29 @@ mod tests {
         );
     }
 
+    /// The env var that turns a test run into the "holder" half of the test below.
+    const HOLDER_ENV: &str = "LOCALPLAY_LOG_LOCK_HOLDER";
+    const HOLDER_LOG_ENV: &str = "LOCALPLAY_LOG_LOCK_LOG";
+    const HOLDER_READY_ENV: &str = "LOCALPLAY_LOG_LOCK_READY";
+
+    /// The child half of [`a_second_holder_of_the_log_is_told_so`].
+    ///
+    /// A byte-range lock is scoped to a *process*, so the holder has to be a real second
+    /// process. Whether a second handle inside one process can take a conflicting lock is a
+    /// different answer on every platform, and the case that matters is two shells.
+    #[test]
+    fn the_lock_holder_process() {
+        if std::env::var(HOLDER_ENV).is_err() {
+            return;
+        }
+        let path = PathBuf::from(std::env::var(HOLDER_LOG_ENV).unwrap());
+        let (_log, owns) = RotatingFile::open_locked(path, 1024, 1).unwrap();
+        assert!(owns, "the holder takes the lock");
+        fs::write(std::env::var(HOLDER_READY_ENV).unwrap(), b"ready").unwrap();
+        // Hold the lock until the parent has tried for it.
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
     /// One process writes the shared log; the other one is told so.
     ///
     /// Two shells would otherwise interleave their lines into one file, and the rotation renames
@@ -160,13 +193,43 @@ mod tests {
     /// the file whole: the process that cannot take it writes a file of its own.
     #[test]
     fn a_second_holder_of_the_log_is_told_so() {
+        if std::env::var(HOLDER_ENV).is_ok() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log");
+        let ready = dir.path().join("holder-ready");
 
-        let (_first, locked) = RotatingFile::open_locked(path.clone(), 1024, 1).unwrap();
-        assert!(locked, "the first holder takes the lock");
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_file::tests::the_lock_holder_process",
+                "--nocapture",
+            ])
+            .env(HOLDER_ENV, "1")
+            .env(HOLDER_LOG_ENV, &path)
+            .env(HOLDER_READY_ENV, &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the holder process starts");
 
-        let (_second, locked) = RotatingFile::open_locked(path, 1024, 1).unwrap();
-        assert!(!locked, "and the second one is refused it");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            if let Ok(Some(status)) = holder.try_wait() {
+                panic!("the holder process exited before it took the lock: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the holder process never took the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let (_second, owns) = RotatingFile::open_locked(path, 1024, 1).unwrap();
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        assert!(!owns, "and the second one is refused it");
     }
 }
