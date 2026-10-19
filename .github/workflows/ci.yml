@@ -219,6 +219,33 @@ jobs:
           npm test
           npm run build
 
+      - name: Screenshot harness (report, not a gate)
+        # The README advertises the screenshot run as part of the verification story, so
+        # it runs here: the twenty states of the window, checked in a real Chromium.
+        #
+        # It is `continue-on-error` for the same reason the verification harness is. The
+        # shots assert on layout, and layout assertions are the kind of thing that can
+        # move under a different font or a slower runner. What it buys is that the
+        # harness keeps working and its output stays inspectable — the pictures are
+        # uploaded below.
+        #
+        # It also covers a class of bug nothing else did: the harness drives the window
+        # through the `ClipSource` seam, so a method added to that interface and not to
+        # the harness's fake is a `TypeError` in the window, invisible to the unit
+        # tests. `src/lib/clip-source-contract.test.ts` now fails the build for that;
+        # this step is what shows the run as a whole.
+        continue-on-error: true
+        working-directory: apps/desktop
+        run: npm run shots
+
+      - name: Upload the screenshot harness's pictures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-screenshots
+          path: target/desktop-shots
+          if-no-files-found: ignore
+
       - name: Desktop shell Rust tests
         # The desktop crate is its own workspace, so run its tests from its manifest
         # directory — after the frontend build above has produced apps/desktop/dist.

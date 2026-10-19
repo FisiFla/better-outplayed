@@ -117,7 +117,12 @@
    * than cleared.
    */
   async function browseClipsDir() {
-    const selected = await onChooseClipsDir().catch(() => null);
+    // `Promise.resolve().then(...)` rather than a bare call: a picker that is missing or
+    // throws synchronously is still a "no directory" to this panel, and a bare call would
+    // let that throw escape as an uncaught page error instead.
+    const selected = await Promise.resolve()
+      .then(() => onChooseClipsDir())
+      .catch(() => null);
     if (typeof selected === 'string') clipsDir = selected;
   }
 

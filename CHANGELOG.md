@@ -98,6 +98,15 @@ versions. For what has and has not been *verified* on real hardware, read
   the webview can no longer widen the asset protocol's read scope to any path it names.
 
 ### Fixed
+- **The screenshot harness drives the whole clip-source contract, and the build now checks
+  that it does.** The harness's fake `ClipSource` had fallen behind the interface: the
+  method that opens the native folder picker was missing, so the settings screenshot
+  failed with `chooseClipsDir is not a function`, and seven further methods were missing
+  besides. The harness was not a CI gate, so the README's "0 failures" went stale instead
+  of turning red. Every method the interface declares is now implemented, a new test
+  (`clip-source-contract.test.ts`) fails the build when the two fall apart again, the
+  screenshot run is a CI step, and the settings panel's Browse button treats a picker
+  that is missing or throws as "no directory" rather than an uncaught error.
 - **The secret scan now covers the whole history, not just the commits a push brought.** The
   per-push gitleaks step narrows its scan to the range the push touched, so a credential
   committed long ago was never reported — and this repository carried a committed TLS test

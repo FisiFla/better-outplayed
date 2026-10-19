@@ -231,11 +231,11 @@ listener, and nothing else).
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 227 vitest tests
+cd apps/desktop && npm test          # 249 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
 cd apps/desktop && npm run shots     # 20 screenshots, 227 checks, 0 failures
-cd apps/desktop/src-tauri && cargo test    # 188 tests, against a real store and real ffmpeg
+cd apps/desktop/src-tauri && cargo test    # 212 tests, against a real store and real ffmpeg
 cd apps/desktop/src-tauri && cargo clippy  # no warnings in shipping code
 ```
 

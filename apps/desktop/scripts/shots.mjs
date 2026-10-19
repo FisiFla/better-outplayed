@@ -570,6 +570,37 @@ function installMockSource(fixture) {
       target.favourite = favourite;
       return { ...target };
     },
+    async setClipTitle(id, title) {
+      const target = find(id);
+      if (!target) throw notFound(id);
+      // A blank title clears it, exactly as the store does.
+      const trimmed = String(title ?? '').trim();
+      target.title = trimmed === '' ? null : trimmed;
+      return { ...target };
+    },
+    async setClipTags(id, tags) {
+      const target = find(id);
+      if (!target) throw notFound(id);
+      target.tags = [...tags];
+      return { ...target };
+    },
+    async copyClipToClipboard(id) {
+      // A fixture cannot put a file on the system clipboard, and must not pretend to: the
+      // window shows nothing of its own afterwards, so an empty promise is the honest answer.
+      const target = find(id);
+      if (!target) throw notFound(id);
+    },
+    async revealClip(id) {
+      // Likewise: there is no file manager behind this harness, and opening one would
+      // take the screenshot run outside the browser.
+      const target = find(id);
+      if (!target) throw notFound(id);
+    },
+    async dragClipOut(id) {
+      // A native drag needs a real window and a real file; the harness has neither.
+      const target = find(id);
+      if (!target) throw notFound(id);
+    },
     async trimClip(id, startMs, endMs) {
       const source = find(id);
       if (!source) throw notFound(id);
@@ -633,6 +664,11 @@ function installMockSource(fixture) {
     // No fixture game splits into matches; an empty answer is what an untagged session returns.
     async sessionMatches() {
       return [];
+    },
+    async extractMatch(sessionId, matchIndex) {
+      // The fixture has no matches — `sessionMatches` above returns an empty list — so
+      // there is nothing to cut, and the backend's answer is the honest one.
+      throw { code: 'match_not_found', message: `session ${sessionId} has no match ${matchIndex}` };
     },
     async setSessionFavourite(id, favourite) {
       const session = sessions.find((s) => s.id === id);
@@ -770,6 +806,12 @@ function installMockSource(fixture) {
           ? `a recording is running: ${engineChanged.join(', ')} takes effect when the next recording starts`
           : null,
       };
+    },
+    async chooseClipsDir() {
+      // The backend runs the native picker; there is no OS dialog behind this harness, so
+      // the pick is dismissed. The panel treats that as "no directory" and leaves its
+      // draft alone, which is what the panel's own contract says a cancelled picker does.
+      throw { code: 'cancelled', message: 'the folder picker was dismissed' };
     },
     async clipNow() {
       const written = { ...fixture.clipNow };
