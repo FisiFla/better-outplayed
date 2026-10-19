@@ -256,6 +256,14 @@ jobs:
         # anywhere: the only Windows runner ran no clippy either. Clippy does not
         # link, so this needs the target's std and no MSVC toolchain, exactly like the
         # check above.
+        #
+        # `localplay-recorder`, `localplay-store` and `localplay-cli` are NOT in this
+        # list: rusqlite's `bundled` SQLite is compiled from C source, and building it
+        # for the MSVC target needs the MSVC C toolchain, which a macOS host does not
+        # have. They are not left unlinted — the `windows` job below lints the whole
+        # workspace natively, those three included, which is how the recorder's
+        # `frame_gaps` dead-code finding was found. This step is the fast pre-check
+        # for the crates that *can* be checked from here.
         run: >-
           cargo clippy
           -p localplay-capture -p localplay-encoder -p localplay-events

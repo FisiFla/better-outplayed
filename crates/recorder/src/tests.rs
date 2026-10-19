@@ -1558,6 +1558,8 @@ fn slow_splice_wrapper(real_ffmpeg: &Path, delay: Duration) -> PathBuf {
 ///
 /// The frames' own timestamps, which is the media timeline: a recording that stopped for a
 /// while has a gap here, however seamless the picture looks.
+// Only the unix-only splice test calls this, so on Windows it would be dead code.
+#[cfg(unix)]
 fn frame_gaps(path: &Path, bin: &FfmpegBinaries) -> Vec<u64> {
     let output = std::process::Command::new(&bin.ffprobe)
         .args([
