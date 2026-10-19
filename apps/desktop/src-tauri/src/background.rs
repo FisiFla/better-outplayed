@@ -534,9 +534,12 @@ pub const CLOSE_HINT: &str = "Closing this window hides localplay in the tray; r
 // Windows only: the shipping target is Windows. The decision below is a plain function with an
 // injectable process boundary, so it is tested; the effect needs a Windows host.
 
-/// The name of the value this application owns under the user's Run key. Nothing else in that
+/// The name of the value this application owns under the user's Run key.
+///
+/// The product's name rather than the binary's: the Run key is shared and user-visible, and
+/// `localplay` is a name a user may have given an entry of their own. Nothing else in that
 /// key is touched, so an entry a user added by hand survives.
-pub const AUTOSTART_VALUE: &str = "localplay";
+pub const AUTOSTART_VALUE: &str = "better-outplayed";
 
 /// The per-user Run key: no elevation, no machine-wide change, and the first place a Windows
 /// user looks to see what starts with their session.
@@ -616,6 +619,64 @@ impl AutostartOutcome {
     }
 }
 
+/// What one `reg.exe` invocation produced.
+///
+/// The platform boundary: the real `reg.exe` in [`apply_autostart`], a fake in tests. What the
+/// command *meant* is decided here rather than there, so that the rule below is one rule and
+/// not a per-platform guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegOutput {
+    /// What the command printed on stdout.
+    pub stdout: String,
+    /// What it printed on stderr.
+    pub stderr: String,
+    /// The exit code, or `None` when the process did not exit normally.
+    pub code: Option<i32>,
+}
+
+impl RegOutput {
+    /// A command that ended the way it should.
+    pub fn ok(stdout: impl Into<String>) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            code: Some(0),
+        }
+    }
+
+    /// A command that failed, with the code and the message it failed with.
+    pub fn failed(code: i32, stderr: impl Into<String>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            code: Some(code),
+        }
+    }
+
+    /// Whether the command succeeded.
+    pub fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// Whether a failed `reg.exe` was the one that means "there is nothing there".
+///
+/// `reg.exe` reports a missing key or value with exit code 1 and this text, and that is the
+/// only failure that means "nothing to do". Every other failure — a permission problem, a
+/// `reg.exe` that could not run — is an error: read as "the value is not set" it makes a
+/// failed read look like a job already done, and the entry the user asked to have removed
+/// survives while the app says it is in sync.
+///
+/// The wording is localised, so a Windows in another language reports the absence differently —
+/// and then the failure is an error, which is the safe direction: the sync says what it could
+/// not read instead of claiming the entry matches.
+fn is_absent(output: &RegOutput) -> bool {
+    output.code == Some(1)
+        && output
+            .stderr
+            .contains("unable to find the specified registry key or value")
+}
+
 /// The executable path a `reg query` reported for `value`, if the value is present.
 ///
 /// `reg query` prints one line per value:
@@ -631,35 +692,145 @@ fn registered_path(output: &str, value: &str) -> Option<String> {
     })
 }
 
+/// Whether a registered entry is this application's own.
+///
+/// The Run key is shared and user-visible, so a value carrying this application's name that
+/// points at something else is somebody else's entry: overwriting it with `/f` or deleting it
+/// would take their program away. The check is on the binary's name rather than on the whole
+/// path, so an install that moved is still recognised as this application's entry and repaired
+/// instead of duplicated.
+fn is_our_entry(data: &str, exe: &Path) -> bool {
+    let data = data.trim().trim_matches('"');
+    // The data is a Windows path and this may not be Windows: split on both separators.
+    let name = data.rsplit(['/', '\\']).next().unwrap_or(data);
+    let exe = exe.to_string_lossy();
+    let ours = exe.rsplit(['/', '\\']).next().unwrap_or_default();
+    !ours.is_empty() && name.eq_ignore_ascii_case(ours)
+}
+
 /// Bring the Windows autostart entry in line with `[app] start_with_system`.
 ///
 /// The config file is the only switch, so this is a sync, not a one-way enable: `false` removes
 /// an entry this app wrote, `true` writes one. `run` is the process boundary (real `reg.exe` in
-/// [`apply_autostart`], a fake in tests) and returns the command's stdout or a failure message.
+/// [`apply_autostart`], a fake in tests) and says what the command produced.
 pub fn sync_autostart(
     enabled: bool,
     exe: &Path,
-    run: &mut impl FnMut(&[String]) -> Result<String, String>,
+    run: &mut impl FnMut(&[String]) -> Result<RegOutput, String>,
 ) -> Result<AutostartOutcome, String> {
-    let listed = run(&reg_argv(RegCommand::Query, AUTOSTART_VALUE, exe))
-        .map_err(|err| format!("could not read the Windows autostart entry: {err}"))?;
-    let registered = registered_path(&listed, AUTOSTART_VALUE);
+    // A read that failed is not the same as a value that is not there: the first leaves the
+    // entry's state unknown, the second is the answer.
+    let mut read_failed = false;
+    let registered = match run(&reg_argv(RegCommand::Query, AUTOSTART_VALUE, exe)) {
+        Ok(output) if output.succeeded() => registered_path(&output.stdout, AUTOSTART_VALUE),
+        Ok(output) if is_absent(&output) => None,
+        Ok(output) => {
+            let err = format!(
+                "reg.exe exited with {}: {}",
+                output.code.unwrap_or(-1),
+                output.stderr
+            );
+            if enabled {
+                // Autostart is wanted and the entry's state is unknown: say so rather than
+                // writing over whatever is there.
+                return Err(format!("could not read the Windows autostart entry: {err}"));
+            }
+            // Autostart is not wanted and the delete is idempotent: it is attempted anyway, so
+            // a failed read cannot leave an entry behind while the app claims it is in sync.
+            read_failed = true;
+            tracing::warn!("the Windows autostart entry could not be read: {err}");
+            None
+        }
+        Err(err) => {
+            if enabled {
+                return Err(format!("could not read the Windows autostart entry: {err}"));
+            }
+            read_failed = true;
+            tracing::warn!("the Windows autostart entry could not be read: {err}");
+            None
+        }
+    };
     let wanted = format!("\"{}\"", exe.display());
 
     match (enabled, registered) {
         (true, Some(path)) if path == wanted => Ok(AutostartOutcome::Unchanged),
-        (true, _) => {
-            run(&reg_argv(RegCommand::Enable, AUTOSTART_VALUE, exe))
-                .map_err(|err| format!("could not write the Windows autostart entry: {err}"))?;
+        (true, Some(path)) => {
+            if !is_our_entry(&path, exe) {
+                return Err(format!(
+                    "the Windows autostart entry {AUTOSTART_VALUE} points at {path}, which is not \
+                     this application, so it was left alone"
+                ));
+            }
+            write_entry(run, exe)?;
             Ok(AutostartOutcome::Enabled)
         }
-        (false, Some(_)) => {
-            run(&reg_argv(RegCommand::Disable, AUTOSTART_VALUE, exe))
-                .map_err(|err| format!("could not remove the Windows autostart entry: {err}"))?;
+        (true, None) => {
+            write_entry(run, exe)?;
+            Ok(AutostartOutcome::Enabled)
+        }
+        (false, Some(path)) => {
+            if !is_our_entry(&path, exe) {
+                return Err(format!(
+                    "the Windows autostart entry {AUTOSTART_VALUE} points at {path}, which is not \
+                     this application, so it was left alone"
+                ));
+            }
+            remove_entry(run, exe)?;
             Ok(AutostartOutcome::Removed)
+        }
+        (false, None) if read_failed => {
+            // The entry may be there: the read that would have said so failed, and the delete
+            // is idempotent, so it is attempted. `reg.exe` reports "nothing there" as its own
+            // answer, which is not a failure.
+            match remove_entry(run, exe) {
+                Ok(removed) => Ok(if removed {
+                    AutostartOutcome::Removed
+                } else {
+                    AutostartOutcome::Unchanged
+                }),
+                Err(err) => Err(err),
+            }
         }
         (false, None) => Ok(AutostartOutcome::Unchanged),
     }
+}
+
+/// Write the entry, and report a failure as a failure.
+fn write_entry(
+    run: &mut impl FnMut(&[String]) -> Result<RegOutput, String>,
+    exe: &Path,
+) -> Result<(), String> {
+    let output = run(&reg_argv(RegCommand::Enable, AUTOSTART_VALUE, exe))
+        .map_err(|err| format!("could not write the Windows autostart entry: {err}"))?;
+    if output.succeeded() {
+        return Ok(());
+    }
+    Err(format!(
+        "could not write the Windows autostart entry: reg.exe exited with {}: {}",
+        output.code.unwrap_or(-1),
+        output.stderr
+    ))
+}
+
+/// Remove the entry, and say whether there was one to remove.
+fn remove_entry(
+    run: &mut impl FnMut(&[String]) -> Result<RegOutput, String>,
+    exe: &Path,
+) -> Result<bool, String> {
+    let output = run(&reg_argv(RegCommand::Disable, AUTOSTART_VALUE, exe))
+        .map_err(|err| format!("could not remove the Windows autostart entry: {err}"))?;
+    if output.succeeded() {
+        return Ok(true);
+    }
+    if is_absent(&output) {
+        // There was nothing to remove: that is the answer, not a failure.
+        return Ok(false);
+    }
+    Err(format!(
+        "could not remove the Windows autostart entry: reg.exe exited with {}: {}",
+        output.code.unwrap_or(-1),
+        output.stderr
+    ))
 }
 
 /// Apply `[app] start_with_system` through `reg.exe`.
@@ -668,24 +839,18 @@ pub fn sync_autostart(
 /// stop a recording session.
 #[cfg(windows)]
 pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, String> {
-    let mut run = |argv: &[String]| -> Result<String, String> {
+    let mut run = |argv: &[String]| -> Result<RegOutput, String> {
         let output = localplay_media::sidecar_command("reg")
             .args(argv)
             .output()
             .map_err(|err| format!("reg.exe could not be run: {err}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() {
-            Ok(stdout)
-        } else {
-            // A `query` for an absent value is the normal "not set" answer, read by the caller from the
-            // empty stdout; anything else is reported.
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if argv.first().map(String::as_str) == Some("query") {
-                Ok(String::new())
-            } else {
-                Err(format!("reg.exe exited with {}: {stderr}", output.status))
-            }
-        }
+        // What the command produced, not what it meant: the "there is nothing there" rule is
+        // one rule, and it lives with the sync rather than here.
+        Ok(RegOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            code: output.status.code(),
+        })
     };
     sync_autostart(enabled, exe, &mut run)
 }
@@ -1523,7 +1688,7 @@ mod tests {
 
         assert_eq!(
             reg_argv(RegCommand::Query, AUTOSTART_VALUE, exe),
-            vec!["query", RUN_KEY, "/v", "localplay"]
+            vec!["query", RUN_KEY, "/v", "better-outplayed"]
         );
         assert_eq!(
             reg_argv(RegCommand::Enable, AUTOSTART_VALUE, exe),
@@ -1531,7 +1696,7 @@ mod tests {
                 "add",
                 RUN_KEY,
                 "/v",
-                "localplay",
+                "better-outplayed",
                 "/t",
                 "REG_SZ",
                 "/d",
@@ -1541,7 +1706,7 @@ mod tests {
         );
         assert_eq!(
             reg_argv(RegCommand::Disable, AUTOSTART_VALUE, exe),
-            vec!["delete", RUN_KEY, "/v", "localplay", "/f"]
+            vec!["delete", RUN_KEY, "/v", "better-outplayed", "/f"]
         );
 
         assert!(
@@ -1549,7 +1714,16 @@ mod tests {
             "per-user, so it needs no elevation: {RUN_KEY}"
         );
         assert!(RUN_KEY.ends_with(r"\Run"), "{RUN_KEY}");
+
+        // The value's name is the product's, not the binary's: the Run key is shared and
+        // user-visible, and a name a user may have given an entry of their own is not ours to
+        // overwrite or delete.
+        assert_eq!(AUTOSTART_VALUE, "better-outplayed");
     }
+
+    /// The message `reg.exe` prints for a key or value that is not there.
+    const ABSENT_MESSAGE: &str =
+        "ERROR: The system was unable to find the specified registry key or value.";
 
     /// A `reg.exe` that answers from memory: the value it reports for `query`, and a log of
     /// everything it was asked to run.
@@ -1566,17 +1740,18 @@ mod tests {
             }
         }
 
-        fn runner(&self) -> impl FnMut(&[String]) -> Result<String, String> + '_ {
+        fn runner(&self) -> impl FnMut(&[String]) -> Result<RegOutput, String> + '_ {
             move |argv: &[String]| {
                 self.calls.borrow_mut().push(argv.to_vec());
                 match argv.first().map(String::as_str) {
                     Some("query") => Ok(match &self.present {
-                        Some(path) => format!(
-                            "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    localplay    REG_SZ    {path}\r\n\r\n"
-                        ),
-                        None => String::new(),
+                        Some(path) => RegOutput::ok(format!(
+                            "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    {AUTOSTART_VALUE}    REG_SZ    {path}\r\n\r\n"
+                        )),
+                        // The one failure that means "there is nothing there".
+                        None => RegOutput::failed(1, ABSENT_MESSAGE),
                     }),
-                    Some(_) => Ok(String::new()),
+                    Some(_) => Ok(RegOutput::ok(String::new())),
                     None => Err("no arguments".to_string()),
                 }
             }
@@ -1667,6 +1842,26 @@ mod tests {
     }
 
     #[test]
+    fn only_the_message_that_means_nothing_there_is_read_as_an_absent_value() {
+        // The rule the sync depends on: a missing value is one specific failure, and every
+        // other one is an error. Reading a permission problem as "the value is not set" is
+        // what left a user's autostart entry in place while the app said it was in sync.
+        assert!(is_absent(&RegOutput::failed(1, ABSENT_MESSAGE)));
+        assert!(
+            !is_absent(&RegOutput::failed(1, "access is denied")),
+            "another message is another failure"
+        );
+        assert!(
+            !is_absent(&RegOutput::failed(2, ABSENT_MESSAGE)),
+            "another exit code is another failure"
+        );
+        assert!(
+            !is_absent(&RegOutput::ok(ABSENT_MESSAGE)),
+            "a command that succeeded has nothing to report"
+        );
+    }
+
+    #[test]
     fn a_registry_failure_is_reported_rather_than_treated_as_absent() {
         // A `reg.exe` that cannot run at all must not be read as "there is no entry", which would make
         // a failed read look like "nothing to do".
@@ -1675,6 +1870,77 @@ mod tests {
 
         let err = sync_autostart(true, exe, &mut run).unwrap_err();
         assert!(err.contains("could not be run"), "{err}");
+    }
+
+    #[test]
+    fn a_query_that_failed_still_removes_the_entry_when_autostart_is_off() {
+        // The read that would have said "there is no entry" failed, so the entry may well be
+        // there. The delete is idempotent, so it is attempted: an entry that survived a failed
+        // read while the app claimed it was in sync is the failure this rules out.
+        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let calls = RefCell::new(Vec::new());
+        let mut run = |argv: &[String]| -> Result<RegOutput, String> {
+            calls
+                .borrow_mut()
+                .push(argv.first().cloned().unwrap_or_default());
+            match argv.first().map(String::as_str) {
+                Some("query") => Ok(RegOutput::failed(1, "access is denied".to_string())),
+                Some("delete") => Ok(RegOutput::ok(String::new())),
+                _ => Err("no arguments".to_string()),
+            }
+        };
+
+        let outcome = sync_autostart(false, exe, &mut run).unwrap();
+
+        assert_eq!(outcome, AutostartOutcome::Removed);
+        assert_eq!(calls.borrow().clone(), ["query", "delete"]);
+    }
+
+    #[test]
+    fn a_query_that_failed_is_an_error_when_autostart_is_wanted() {
+        // The other way round: the entry's state is unknown and something is about to be written
+        // over it, so the sync says what it could not read instead of guessing.
+        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let mut run = |_: &[String]| Err("reg.exe exited with 1: access is denied".to_string());
+
+        let err = sync_autostart(true, exe, &mut run).unwrap_err();
+
+        assert!(err.contains("could not read"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_that_points_at_another_program_is_left_alone() {
+        // The Run key is shared: a value with this application's name that names somebody else's
+        // program is theirs, and `/f` would overwrite it and a delete would take it away.
+        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let theirs = r#""C:\Users\victim\Scripts\recorder.exe""#;
+
+        let reg = FakeReg::new(Some(theirs));
+        let mut run = reg.runner();
+        let err = sync_autostart(false, exe, &mut run).unwrap_err();
+        assert!(err.contains("not this application"), "{err}");
+        assert_eq!(reg.commands(), ["query"], "and it was not deleted");
+
+        let reg = FakeReg::new(Some(theirs));
+        let mut run = reg.runner();
+        let err = sync_autostart(true, exe, &mut run).unwrap_err();
+        assert!(err.contains("not this application"), "{err}");
+        assert_eq!(reg.commands(), ["query"], "and it was not overwritten");
+    }
+
+    #[test]
+    fn an_install_that_moved_is_still_recognised_as_this_applications_entry() {
+        // The check is on the binary's name, not on the whole path: a moved install is this
+        // application's entry and is repaired, not left behind as somebody else's.
+        let exe = Path::new(r"D:\games\localplay\localplay.exe");
+        let reg = FakeReg::new(Some(r#""C:\old\localplay.exe""#));
+        let mut run = reg.runner();
+
+        assert_eq!(
+            sync_autostart(true, exe, &mut run).unwrap(),
+            AutostartOutcome::Enabled
+        );
+        assert_eq!(reg.commands(), ["query", "add"]);
     }
 
     #[cfg(not(windows))]

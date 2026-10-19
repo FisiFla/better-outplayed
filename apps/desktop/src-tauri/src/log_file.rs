@@ -15,11 +15,34 @@ pub struct RotatingFile {
     keep: usize,
     file: File,
     written: u64,
+    /// Whether this file holds the exclusive lock. The lock belongs to the handle, and the
+    /// rotation opens a new one, so it is taken again on the new file.
+    locked: bool,
 }
 
 impl RotatingFile {
     pub fn open(path: PathBuf, max_bytes: u64, keep: usize) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Self::from_file(file, path, max_bytes, keep)
+    }
+
+    /// Open the log and try to take an exclusive lock on it.
+    ///
+    /// Two shells (the second launch is the single-instance plugin's handover) would otherwise
+    /// interleave into one file, and the rotation renames it — which fails on Windows while the
+    /// other process holds it open. The lock is the cheapest way to keep one file whole: the
+    /// process that cannot take it writes a file of its own.
+    ///
+    /// The boolean is `false` when another process holds the lock.
+    pub fn open_locked(path: PathBuf, max_bytes: u64, keep: usize) -> io::Result<(Self, bool)> {
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let locked = fs4::fs_std::FileExt::try_lock_exclusive(&file)?;
+        let mut this = Self::from_file(file, path, max_bytes, keep)?;
+        this.locked = locked;
+        Ok((this, locked))
+    }
+
+    fn from_file(file: File, path: PathBuf, max_bytes: u64, keep: usize) -> io::Result<Self> {
         let written = file.metadata()?.len();
         let mut this = Self {
             path,
@@ -27,6 +50,7 @@ impl RotatingFile {
             keep,
             file,
             written,
+            locked: false,
         };
         if this.written >= this.max_bytes {
             this.rotate()?;
@@ -58,6 +82,11 @@ impl RotatingFile {
             .create(true)
             .append(true)
             .open(&self.path)?;
+        // The lock belonged to the handle that was just renamed away, so the new file takes it
+        // again: a file nobody holds is a file another process may take.
+        if self.locked {
+            self.locked = fs4::fs_std::FileExt::try_lock_exclusive(&self.file).unwrap_or(false);
+        }
         self.written = 0;
         Ok(())
     }
@@ -122,5 +151,22 @@ mod tests {
             fs::metadata(dir.path().join("app.log.1")).unwrap().len(),
             500
         );
+    }
+
+    /// One process writes the shared log; the other one is told so.
+    ///
+    /// Two shells would otherwise interleave their lines into one file, and the rotation renames
+    /// it — which fails on Windows while the other process holds it open. The lock is what keeps
+    /// the file whole: the process that cannot take it writes a file of its own.
+    #[test]
+    fn a_second_holder_of_the_log_is_told_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+
+        let (_first, locked) = RotatingFile::open_locked(path.clone(), 1024, 1).unwrap();
+        assert!(locked, "the first holder takes the lock");
+
+        let (_second, locked) = RotatingFile::open_locked(path, 1024, 1).unwrap();
+        assert!(!locked, "and the second one is refused it");
     }
 }

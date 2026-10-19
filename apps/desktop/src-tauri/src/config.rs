@@ -42,13 +42,21 @@ use localplay_recorder::config_schema;
 use localplay_recorder::event_driver::EventsSection;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 /// The repository's example config, compiled in as the fallback for a fresh install. The path
 /// is relative to this file.
 pub const EXAMPLE_CONFIG: &str = include_str!("../../../../config.example.toml");
 
 /// The `[storage]` section of the config file.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// **Deliberately more forgiving than the CLI's own `StorageSection`**, which requires all
+/// three keys: a key the file omits falls back to the example's value here. The asymmetry runs
+/// one way only — the desktop accepts everything the CLI accepts and a little more — because
+/// the shell opens a window that can show the problem and repair it, and the CLI has nothing
+/// to show one in. The fallback is the example's value and never zero: a zero cap would make
+/// every clip "over the cap", which is a far worse failure than a missing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
     /// Empty means "the `clips` directory under the application data directory".
     pub clips_dir: String,
@@ -57,6 +65,12 @@ pub struct StorageConfig {
     /// A non-favourited clip older than this many days is deleted.
     pub max_age_days: u64,
 }
+
+/// The cap a file that omits `max_total_bytes` falls back to: the example's 50 GiB.
+const DEFAULT_MAX_TOTAL_BYTES: u64 = 53_687_091_200;
+
+/// The age a file that omits `max_age_days` falls back to: the example's seven days.
+const DEFAULT_MAX_AGE_DAYS: u64 = 7;
 
 impl StorageConfig {
     /// The settings from the repository's example config, the fallback when no `config.toml`
@@ -67,13 +81,26 @@ impl StorageConfig {
 
     pub fn from_toml(text: &str) -> Result<Self, CommandError> {
         // Only `[storage]` is required: an otherwise capture-shaped file is valid here, and a file
-        // whose `[storage]` is missing or mis-typed is not.
+        // whose `[storage]` is missing or mis-typed is not. A *key* the section omits falls back
+        // to the example's value (see the type's docs); a key it mistypes is still an error, so a
+        // typo'd cap is never read as "not set".
         #[derive(Deserialize)]
         struct File {
-            storage: StorageConfig,
+            storage: PartialStorage,
+        }
+        #[derive(Deserialize)]
+        struct PartialStorage {
+            clips_dir: Option<String>,
+            max_total_bytes: Option<u64>,
+            max_age_days: Option<u64>,
         }
         config_schema::parse::<File>(text)
             .map(|f| f.storage)
+            .map(|storage| Self {
+                clips_dir: storage.clips_dir.unwrap_or_default(),
+                max_total_bytes: storage.max_total_bytes.unwrap_or(DEFAULT_MAX_TOTAL_BYTES),
+                max_age_days: storage.max_age_days.unwrap_or(DEFAULT_MAX_AGE_DAYS),
+            })
             .map_err(|err| {
                 CommandError::new(
                     ErrorCode::InvalidInput,
@@ -88,21 +115,112 @@ impl StorageConfig {
     /// their cap must not be shown an app quietly behaving as if they had not. The CLI also
     /// refuses to start on a bad file.
     pub fn load(path: &Path) -> Result<Self, CommandError> {
+        Self::from_toml(&Self::text_or_example(path)?)
+    }
+
+    /// The file's text, or the example's when there is no file.
+    ///
+    /// The example is compiled in, so a fresh install has the values the repository documents.
+    fn text_or_example(path: &Path) -> Result<String, CommandError> {
         if !path.is_file() {
             tracing::info!(
                 "no config at {}; using the values from config.example.toml",
                 path.display()
             );
-            return Self::example();
+            return Ok(EXAMPLE_CONFIG.to_string());
         }
-        let text = std::fs::read_to_string(path).map_err(|err| {
+        std::fs::read_to_string(path).map_err(|err| {
             CommandError::new(
                 ErrorCode::Io,
                 format!("could not read the config file {}: {err}", path.display()),
             )
-        })?;
-        Self::from_toml(&text)
+        })
     }
+
+    /// The settings a shell that could not read the file starts with.
+    ///
+    /// The example's values, or the documented defaults if the compiled-in example cannot be
+    /// read (which a test pins against the file). Never zero: a zero cap would make every clip
+    /// "over the cap".
+    pub fn fallback() -> Self {
+        Self::example().unwrap_or_else(|_| Self {
+            clips_dir: String::new(),
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_age_days: DEFAULT_MAX_AGE_DAYS,
+        })
+    }
+
+    /// The settings to start the shell with, and the warning to show when the file's could not
+    /// be read.
+    ///
+    /// A malformed config must not stop the shell: the review window, the tray and the hotkey
+    /// all work whatever the file says, and the settings panel is where a user repairs it. The
+    /// CLI refuses to start on a bad file — it has no window to say why in — so the desktop
+    /// starts with the example's values and puts the reason where the user will see it.
+    ///
+    /// A key the file omits is a warning too, not silence: the cap in force is the example's,
+    /// and the user should hear that theirs was not read.
+    pub fn load_or_example(path: &Path) -> (Self, Option<String>) {
+        let text = match Self::text_or_example(path) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::error!("{err}");
+                return (
+                    Self::fallback(),
+                    Some(format!(
+                        "the config file could not be read, so the values in config.example.toml \
+                         are in force: {}",
+                        err.message
+                    )),
+                );
+            }
+        };
+        match Self::from_toml(&text) {
+            Ok(storage) => {
+                let missing = missing_storage_keys(&text);
+                if missing.is_empty() {
+                    (storage, None)
+                } else {
+                    (
+                        storage,
+                        Some(format!(
+                            "the config file does not set {}, so the values in \
+                             config.example.toml are in force for them",
+                            missing.join(", ")
+                        )),
+                    )
+                }
+            }
+            Err(err) => {
+                tracing::error!("{err}");
+                (
+                    Self::fallback(),
+                    Some(format!(
+                        "the config file could not be read, so the values in config.example.toml \
+                         are in force: {}",
+                        err.message
+                    )),
+                )
+            }
+        }
+    }
+}
+
+/// The `[storage]` keys the file does not set.
+///
+/// Each of them falls back to the example's value, and each is named: a user whose cap is not
+/// the one they set should hear about it rather than find out when a clip is deleted.
+fn missing_storage_keys(text: &str) -> Vec<&'static str> {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(storage) = doc.get("storage").and_then(|item| item.as_table_like()) else {
+        return Vec::new();
+    };
+    ["clips_dir", "max_total_bytes", "max_age_days"]
+        .into_iter()
+        .filter(|key| storage.get(key).is_none())
+        .collect()
 }
 
 /// The `[buffer]`, `[encode]` and `[storage]` sections: everything the recorder needs to start.
@@ -304,7 +422,7 @@ impl EngineOptionsConfig {
             #[serde(default)]
             events: EventsSection,
         }
-        config_schema::parse::<File>(text)
+        let config = config_schema::parse::<File>(text)
             .map(|f| Self {
                 recorder: f.recorder,
                 mic: f.mic,
@@ -319,7 +437,12 @@ impl EngineOptionsConfig {
                          {err}"
                     ),
                 )
-            })
+            })?;
+        // The GSI port is the one key in these sections the CLI bounds, so the desktop bounds it
+        // too: a cfg that points the game at port 80 would have the game talk to whatever else
+        // is listening there.
+        validate_gsi_port(config.events.gsi_port)?;
+        Ok(config)
     }
 
     pub fn load(path: &Path) -> Result<Self, CommandError> {
@@ -350,6 +473,26 @@ impl EngineOptionsConfig {
 /// that never renders, with no way to repair the file from the UI.
 pub const FPS_MIN: u32 = 1;
 pub const FPS_MAX: u32 = 240;
+
+/// The GSI listener's port rule, the CLI's (`apps/localplay-cli/src/config.rs`).
+///
+/// `0` turns the listener off; anything else is a real port, and the default sits above the
+/// ephemeral range so a temporarily bound listener elsewhere cannot shadow it. The desktop
+/// applies the same rule the CLI does, because the desktop writes the GSI cfg the game reads:
+/// a cfg pointing at port 80 would have the game talk to whatever else is listening there.
+pub fn validate_gsi_port(port: u16) -> Result<(), CommandError> {
+    if port == 0 || port >= 1024 {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "events.gsi_port must be 0 (the listener off) or between 1024 and 65535, but it \
+                 is {port}"
+            ),
+        ))
+    }
+}
 
 /// One edited key. Typed by construction, so the writer never parses user text into TOML
 /// values.
@@ -900,6 +1043,23 @@ fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, Comman
         .collect()
 }
 
+/// The lock that serialises the settings file's read-modify-write.
+///
+/// Two concurrent applies both read the same text and both write it back: the file itself is
+/// never corrupted (the temp name carries the pid and a counter), but one call's edit is
+/// silently lost, because the second write is based on a read that predates the first write.
+/// The window serialises its own buttons behind a `busy` flag, so this is the belt to that
+/// braces: nothing in the backend may depend on a flag that lives in the webview.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The settings write lock, held for as long as the caller needs it.
+///
+/// A poisoned lock is taken anyway: a panic in one write must not stop the next one, and the
+/// file is written atomically either way.
+pub(crate) fn settings_write_lock() -> MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 /// Write edited keys into the file at `path`, preserving everything else.
 ///
 /// Comments, blank lines and the formatting of untouched keys survive: the file is parsed to a
@@ -915,7 +1075,23 @@ fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, Comman
 /// The temp file is named uniquely per call: the window serialises applies behind its `busy`
 /// flag, but the runtime dispatches invokes concurrently, and a shared name would let the
 /// surviving rename publish a half-overwritten document.
+///
+/// The whole read-modify-write happens under [`settings_write_lock`], so two applies cannot
+/// lose one another's edit.
 pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandError> {
+    let _guard = settings_write_lock();
+    write_settings_locked(path, edits)
+}
+
+/// [`write_settings`], with [`settings_write_lock`] already held.
+///
+/// The caller holds the lock so that a read, a write and the read back that follows them are
+/// one sequence: the settings panel reports what changed by reading the file twice, and the
+/// two reads must bracket the write.
+pub(crate) fn write_settings_locked(
+    path: &Path,
+    edits: &[SettingEdit],
+) -> Result<(), CommandError> {
     for edit in edits {
         validate_edit(edit)?;
     }
@@ -951,10 +1127,11 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
         )
     })?;
 
-    // Stamp the layout version the file now follows. Absent means v1, the current version, so no
-    // migration is needed yet; a real migration must be applied to `doc` before stamping.
-    doc[config_schema::SCHEMA_VERSION_KEY] =
-        toml_edit::value(i64::from(config_schema::CURRENT_SCHEMA_VERSION));
+    // The layout version the file is brought to *before* it is stamped with it: a file that
+    // claims a version its content does not follow is worse than a file that is refused,
+    // because the CLI (which does migrate on read) would then skip the step the migration
+    // existed for and the settings it carried would be silently lost.
+    migrate_to_current(&mut doc, &text)?;
 
     for edit in edits {
         let (table_key, value_key, section) = match edit {
@@ -1040,6 +1217,144 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
     Ok(())
 }
 
+/// Bring the document to the layout version this build writes, and stamp it with that version.
+fn migrate_to_current(doc: &mut toml_edit::DocumentMut, text: &str) -> Result<(), CommandError> {
+    migrate_document(
+        doc,
+        text,
+        config_schema::CURRENT_SCHEMA_VERSION,
+        config_schema::MIGRATIONS,
+    )
+}
+
+/// The document, brought to `current` by `steps` and stamped with it.
+///
+/// The stamp is the last thing that happens, and only after the file has actually been brought
+/// to the version it is stamped with. A file that claims a version its content does not follow
+/// is worse than a file that is refused: the CLI migrates on read, so it would take the stamp
+/// at its word, skip the step the migration existed for, and lose exactly the settings that
+/// migration was written to carry.
+///
+/// Two rules keep that from happening:
+///
+/// * one migration per version step. A build that stamps a version it has no migration for
+///   refuses to write at all, loudly, rather than writing a file that lies about its layout;
+/// * the migration is applied to the document key by key, so the comments and the formatting of
+///   everything the migration did not touch survive.
+///
+/// The migration steps work on a `toml::Table` (`config_schema::Migration`) and the document is
+/// a `toml_edit::DocumentMut`: the two value types have no conversion between them, so a
+/// migrated value is turned into a document item by rendering it as TOML and parsing it back.
+fn migrate_document(
+    doc: &mut toml_edit::DocumentMut,
+    text: &str,
+    current: u32,
+    steps: &[config_schema::Migration],
+) -> Result<(), CommandError> {
+    if steps.len() as u32 + 1 != current {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "this build writes schema version {current} but has {} migration(s) for it, so \
+                 the config file was not changed",
+                steps.len()
+            ),
+        ));
+    }
+    let mut table: toml::Table = text.parse().map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the config file could not be parsed: {err}"),
+        )
+    })?;
+    let before = table.clone();
+    config_schema::migrate_with(&mut table, current, steps).map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the config file was not changed: {err}"),
+        )
+    })?;
+    if !same_content(&before, &table) {
+        merge_migrated(doc.as_table_mut(), &before, &table)?;
+    }
+    doc[config_schema::SCHEMA_VERSION_KEY] = toml_edit::value(i64::from(current));
+    Ok(())
+}
+
+/// Whether two tables hold the same content, ignoring the version stamp.
+///
+/// The stamp is the version's own business: comparing it would say every file changed.
+fn same_content(a: &toml::Table, b: &toml::Table) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.remove(config_schema::SCHEMA_VERSION_KEY);
+    b.remove(config_schema::SCHEMA_VERSION_KEY);
+    a == b
+}
+
+/// The migrated table, merged into the document.
+///
+/// Only what the migration changed is touched: a key it added is added, a key it changed is
+/// replaced, a key it removed is removed, and everything else keeps its comments and its
+/// formatting.
+fn merge_migrated(
+    table: &mut dyn toml_edit::TableLike,
+    before: &toml::Table,
+    after: &toml::Table,
+) -> Result<(), CommandError> {
+    // A key the migration dropped goes with it: the document has to end up holding what the
+    // migrated table holds, not what it held plus the new shape.
+    for key in before.keys() {
+        if after.contains_key(key) {
+            continue;
+        }
+        table.remove(key);
+    }
+    for (key, value) in after {
+        if key == config_schema::SCHEMA_VERSION_KEY {
+            continue;
+        }
+        let existing = table.get(key).cloned();
+        match (existing, before.get(key), value) {
+            (
+                Some(toml_edit::Item::Table(mut existing)),
+                Some(toml::Value::Table(old)),
+                toml::Value::Table(new),
+            ) => {
+                merge_migrated(&mut existing, old, new)?;
+            }
+            (Some(existing), _, value) => {
+                if item_value(&existing).as_ref() != Some(value) {
+                    table.insert(key, item_from_value(value)?);
+                }
+            }
+            (None, _, value) => {
+                table.insert(key, item_from_value(value)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The value a document item holds, as the `toml` crate's own value type.
+///
+/// The two crates have no conversion between their values, so the item is rendered as TOML and
+/// read back. The comparison the merge needs is "did this value change", not "is this the same
+/// formatting".
+fn item_value(item: &toml_edit::Item) -> Option<toml::Value> {
+    toml::from_str::<toml::Value>(&item.to_string()).ok()
+}
+
+/// A migrated value, as a document item.
+fn item_from_value(value: &toml::Value) -> Result<toml_edit::Item, CommandError> {
+    value.to_string().parse().map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the migrated value could not be written back: {err}"),
+        )
+    })
+}
+
 /// The application data directory, by the same rule the CLI uses.
 ///
 /// Duplicated on purpose: the two binaries must agree on this path or the shell would show an
@@ -1104,6 +1419,72 @@ mod tests {
             "the message must name the section: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_storage_key_the_file_omits_falls_back_to_the_examples_value() {
+        // The CLI's own `StorageSection` requires all three keys; the desktop's reader does not,
+        // and the asymmetry runs one way only: the desktop accepts everything the CLI accepts.
+        // The fallback is the example's value and never zero — a zero cap would make every clip
+        // "over the cap", which is a far worse failure than a missing key.
+        let cfg = StorageConfig::from_toml("[storage]\nclips_dir = \"\"\n").unwrap();
+
+        assert_eq!(cfg.clips_dir, "");
+        assert_eq!(cfg.max_total_bytes, 53_687_091_200, "the example's cap");
+        assert_eq!(cfg.max_age_days, 7, "the example's age");
+
+        // A key that is *mistyped* is still an error: a typo'd cap must not read as "not set".
+        let err = StorageConfig::from_toml("[storage]\nmax_total_bytes = \"lots\"\n").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn the_keys_a_file_omits_are_named() {
+        // The shell puts these in a warning: a user whose cap is not the one they set should
+        // hear about it rather than find out when a clip is deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 2048\n",
+        )
+        .unwrap();
+        let (storage, warning) = StorageConfig::load_or_example(&path);
+        assert_eq!(
+            storage.max_total_bytes, 2048,
+            "the file's own value is used"
+        );
+        let warning = warning.expect("the key that fell back is a warning");
+        assert!(warning.contains("max_age_days"), "{warning}");
+        assert!(!warning.contains("max_total_bytes"), "{warning}");
+
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 2048\n\
+             max_age_days = 1\n",
+        )
+        .unwrap();
+        let (_storage, warning) = StorageConfig::load_or_example(&path);
+        assert!(
+            warning.is_none(),
+            "a file that sets everything says nothing"
+        );
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_starts_the_shell_with_the_examples_values() {
+        // The CLI refuses to start on a bad file; the desktop has a window to show the problem
+        // in, so it starts with the example's values and says so.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[storage\nclips_dir = ").unwrap();
+
+        let (storage, warning) = StorageConfig::load_or_example(&path);
+
+        assert_eq!(storage, StorageConfig::fallback(), "the example's values");
+        let warning = warning.expect("a file that could not be read is a warning");
+        assert!(warning.contains("config file"), "{warning}");
     }
 
     #[test]
@@ -1283,6 +1664,36 @@ mod tests {
                 .unwrap();
         assert!(!set.events.lol_poll_enabled);
         assert_eq!(set.events.gsi_port, 0);
+    }
+
+    #[test]
+    fn a_gsi_port_the_cli_would_refuse_is_refused_here_too() {
+        // The CLI refuses to start when `events.gsi_port` is neither 0 nor in the ephemeral
+        // range's complement; the desktop writes the GSI cfg the game reads, so a port below
+        // 1024 would point the game at whatever else is listening there.
+        for bad in [80, 443, 1023] {
+            let err = EngineOptionsConfig::from_toml(&format!(
+                "[events]\nlol_poll_enabled = true\ngsi_port = {bad}\n"
+            ))
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "port {bad}");
+            assert!(
+                err.message.contains("events.gsi_port"),
+                "got: {}",
+                err.message
+            );
+        }
+
+        // 0 is the documented way to turn the listener off, and a real port is fine.
+        for good in [0, 1024, 45671] {
+            assert!(
+                EngineOptionsConfig::from_toml(&format!(
+                    "[events]\nlol_poll_enabled = true\ngsi_port = {good}\n"
+                ))
+                .is_ok(),
+                "port {good}"
+            );
+        }
     }
 
     #[test]
@@ -1630,6 +2041,73 @@ mod tests {
         assert!(read_effective_settings(&path).is_ok());
     }
 
+    /// A file is migrated to the version it is stamped with, or the write is refused.
+    ///
+    /// The bug this rules out: the desktop stamped the current version onto a file it had not
+    /// migrated, and the CLI — which does migrate on read — then took the stamp at its word,
+    /// skipped the step the migration existed for, and lost exactly the settings that step
+    /// carried.
+    #[test]
+    fn a_file_is_migrated_before_it_is_stamped() {
+        // A stand-in for the v1 -> v2 step, so the rule is pinned while `MIGRATIONS` is empty.
+        fn v1_to_v2(table: &mut toml::Table) {
+            let old = table.remove("old_name").unwrap();
+            table.insert("new_name".into(), old);
+        }
+        let text = "old_name = 7\n[storage]\n# a comment the migration did not touch\n\
+             clips_dir = \"\"\n";
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+
+        migrate_document(&mut doc, text, 2, &[v1_to_v2]).unwrap();
+
+        let migrated = doc.to_string();
+        assert!(migrated.contains("new_name = 7"), "{migrated}");
+        assert!(!migrated.contains("old_name"), "{migrated}");
+        assert!(migrated.contains("schema_version = 2"), "{migrated}");
+        assert!(
+            migrated.contains("# a comment the migration did not touch"),
+            "the comments of what the migration did not touch survive: {migrated}"
+        );
+    }
+
+    /// A build that has no migration for the version it would stamp refuses to write.
+    ///
+    /// Silently stamping a version the file was not migrated to is the failure this is about, so
+    /// the refusal is loud and the file is left alone.
+    #[test]
+    fn a_build_that_cannot_migrate_to_the_version_it_stamps_refuses_to_write() {
+        let text = "[storage]\nclips_dir = \"\"\n";
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+
+        let err = migrate_document(&mut doc, text, 2, &[]).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("schema version 2"), "{}", err.message);
+        assert!(
+            !doc.to_string().contains("schema_version"),
+            "and nothing was stamped: {doc}"
+        );
+    }
+
+    /// The writer migrates the file it writes, with this build's own migrations.
+    #[test]
+    fn the_writer_leaves_a_file_at_the_current_version_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\nmax_age_days = 1\n",
+        )
+        .unwrap();
+
+        write_settings(&path, &[SettingEdit::Fps(30)]).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("schema_version = 1"), "{text}");
+        assert!(text.contains("fps = 30"), "{text}");
+        assert!(text.contains("max_total_bytes = 1"), "and the rest: {text}");
+    }
+
     #[test]
     fn a_newer_schema_is_refused_by_every_reader_and_the_writer_leaves_the_file_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1741,6 +2219,66 @@ mod tests {
         write_settings(&path, &[]).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Two applies at once must not lose one another's edit.
+    ///
+    /// Each write is atomic on its own, so the file is never half-written — but two concurrent
+    /// applies that both read the same text would both write, and the second write would be
+    /// based on a file the first had already changed. The write lock makes the read, the edit
+    /// and the write one sequence.
+    #[test]
+    fn two_concurrent_applies_both_survive() {
+        let (_dir, path) = settings_file();
+
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || write_settings(&path, &[SettingEdit::Fps(30)])
+        });
+        let second = std::thread::spawn({
+            let path = path.clone();
+            move || write_settings(&path, &[SettingEdit::MicEnabled(true)])
+        });
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fps = 30"), "the first edit survived: {text}");
+        assert!(
+            text.contains("enabled = true"),
+            "and so did the second: {text}"
+        );
+    }
+
+    /// A write waits for the write lock, and goes through when it is released.
+    ///
+    /// The serialisation itself, pinned: the read, the edit and the write are one sequence, so
+    /// a second apply reads the file the first one wrote.
+    #[test]
+    fn a_write_waits_for_the_write_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_dir, path) = settings_file();
+        let guard = settings_write_lock();
+        let (tx, rx) = mpsc::channel();
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                write_settings(&path, &[SettingEdit::Fps(30)]).unwrap();
+                let _ = tx.send(());
+            }
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the write is waiting for the lock this thread holds"
+        );
+
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the write went through once the lock was released");
+        writer.join().unwrap();
     }
 
     #[test]

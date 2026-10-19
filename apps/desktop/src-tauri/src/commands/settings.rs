@@ -143,12 +143,17 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
 /// recording is running and one of them changed value. `storage.clips_dir` is applied by the
 /// caller (paths rebuild, asset scope); this function reports it in `applied` but touches no
 /// state.
+///
+/// The read before the write and the read after it are one sequence with the write itself, under
+/// the settings write lock: two concurrent applies would otherwise both read the same text, and
+/// the second write would be based on a file the first had already changed.
 pub fn update_settings_file(
     app_data_dir: &Path,
     config_path: &Path,
     update: &SettingsUpdate,
     recorder_running: bool,
 ) -> Result<UpdateSettingsOutcome, CommandError> {
+    let _guard = crate::config::settings_write_lock();
     let before = crate::config::read_effective_settings(config_path)?;
     let mut edits = Vec::new();
     if let Some(dir) = &update.clips_dir {
@@ -187,7 +192,7 @@ pub fn update_settings_file(
     let applied: Vec<String> = edits.iter().map(|edit| edit.key().to_string()).collect();
 
     if !edits.is_empty() {
-        crate::config::write_settings(config_path, &edits)?;
+        crate::config::write_settings_locked(config_path, &edits)?;
     }
     let after = read_settings(app_data_dir, config_path)?;
 

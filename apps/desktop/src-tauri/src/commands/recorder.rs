@@ -140,10 +140,27 @@ pub struct RecorderHost {
     /// Told about every clip that lands, whichever trigger took it (button, tray, hotkey or a
     /// game event). Set once by the shell, which owns the notification; empty in tests.
     clip_hook: Arc<OnceLock<ClipSavedHook>>,
+    /// **TEST-ONLY.** The hooks a test hangs on a stop.
+    #[cfg(test)]
+    probe: Mutex<StopProbe>,
 }
 
 /// What the shell does when a clip is saved (a toast and a sound, in the app).
 pub type ClipSavedHook = Box<dyn Fn(&RecordedClipDto) + Send + Sync>;
+
+/// **TEST-ONLY.** The hooks a test hangs on a stop.
+///
+/// `entered` runs at the start of the stop and `leaving` at the end, and both run with the
+/// recorder slot's lock held. That the lock is held at both ends is the point: it is what
+/// makes a start that arrives mid-stop wait instead of opening a second capture session.
+#[cfg(test)]
+#[derive(Default)]
+pub struct StopProbe {
+    /// Called at the start of the stop, with the slot lock held.
+    pub entered: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Called at the end of the stop, with the slot lock still held.
+    pub leaving: Option<Box<dyn Fn() + Send + Sync>>,
+}
 
 impl RecordedClipDto {
     fn from_clip(clip: &RecordedClip) -> Self {
@@ -166,6 +183,32 @@ impl RecorderHost {
             current: Mutex::new(None),
             events: Mutex::new(None),
             clip_hook: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            probe: Mutex::new(StopProbe::default()),
+        }
+    }
+
+    /// **TEST-ONLY.** Hang the test's hooks on the next stop.
+    #[cfg(test)]
+    pub fn watch_stop(&self, probe: StopProbe) {
+        *self.probe.lock().unwrap_or_else(|err| err.into_inner()) = probe;
+    }
+
+    /// **TEST-ONLY.** The test's "a stop has begun" hook, with the slot lock held.
+    #[cfg(test)]
+    fn probe_entered(&self) {
+        let probe = self.probe.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(hook) = probe.entered.as_ref() {
+            hook();
+        }
+    }
+
+    /// **TEST-ONLY.** The test's "a stop is about to finish" hook, with the slot lock held.
+    #[cfg(test)]
+    fn probe_leaving(&self) {
+        let probe = self.probe.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(hook) = probe.leaving.as_ref() {
+            hook();
         }
     }
 
@@ -372,10 +415,18 @@ impl RecorderHost {
         if let Ok(mut held) = self.events.lock() {
             held.take();
         }
-        let taken = self.slot()?.take();
+        // The guard lives until this function returns, and that is the whole point of it: a start
+        // that arrives while the encoder is still flushing and the capture session is still
+        // closing waits for the lock instead of opening a second capture session beside the one
+        // that is closing. (The window's buttons are serialised by the frontend's `busy` flag;
+        // the tray's item and the recording hotkey are not, and they reach this same code.)
+        let mut slot = self.slot()?;
+        let taken = slot.take();
         let Some(recorder) = taken else {
             return Ok(RecordingStatusDto::from(RecorderStatus::stopped()));
         };
+        #[cfg(test)]
+        self.probe_entered();
         let outcome = recorder.stop().map_err(|err| {
             CommandError::new(
                 ErrorCode::Recording,
@@ -385,6 +436,8 @@ impl RecorderHost {
         let status = RecordingStatusDto::from(recorder.status());
         // The status is reported either way (a recorder that failed while stopping still has counters
         // worth showing), but a failed stop is still a failure.
+        #[cfg(test)]
+        self.probe_leaving();
         outcome.map(|()| status)
     }
 
@@ -667,6 +720,114 @@ mod tests {
         );
         assert!(!first.running);
         assert_eq!(first.error, None);
+    }
+
+    /// A start that arrives while a stop is in flight must not open a second capture session.
+    ///
+    /// The stop holds the recorder slot's lock while the encoder flushes and the capture session
+    /// closes, so the start waits for it: "stop then start" is a sequence, not two sessions
+    /// running beside each other. The tray's item and the recording hotkey reach this code
+    /// without the window's `busy` flag between them, which is how the race was reachable.
+    ///
+    /// The capture source is the engine's synthetic stub, so no session is opened on the host's
+    /// display, and the encoder is the software one, as in the integration test above.
+    #[test]
+    fn a_start_during_a_stop_waits_for_the_stop_to_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let f = Fixture::new();
+        let host = std::sync::Arc::new(host(&f, true));
+        let mut settings = RecordingConfig::example().unwrap();
+        settings.buffer.pre_seconds = 2;
+        settings.buffer.post_seconds = 1;
+        settings.buffer.segment_time = 1;
+        settings.encode.fps = 10;
+        settings.encode.output_size = String::new();
+
+        let started = host
+            .start_for_test_with_stub_sources(&settings)
+            .expect("the stub start opens no capture session on the host's display");
+        assert!(started.running);
+
+        // The stop is held open at its first hook, which runs with the slot lock held. Only the
+        // first stop is held: the test stops the recorder again at the end, and that one must
+        // not wait for a release that is never sent.
+        let (release_tx, release_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        // The release channel lives behind a mutex: a `Receiver` is not `Sync`, and the hook has
+        // to be.
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let held_once = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_finished = std::sync::Arc::new(AtomicBool::new(false));
+        host.watch_stop(StopProbe {
+            entered: Some(Box::new(move || {
+                let _ = entered_tx.send(());
+                if !held_once.swap(true, Ordering::SeqCst) {
+                    // The test holds the stop here, with the slot lock held.
+                    let _ = release_rx
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .recv();
+                }
+            })),
+            leaving: Some(Box::new({
+                let stop_finished = std::sync::Arc::clone(&stop_finished);
+                move || stop_finished.store(true, Ordering::SeqCst)
+            })),
+        });
+
+        let stopper = {
+            let host = std::sync::Arc::clone(&host);
+            std::thread::spawn(move || host.stop())
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the stop began");
+
+        // A start, now, while the stop is in flight.
+        let start_returned = std::sync::Arc::new(AtomicBool::new(false));
+        let start_saw_the_stop_finish = std::sync::Arc::new(AtomicBool::new(false));
+        let starter = {
+            let host = std::sync::Arc::clone(&host);
+            let settings = settings.clone();
+            let start_returned = std::sync::Arc::clone(&start_returned);
+            let start_saw_the_stop_finish = std::sync::Arc::clone(&start_saw_the_stop_finish);
+            let stop_finished = std::sync::Arc::clone(&stop_finished);
+            std::thread::spawn(move || {
+                let outcome = host.start_for_test_with_stub_sources(&settings);
+                start_returned.store(true, Ordering::SeqCst);
+                start_saw_the_stop_finish
+                    .store(stop_finished.load(Ordering::SeqCst), Ordering::SeqCst);
+                outcome
+            })
+        };
+
+        // The start is waiting for the lock the stop holds: it cannot have opened a capture
+        // session of its own while the first one is still closing.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !start_returned.load(Ordering::SeqCst),
+            "a start completed while the stop was still in flight: two capture sessions at once"
+        );
+
+        // Let the stop finish. The lock is released after the last hook, so the start may only
+        // proceed once the stop is done with it.
+        release_tx.send(()).unwrap();
+        let stopped = stopper.join().unwrap().unwrap();
+        assert!(!stopped.running, "the recording stopped");
+
+        let started_again = starter
+            .join()
+            .unwrap()
+            .expect("the start went through after the stop");
+        assert!(started_again.running);
+        assert!(
+            start_saw_the_stop_finish.load(Ordering::SeqCst),
+            "the start ran before the stop had released the recorder slot"
+        );
+
+        host.stop().unwrap();
     }
 
     #[test]

@@ -8,6 +8,10 @@
 //! runtime or a window. The wiring itself (the tray appearing, the window hiding, a key
 //! arriving) needs a desktop and is not covered by tests.
 
+// Test bodies may unwrap and may chunk by a constant; production code may do neither.
+// Scoped to the test build of this crate, so it cannot hide either in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
+
 pub mod background;
 pub mod clip_files;
 pub mod commands;
@@ -65,10 +69,24 @@ pub struct AppState {
     /// (`localplay-recorder`). A host rather than a bare handle because a start must resolve the
     /// application data directory and the ffmpeg sidecar binaries, both already here.
     recorder: RecorderHost,
-    /// What installing the clip hotkey concluded at startup: the chord, whether a listener is
+    /// What installing the clip hotkey concluded: the chord, whether a listener is
     /// really there, and why not when it is not. The window shows this instead of assuming the
     /// hotkey works, since a hotkey that silently does nothing is the worst outcome of the feature.
-    hotkey: HotkeyStatus,
+    ///
+    /// Behind a `Mutex` because it is not known when the state is built: the hotkey is installed
+    /// in `setup`, after the single-instance plugin has decided whether this process is the one
+    /// that stays (see `run`).
+    hotkey: Mutex<HotkeyStatus>,
+    /// The directories the clips directory may be: the ones the user approved.
+    ///
+    /// The asset protocol is the window's only read channel (`capabilities/default.json` grants
+    /// no filesystem permission), so a command that widened the scope to a path the webview named
+    /// would let the webview read any directory on the disk. A clips directory outside the
+    /// application data directory is therefore one the user picked in the native folder picker
+    /// (`choose_clips_dir`) or one the config file already names.
+    approved_roots: Mutex<Vec<PathBuf>>,
+    /// The log file this process writes, and the health page reads.
+    log_path: PathBuf,
 }
 
 impl AppState {
@@ -79,7 +97,7 @@ impl AppState {
     pub fn open(
         app_data_dir: &Path,
         storage: StorageConfig,
-        hotkey: HotkeyStatus,
+        log_path: PathBuf,
     ) -> Result<Self, CommandError> {
         std::fs::create_dir_all(app_data_dir).map_err(|e| {
             CommandError::new(
@@ -155,7 +173,12 @@ impl AppState {
             app_data_dir: app_data_dir.to_path_buf(),
             warnings,
             recorder,
-            hotkey,
+            hotkey: Mutex::new(HotkeyStatus::not_installed(
+                config::DEFAULT_CLIP_HOTKEY,
+                "the hotkey is installed when the shell has finished starting",
+            )),
+            approved_roots: Mutex::new(Vec::new()),
+            log_path,
         })
     }
 
@@ -165,8 +188,75 @@ impl AppState {
     }
 
     /// What installing the clip hotkey concluded at startup.
-    pub fn hotkey(&self) -> &HotkeyStatus {
-        &self.hotkey
+    pub fn hotkey(&self) -> HotkeyStatus {
+        self.hotkey
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Record what installing the clip hotkey concluded.
+    ///
+    /// The hotkey is installed in `setup`, because that is where the single-instance plugin has
+    /// already decided whether this process stays; the state is built before that.
+    pub fn set_hotkey(&self, hotkey: HotkeyStatus) {
+        *self.hotkey.lock().unwrap_or_else(|err| err.into_inner()) = hotkey;
+    }
+
+    /// Record a problem the window should show.
+    ///
+    /// The startup warnings are how the shell says "this works, but something is wrong": ffmpeg
+    /// is missing, the config file could not be read. They go to the storage panel, where a user
+    /// sees them, not only to a log nobody reads.
+    pub fn warn(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    /// The log file this process writes.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    /// The default clips directory: the one under the application data directory.
+    pub fn default_clips_dir(&self) -> PathBuf {
+        self.app_data_dir.join("clips")
+    }
+
+    /// Approve a directory the user picked, so a later update may name it.
+    pub fn approve_clips_root(&self, dir: &Path) {
+        let mut roots = self
+            .approved_roots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if !roots.iter().any(|root| root == dir) {
+            tracing::info!("the clips directory {} is approved", dir.display());
+            roots.push(dir.to_path_buf());
+        }
+    }
+
+    /// Whether `dir` is a clips directory this shell may use.
+    ///
+    /// Empty is the default and always allowed. Anything else must be an approved root or live
+    /// inside one: the webview may not widen the asset protocol's scope to a path it named.
+    ///
+    /// A path with a `..` segment is refused whatever it starts with: the scope is resolved and
+    /// not canonicalised, so `<approved>/../elsewhere` is a directory the approval does not name.
+    pub fn clips_dir_allowed(&self, dir: &str) -> bool {
+        if dir.is_empty() {
+            return true;
+        }
+        let wanted = PathBuf::from(dir);
+        if wanted
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        self.approved_roots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .any(|root| wanted == *root || wanted.starts_with(root))
     }
 
     /// The `config.toml` this process read: the file the tray's "open config file" item reveals and
@@ -279,7 +369,10 @@ fn set_clip_tags(
 }
 
 /// Put the clip's file on the system clipboard, as a file.
-#[tauri::command(rename_all = "snake_case")]
+///
+/// Async because it waits for PowerShell: the call blocks until the child process is done, and
+/// the window must not stop answering while it does.
+#[tauri::command(async, rename_all = "snake_case")]
 fn copy_clip_to_clipboard(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
     let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
     clip_files::copy_file_to_clipboard(&path)
@@ -347,7 +440,9 @@ fn start_native_drag(_window: &tauri::WebviewWindow, _path: PathBuf) -> Result<(
 }
 
 /// Cut `[start_ms, end_ms)` into a new clip file with a lossless stream copy.
-#[tauri::command(rename_all = "snake_case")]
+///
+/// Async because it runs ffmpeg: the cut takes as long as the footage does, up to a minute.
+#[tauri::command(async, rename_all = "snake_case")]
 fn trim_clip(
     state: State<'_, AppState>,
     id: i64,
@@ -358,7 +453,9 @@ fn trim_clip(
 }
 
 /// A cached JPEG thumbnail for one clip at one timestamp.
-#[tauri::command(rename_all = "snake_case")]
+///
+/// Async because it runs ffmpeg per clip, and a list of clips is a list of ffmpeg runs.
+#[tauri::command(async, rename_all = "snake_case")]
 fn thumbnail(
     state: State<'_, AppState>,
     id: i64,
@@ -430,7 +527,10 @@ fn set_session_favourite(
 }
 
 /// Delete a session: the row first, then its segments and its recorded file.
-#[tauri::command(rename_all = "snake_case")]
+///
+/// Async because deleting a session removes a whole directory of footage, which takes as long as
+/// the disk needs.
+#[tauri::command(async, rename_all = "snake_case")]
 fn delete_session(
     state: State<'_, AppState>,
     session_id: i64,
@@ -451,10 +551,18 @@ fn extract_clip(
 
 // -- recording ---------------------------------------------------------------------------
 //
-// These four are `async`, unlike every other command here, because tauri runs a synchronous
-// command on the webview's own thread and two of them block for real time: `clip_now` waits
-// for the post-roll (seconds), and a start runs the encoder smoke test. An `async fn` runs on
-// the runtime's workers, keeping the window responsive while a clip is saved.
+// The recording commands are `async`, unlike most of the others, because tauri runs a
+// synchronous command on the webview's own thread and these block for real time: `clip_now`
+// waits for the post-roll (seconds), and a start runs the encoder smoke test. An `async fn`
+// runs on the runtime's workers, keeping the window responsive while a clip is saved.
+//
+// The same applies to the commands that are not about recording but block just as long: a
+// `trim_clip` runs ffmpeg over the whole window, a `thumbnail` runs ffmpeg per clip, a
+// `delete_session` removes a directory of footage, `copy_clip_to_clipboard` waits for
+// PowerShell, `list_audio_devices` waits for the thread that owns the COM apartment, and
+// `update_settings` writes the file and flushes it to disk. Each of those carries
+// `#[tauri::command(async)]`, which dispatches a synchronous body to a thread pool — the
+// signature does not have to change for that.
 
 /// Start recording through the shared engine.
 #[tauri::command(rename_all = "snake_case")]
@@ -491,7 +599,7 @@ async fn clip_now(state: State<'_, AppState>) -> Result<RecordedClipDto, Command
 fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
     let config_path = state.config_path();
     Ok(AppStatus {
-        hotkey: state.hotkey().clone(),
+        hotkey: state.hotkey(),
         config_exists: config_path.is_file(),
         config_path: config_path.to_string_lossy().into_owned(),
         close_hint: background::CLOSE_HINT.to_string(),
@@ -502,7 +610,7 @@ fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
 #[tauri::command(rename_all = "snake_case")]
 fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError> {
     let status = state.recorder.raw_status();
-    let log_path = state.app_data_dir.join("logs").join("better-outplayed.log");
+    let log_path = state.log_path().to_path_buf();
     let clips_dir = state
         .paths
         .lock()
@@ -559,13 +667,67 @@ fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, Com
 /// The active microphones and outputs, for the device pickers. Empty off Windows.
 ///
 /// Listed on a thread of its own: enumeration takes a COM apartment, and the UI thread's is not
-/// ours to change.
-#[tauri::command(rename_all = "snake_case")]
+/// ours to change. Async because the join waits for that thread: a synchronous command would
+/// wait on the UI thread for it.
+#[tauri::command(async, rename_all = "snake_case")]
 fn list_audio_devices() -> Result<localplay_capture::audio_devices::AudioDevices, CommandError> {
     std::thread::spawn(localplay_capture::audio_devices::list_audio_devices)
         .join()
         .map_err(|_| CommandError::new(ErrorCode::Recording, "listing audio devices panicked"))?
         .map_err(|e| CommandError::new(ErrorCode::Recording, format!("{e:#}")))
+}
+
+/// Pick the clips directory, in the native folder picker, and approve it.
+///
+/// The picker runs here rather than in the webview because its answer decides what the webview
+/// may read: the asset protocol's scope is the window's only read channel (`capabilities/default.json`
+/// grants no filesystem permission), so a directory the webview names is a directory the webview
+/// could have named for itself. What the user picks in a native dialog is an approval, and it is
+/// recorded on this side.
+///
+/// The path this returns may be handed to `update_settings` as `clips_dir`: it is approved, so
+/// the write is allowed.
+#[tauri::command(async, rename_all = "snake_case")]
+fn choose_clips_dir(app: AppHandle, state: State<'_, AppState>) -> Result<String, CommandError> {
+    let path = pick_clips_folder(&app, None)?;
+    state.approve_clips_root(Path::new(&path));
+    Ok(path)
+}
+
+/// The native folder picker, and what the user picked in it.
+///
+/// `start_at` is where the dialog opens, when the caller knows a folder the user was aiming at.
+/// The picker runs on the main thread and the answer comes back on this one, so the command
+/// that waits for it must not be the UI thread's.
+fn pick_clips_folder(app: &AppHandle, start_at: Option<&str>) -> Result<String, CommandError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut builder = app.dialog().file().set_title("Choose the clips directory");
+    if let Some(start) = start_at.map(Path::new).filter(|start| start.is_dir()) {
+        builder = builder.set_directory(start);
+    }
+    builder.pick_folder(move |folder| {
+        let _ = tx.send(folder);
+    });
+    let picked = rx.recv().map_err(|_| {
+        CommandError::new(
+            ErrorCode::Io,
+            "the folder picker did not answer: the window may be closing",
+        )
+    })?;
+    let Some(folder) = picked else {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            "no folder was chosen, so the clips directory was not changed".to_string(),
+        ));
+    };
+    let path = folder.into_path().map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("the chosen folder is not a path this shell can use: {err}"),
+        )
+    })?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Edit settings: validate, prove the clips directory usable, write the file, apply what
@@ -579,12 +741,27 @@ fn list_audio_devices() -> Result<localplay_capture::audio_devices::AudioDevices
 /// The clips directory is created before the file is written, and the order is load-bearing:
 /// the next launch reads the file before it can open a window, so a directory that cannot be
 /// made must never get that far. See `commands::update_settings_and_prepare`.
-#[tauri::command(rename_all = "snake_case")]
+///
+/// Async because it writes the file and creates a directory: both are filesystem work, and the
+/// write is flushed to disk before it returns.
+#[tauri::command(async, rename_all = "snake_case")]
 fn update_settings(
     state: State<'_, AppState>,
     app: AppHandle,
     update: commands::SettingsUpdate,
 ) -> Result<commands::UpdateSettingsOutcome, CommandError> {
+    // The clips directory decides what the window may read: the asset protocol is its only read
+    // channel, so a directory it may name is a directory it may read. A path the user has not
+    // approved is therefore asked for in the native folder picker, and what the user picks
+    // there is what is written — the file is the user's own, and the next launch trusts it.
+    let mut update = update;
+    if let Some(dir) = update.clips_dir.clone() {
+        if !state.clips_dir_allowed(&dir) {
+            let picked = pick_clips_folder(&app, Some(&dir))?;
+            state.approve_clips_root(Path::new(&picked));
+            update.clips_dir = Some(picked);
+        }
+    }
     let running = state.recorder().is_running()?;
     // `update_settings_and_prepare` creates the new clips directory before it writes anything, so
     // what is left here, committing it to the running shell and re-scoping the asset protocol, is
@@ -615,19 +792,37 @@ fn commit_clips_dir(
     paths: AppPaths,
     clips_dir: &str,
 ) -> Result<(), CommandError> {
-    *state
-        .paths
-        .lock()
-        .map_err(|_| AppState::poisoned("the paths lock"))? = paths.clone();
+    let previous = {
+        let mut guard = state
+            .paths
+            .lock()
+            .map_err(|_| AppState::poisoned("the paths lock"))?;
+        let previous = guard.clips_dir.clone();
+        *guard = paths.clone();
+        previous
+    };
     state
         .storage
         .lock()
         .map_err(|_| AppState::poisoned("the storage lock"))?
         .clips_dir = clips_dir.to_string();
-    if let Err(err) = app
-        .asset_protocol_scope()
-        .allow_directory(&paths.clips_dir, true)
-    {
+
+    // The scope is rebuilt, not widened: the directory the window could read before is taken out
+    // of it, so moving the clips directory does not leave the old one readable for the rest of
+    // the session. The default directory is the exception — the static scope in `tauri.conf.json`
+    // covers it, and a forbidden pattern cannot be taken back, so forbidding it would break the
+    // default for good.
+    let scope = app.asset_protocol_scope();
+    if previous != paths.clips_dir && previous != state.default_clips_dir() {
+        if let Err(err) = scope.forbid_directory(&previous, true) {
+            tracing::warn!(
+                "the asset protocol was not taken off {}: {err}. Files in that directory may \
+                 still be readable.",
+                previous.display()
+            );
+        }
+    }
+    if let Err(err) = scope.allow_directory(&paths.clips_dir, true) {
         tracing::warn!(
             "the asset protocol was not scoped to {}: {err}. Clips in that directory will \
              not play.",
@@ -637,6 +832,82 @@ fn commit_clips_dir(
     Ok(())
 }
 
+/// The clip hotkey the config asks for, installed, and the channel a press arrives on.
+///
+/// Split out of `setup` so that what it decides can be tested without a window: the chord, the
+/// optional chords beside it, and the reason when nothing could be installed.
+fn install_clip_hotkey(
+    cfg: &BackgroundConfig,
+) -> (
+    HotkeyStatus,
+    Option<std::sync::mpsc::Receiver<background::HotkeyAction>>,
+) {
+    let mut extras = Vec::new();
+    if let Some(chord) = &cfg.toggle_recording_hotkey {
+        extras.push((background::HotkeyAction::ToggleRecording, chord.as_str()));
+    }
+    if let Some(chord) = &cfg.bookmark_hotkey {
+        extras.push((background::HotkeyAction::Bookmark, chord.as_str()));
+    }
+    background::install_hotkey(&cfg.clip_hotkey, &extras)
+}
+
+/// Open the shell's state, falling back to the example's settings when the config file cannot be
+/// read.
+///
+/// A config that cannot be parsed is a warning, not a refusal: the review window, the tray and
+/// the hotkey all work whatever the file says, and the settings panel is where a user repairs
+/// it. The CLI refuses to start on a bad file, because it has no window to say why in.
+///
+/// The one thing that ends the process is an index that cannot be opened: there is nothing to
+/// show and nothing to repair it from.
+fn open_state(
+    app_data_dir: &Path,
+    config_path: &Path,
+    log_path: PathBuf,
+) -> Result<AppState, CommandError> {
+    let (storage, warning) = StorageConfig::load_or_example(config_path);
+    let mut state = match AppState::open(app_data_dir, storage.clone(), log_path.clone()) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::error!("{err}");
+            // The clips directory the file named could not be made: a relative path resolved
+            // against a working directory that is not there, say (a Start-Menu launch has
+            // `C:\Windows\System32` as its working directory). The default directory is under
+            // the application data directory, which is where the index lives too, so it is the
+            // one that can be relied on.
+            let mut state = AppState::open(app_data_dir, StorageConfig::fallback(), log_path)
+                .map_err(|err| {
+                    tracing::error!("{err}");
+                    err
+                })?;
+            state.warn(format!(
+                "the clips directory in the config file could not be used, so the default one \
+                 under the application data directory is in force: {}",
+                err.message
+            ));
+            state
+        }
+    };
+    if let Some(warning) = warning {
+        state.warn(warning);
+    }
+    // The directories the clips directory may be: the application data directory, and whatever
+    // the config file names. The config file is the user's own, and the shell only ever writes
+    // a directory into it that the user approved (see `update_settings`).
+    state.approve_clips_root(app_data_dir);
+    let configured = state
+        .storage
+        .lock()
+        .map_err(|_| AppState::poisoned("the storage lock"))?
+        .clips_dir
+        .clone();
+    if !configured.is_empty() {
+        state.approve_clips_root(Path::new(&configured));
+    }
+    Ok(state)
+}
+
 /// Start the desktop application.
 ///
 /// No test calls this: it opens a window. Everything it wires together is verified through the
@@ -644,18 +915,10 @@ fn commit_clips_dir(
 /// does not prove).
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    init_tracing();
+    let log_path = init_tracing();
 
     let app_data_dir = config::app_data_dir();
     let config_path = app_data_dir.join("config.toml");
-    let storage = match StorageConfig::load(&config_path) {
-        Ok(storage) => storage,
-        Err(err) => {
-            tracing::error!("{err}");
-            eprintln!("localplay: {err}");
-            std::process::exit(1);
-        }
-    };
 
     // The config story, said once at startup as the CLI does: which file, and whether it was there.
     // A user who just edited `[hotkeys] clip` reads the path here.
@@ -669,46 +932,28 @@ pub fn run() {
         );
     }
 
-    // The hotkey listener is registered here, before anything can want to trigger it; the thread
-    // that turns a press into a clip starts in `setup`, which has the application handle needed to
-    // reach the recorder.
-    let (hotkey_status, presses) = match &background_cfg {
-        Ok(cfg) => {
-            let mut extras = Vec::new();
-            if let Some(chord) = &cfg.toggle_recording_hotkey {
-                extras.push((background::HotkeyAction::ToggleRecording, chord.as_str()));
-            }
-            if let Some(chord) = &cfg.bookmark_hotkey {
-                extras.push((background::HotkeyAction::Bookmark, chord.as_str()));
-            }
-            background::install_hotkey(&cfg.clip_hotkey, &extras)
-        }
-        Err(err) => (
-            HotkeyStatus::not_installed(
-                "(none)",
-                format!(
-                    "the config file could not be read, so no hotkey is installed: {}",
-                    err.message
-                ),
-            ),
-            None,
-        ),
-    };
-    match &hotkey_status.error {
-        // Loud on purpose: otherwise invisible until a user presses the key in a game and nothing
-        // happens.
-        Some(error) => tracing::error!("the clip hotkey is NOT installed — {error}"),
-        None => tracing::info!("the clip hotkey {} is installed", hotkey_status.chord),
-    }
-
-    let state = match AppState::open(&app_data_dir, storage, hotkey_status.clone()) {
+    // The state is built before the window, so a command has something to answer from the moment
+    // the window exists. A config file that could not be read is a warning on the state, not a
+    // reason to end the process: see `open_state`.
+    let mut state = match open_state(&app_data_dir, &config_path, log_path) {
         Ok(state) => state,
         Err(err) => {
+            // The index could not be opened. There is no window to show that in and no way to
+            // repair it from, so the process ends; the reason is in the log.
             tracing::error!("{err}");
             eprintln!("localplay: {err}");
             std::process::exit(1);
         }
     };
+    if let Err(err) = &background_cfg {
+        // Said out loud, because the two things this config decides — the hotkey and the
+        // start-with-Windows entry — are both off, and nothing else says so.
+        state.warn(format!(
+            "the config file could not be read, so no hotkey is installed and the \
+             start-with-Windows setting was not applied: {}",
+            err.message
+        ));
+    }
     let asset_roots = state.asset_roots();
 
     tauri::Builder::default()
@@ -726,6 +971,33 @@ pub fn run() {
         // The "clip saved" toast and sound (see `RecorderHost::on_clip_saved`).
         .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
+            // The hotkey is installed here, and not before the builder: Tauri runs the plugins'
+            // setup before the application's own, and the single-instance plugin's check is one
+            // of them. A second launch is therefore gone before it can reach `RegisterHotKey` —
+            // which is the whole point, because the chord belongs to the instance that stays.
+            // (Registering it earlier handed the chord to whichever process lost the race, and
+            // the survivor was left with no hotkey and a message naming the wrong cause.)
+            let (hotkey_status, presses) = match &background_cfg {
+                Ok(cfg) => install_clip_hotkey(cfg),
+                Err(err) => (
+                    HotkeyStatus::not_installed(
+                        "(none)",
+                        format!(
+                            "the config file could not be read, so no hotkey is installed: {}",
+                            err.message
+                        ),
+                    ),
+                    None,
+                ),
+            };
+            match &hotkey_status.error {
+                // Loud on purpose: otherwise invisible until a user presses the key in a game and nothing
+                // happens.
+                Some(error) => tracing::error!("the clip hotkey is NOT installed — {error}"),
+                None => tracing::info!("the clip hotkey {} is installed", hotkey_status.chord),
+            }
+            state.set_hotkey(hotkey_status.clone());
+
             // Playback is served by Tauri's asset protocol, scoped to the clips directory; there is no
             // file server. `tauri.conf.json` carries the static scope for the default layout; this adds
             // the directories this process resolved, which makes a configured `storage.clips_dir` outside
@@ -761,9 +1033,10 @@ pub fn run() {
 
             // The start-with-Windows entry, if the config asks for it. Best effort and never fatal: a
             // failed autostart write must not stop a recording session. Windows only; elsewhere it reports
-            // why it did nothing.
-            if let Ok(cfg) = &background_cfg {
-                match std::env::current_exe() {
+            // why it did nothing. A config file that could not be read is said out loud too: the entry
+            // is not applied, and nothing else would say so.
+            match &background_cfg {
+                Ok(cfg) => match std::env::current_exe() {
                     Ok(exe) => match background::apply_autostart(cfg.start_with_system, &exe) {
                         Ok(outcome) => tracing::info!(
                             "start_with_system = {}: {}",
@@ -773,7 +1046,11 @@ pub fn run() {
                         Err(err) => tracing::warn!("autostart was not applied: {err}"),
                     },
                     Err(err) => tracing::warn!("autostart was not applied: {err}"),
-                }
+                },
+                Err(err) => tracing::warn!(
+                    "autostart was not applied: the config file could not be read: {}",
+                    err.message
+                ),
             }
 
             if let Err(err) = wire_background(app.handle().clone(), hotkey_status.clone(), presses)
@@ -812,6 +1089,7 @@ pub fn run() {
             get_settings,
             list_audio_devices,
             update_settings,
+            choose_clips_dir,
             health,
             gsi_targets,
             install_gsi_cfg,
@@ -1141,7 +1419,7 @@ impl TrayWiring {
                 // second, but a menu already stale when it reopens lies twice.
                 if let Some(wiring) = app.try_state::<Arc<TrayWiring>>() {
                     if let Some(state) = app.try_state::<AppState>() {
-                        wiring.refresh(&shell, state.hotkey());
+                        wiring.refresh(&shell, &state.hotkey());
                     }
                 }
             })
@@ -1231,7 +1509,12 @@ impl TrayWiring {
     }
 }
 
-fn init_tracing() {
+/// Set up the log file and the tracing subscriber, and return the file this process writes.
+///
+/// The file is the one the health page reads, so it is returned rather than recomputed: a
+/// process that could not take the log's lock writes to a file of its own, and the health page
+/// must show the file that holds *this* process's problems.
+fn init_tracing() -> PathBuf {
     // **A windowed application has no stderr.** `fmt()` writes to stderr by default and Windows
     // gives a GUI process nowhere for it to go, so every `warn!` and `error!` would be discarded.
     // The file is what makes the app diagnosable over SSH instead of by screenshot.
@@ -1250,8 +1533,30 @@ fn init_tracing() {
         .flatten()
         .and_then(|()| {
             // 5 MB x (1 live + 3 rotated): a background app must not grow its log forever.
-            log_file::RotatingFile::open(log_dir.join("better-outplayed.log"), 5 * 1024 * 1024, 3)
-                .ok()
+            const MAX_BYTES: u64 = 5 * 1024 * 1024;
+            const KEEP: usize = 3;
+            let shared = log_dir.join("better-outplayed.log");
+            // One process writes the shared file: the lock keeps a second launch out of it, so the
+            // two cannot interleave their lines and the rotation cannot rename a file the other
+            // process holds open (which fails on Windows). The loser writes a file of its own.
+            match log_file::RotatingFile::open_locked(shared.clone(), MAX_BYTES, KEEP) {
+                Ok((file, true)) => Some((file, shared)),
+                Ok((_file, false)) => {
+                    let own = log_dir.join(format!("better-outplayed-{}.log", std::process::id()));
+                    tracing::warn!(
+                        "another process is writing {}; this one writes {}",
+                        shared.display(),
+                        own.display()
+                    );
+                    log_file::RotatingFile::open(own.clone(), MAX_BYTES, KEEP)
+                        .ok()
+                        .map(|file| (file, own))
+                }
+                Err(err) => {
+                    tracing::warn!("the log file could not be opened: {err}");
+                    None
+                }
+            }
         });
 
     // A panic is silent in a windowed process too, and explains a window that stops answering.
@@ -1265,15 +1570,19 @@ fn init_tracing() {
     // `try_init` rather than `init`: a second initialisation (a test harness, an embedding process)
     // must not panic the application.
     match log_file {
-        Some(file) => {
+        Some((file, path)) => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
                 .try_init();
+            path
         }
         None => {
             let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+            // The file the health page names even though nothing could be written to it: the
+            // path is where the log *would* be, which is the answer a user needs.
+            log_dir.join("better-outplayed.log")
         }
     }
 }
@@ -1286,11 +1595,10 @@ mod tests {
         StorageConfig::example().unwrap()
     }
 
-    /// The hotkey status a test's shell gets: the documented chord, and the truth about this build
-    /// (`install_hotkey` asks `hotkey::supported`, so off Windows tests exercise the "nothing is
-    /// listening, and here is why" path). No test registers a real chord; that needs Windows.
-    fn hotkey_status() -> HotkeyStatus {
-        background::install_hotkey(crate::config::DEFAULT_CLIP_HOTKEY, &[]).0
+    /// The log file a test's shell claims: the name the health page would show. Nothing writes
+    /// to it, and the path does not have to exist.
+    fn log_path() -> PathBuf {
+        PathBuf::from("better-outplayed.log")
     }
 
     /// The directory holding this crate's manifest (`apps/desktop/src-tauri`), from which
@@ -1354,7 +1662,7 @@ mod tests {
     fn the_state_names_the_config_file_this_process_reads() {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
-        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert_eq!(state.config_path(), app_dir.join("config.toml"));
         assert!(
@@ -1385,12 +1693,17 @@ mod tests {
         let resources = config["bundle"]["resources"]
             .as_object()
             .expect("bundle.resources is a path-to-destination map");
-        assert_eq!(
-            resources.len(),
-            1,
-            "exactly one mapping rule, the sidecar directory"
-        );
-        let (source, destination) = resources.iter().next().unwrap();
+        // The sidecar directory is the rule that matters here; the bundle may map other files
+        // beside it (the licence and its notices), and what must not happen is the sidecars
+        // landing somewhere discovery does not read.
+        let (source, destination) = resources
+            .iter()
+            .find(|(_, destination)| {
+                destination.as_str().is_some_and(|destination| {
+                    destination.trim_end_matches('/') == localplay_media::binaries::SIDECAR_DIR_NAME
+                })
+            })
+            .expect("the sidecar directory is mapped");
         let destination = destination.as_str().expect("the destination is a string");
 
         assert_eq!(
@@ -1503,7 +1816,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
 
-        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert!(
             app_dir.join("localplay.db").is_file(),
@@ -1528,7 +1841,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
 
-        let first = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        let first = AppState::open(&app_dir, storage(), log_path()).unwrap();
         // The listing only names files that are there, so the row needs its file: an empty stand-in,
         // never opened, like the commands tests' `add_row`.
         std::fs::write(app_dir.join("clips").join("kept.mp4"), b"").unwrap();
@@ -1546,7 +1859,7 @@ mod tests {
         };
         drop(first);
 
-        let second = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        let second = AppState::open(&app_dir, storage(), log_path()).unwrap();
         let clips = second.with_deps(commands::list_clips).unwrap();
         assert_eq!(clips.len(), 1, "the second open reads what the first wrote");
         assert_eq!(clips[0].id, id);
@@ -1556,7 +1869,7 @@ mod tests {
     fn the_asset_roots_are_the_clips_directory_and_the_thumbnail_cache() {
         let dir = tempfile::tempdir().unwrap();
         let app_dir = dir.path().join("localplay");
-        let state = AppState::open(&app_dir, storage(), hotkey_status()).unwrap();
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert_eq!(
             state.asset_roots(),
@@ -1574,7 +1887,7 @@ mod tests {
             ..storage()
         };
 
-        let state = AppState::open(&app_dir, configured, hotkey_status()).unwrap();
+        let state = AppState::open(&app_dir, configured, log_path()).unwrap();
 
         assert!(elsewhere.is_dir(), "the configured directory is created");
         assert_eq!(
@@ -1604,11 +1917,140 @@ mod tests {
         .unwrap();
 
         let storage = StorageConfig::load(&app_dir.join("config.toml")).unwrap();
-        let state = AppState::open(&app_dir, storage, hotkey_status()).unwrap();
+        let state = AppState::open(&app_dir, storage, log_path()).unwrap();
 
         assert_eq!(
             state.with_deps(commands::storage_stats).unwrap().cap_bytes,
             2048
+        );
+    }
+
+    /// A config file the shell cannot read must not take the shell down with it.
+    ///
+    /// A release build has no console, so the old `eprintln!` went nowhere: the app exited with
+    /// no window, no tray and no message, and the only trace was a line in a log file. The shell
+    /// starts with the example's values instead and says what happened in the storage panel,
+    /// where a user can see it and repair the file.
+    #[test]
+    fn a_config_missing_a_storage_key_still_opens_the_shell_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("localplay");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        // `max_age_days` is missing: a key the desktop's reader falls back on, a section the CLI
+        // would refuse.
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[storage]\nclips_dir = \"\"\nmax_total_bytes = 2048\n",
+        )
+        .unwrap();
+
+        let state = open_state(&app_dir, &app_dir.join("config.toml"), log_path())
+            .expect("the shell opens whatever the config file says");
+
+        assert!(
+            state.warnings.iter().any(|w| w.contains("max_age_days")),
+            "the key that fell back is named: {:?}",
+            state.warnings
+        );
+        assert!(
+            state.with_deps(commands::storage_stats).unwrap().cap_bytes > 0,
+            "and the storage policy is the example's, not a zero cap that would delete everything"
+        );
+    }
+
+    /// A config file that cannot be read at all — not even as TOML — is the same story.
+    #[test]
+    fn a_config_that_is_not_toml_still_opens_the_shell_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("localplay");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "[storage\nclips_dir = ").unwrap();
+
+        let state = open_state(&app_dir, &app_dir.join("config.toml"), log_path())
+            .expect("the shell opens whatever the config file says");
+
+        assert!(
+            state.warnings.iter().any(|w| w.contains("config file")),
+            "the reason is a warning the window shows: {:?}",
+            state.warnings
+        );
+    }
+
+    /// The hotkey is installed after the single-instance check, so the state is built before it
+    /// exists.
+    ///
+    /// Tauri runs the plugins' setup before the application's own, and the single-instance
+    /// plugin's check is one of them: a second launch is gone before it can reach
+    /// `RegisterHotKey`. A state that carried a hotkey would have had to register the chord
+    /// before that check, which is how the chord ended up on the process that was leaving.
+    #[test]
+    fn the_state_is_built_before_the_hotkey_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("localplay");
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
+
+        assert!(
+            !state.hotkey().installed,
+            "nothing is listening yet: the chord is registered in setup, after the \
+             single-instance check"
+        );
+
+        state.set_hotkey(HotkeyStatus::installed("Ctrl+F9"));
+        assert_eq!(state.hotkey().chord, "Ctrl+F9");
+        assert!(state.hotkey().installed);
+    }
+
+    /// The chord the config names is the one that is installed, and a chord that cannot be read
+    /// installs nothing at all.
+    #[test]
+    fn the_hotkey_comes_from_the_config_and_a_typo_installs_nothing() {
+        let cfg = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Alt+F9\"\n").unwrap();
+        let (status, _presses) = install_clip_hotkey(&cfg);
+        assert_eq!(status.chord, "Alt+F9", "the chord the user wrote is used");
+
+        let cfg = BackgroundConfig::from_toml("[hotkeys]\nclip = \"Ctrl+Shift\"\n").unwrap();
+        let (status, presses) = install_clip_hotkey(&cfg);
+        assert!(
+            !status.installed,
+            "a chord that does not parse installs nothing"
+        );
+        assert!(presses.is_none());
+    }
+
+    /// The webview may not widen the asset protocol's scope to a path it names.
+    ///
+    /// The asset protocol is the window's only read channel (`capabilities/default.json` grants
+    /// no filesystem permission), so a clips directory the webview could name for itself is a
+    /// directory the webview could read. Only the default, the application data directory, and
+    /// the directories the user picked in the native folder picker are allowed; a path the
+    /// webview names is asked for in that picker instead (`update_settings`).
+    #[test]
+    fn only_an_approved_clips_directory_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("localplay");
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
+        state.approve_clips_root(&app_dir);
+
+        assert!(state.clips_dir_allowed(""), "the default is always allowed");
+        assert!(
+            state.clips_dir_allowed(&app_dir.join("clips").to_string_lossy()),
+            "and so is the application data directory"
+        );
+        assert!(
+            !state.clips_dir_allowed(r"C:\Users\victim\Documents"),
+            "a path the webview named is not"
+        );
+
+        let picked = dir.path().join("picked");
+        std::fs::create_dir_all(&picked).unwrap();
+        state.approve_clips_root(&picked);
+        assert!(
+            state.clips_dir_allowed(&picked.to_string_lossy()),
+            "a directory the user picked in the native picker is"
+        );
+        assert!(
+            !state.clips_dir_allowed(&picked.join("..").join("elsewhere").to_string_lossy()),
+            "and not a path that climbs out of it"
         );
     }
 }
