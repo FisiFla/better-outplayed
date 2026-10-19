@@ -14,6 +14,16 @@
 # LGPL ffmpeg builds only: localplay never uses libx264/libx265, so GPL builds are
 # unnecessary and would impose GPL obligations on the distributed app (README).
 #
+# The pin is BtbN's `-lgpl` variant. BtbN's README describes it as "Lacking libraries that
+# are GPL-only. Most prominently libx264 and libx265", and the build's own configure line
+# carries `--disable-libx264 --disable-libx265` and no `--enable-gpl`. The binary's licence
+# banner reads "LGPL version 3 or later". This is *not* Gyan's "essentials" build, which
+# upstream documents as GPLv3 and which does carry libx264 and libx265.
+#
+# The URL is a *versioned* release asset, not a moving "latest" download, so the pin stays
+# valid until it is deliberately changed. BtbN keeps the last build of each month for two
+# years, so a month-end tag is durable.
+#
 # Only the Windows target is required for shipping; the PoC's target is Windows 10 1903+.
 # It is the only entry here on purpose: adding one is only worth doing when the URL's
 # provenance can be named confidently, and that has not been established for a macOS or
@@ -25,16 +35,16 @@
 
 [[platform]]
 target = "x86_64-pc-windows-msvc"
-# Gyan's "essentials" build — the LGPL Windows build the ffmpeg download page itself points
-# at (https://www.gyan.dev/ffmpeg/builds/). No libx264/libx265.
-archive_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# BtbN/FFmpeg-Builds, the `win64-lgpl` variant — the build that lacks the GPL-only
+# encoders localplay has no use for. See the note above on why this is not Gyan's build.
+archive_url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-9.0.zip"
 # Recorded with `cargo xtask sidecars record`, reviewed in the PR. `fetch` refuses to run
 # while this still reads RECORD_ME.
-sha256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+sha256 = "6b264b9e6019103f601d98c292bd332fd87acf1c5e941ddff4fb71760fe63432"
 archive_kind = "zip"
 # Paths *inside the archive*. Upstream wraps everything in a versioned top-level directory
 # whose name changes with every release, so each entry is matched as a path suffix and only
 # the file name is kept: `bin/ffmpeg.exe` matches
-# `ffmpeg-<version>-essentials_build/bin/ffmpeg.exe` and lands at `binaries/ffmpeg.exe`. Nothing
+# `ffmpeg-<version>-win64-lgpl/bin/ffmpeg.exe` and lands at `binaries/ffmpeg.exe`. Nothing
 # outside this list is ever extracted, and an entry that is not in the archive is an error.
 binaries = ["bin/ffmpeg.exe", "bin/ffprobe.exe"]

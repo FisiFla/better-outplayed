@@ -1,0 +1,23 @@
+better-outplayed
+Copyright (c) 2026 FisiFla
+
+Licensed under either of
+
+  the Apache License, Version 2.0, or
+  the MIT licence,
+
+at your option. This is the licence of the application itself. It is *not* the licence
+of the third-party components compiled into it or shipped beside it: each of those is
+listed, with its own licence, in THIRD_PARTY_NOTICES.md, which is installed next to this
+file.
+
+  Apache License, Version 2.0
+    the full text is in the repository as LICENSE-APACHE, and at
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  MIT licence
+    the full text is in the repository as LICENSE-MIT, and at
+    http://opensource.org/licenses/MIT
+
+The repository is at https://github.com/FisiFla/better-outplayed, and the third-party
+notices are at apps/desktop/THIRD_PARTY_NOTICES.md in it.

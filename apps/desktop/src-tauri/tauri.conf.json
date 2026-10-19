@@ -48,8 +48,11 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../../binaries/": "binaries/"
+      "../../../binaries/": "binaries/",
+      "../LICENSE.txt": "LICENSE.txt",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
+    "licenseFile": "../LICENSE.txt",
     "publisher": "FisiFla",
     "copyright": "Copyright (c) 2026 FisiFla",
     "category": "Video",
