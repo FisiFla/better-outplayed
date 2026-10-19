@@ -386,13 +386,17 @@ fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
             + if tr_flags & 0x00_0800 != 0 { 4 } else { 0 }; // sample_composition_time_offset
         let mut total = 0u64;
         for i in 0..sample_count as usize {
-            let b = trun.get(at + i * entry..at + i * entry + 4)?;
-            total += u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            // The index arithmetic saturates: a malformed header can declare a sample count
+            // this build cannot walk, and an out-of-range read is a fragment whose length is
+            // unknown, not a panic.
+            let at = at.saturating_add(i.saturating_mul(entry));
+            let b = trun.get(at..at.saturating_add(4))?;
+            total = total.saturating_add(u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])));
         }
         return Some(total);
     }
     // No per-sample durations: every sample is `default_sample_duration` long.
-    default_duration.map(|d| u64::from(d) * u64::from(sample_count))
+    default_duration.map(|d| u64::from(d).saturating_mul(u64::from(sample_count)))
 }
 
 #[cfg(test)]

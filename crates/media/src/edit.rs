@@ -26,7 +26,9 @@ pub const COPY_MIN_BYTES_PER_SEC: u64 = 10_000_000;
 
 /// Wall-clock budget for copying `bytes` with `-c copy`.
 pub fn copy_budget(bytes: u64) -> Duration {
-    COPY_FLOOR + Duration::from_secs(bytes / COPY_MIN_BYTES_PER_SEC.max(1))
+    // Saturating, because a budget that cannot be represented is a budget that runs out rather
+    // than a panic in the middle of a copy that has already done its work.
+    Duration::from_secs(bytes / COPY_MIN_BYTES_PER_SEC.max(1)).saturating_add(COPY_FLOOR)
 }
 
 /// Remux without re-encoding, moving the index to the front for fast seeking.
@@ -214,11 +216,24 @@ pub fn ffmetadata(chapters: &[Chapter], duration_ms: u64) -> String {
     out
 }
 
-/// ffmetadata reads `=`, `;`, `#`, `\` and newlines as syntax, so a title must escape them.
+/// ffmetadata reads `=`, `;`, `#`, `\`, newlines and carriage returns as syntax, so a title must
+/// escape them.
+///
+/// A carriage return is in the set for the same reason a newline is, and it is the one that
+/// matters: ffmetadata's demuxer treats a carriage return as a line break. Measured on ffmpeg
+/// 9.0.2, a title of `raw\rtitle=injected` came back with the title `injected` — the carriage
+/// return ended the line and the rest of it became a key of its own, which is the chapter's own
+/// title. Escaped, the same text comes back as one title.
+///
+/// The brackets are escaped for the same reason `=` is: `[CHAPTER]` opens a section, and a title
+/// that opened one would end the chapter it belongs to.
+///
+/// The titles are `EventKind::as_tag()` constants in practice, so this is defence in depth: it
+/// is what a free-text title would need, and it costs nothing while it is true.
 fn escape_ffmetadata(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
-        if matches!(c, '=' | ';' | '#' | '\\' | '\n') {
+        if matches!(c, '=' | ';' | '#' | '\\' | '\n' | '\r' | '[' | ']') {
             out.push('\\');
         }
         out.push(c);
@@ -336,7 +351,9 @@ pub fn write_concat_list(segments: &[PathBuf], list: &Path) -> Result<u64> {
         // Absolute, so the list does not depend on the working directory.
         let path =
             std::fs::canonicalize(seg).with_context(|| format!("resolving {}", seg.display()))?;
-        total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // The total is the budget the copy will be given, so it saturates rather than
+        // overflowing: a list of segments cannot hold more bytes than a `u64` can say.
+        total = total.saturating_add(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
         writeln!(file, "file '{}'", concat_list_path(&path))
             .with_context(|| format!("writing {}", list.display()))?;
     }
@@ -447,8 +464,8 @@ pub fn concat_list_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        concat_list_path, copy_budget, ffmetadata, Chapter, COPY_FLOOR, COPY_MIN_BYTES_PER_SEC,
-        LEAD_IN_TITLE,
+        concat_list_path, copy_budget, ffmetadata, trim_lossless, Chapter, COPY_FLOOR,
+        COPY_MIN_BYTES_PER_SEC, LEAD_IN_TITLE,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -564,7 +581,38 @@ mod tests {
 
     #[test]
     fn ffmetadata_syntax_in_a_title_is_escaped() {
-        let meta = ffmetadata(&[chapter(0, "a=b;c#d\\e\nf")], 10);
-        assert!(meta.contains("title=a\\=b\\;c\\#d\\\\e\\\nf\n"), "{meta}");
+        let meta = ffmetadata(&[chapter(0, "a=b;c#d\\e\nf\rg[h]i")], 10);
+        assert!(
+            meta.contains("title=a\\=b\\;c\\#d\\\\e\\\nf\\\rg\\[h\\]i\n"),
+            "{meta}"
+        );
+    }
+
+    /// A trim range that is not strictly positive is refused before anything is spawned.
+    ///
+    /// The range's length is `end_ms - start_ms`, so a range that is not positive would
+    /// underflow. The check is what keeps an extreme pair of timestamps — the largest a `u64`
+    /// can hold — from wrapping into an enormous duration instead of being refused.
+    #[test]
+    fn an_empty_trim_range_is_refused_before_anything_is_spawned() {
+        // The binaries do not exist: the refusal must come before they are used.
+        let bin = crate::FfmpegBinaries {
+            ffmpeg: "/nonexistent/ffmpeg".into(),
+            ffprobe: "/nonexistent/ffprobe".into(),
+        };
+        for (start_ms, end_ms) in [(u64::MAX, u64::MAX), (u64::MAX, 0), (10, 10)] {
+            let err = trim_lossless(
+                &bin,
+                Path::new("/nonexistent/in.mp4"),
+                Path::new("/nonexistent/out.mp4"),
+                start_ms,
+                end_ms,
+            )
+            .expect_err("an empty range is refused");
+            assert!(
+                err.to_string().contains("trim range is empty"),
+                "the refusal must name the case: {err}"
+            );
+        }
     }
 }

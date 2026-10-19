@@ -4,6 +4,9 @@
 //! rows this module hands out and applies that decision row-first, file-second, so no file is
 //! unlinked without a committed delete naming it.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod cleanup;
 pub mod matches;
 pub mod retention;
@@ -11,6 +14,7 @@ pub mod retention;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The schema this build writes. Each version adds columns in place without reading, copying or
 /// losing a row (see [`Store::migrate`]): v2 the session columns, v3 the media-clock anchor of a
@@ -322,17 +326,44 @@ pub struct Store {
     conn: Connection,
 }
 
+/// How long a write waits for another connection's lock before it gives up.
+///
+/// Two processes write this database: the desktop shell (favourite, rename, tag, trim, delete)
+/// and the recorder (a row per hotkey press, a bulk delete per cleanup pass). They are separate
+/// connections to the same file, and SQLite's default busy timeout is zero: a write that meets a
+/// held lock fails with `SQLITE_BUSY` at once rather than waiting for it to clear.
+///
+/// The recorder treats an index failure as non-fatal but logs it at ERROR, so a hotkey press that
+/// collided with a UI write left the clip's file on disk with no row naming it: invisible in the
+/// library, and unmanaged by the storage policy, which can only manage what the index names.
+///
+/// Five seconds is far longer than any of these writes takes (each is a single statement, and the
+/// cleanup pass's bulk delete is one transaction) and short enough that a writer which really is
+/// stuck does not wedge the recorder's hotkey path.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Store {
+    /// A store on a private in-memory database.
+    ///
+    /// The busy timeout is set for symmetry with [`Store::open`]: an in-memory database has no
+    /// other connection to collide with, but the two paths must not differ in anything else.
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self {
-            conn: Connection::open_in_memory().context("opening in-memory db")?,
-        })
+        let conn = Connection::open_in_memory().context("opening in-memory db")?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("setting the in-memory db's busy timeout")?;
+        Ok(Self { conn })
     }
 
+    /// A store on the database file at `path`.
+    ///
+    /// The busy timeout is what makes two processes able to share the file (see
+    /// [`BUSY_TIMEOUT`]): without it, a write that meets the other process's lock fails at once
+    /// instead of waiting for it.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
-            conn: Connection::open(path).with_context(|| format!("opening {}", path.display()))?,
-        })
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .with_context(|| format!("setting the busy timeout on {}", path.display()))?;
+        Ok(Self { conn })
     }
 
     /// Forward-only migrations. A schema newer than this build is refused rather than downgraded.
@@ -494,9 +525,9 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 path,
-                clip.started_at_ms as i64,
-                clip.duration_ms as i64,
-                clip.size_bytes as i64,
+                to_i64(clip.started_at_ms),
+                to_i64(clip.duration_ms),
+                to_i64(clip.size_bytes),
                 clip.codec,
                 now_ms(),
             ],
@@ -514,9 +545,9 @@ impl Store {
             Ok(Clip {
                 id: r.get(0)?,
                 path: PathBuf::from(r.get::<_, String>(1)?),
-                started_at_ms: r.get::<_, i64>(2)? as u64,
-                duration_ms: r.get::<_, i64>(3)? as u64,
-                size_bytes: r.get::<_, i64>(4)? as u64,
+                started_at_ms: to_u64(r.get::<_, i64>(2)?),
+                duration_ms: to_u64(r.get::<_, i64>(3)?),
+                size_bytes: to_u64(r.get::<_, i64>(4)?),
                 codec: r.get(5)?,
                 favourite: r.get::<_, i64>(6)? != 0,
                 created_at_ms: r.get(7)?,
@@ -612,7 +643,7 @@ impl Store {
             params![
                 event.session_id,
                 event.kind,
-                event.at_ms as i64,
+                to_i64(event.at_ms),
                 event.payload,
                 event.clip_id,
             ],
@@ -647,7 +678,7 @@ impl Store {
              WHERE session_id = ?1 AND at >= ?2 AND at < ?3 ORDER BY at, id",
         )?;
         let rows = stmt.query_map(
-            params![session_id, from_ms as i64, to_ms as i64],
+            params![session_id, to_i64(from_ms), to_i64(to_ms)],
             read_event,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -673,7 +704,7 @@ impl Store {
                 .query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM clips", [], |r| {
                     r.get(0)
                 })?;
-        Ok(bytes.max(0) as u64)
+        Ok(to_u64(bytes))
     }
 
     /// Delete the row and return its path so the caller can unlink afterwards (row before file).
@@ -919,7 +950,7 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
-        Ok(bytes.max(0) as u64)
+        Ok(to_u64(bytes))
     }
 
     /// Delete the session row and hand back the paths so the caller removes them afterwards: the
@@ -1021,16 +1052,34 @@ fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         id: row.get(0)?,
         session_id: row.get(1)?,
         kind: row.get(2)?,
-        at_ms: row.get::<_, i64>(3)? as u64,
+        at_ms: to_u64(row.get::<_, i64>(3)?),
         payload: row.get(4)?,
         clip_id: row.get(5)?,
     })
 }
 
+/// A `u64` as the signed integer SQLite's columns hold, clamped rather than wrapped.
+///
+/// The values come from outside the index — a file's size, a duration on the media timeline — and
+/// the columns are signed, so a value beyond `i64::MAX` must not wrap into a negative one: a
+/// negative size reads as "no bytes" and a negative timestamp as "before the epoch".
+fn to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// A signed integer from a row as the `u64` the API hands out, clamped rather than wrapped.
+///
+/// The inverse of [`to_i64`], and the same rule for a row this build did not write: a negative
+/// column is a corrupt row, and `as u64` would turn it into a number near `u64::MAX` rather than
+/// into the absence of a value.
+fn to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -1146,6 +1195,137 @@ mod tests {
             .query_row("SELECT count(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Two writers on one database file wait for the lock instead of failing on it.
+    ///
+    /// The desktop shell and the recorder are separate processes on the same `localplay.db`, and
+    /// SQLite's default busy timeout is zero: a write that meets the other connection's lock
+    /// fails with `SQLITE_BUSY` at once. The recorder's answer to that is to log an error and
+    /// carry on, which leaves the clip's file on disk with no row naming it: invisible in the
+    /// library, and unmanaged by the storage policy, which can only manage what the index names.
+    ///
+    /// So the second writer has to wait, and this test holds the lock open to prove it: the
+    /// second write is still pending while the lock is held, and it succeeds once the lock is
+    /// released. A store without a busy timeout fails it at once, with "database is locked".
+    #[test]
+    fn two_writers_on_one_database_wait_for_the_lock_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("localplay.db");
+        let first = Store::open(&db).unwrap();
+        first.migrate().unwrap();
+        let second = Store::open(&db).unwrap();
+
+        // The first writer holds the database's write lock, the way a cleanup pass's bulk
+        // delete does while it commits.
+        first.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        first
+            .conn
+            .execute(
+                "INSERT INTO clips (path, started_at, duration_ms, size_bytes, codec, created_at)
+                 VALUES ('/clips/held.mp4', 1, 1, 1, 'h264', 1)",
+                [],
+            )
+            .unwrap();
+
+        // The second writer writes from another thread, so this thread can release the lock.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let id = second.insert_clip(&NewClip {
+                path: "/clips/second.mp4".into(),
+                started_at_ms: 2,
+                duration_ms: 2,
+                size_bytes: 2,
+                codec: "h264".into(),
+            });
+            let _ = tx.send(id);
+        });
+
+        // It must be waiting, not failing: a store without a busy timeout reports "database is
+        // locked" here, and the write is over before this timeout expires.
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second writer must wait for the lock rather than fail with SQLITE_BUSY"
+        );
+
+        first.conn.execute_batch("COMMIT").unwrap();
+        let id = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second writer finishes once the lock is released")
+            .expect("the second write must not have failed with SQLITE_BUSY");
+        writer.join().unwrap();
+
+        let clips = first.list_clips().unwrap();
+        assert_eq!(clips.len(), 2, "both writers' rows are in the database");
+        assert!(
+            clips.iter().any(|c| c.id == id),
+            "and the second writer's own row is among them"
+        );
+    }
+
+    /// A value too large for its column is clamped rather than wrapped into a negative one.
+    ///
+    /// The columns are signed and the values come from outside the index (a file's size, a
+    /// duration on the media timeline). A `u64` beyond `i64::MAX` must not become a negative
+    /// number: a negative size reads as "no bytes" and a negative timestamp as "before the
+    /// epoch".
+    #[test]
+    fn a_value_too_large_for_its_column_is_clamped_rather_than_wrapped() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = s
+            .insert_clip(&NewClip {
+                path: "/clips/huge.mp4".into(),
+                started_at_ms: 1,
+                duration_ms: u64::MAX,
+                size_bytes: u64::MAX,
+                codec: "h264".into(),
+            })
+            .unwrap();
+
+        let clip = s
+            .list_clips()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(
+            clip.duration_ms,
+            i64::MAX as u64,
+            "clamped, not wrapped into a negative duration"
+        );
+        assert_eq!(
+            clip.size_bytes,
+            i64::MAX as u64,
+            "clamped, not wrapped into a negative size"
+        );
+        assert_eq!(
+            s.total_bytes().unwrap(),
+            i64::MAX as u64,
+            "and the total counts what the row actually holds"
+        );
+
+        // A row this build did not write: a negative column is a corrupt row, and it must read
+        // as the absence of a value rather than as a number near `u64::MAX`.
+        s.conn
+            .execute(
+                "UPDATE clips SET size_bytes = -1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let clip = s
+            .list_clips()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(
+            clip.size_bytes, 0,
+            "a negative size is no size, not a huge one"
+        );
     }
 
     #[test]

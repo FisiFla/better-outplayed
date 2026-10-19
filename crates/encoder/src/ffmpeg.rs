@@ -1026,6 +1026,67 @@ impl Encoder for FfmpegEncoder {
     }
 }
 
+/// The encoder's backstop: a dropped encoder kills its child and reaps it.
+///
+/// [`Encoder::finish`] is the graceful path — it closes the inputs, waits for ffmpeg to exit and
+/// reports why it could not. This is the path a *failed start* takes: `Prepared::begin` spawns
+/// the child and then has fallible steps left (`store.start_session`, `capture.start()`), and when
+/// one of them fails the encoder is dropped without `finish()` ever being called.
+///
+/// `std::process::Child`'s own `Drop` neither kills nor reaps the process. The child does end,
+/// because the writer thread's pipe closes when the encoder's queues go, but nothing ever waits
+/// for it: it lingers as a zombie on Unix and as an unowned process on Windows. The three writer
+/// threads are detached too: they end on their own, but nothing joins them.
+///
+/// So the child is killed and reaped here, and the writers are joined. The order is the same one
+/// [`Encoder::finish`] uses and for the same reason: the child first, because the video writer
+/// is blocked writing into its stdin and only the child's death breaks that pipe; the writers
+/// last, because a writer that has not ended yet has nothing to be joined from.
+///
+/// The hardware encoder's thread comes before all of it, for a sharper reason: it holds a clone
+/// of the video queue's sender, so the queue only closes once that thread has ended. Joining the
+/// video writer before shutting the hardware encoder down would wait for a thread that cannot
+/// end until the join returns.
+///
+/// The join is bounded by the audio pump's own connect deadline ([`AUDIO_CONNECT_TIMEOUT`]): a
+/// child that died before dialling leaves that thread waiting for a connection that will never
+/// come, and waiting it out is the price of not leaving it detached. `finish()` pays the same
+/// wait on the same failure.
+///
+/// None of this can fail the caller: a `Drop` has nowhere to report an error, and what it fixes
+/// is a leak rather than a loss.
+impl Drop for FfmpegEncoder {
+    fn drop(&mut self) {
+        // The hardware encoder first: its thread holds a clone of the video queue's sender, so
+        // the queue closes only once it has ended. `finish` has already taken it, so a finished
+        // encoder shuts nothing down twice.
+        #[cfg(windows)]
+        if let Some(mut mft) = self.mft.take() {
+            mft.shutdown();
+        }
+
+        // The senders next: a pump loop ends when its channel closes, and the writer thread then
+        // lets go of the child's stdin.
+        self.video_tx.take();
+        self.audio_tx.take();
+        self.mic_tx.take();
+
+        // The child, killed rather than waited for. `try_wait` reaps a child that has already
+        // exited, so an encoder that was finished properly is not killed a second time; `wait`
+        // then returns the status it already has, without blocking.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+
+        // The writers last. `finish` has already taken them, so a finished encoder joins
+        // nothing twice; an unfinished one joins the threads it would otherwise detach.
+        let _ = join_writer(self.video_writer.take(), "video");
+        let _ = join_writer(self.audio_writer.take(), GAME_AUDIO_LABEL);
+        let _ = join_writer(self.mic_writer.take(), MICROPHONE_LABEL);
+    }
+}
+
 impl FfmpegEncoder {
     /// Hand a captured texture to the hardware encoder's thread. Returns nothing, always.
     ///
@@ -1277,6 +1338,11 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The stand-in children are `#!/bin/sh` scripts and their liveness is checked with
+    // `kill -0`, so both imports belong to the Unix-only tests.
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
     use std::process::Command;
 
     /// Constant-bitrate rate control reaches the argument list for every encoder family, with the
@@ -2025,6 +2091,151 @@ mod tests {
                 "a shutdown that had to kill the child must say so rather than pass it over: {err:#}"
             );
         }
+    }
+
+    /// A dropped encoder kills its child and reaps it.
+    ///
+    /// The failure this prevents: `Prepared::begin` spawns the child and then has fallible steps
+    /// left, and when one of them fails the encoder is dropped without `finish()` ever being
+    /// called. `Child`'s own `Drop` neither kills nor reaps the process, so the child kept running
+    /// and nothing ever waited for it.
+    ///
+    /// The stand-in records its own pid and then never exits, so the test can ask the operating
+    /// system whether the process is still there. `kill -0` succeeds for a zombie as well — a
+    /// reaped process is the only one that fails it — so this asserts the reaping, not merely the
+    /// killing.
+    ///
+    /// Unix-only: the stand-in is a `#!/bin/sh` script and the liveness check is `kill -0`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_encoder_kills_and_reaps_its_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("ffmpeg.pid");
+        let stub = dir.path().join("ffmpeg");
+        // `exec` so the process that is killed is the one that would not exit, and so the pid the
+        // shell records is the pid that ends up owning it.
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 600\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
+        let mut cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        // No game audio: the audio pump would spend its whole connect deadline waiting for a dial
+        // that never comes, and this test is about the child, not about that wait.
+        cfg.game_audio = false;
+        let encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn");
+
+        let pid = wait_for_pid(&pidfile);
+        assert!(process_exists(pid), "the stand-in is running");
+
+        // The encoder is dropped here, exactly as a failed start drops it: `finish` is never
+        // called.
+        drop(encoder);
+
+        assert!(
+            !process_exists(pid),
+            "the child must be gone, and reaped: `kill -0` still succeeds on a zombie"
+        );
+    }
+
+    /// A finished encoder is not killed again when it is dropped.
+    ///
+    /// `finish` is the graceful path and `Drop` is the backstop, and the two must not fight over
+    /// the same child. The stand-in exits on its own, so `finish` finds it already gone; the drop
+    /// that follows has nothing left to kill, and the process is gone either way.
+    ///
+    /// Unix-only: the stand-in is a `#!/bin/sh` script.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_encoder_is_not_killed_again_when_it_is_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("ffmpeg.pid");
+        let stub = dir.path().join("ffmpeg");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nsleep 0.2\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
+        let mut cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        cfg.game_audio = false;
+        let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn");
+
+        let pid = wait_for_pid(&pidfile);
+        encoder
+            .finish()
+            .expect("the stand-in exits on its own, so the shutdown succeeds");
+
+        drop(encoder);
+
+        assert!(
+            !process_exists(pid),
+            "the child is gone, and the drop did not have to kill it a second time"
+        );
+    }
+
+    /// The pid the stand-in child recorded, once it has written it.
+    #[cfg(unix)]
+    fn wait_for_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in child never recorded its pid in {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Whether a process is still there, the way the shell asks: `kill -0` sends no signal, it
+    /// only reports whether the pid could be signalled. A zombie answers it too, so a process that
+    /// fails it has been reaped, not merely killed.
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        Command::new("/bin/sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     /// A frame with no pixels is refused rather than written as a zero-length frame.

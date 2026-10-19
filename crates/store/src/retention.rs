@@ -251,7 +251,11 @@ fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> C
     // A negative `size_bytes` (a hand-edited row, an overflowed writer) counts as zero, as `total_bytes` clamps it.
     let bytes = |s: &Session| s.size_bytes.max(0) as u64;
 
-    let mut remaining: u64 = sessions.iter().map(bytes).sum();
+    // The sums saturate: the bytes come from rows the index does not control, and a store that
+    // claims more than a `u64` holds must over-count rather than panic in the middle of a pass.
+    let mut remaining: u64 = sessions
+        .iter()
+        .fold(0, |total, s| total.saturating_add(bytes(s)));
     for (i, session) in ordered.iter().enumerate() {
         if !exempt(session) && now_ms.saturating_sub(session.started_at_ms) > max_age_ms {
             marked[i] = Some(DeletionReasons {
@@ -263,7 +267,10 @@ fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> C
     }
 
     // Is the cap reachable at all? Only while the bytes nothing may evict are within it.
-    let immune_bytes: u64 = sessions.iter().filter(|s| exempt(s)).map(bytes).sum();
+    let immune_bytes: u64 = sessions
+        .iter()
+        .filter(|s| exempt(s))
+        .fold(0, |total, s| total.saturating_add(bytes(s)));
     let over_cap_by_bytes = immune_bytes.saturating_sub(rules.max_total_bytes);
 
     if over_cap_by_bytes == 0 {
@@ -505,7 +512,7 @@ enum Removal {
 fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_bytes: u64) {
     match removal {
         Removal::Removed(actual) => {
-            outcome.bytes_reclaimed += actual;
+            outcome.bytes_reclaimed = outcome.bytes_reclaimed.saturating_add(actual);
             if actual != planned_bytes {
                 tracing::debug!(
                     "retention: removed {actual} bytes from {} where the row claimed \
@@ -629,7 +636,7 @@ fn tree_bytes(path: &Path) -> std::io::Result<u64> {
     }
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
-        total += tree_bytes(&entry?.path())?;
+        total = total.saturating_add(tree_bytes(&entry?.path())?);
     }
     Ok(total)
 }

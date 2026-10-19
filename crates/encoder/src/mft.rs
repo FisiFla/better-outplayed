@@ -1246,55 +1246,6 @@ fn video_type(subtype: &windows::core::GUID, size: (u32, u32), fps: u32) -> Resu
     Ok(media_type)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// What this machine offers, and whether it takes the capture path's own D3D11 device.
-    ///
-    /// Reports, and asserts only platform facts: the enumeration must work and every MFT returned must
-    /// have accepted the handshake or said why not. Requiring an encoder to exist would fail on a
-    /// machine that legitimately has none.
-    /// 4K at 60 needs level 5.2 and an H.264 MFT refuses a type whose level cannot carry it; 4K at
-    /// 30 and 1440p at 60 still fit 5.1.
-    #[test]
-    fn the_h264_level_follows_the_declared_rate() {
-        assert_eq!(h264_level((3840, 2160), 60), eAVEncH264VLevel5_2.0 as u32);
-        assert_eq!(h264_level((3840, 2160), 30), eAVEncH264VLevel5_1.0 as u32);
-        assert_eq!(h264_level((2560, 1440), 60), eAVEncH264VLevel5_1.0 as u32);
-        assert_eq!(h264_level((1920, 1080), 60), eAVEncH264VLevel5_1.0 as u32);
-    }
-
-    #[test]
-    fn the_hardware_encoders_are_enumerable_and_answer_the_d3d11_handshake() {
-        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
-        eprintln!(
-            "hardware H.264 encoder MFTs on this machine: {}",
-            encoders.len()
-        );
-        for encoder in &encoders {
-            eprintln!(
-                "  {:<44} d3d11={:<5} async={:<5} url={}",
-                encoder.name,
-                encoder.accepts_d3d11,
-                encoder.asynchronous,
-                encoder.hardware_url.as_deref().unwrap_or("-"),
-            );
-            if let Some(why) = &encoder.refusal {
-                eprintln!("      refused: {why}");
-            }
-        }
-        for encoder in &encoders {
-            assert!(
-                encoder.accepts_d3d11 || encoder.refusal.is_some(),
-                "{} neither accepted the handshake nor gave a reason, which would make the \
-                 answer unusable either way",
-                encoder.name
-            );
-        }
-    }
-}
-
 /// How many textures may be waiting for the hardware encoder.
 ///
 /// Two, derived rather than chosen. Capture hands out three handover textures in turn, so the
@@ -2107,4 +2058,53 @@ pub fn describe_adapters() -> Vec<String> {
         index += 1;
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What this machine offers, and whether it takes the capture path's own D3D11 device.
+    ///
+    /// Reports, and asserts only platform facts: the enumeration must work and every MFT returned must
+    /// have accepted the handshake or said why not. Requiring an encoder to exist would fail on a
+    /// machine that legitimately has none.
+    /// 4K at 60 needs level 5.2 and an H.264 MFT refuses a type whose level cannot carry it; 4K at
+    /// 30 and 1440p at 60 still fit 5.1.
+    #[test]
+    fn the_h264_level_follows_the_declared_rate() {
+        assert_eq!(h264_level((3840, 2160), 60), eAVEncH264VLevel5_2.0 as u32);
+        assert_eq!(h264_level((3840, 2160), 30), eAVEncH264VLevel5_1.0 as u32);
+        assert_eq!(h264_level((2560, 1440), 60), eAVEncH264VLevel5_1.0 as u32);
+        assert_eq!(h264_level((1920, 1080), 60), eAVEncH264VLevel5_1.0 as u32);
+    }
+
+    #[test]
+    fn the_hardware_encoders_are_enumerable_and_answer_the_d3d11_handshake() {
+        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
+        eprintln!(
+            "hardware H.264 encoder MFTs on this machine: {}",
+            encoders.len()
+        );
+        for encoder in &encoders {
+            eprintln!(
+                "  {:<44} d3d11={:<5} async={:<5} url={}",
+                encoder.name,
+                encoder.accepts_d3d11,
+                encoder.asynchronous,
+                encoder.hardware_url.as_deref().unwrap_or("-"),
+            );
+            if let Some(why) = &encoder.refusal {
+                eprintln!("      refused: {why}");
+            }
+        }
+        for encoder in &encoders {
+            assert!(
+                encoder.accepts_d3d11 || encoder.refusal.is_some(),
+                "{} neither accepted the handshake nor gave a reason, which would make the \
+                 answer unusable either way",
+                encoder.name
+            );
+        }
+    }
 }

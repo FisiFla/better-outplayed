@@ -115,8 +115,11 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
 
     // The age rule, and the running total the size rule works from. `saturating_sub` keeps a clip
     // with a future `created_at` (a clock that stepped backwards) from reading as ancient, and the
-    // total from underflowing.
-    let mut remaining: u64 = clips.iter().map(|c| c.size_bytes).sum();
+    // total from underflowing. The sum saturates for the same reason: a library that claims more
+    // bytes than a `u64` holds must over-count, not panic in the middle of a cleanup pass.
+    let mut remaining: u64 = clips
+        .iter()
+        .fold(0, |total, c| total.saturating_add(c.size_bytes));
     for (i, clip) in ordered.iter().enumerate() {
         if !clip.favourite && now_ms.saturating_sub(clip.created_at_ms) > max_age_ms {
             marked[i] = Some(DeletionReasons {
@@ -131,8 +134,7 @@ pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> Clea
     let favourite_bytes: u64 = clips
         .iter()
         .filter(|c| c.favourite)
-        .map(|c| c.size_bytes)
-        .sum();
+        .fold(0, |total, c| total.saturating_add(c.size_bytes));
     let over_cap_by_bytes = favourite_bytes.saturating_sub(policy.max_total_bytes);
 
     if over_cap_by_bytes == 0 {
@@ -260,7 +262,9 @@ pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutco
             continue;
         }
         match std::fs::remove_file(&path) {
-            Ok(()) => outcome.bytes_reclaimed += entry.size_bytes,
+            Ok(()) => {
+                outcome.bytes_reclaimed = outcome.bytes_reclaimed.saturating_add(entry.size_bytes)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(
                     "cleanup: clip #{} was deleted from the index but its file was already \

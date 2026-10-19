@@ -276,16 +276,33 @@ impl MediaInfo {
         let audio = self.audio.as_ref()?;
         let video_dur = video.duration_ms?;
         let audio_dur = audio.duration_ms?;
-        let video_end = video.start_ms.unwrap_or(0) + video_dur as i64;
-        let audio_end = audio.start_ms.unwrap_or(0) + audio_dur as i64;
+        // The ends are saturating arithmetic on ffprobe's own numbers: a duration and a start
+        // time both come out of the file, and a corrupt one must neither wrap into a negative
+        // end nor overflow the sum into a panic.
+        let video_end = video
+            .start_ms
+            .unwrap_or(0)
+            .saturating_add(ms_i64(video_dur));
+        let audio_end = audio
+            .start_ms
+            .unwrap_or(0)
+            .saturating_add(ms_i64(audio_dur));
         Some(AvDrift {
             video_ms: video_dur,
             audio_ms: audio_dur,
             video_start_ms: video.start_ms,
             audio_start_ms: audio.start_ms,
-            delta_ms: video_end - audio_end,
+            delta_ms: video_end.saturating_sub(audio_end),
         })
     }
+}
+
+/// A millisecond count as a signed number, clamped rather than wrapped.
+///
+/// ffprobe's durations are read out of a file, so an absurd one must not turn into a negative
+/// number: `u64::MAX as i64` is `-1`, which would put a stream's end before its start.
+fn ms_i64(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
 }
 
 /// Encode exactly one frame with `encoder` and throw the output away.
@@ -587,6 +604,42 @@ mod tests {
         }"#;
         let info = MediaInfo::from_ffprobe_json(json).expect("valid probe json");
         assert!(info.av_drift().is_none(), "no audio stream means no drift");
+    }
+
+    /// A duration no file could hold does not make the drift arithmetic wrap.
+    ///
+    /// The durations come out of the file, so an absurd one is possible, and `u64::MAX as i64` is
+    /// `-1`: the end of a stream would land before its start, and the sum of two such ends could
+    /// overflow into a panic. The ends are clamped and the difference saturates instead.
+    #[test]
+    fn an_absurd_duration_does_not_wrap_the_drift() {
+        let (video, audio) = stream_durations(u64::MAX, 0);
+        let info = MediaInfo {
+            duration_ms: u64::MAX,
+            size_bytes: 0,
+            video: Some(video),
+            audio: Some(audio),
+        };
+        let drift = info.av_drift().expect("both durations present");
+        assert_eq!(
+            drift.delta_ms,
+            i64::MAX,
+            "the video's end is clamped, and the difference is not a wrapped negative"
+        );
+
+        let (video, audio) = stream_durations(0, u64::MAX);
+        let info = MediaInfo {
+            duration_ms: u64::MAX,
+            size_bytes: 0,
+            video: Some(video),
+            audio: Some(audio),
+        };
+        let drift = info.av_drift().expect("both durations present");
+        assert_eq!(
+            drift.delta_ms,
+            -i64::MAX,
+            "and the other way round the difference saturates too"
+        );
     }
 
     /// The probe size is a hardware constraint, not a preference (see [`SMOKE_SIZE`]). This guards
