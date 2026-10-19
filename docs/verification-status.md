@@ -1950,3 +1950,72 @@ production code is linted and test code is not.
   the listener now exposes `port()` and `accepts_token()` for exactly that).
 - The per-session ephemeral GSI port is available in the events crate but the recorder still
   writes the configured port into the `.cfg`, so the port remains squattable (#44).
+
+## 26. The GSI token, the port and the install (2026-10-19)
+
+§25 left two things open: the game-state token was still written in cleartext into the
+game's own `cfg` folder, and the listener's port was still the configured one, so another
+local program could squat on it and receive the game's POSTs — and with them the token. The
+installer also re-read the token file on its own, so a token file replaced mid-recording left
+the game posting a token the listener refused, every POST answered `403` until the
+application restarted.
+
+This section records what changed, and what was **not** re-measured.
+
+### One listener, per-game paths, per-game tokens
+
+Each game now has its own token file (`gsi-token-cs2.txt`, `gsi-token-dota2.txt`), its own
+path on the listener (`/gsi/cs2`, `/gsi/dota2`) and its own **app id** (730, 570). The
+listener resolves the request path first: a path no game serves is `404` and the body is
+never read; a token that is not that path's own is `403`; a payload whose `provider.appid`
+is not that game's is `403`. A token lifted from one game's installed `.cfg` therefore
+cannot forge the other game's events, which is the part the cleartext file made possible.
+
+The old single `gsi-token.txt` is **migrated by copy** into each per-game file (a copy keeps
+the `0600` mode), and is left in place so an older build still finds its token. Both games
+inherit it, so an already-installed `.cfg` keeps working.
+
+### The listener is bound before anything is written
+
+The order used to be: write the `.cfg` naming the configured port, then bind. A port
+already taken meant a `.cfg` was left behind naming a **squatter's** port, and the game
+posted its token there. The order is now: bind, then write, and every `.cfg` — in the
+application's data directory *and* in the game's own folder — names **the port the listener
+actually bound**. A failed bind leaves no `.cfg` behind at all.
+
+### The installer takes the live binding, and refuses without one
+
+The installer no longer reads the token file. It takes the binding the running listener
+serves — the live port, that game's path and the token in force — and writes it. With no
+listener running there is nothing for the game to post to, so the install is refused with
+the reason rather than writing a file that cannot work. The write is **atomic** (a
+uniquely-named temp file in the same directory, written, flushed, then renamed over the
+destination), and a remembered install is rewritten when the listener's port moves.
+
+The containment rule was changed as well, and the change is worth stating plainly: the
+destination must be a known library's `steamapps/common/<game folder>`, and the containment
+root is **the library**, not the game folder and not the Steam root. A symlink planted
+inside the game folder that escapes the library is refused. A game in a **secondary**
+library — one the user's own `libraryfolders.vdf` lists — is installed, because that file
+is the user's own Steam configuration: no other unprivileged account can edit it, and the
+application writes with that user's own permissions either way. Refusing it would break a
+game on a second drive for no security gain.
+
+### The port can now be unguessable
+
+`[events] gsi_ephemeral_port` (default `false`) has the operating system pick the port
+instead of the configured one. `gsi_port = 0` still switches the listener off entirely, in
+both modes.
+
+### What was **not** re-measured
+
+- This was **verified on the development host (macOS) only**. The new routing, the token
+  scoping, the atomic install and the containment rule are covered by the unit and
+  integration tests — 28 new ones — and by the clippy and formatting gates. They have not
+  been exercised against a real CS2 or Dota 2 client.
+- The token is **still** written in cleartext into the game's `cfg` folder. That cannot be
+  removed: the game has to be able to read it. The mitigation is the app-id scoping and the
+  optional unguessable port, and the residual risk is unchanged by this work.
+- A fixed port is still squattable unless `gsi_ephemeral_port` is turned on. The default is
+  unchanged at `45671`.
+- No Windows run of the harness has happened with any of this in place.

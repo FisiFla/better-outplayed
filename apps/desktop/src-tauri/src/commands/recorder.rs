@@ -3,11 +3,14 @@
 use super::settings::recorder_options;
 use super::*;
 use crate::config::{EngineOptionsConfig, RecordingConfig};
+use crate::health::InstalledGsi;
 #[cfg(test)]
 use localplay_capture::stub::StubConfig;
 use localplay_media::FfmpegBinaries;
 use localplay_recorder::event_driver::{EventDriver, Policy};
-use localplay_recorder::{RecordedClip, Recorder, RecorderConfig, RecorderStatus, Sources};
+use localplay_recorder::{
+    GsiBinding, RecordedClip, Recorder, RecorderConfig, RecorderStatus, Sources,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -140,6 +143,14 @@ pub struct RecorderHost {
     /// Told about every clip that lands, whichever trigger took it (button, tray, hotkey or a
     /// game event). Set once by the shell, which owns the notification; empty in tests.
     clip_hook: Arc<OnceLock<ClipSavedHook>>,
+    /// The GSI cfgs the shell installed into games' own directories, and the binding each
+    /// was written from.
+    ///
+    /// The port the listener binds can change between runs (it is configurable, and it may be
+    /// an ephemeral one), so an installed file that names an old port is a game posting into
+    /// the void. This record is what lets a start rewrite it. Shared with the shell's state,
+    /// which owns the installations.
+    installed_gsi: Arc<Mutex<Vec<InstalledGsi>>>,
     /// **TEST-ONLY.** The hooks a test hangs on a stop.
     #[cfg(test)]
     probe: Mutex<StopProbe>,
@@ -176,13 +187,18 @@ impl RecordedClipDto {
 }
 
 impl RecorderHost {
-    pub fn new(app_data_dir: PathBuf, bins: Option<FfmpegBinaries>) -> Self {
+    pub fn new(
+        app_data_dir: PathBuf,
+        bins: Option<FfmpegBinaries>,
+        installed_gsi: Arc<Mutex<Vec<InstalledGsi>>>,
+    ) -> Self {
         Self {
             app_data_dir,
             bins,
             current: Mutex::new(None),
             events: Mutex::new(None),
             clip_hook: Arc::new(OnceLock::new()),
+            installed_gsi,
             #[cfg(test)]
             probe: Mutex::new(StopProbe::default()),
         }
@@ -236,6 +252,40 @@ impl RecorderHost {
             .ok()
             .and_then(|slot| slot.as_ref().map(|d| d.reports().to_vec()))
             .unwrap_or_default()
+    }
+
+    /// The games the GSI listener serves right now, with the live port and token.
+    ///
+    /// Empty when nothing is recording, or when the listener is off or failed to start:
+    /// there is then nothing serving, so there is nothing for a game to post to and
+    /// nothing for the installer to write.
+    pub fn gsi_bindings(&self) -> Vec<GsiBinding> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|driver| driver.gsi_bindings()))
+            .unwrap_or_default()
+    }
+
+    /// Rewrite the installed GSI cfgs whose live binding has moved.
+    ///
+    /// The port the listener binds can change between runs, and the token with it, so a
+    /// `.cfg` left in a game's folder naming the old ones is exactly the stale file this
+    /// exists to prevent: the game posts to a port nobody listens on, or with a token the
+    /// listener refuses, and every POST is answered `403` until the application restarts.
+    ///
+    /// An installation that cannot be rewritten is dropped rather than retried at every
+    /// start (see [`crate::health::refresh_installed_gsi`]).
+    fn refresh_installed_gsi(&self, bindings: &[GsiBinding]) {
+        let Ok(mut installed) = self.installed_gsi.lock() else {
+            tracing::warn!("the installed GSI cfgs could not be refreshed: the record is locked");
+            return;
+        };
+        crate::health::refresh_installed_gsi(
+            &mut installed,
+            bindings,
+            &crate::health::steam_roots(),
+        );
     }
 
     /// The engine's own status, undigested (the health page wants the encoder name).
@@ -373,9 +423,14 @@ impl RecorderHost {
                 },
             ) {
                 Ok(driver) => {
+                    // The live bindings, taken before the driver moves: the port the
+                    // listener bound is the port the game's cfg has to name, and an
+                    // installed cfg that names an older one is rewritten here.
+                    let bindings = driver.gsi_bindings();
                     if let Ok(mut held) = self.events.lock() {
                         *held = Some(driver);
                     }
+                    self.refresh_installed_gsi(&bindings);
                 }
                 Err(err) => tracing::warn!("the game-event sources could not start: {err:#}"),
             }
@@ -515,6 +570,7 @@ mod tests {
         RecorderHost::new(
             app_data_dir.to_path_buf(),
             with_ffmpeg.then(|| f.bins.clone()),
+            Arc::new(Mutex::new(Vec::new())),
         )
     }
 
@@ -843,6 +899,17 @@ mod tests {
             "the message must say why there is no clip: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_host_with_no_recording_serves_no_gsi_bindings() {
+        // Nothing is listening, so there is nothing for a game to post to: the installer
+        // must refuse rather than write a cfg naming a port nobody holds.
+        let f = Fixture::new();
+        let host = host(&f, true);
+
+        assert!(host.gsi_bindings().is_empty());
+        assert!(host.event_reports().is_empty());
     }
 
     #[test]

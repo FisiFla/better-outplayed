@@ -30,6 +30,7 @@ use commands::{
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use localplay_media::FfmpegBinaries;
+use localplay_recorder::GsiBinding;
 use localplay_store::Store;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -87,6 +88,15 @@ pub struct AppState {
     approved_roots: Mutex<Vec<PathBuf>>,
     /// The log file this process writes, and the health page reads.
     log_path: PathBuf,
+    /// The GSI cfgs this shell installed into games' own directories, and the binding each
+    /// was written from.
+    ///
+    /// The port the GSI listener binds can change between runs (it is configurable, and it
+    /// may be an ephemeral one the operating system picked), so an installed `.cfg` naming
+    /// an old port is a game posting into the void. This record is what lets a recording
+    /// start rewrite it. Shared with the recorder host, which does the rewriting when the
+    /// listener comes up.
+    installed_gsi: Arc<Mutex<Vec<health::InstalledGsi>>>,
 }
 
 impl AppState {
@@ -164,7 +174,15 @@ impl AppState {
             store.total_bytes().unwrap_or(0)
         );
 
-        let recorder = RecorderHost::new(app_data_dir.to_path_buf(), bins.clone());
+        // One record of the GSI cfgs this shell installed, shared with the recorder host:
+        // the host rewrites an installed cfg when the listener's port moves, and the
+        // install command is what records it.
+        let installed_gsi = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecorderHost::new(
+            app_data_dir.to_path_buf(),
+            bins.clone(),
+            Arc::clone(&installed_gsi),
+        );
         Ok(Self {
             store: Mutex::new(store),
             bins,
@@ -179,12 +197,31 @@ impl AppState {
             )),
             approved_roots: Mutex::new(Vec::new()),
             log_path,
+            installed_gsi,
         })
     }
 
     /// The recording engine this window drives. No UI is built unless it can record.
     pub fn recorder(&self) -> &RecorderHost {
         &self.recorder
+    }
+
+    /// Record a GSI installation, so a later recording start can rewrite it.
+    ///
+    /// The port the GSI listener binds can change between runs, and a `.cfg` left in a game's
+    /// folder naming an old one is a game posting into the void.
+    pub fn remember_gsi_install(
+        &self,
+        game: health::GsiGame,
+        install: &Path,
+        path: &Path,
+        binding: &GsiBinding,
+    ) {
+        let mut installed = self
+            .installed_gsi
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        health::remember_install(&mut installed, game, install, path, binding);
     }
 
     /// What installing the clip hotkey concluded at startup.
@@ -639,22 +676,50 @@ fn gsi_targets() -> Vec<health::GsiTarget> {
 ///
 /// The webview names only the game; the directory is found here, never supplied (see
 /// `health.rs`).
+///
+/// The file is written from the *live* binding the running listener serves: the port it
+/// bound and the token it accepts. Nothing is re-read from the token file, because the
+/// listener read that file once, when it started, and a file replaced since would leave the
+/// game posting a token the listener refuses — every POST answered `403` until the
+/// application restarts.
+///
+/// With no listener running there is nothing for the game to post to, so the install is
+/// refused with the reason rather than writing a file that cannot work.
 #[tauri::command(rename_all = "snake_case")]
 fn install_gsi_cfg(
     state: State<'_, AppState>,
     game: health::GsiGame,
 ) -> Result<health::GsiInstallOutcome, CommandError> {
-    let install = health::find_install(game, &health::steam_libraries(&health::steam_roots()))
-        .ok_or_else(|| {
-            CommandError::new(
-                ErrorCode::InvalidInput,
-                format!("{} was not found in any Steam library", game.label()),
-            )
-        })?;
-    let port = config::EngineOptionsConfig::load(&state.config_path())?
+    let roots = health::steam_roots();
+    // The libraries Steam knows about: the roots the operating system names, plus the
+    // secondary libraries the user's own `libraryfolders.vdf` lists.
+    let libraries = health::steam_libraries(&roots);
+    let install = health::find_install(game, &libraries).ok_or_else(|| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("{} was not found in any Steam library", game.label()),
+        )
+    })?;
+    let configured_port = config::EngineOptionsConfig::load(&state.config_path())?
         .events
         .gsi_port;
-    health::install_gsi_cfg(game, &install, &state.app_data_dir, port)
+    let binding = state
+        .recorder
+        .gsi_bindings()
+        .into_iter()
+        .find(|binding| binding.game == game.game_id());
+    let listener = match binding.as_ref() {
+        Some(binding) => health::GsiListener::Running(binding),
+        // The listener is off in the configuration: say so with the setting's name.
+        None if configured_port == 0 => health::GsiListener::SwitchedOff,
+        None => health::GsiListener::NotRunning,
+    };
+    let outcome = health::install_gsi_cfg(game, &install, listener, &libraries)?;
+    // Remembered so a later start can rewrite it when the listener's port moves.
+    if let Some(binding) = binding {
+        state.remember_gsi_install(game, &install, Path::new(&outcome.path), &binding);
+    }
+    Ok(outcome)
 }
 
 /// The effective settings, for the settings panel: the file's values where it sets them,

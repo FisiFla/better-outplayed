@@ -98,6 +98,8 @@ versions. For what has and has not been *verified* on real hardware, read
   the webview can no longer widen the asset protocol's read scope to any path it names.
 
 ### Fixed
+- **The game state integration can no longer be squatted, go stale, or be forged with another game's token.** Each game now has its own token and its own path, and the listener refuses a payload whose provider app id is not that game's, so a token lifted from one game's installed `.cfg` cannot forge the other game's events. The listener is bound before any `.cfg` is written, and every `.cfg` -- in the app's data directory and in the game's own folder -- names the port it actually bound rather than the configured one. The desktop shell no longer re-reads the token file on its own: the installed `.cfg` is written from the live binding, it is written atomically, it is refreshed when the listener's port moves, and an install is refused outright when no listener is running. `[events] gsi_ephemeral_port` opts into an unguessable port for anyone who does not need a fixed one. The old single token file is migrated into the per-game files, so an existing install keeps working.
+
 - **The screenshot harness drives the whole clip-source contract, and the build now checks
   that it does.** The harness's fake `ClipSource` had fallen behind the interface: the
   method that opens the native folder picker was missing, so the settings screenshot
