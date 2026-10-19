@@ -1,4 +1,4 @@
-# Packaging localplay
+# Packaging better-outplayed
 
 **Status: packagable, not shippable.** Two things were true before this document existed, and
 neither is true now: `bundle.active` was `false`, so `tauri build` produced no artifact anyone
@@ -9,7 +9,8 @@ pipeline.
 
 What is still **not** true is more important than what is, and §5 lists it in full: the
 artifacts are **unsigned**, the **icon is a placeholder**, there is **no auto-update**, and
-**nobody has installed this on Windows**. Read §5 before repeating anything in §1 as a
+the Windows installer has been **installed and uninstalled on the test machine but never on
+a user's machine** (§3.5). Read §5 before repeating anything in §1 as a
 release claim.
 
 This document is written the same way as
@@ -22,9 +23,9 @@ This document is written the same way as
 
 | Target | Config | Artifact | Built in this repository? |
 |---|---|---|---|
-| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `localplay_0.1.0_x64-setup.exe` | **No** — needs a Windows host (§3) |
-| macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `localplay.app` | **Yes**, on this development host (§4) |
-| macOS | (not enabled) `.dmg` | `localplay_0.1.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
+| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `better-outplayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
+| macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `better-outplayed.app` | **Yes**, on this development host (§4) |
+| macOS | (not enabled) `.dmg` | `better-outplayed_0.1.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
 | Linux | — | — | No target: the capture path is Windows-only (spec §2) |
 
 Common metadata, from `apps/desktop/src-tauri/tauri.conf.json`, all of it consistent with the
@@ -32,7 +33,7 @@ rest of the repository rather than invented here:
 
 | Field | Value | Where it comes from |
 |---|---|---|
-| `productName` | `localplay` | the README's own name for the app; `bundle.licenseFile` aside, this is what the installer shows |
+| `productName` | `better-outplayed` | the product's own name, and what the installer shows; §3.3 records when it changed and why the install directory follows it |
 | `mainBinaryName` | `localplay` | without it the installed executable would be `localplay-desktop`, the Cargo package name |
 | `version` | `0.1.0` | `[workspace.package] version` in the root `Cargo.toml`, and `package.json` |
 | `identifier` | `io.github.fisifla.better-outplayed` | reverse-DNS of the project's owner (`github.com/FisiFla`, the maintainer's address in the git history). Fixed now on purpose: it is the Windows uninstall key and the macOS bundle id |
@@ -42,7 +43,8 @@ rest of the repository rather than invented here:
 | `homepage` | `https://github.com/FisiFla/better-outplayed` | `repository` in the root `Cargo.toml` |
 | `shortDescription` | *Local, zero-cloud game clipping and replay buffer for Windows* | the README's tagline |
 | `longDescription` | the README's first paragraph, plus the Windows/encoder requirement | README + spec §2 |
-| `licenseFile` | **unset, deliberately** | localplay is dual-licensed (MIT **OR** Apache-2.0) and this key takes a single path. Naming one file would misstate the licence. A release should add a short file that states the dual licence and points at both, or the installer simply shows no licence page |
+| `licenseFile` | `../LICENSE.txt` | a short file that states the **dual** licence (MIT **OR** Apache-2.0) and points at both texts and at the third-party notices, so the installer shows a licence page that is not wrong. It was unset for a long time because naming a single licence file would have misstated the dual licence; the file states the dual licence instead |
+| `resources` (bundle) | the sidecars, plus `LICENSE.txt` and `THIRD_PARTY_NOTICES.md` | the notices have to travel with the binaries they describe — the bundled ffmpeg is LGPL v3-or-later and its source offer lives in the notices file |
 
 ---
 
@@ -76,8 +78,8 @@ templates):
 
 | Platform | Resource directory | Sidecars therefore at | Installer mechanism |
 |---|---|---|---|
-| Windows (`nsis`, `msi`) | the directory holding the executable | `%LOCALAPPDATA%\localplay\binaries\ffmpeg.exe` (per-user) or `C:\Program Files\localplay\binaries\ffmpeg.exe` (all-users) | the NSIS template does `SetOutPath $INSTDIR` and then `File /a "/oname=<destination>"` for every resource |
-| macOS (`.app`) | `<Foo>.app/Contents/Resources` | `localplay.app/Contents/Resources/binaries/ffmpeg` | `bundle_project` copies resources into `Contents/Resources` and the main binary into `Contents/MacOS` |
+| Windows (`nsis`, `msi`) | the directory holding the executable | `%LOCALAPPDATA%\better-outplayed\binaries\ffmpeg.exe` (per-user) or `C:\Program Files\better-outplayed\binaries\ffmpeg.exe` (all-users) | the NSIS template does `SetOutPath $INSTDIR` and then `File /a "/oname=<destination>"` for every resource |
+| macOS (`.app`) | `<Foo>.app/Contents/Resources` | `better-outplayed.app/Contents/Resources/binaries/ffmpeg` | `bundle_project` copies resources into `Contents/Resources` and the main binary into `Contents/MacOS` |
 
 ### 2.3 How the app finds them (`crates/media/src/binaries.rs`)
 
@@ -154,12 +156,13 @@ npm ci
 > sidecars and the npm dependencies. The `npm run tauri` form is fine with no flags after it, and
 > the `--` form is correct in bash, which is why CI uses it.
 
-Expected artifacts (the paths and names follow Tauri's conventions; **neither was produced
-here**, because the installer cannot be built from macOS):
+Expected artifacts (the paths and names follow Tauri's conventions; **neither could be
+produced from macOS**, because the installer cannot be built here — §3.5 records the one
+that was built on the Windows test machine, and it is named as above):
 
 ```text
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\localplay_0.1.0_x64-setup.exe
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\localplay_0.1.0_x64_en-US.msi   # only with --bundles msi
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\better-outplayed_0.1.0_x64-setup.exe
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\better-outplayed_0.1.0_x64_en-US.msi   # only with --bundles msi
 ```
 
 **This is a compile-and-bundle step and nothing else. It does not launch the application.**
@@ -176,7 +179,8 @@ Read from Tauri v2's NSIS template (`crates/tauri-bundler/src/bundle/windows/nsi
 not from a run:
 
 - installs the executable and every resource to `$INSTDIR`, per-user by default:
-  `%LOCALAPPDATA%\localplay` (all-users, `C:\Program Files\localplay`, is available in the UI
+  `%LOCALAPPDATA%\better-outplayed` (all-users, `C:\Program Files\better-outplayed`, is
+  available in the UI
   and needs elevation). `tauri.windows.conf.json` pins `installMode: currentUser` explicitly so
   this is a decision rather than an inherited default;
 - creates a Start Menu shortcut (and an optional desktop shortcut offered by the finish page),
@@ -222,7 +226,7 @@ Both *were* read out of the NSIS template; §3.5 records what they actually did 
 ### 3.4 Checking an installer without installing it
 
 On the Windows test machine, the installer's contents can be listed without running either it or the
-app (`7z l localplay_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
+app (`7z l better-outplayed_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
 first-pass check that `binaries\ffmpeg.exe` is inside. `npm run sidecars:check` already prints
 what was embedded at build time, and that *is* verified here (§4.2).
 
@@ -271,7 +275,7 @@ inspected on the machine the work is done on.
 cargo xtask sidecars fetch --target x86_64-pc-windows-msvc   # optional here
 cd apps/desktop
 npm ci
-npm run tauri -- build            # -> src-tauri/target/release/bundle/macos/localplay.app
+npm run tauri -- build            # -> src-tauri/target/release/bundle/macos/better-outplayed.app
 ```
 
 ### 4.1 What was built here
@@ -293,7 +297,9 @@ bundling sidecars from .../localplay/binaries: ffmpeg (0.0 MiB), ffprobe (0.0 Mi
 ```
 
 Artifact: **`apps/desktop/src-tauri/target/release/bundle/macos/localplay.app`**, ad-hoc signed
-only (§4.4). Its size is decided entirely by what sits in `binaries/` when it is built:
+only (§4.4). The bundle is named after `productName`, and that was still `localplay` when
+this build ran: the product was renamed to `better-outplayed` on 2026-09-26 (§3.3), so a
+build from the current tree produces `better-outplayed.app`. Its size is decided entirely by what sits in `binaries/` when it is built:
 
 | `binaries/` held | `.app` size | Of which sidecars |
 |---|---|---|
@@ -387,7 +393,9 @@ failed to bundle project: error running bundle_dmg.sh
 
 `tauri.macos.conf.json` therefore lists `["app"]`, so the default macOS build succeeds. On a
 host where `hdiutil` is permitted, `npm run tauri -- build --bundles app,dmg` should produce
-`target/release/bundle/dmg/localplay_0.1.0_aarch64.dmg`; that is **unverified**.
+`target/release/bundle/dmg/better-outplayed_0.1.0_aarch64.dmg`; that is **unverified**.
+(The attempt above was made on 2026-09-23, before the product was renamed; the volume name
+and the artifact name both follow `productName`.)
 
 ### 4.4 The macOS bundle is not distributable
 

@@ -13,7 +13,7 @@ on loopback (game-state-integration HTTP listener, token-gated; audio transport 
 makes no outbound connections. In scope:
 
 - a local attacker or malicious game config reaching the GSI listener,
-- a malicious or corrupt clip / `index.db` causing file access outside the library
+- a malicious or corrupt clip / `localplay.db` causing file access outside the library
   (`delete_clip` refuses to unlink outside the clips and app-data directories),
 - the webview (strict CSP, no filesystem/shell/http capability granted),
 - supply chain: pinned, checksummed ffmpeg sidecars; `cargo-deny`, `npm audit` and gitleaks in CI.

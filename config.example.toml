@@ -267,17 +267,11 @@ clip = "Ctrl+F8"
 # Desktop app only, off unless uncommented. Each must be a chord nothing else holds:
 #   toggle_recording = "Ctrl+F9"   # start / stop the recording
 #   bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
-#   clip_short = "Ctrl+F7"         # a short clip: short_pre_seconds / short_post_seconds
-#   clip_long = "Ctrl+Shift+F8"    # a long clip: long_pre_seconds / long_post_seconds
-# Clip lengths for the two chords above (seconds; clamped to [buffer] max_pre_seconds /
-# max_post_seconds). The long one only reaches past pre_seconds if max_pre_seconds allows.
-#   short_pre_seconds = 10
-#   short_post_seconds = 2
-#   long_pre_seconds = 60
-#   long_post_seconds = 10
+# Only these three are read in this build. Anything else here is ignored, because the
+# config structs do not deny unknown fields.
 
 [app]
-# Start localplay with Windows (the desktop app; the CLI is never autostarted).
+# Start better-outplayed with Windows (the desktop app; the CLI is never autostarted).
 #
 # `true`  = the app owns a value under
 #           HKCU\Software\Microsoft\Windows\CurrentVersion\Run — the per-user Run key — so
@@ -300,8 +294,11 @@ start_with_system = false
 #
 # The poller only ever talks to 127.0.0.1:2999 — the game's own local API. A refused
 # connection is its normal state (no game running, or no League installed) and is not an
-# error. The endpoint serves a self-signed certificate, so TLS verification is relaxed for
-# that one address-pinned client and for nothing else.
+# error. The endpoint's certificate is issued by a root the client pins (the platform roots
+# are disabled), so nothing is relaxed but the host-name match — an IP literal has no name
+# to satisfy. The relaxation lives in exactly one file, the one that also pins the address,
+# and a guard test asserts that no file in the tree disables chain verification and that
+# exactly one may relax the host-name check.
 lol_poll_enabled = true
 
 # --- CS2 / Dota 2 (Valve Game State Integration) ------------------------------------

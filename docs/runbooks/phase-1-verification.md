@@ -57,7 +57,7 @@ It builds the release CLI, probes the encoders, starts the buffer with a **bound
 documented configuration** (printed in the report), takes one clip through the CLI's own
 verification trigger (`buffer --self-test-clip-after` — see criterion 3), probes that clip
 with ffprobe (duration, streams, codec, A/V drift, audio level), reads the process's own
-CPU time and working set against criterion 6's thresholds, checks the scratch cap and that
+CPU time and working set against criterion 6's thresholds, checks the ring's RAM cap and that
 eviction happened, confirms the media-vs-wall-clock ratio from the status line's `span=`
 (not from file mtimes), exercises criterion 7 by forcing a vendor this machine cannot run,
 and writes everything — every check, its expected value, its measured value, and the raw
@@ -138,12 +138,12 @@ hevc_qsv     not advertised
 
 If `%LOCALAPPDATA%\localplay\config.toml` does not exist, the CLI runs with the built-in
 example defaults (`pre_seconds = 30`, `post_seconds = 5`, `fps = 60`,
-`segment_time = 1`, `scratch_cap_bytes = 2147483648`, `vendor = "auto"`). To change
+`segment_time = 1`, `ram_cap_bytes = 268435456`, `vendor = "auto"`). To change
 anything, copy `config.example.toml` there and edit it. At minimum:
 
 - `encode.vendor` — a vendor step 0.2 reported **`advertised, WORKS`**, or `"auto"`.
 - `encode.fps`, `buffer.pre_seconds`, `buffer.post_seconds`, `buffer.segment_time`,
-  `buffer.scratch_cap_bytes` — as you want them for the runs below.
+  `buffer.ram_cap_bytes` — as you want them for the runs below.
 
 `localplay` never reads configuration from environment variables.
 
@@ -208,8 +208,10 @@ At startup, on stdout:
   the rate the pipeline is running at: your configured `encode.fps` unless the probe above
   reduced it.
 
-Within a few seconds, `seg-000000.mp4`, `seg-000001.mp4`, … appear in
-`%LOCALAPPDATA%\localplay\scratch\`.
+Nothing is written to the disk while the buffer runs. `seg-000000.mp4`,
+`seg-000001.mp4`, … do **not** appear in `%LOCALAPPDATA%\localplay\scratch\` — the ring
+holds its footage in RAM and writes nothing until a clip is saved. (A full *session*
+recording does write segments, into `sessions\`.)
 
 With `RUST_LOG=debug`, every ~200 ms you get a line:
 
@@ -237,7 +239,7 @@ count of payloads it had to discard because its queue was full during that run: 
 capture cannot be slowed down, so ffmpeg falling behind costs frames rather than memory.
 Zero is the expected value on a machine that keeps up; **a non-zero and rising
 `dropped=` means the encoder is the bottleneck** — the recording has holes in it, and the
-run should not be reported as clean. The queue is bounded (4 video frames, 32 audio
+run should not be reported as clean. The queue is bounded (4 video frames, 300 audio
 blocks), so these counters can never be traded for unbounded RAM.
 
 `skipped=` is the other half of `frames=`: the frames the capture backend offered that the
@@ -285,8 +287,9 @@ resolution and the pipe size.
 - `WGC capture started on the primary monitor` appears but `width=`/`height=` is **not**
   your monitor's resolution (e.g. `1280x720` would mean the synthetic stub ran, i.e. the
   real backend was not selected on this build).
-- After 30 s, `frames=` is still `0`, `span=` is still `0`, `segments=` is still `0`, and
-  no `seg-*.mp4` files exist — frames are not flowing.
+- After 30 s, `frames=` is still `0`, `span=` is still `0` and `segments=` is still `0` —
+  frames are not flowing. (No `seg-*.mp4` files appear either, but in buffer mode they
+  never do; that is not the signal.)
 - `frames=` grows materially slower than `T × <fps>` (e.g. well under half of `<fps>`),
   or `span=` grows materially slower than 1000 ms per wall-clock second — capture is not
   keeping up at the configured fps (or the pipeline is stalling).
@@ -299,55 +302,58 @@ resolution and the pipe size.
   corresponds to more real seconds than asked for — lower `encode.fps` or `encode.output_size`.
 
 **Do not misread:** if `segments=` has stopped climbing but `span` still grows, that is
-normal ring behaviour once the scratch cap is reached (oldest segments are evicted) — not
+normal ring behaviour once the RAM budget is reached (oldest footage is evicted) — not
 a criterion-1 failure.
 
 ---
 
-## Criterion 2 — Scratch directory stays at or under `scratch_cap_bytes`
+## Criterion 2 — The ring's RAM budget is not exceeded
 
 **Command**
 
 Run the same `buffer` process (with `RUST_LOG=debug`) for a **5-minute soak**, and read
 the `bytes=` field from the debug ledger line.
 
-To make eviction actually happen inside 5 minutes, set `buffer.scratch_cap_bytes` lower
+**The cap is a RAM budget, not a disk cap.** `buffer.scratch_cap_bytes` was removed when
+the ring moved into RAM; the key that bounds it now is `buffer.ram_cap_bytes` (256 MiB by
+default). In buffer mode the ring holds its footage **in RAM** and writes **nothing to the
+disk at all** — there is no `scratch\` directory of `seg-*.mp4` files to measure. (A full
+*session* recording does write segments, into `sessions\`.)
+
+To make eviction actually happen inside 5 minutes, set `buffer.ram_cap_bytes` lower
 than the soak will produce but comfortably higher than `(pre_seconds + post_seconds)`
 worth of footage (otherwise the pre-roll window is truncated). Estimate one second of
 video as `bitrate_kbps / 8` kilobytes plus `audio.bitrate_kbps / 8` kilobytes of audio,
 then multiply by 300 s. For example, at `bitrate_kbps = 20000` that is roughly 2.5 MB/s,
-so 5 minutes is roughly 750 MB — set the cap below that. Make sure the cap is also
+so 5 minutes is roughly 750 MB — set the budget below that. Make sure the budget is also
 larger than a **single** segment, because the ring always retains at least one segment
 and the CLI aborts if it cannot satisfy the cap (see below).
 
 **Expected observation (PASS)**
 
 - The debug line's `bytes=` rises, then plateaus once the ring is full, and **never
-  exceeds** the configured `scratch_cap_bytes` for the whole soak.
+  exceeds** the configured `ram_cap_bytes` for the whole soak.
 - The process keeps running — it never aborts.
+- No `scratch\` directory of `seg-*.mp4` files appears at all: buffer mode writes
+  nothing to the disk while it buffers.
 
-**Measure the LEDGER, not the directory.** `bytes=` is `BufferStats.bytes_on_disk` — the
-sum of the *indexed* segments. Do **not** run `du` / `dir /s` on the scratch directory
-and compare that. The directory can legitimately hold **one extra segment** beyond the
-ledger: `scanner::newly_complete` withholds the newest segment, because ffmpeg may still
-be appending to it, so that file is not yet indexed — and therefore not yet evictable.
-The ledger is the binding constraint.
+**Measure the LEDGER, not a directory.** `bytes=` is the number of bytes the ring holds
+in RAM. There is nothing on disk to compare it against: `du` / `dir /s` over the data
+directory will find the clip you asked for and nothing else.
 
 **FAILURE looks like**
 
 - The process aborts with
-  `Error: scratch cap violated: <b> bytes on disk exceeds <cap>`. That is the code's own
-  assertion on the ledger, so seeing it is unambiguous.
-- The `bytes=` field ever exceeds the cap while the process keeps running — enforcement
+  `Error: the in-memory ring is over its RAM budget: <held> bytes held against <cap>`.
+  That is the code's own assertion on the ring, so seeing it is unambiguous.
+- The `bytes=` field ever exceeds the budget while the process keeps running — enforcement
   is broken.
-- The scratch directory measures **two or more segments** over the cap, or far more than
-  one segment over. (One extra file is expected and is not a failure; the ledger is what
-  you compare.)
+- A `scratch\` directory of `seg-*.mp4` files appears during a buffer run — that is
+  session behaviour leaking into buffer mode.
 
-**Do not misread:** a single extra `seg-*.mp4` in the directory, above the ledger total,
-is the withheld in-progress segment — normal, not a defect. Also, if you set the cap
-smaller than one segment, the ledger can never satisfy it and the run aborts by design;
-that is a misconfiguration, not a criterion-2 failure.
+**Do not misread:** if you set the budget smaller than one segment, the ring can never
+satisfy it and the run aborts by design; that is a misconfiguration, not a criterion-2
+failure.
 
 ---
 
@@ -698,9 +704,11 @@ The audio backend opens the loopback stream asking the audio **engine** to conve
 pipeline's 48 kHz stereo s16 (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
 AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`), so a default playback device whose native mix
 format is 44.1 kHz or 96 kHz — the usual default for USB DACs and wireless gaming
-headsets — no longer refuses to start. This build has **no Rust-side resampling**, and
-that engine-side conversion has never been observed: this is where it gets observed.
-Set the machine's default playback device to 44.1 kHz (or 96 kHz) in Windows Sound
+headsets — no longer refuses to start. This build has **no Rust-side resampling**; the
+engine-side conversion **has** been observed, on the Windows test machine on 2026-09-24
+(ledger §10.2: the backend logged `converting=true` and the clip had audio in it), so this
+section is the regression check for it rather than the first sighting. Set the machine's
+default playback device to 44.1 kHz (or 96 kHz) in Windows Sound
 settings first, or there is nothing to check.
 
 1. Play something audible (a game, a video, music), then take a clip as in criterion 3.
@@ -747,10 +755,13 @@ not softened; do not read a pass elsewhere as coverage of them.
   `docs/verification-status.md` §1). Since then a **2026-09-24 session** (§10 of the same
   file) ran the whole workspace's test suite on the Windows test machine and, in a real desktop session,
   captured a clip with the shipping build. That run is the current evidence for the readback
-  skip's *pacer* half (`dd921b3`) and for the WASAPI autoconversion (`0848fc7`); what it did
+  skip's *pacer* half (`dd921b3`) and for the WASAPI autoconversion (`5a3dce8`); what it did
   **not** cover is the WGC `discard_pending` half — the CLI test that covers the readback path
-  drives the **stub** capture, not WGC — and the silence detector (`2a63949`) has still never
-  *fired*. The GUI window has never been opened, and every criterion below still needs a run
+  drives the **stub** capture, not WGC — and the silence detector (`4ce2c72`) has still never
+  *fired*. The GUI window **has** been opened — the installer was built, installed and run
+  in a real session 1 on 2026-09-26 (ledger §7's correction, `docs/packaging.md` §3.5) —
+  but the tray, the keypress and hide-on-close are still unobserved, and every criterion
+  below still needs a run
   on the **current** build. This runbook is where that gets done.
 - **Engine-side sample-rate conversion has now been observed.** The WASAPI backend
   initialises the loopback stream with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
@@ -779,21 +790,27 @@ not softened; do not read a pass elsewhere as coverage of them.
   lists encoders with `ffmpeg -encoders` *and* makes each advertised candidate encode one
   generated 320x240 frame (`cargo xtask probe` reports all three states: `advertised, WORKS`,
   `advertised, FAILS: …`, `not advertised`). That proves the encoder **opens** on this
-  machine. It does **not** prove the *live capture path* drives it at 4K, and the
-  `advertised, FAILS` case has **not** yet been observed on real hardware in this change —
-  whoever has the Windows test machine confirms it with `cargo xtask probe` there. What is verified on the
+  machine. It does **not** prove the *live capture path* drives it at 4K. The
+  `advertised, FAILS` case **has** been observed on real hardware — on the Windows test
+  machine, where ffmpeg listed `h264_amf` and died with `DLL amfrt64.dll failed to open`
+  (ledger §1) — but not on the *live capture path*; whoever has the Windows test machine
+  confirms it with `cargo xtask probe` there. What is verified on the
   development host is the selection logic (against injected results) and the smoke test's
   own plumbing (a working encoder passes, an encoder that cannot open reports ffmpeg's
   reason, a hanging child is bounded by the timeout).
 - **The harness is not a substitute for a human.** `cargo xtask verify` runs the criteria
-  it can automate and marks the rest *not performed* with a reason. It has **never been run
-  on Windows** — it was written and exercised on the development host against the synthetic
-  backends (its self-test trigger, its parsers, its report writer and its criterion-7 path
-  all ran there). The first thing to check on the Windows test machine is that the interactive session it
+  it can automate and marks the rest *not performed* with a reason. It has **run on
+  Windows** twice — on 2026-10-15 and again on 2026-10-16, the second time after the
+  harness itself was corrected (ledger §21 and §23) — but a fresh run is still checking
+  the harness as much as the app. The first thing to check on the Windows test machine is that the interactive session it
   runs in really gives the capture backend a desktop: if the report's `capture_started` row
   says the WGC line is missing, or the geometry says `1280x720`, the session has no
-  desktop (or the stub ran) and nothing else in that report means anything. See its own
-  "What this harness does not cover" section for the full list.
+  desktop (or the stub ran) and nothing else in that report means anything. One row was
+  still *not performed* after both runs: `silence_detector`, which needs a machine whose
+  default playback device is not 48 kHz. The other, `eviction`, was unperformable only
+  because the row was written against the old disk ring — it has since been rewritten to
+  read the ring's `evicted=` counter out of the status line (ledger §25). See the harness's
+  own "What this harness does not cover" section for the full list.
 - **Non-Windows runs prove none of this.** Off Windows the pipeline uses `StubCapture`,
   which captures a synthetic image and nothing real. A green macOS/Linux test run is not
   evidence for any of the eight criteria.
@@ -831,8 +848,8 @@ per criterion, with the measured value and PASS/FAIL. Record, specifically:
 - **Criterion 1:** the WGC display name and the captured `W×H`; the configured `fps`; and
   whether `frames=` grew at roughly `fps × seconds` and `span=` tracked real time over the
   run (yes/no).
-- **Criterion 2:** the configured `scratch_cap_bytes`; the largest `bytes=` seen; and the
-  largest the scratch directory measured (note if it was exactly one segment over).
+- **Criterion 2:** the configured `ram_cap_bytes`; the largest `bytes=` seen; and that no
+  `seg-*.mp4` files were written while the buffer ran.
 - **Criterion 3:** `post_seconds`; the measured trigger→`wrote` delta (with the self-test
   trigger this is the two log timestamps; with a real press, your stopwatch); pass/fail
   against `post_seconds + 2 s`.

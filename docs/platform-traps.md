@@ -54,7 +54,7 @@ stream.set_write_timeout(Some(timeout))?;
    pattern, same inheritance; a non-blocking socket ignored the request read timeout and
    `http` read a `WouldBlock` as a **malformed request (400)** instead of answering the
    client. Fixed by `stream.set_nonblocking(false)` before setting the timeouts (commit
-   `c5abc58`). **This one was caught only by CI on a fresh runner** — the failing test
+   `bd59fce`). **This one was caught only by CI on a fresh runner** — the failing test
    `crates/events/tests/gsi_listener.rs::a_post_with_no_auth_block_at_all_is_rejected`
    asserted `403` and got `400`:
 

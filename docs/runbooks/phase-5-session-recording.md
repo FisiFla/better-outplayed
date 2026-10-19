@@ -6,7 +6,10 @@ How to drive the new surface, and what has actually been observed. Written the w
 
 Everything below was run on the development host (macOS, ffmpeg on `PATH`, no GPU encoder)
 with the synthetic sources, which is the only place this pipeline can be exercised without
-Windows. **No Windows run exists** for any of it.
+Windows. **The microphone and the WASAPI capture path have, however, run on Windows**: the
+2026-09-24 session produced a clip with two audio streams and `converting=true` on the
+Windows test machine (ledger §10.2), and the audio-queue fix that followed it was verified
+there (ledger §10.4). Everything else below was still only ever run on the development host.
 
 ---
 
@@ -119,7 +122,9 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
 1. **Buffer-mode session rows share one scratch directory.** Their `size_bytes` is "the bytes
    the ring holds", so two buffer sessions can count the same segments. Full-session rows are
    exact (their own directory).
-2. **The 4K sustained-rate issue is unchanged** (a separate open issue). A full session
+2. **The 4K sustained-rate issue is closed** ([issue #1](https://github.com/FisiFla/better-outplayed/issues/1),
+   closed): the zero-copy path sustains 59.6 of 60 fps with no dropped frames at 3.1–4.0% of
+   one core (ledger §13, §15). A full session
    records at whatever rate the machine sustains; the media timeline is the frames' arrival
    timestamps, so a `pre_seconds` window is still that many real seconds, but at 4K the
    picture can hold frames that were dropped. It does not make full-session recording
