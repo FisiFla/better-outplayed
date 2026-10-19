@@ -1897,7 +1897,7 @@ Windows hardware. Specifically:
   has not been re-soaked at 4K;
 - the desktop shell changes (the degraded start, the hotkey ordering, the folder picker) have
   been exercised by the shell's own test suite and **not** by a person on a screen;
-- the frontend changes have been checked by `svelte-check` (0 errors) and 249 vitest cases,
+- the frontend changes have been checked by `svelte-check` (0 errors) and 251 vitest cases,
   and **not** by a mouse.
 
 The honest summary is: **the code is verified on the development host, the Windows path is

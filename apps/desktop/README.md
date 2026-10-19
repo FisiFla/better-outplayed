@@ -231,7 +231,7 @@ listener, and nothing else).
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 249 vitest tests
+cd apps/desktop && npm test          # 251 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
 cd apps/desktop && npm run shots     # 20 screenshots, 227 checks, 0 failures
