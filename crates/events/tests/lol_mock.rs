@@ -14,6 +14,10 @@
 //!
 //! Every socket is loopback and the poller only issues `GET`s to an in-process responder.
 
+// An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
+// exemption does not reach it: the same rule, stated here.
+#![allow(clippy::unwrap_used)]
+
 use localplay_events::lol::{Endpoint, LolConfig, LolPoller, Response};
 use localplay_events::{EventKind, GameEvent};
 use native_tls::{Identity, TlsAcceptor, TlsConnector};
@@ -397,6 +401,36 @@ fn attaching_to_a_game_already_in_progress_does_not_replay_its_history() {
     let requests = mock.requests();
     assert!(requests.len() >= 2, "the mock saw the polls: {requests:?}");
     assert_eq!(requests[0], "GET /liveclientdata/allgamedata HTTP/1.1");
+}
+
+#[test]
+fn the_live_client_is_only_ever_asked_for_a_get() {
+    // The Live Client Data API is read-only: the client asks it for a document and nothing
+    // else. A `POST` or a `PUT` to the game client is the one thing that must never happen
+    // next to kernel anti-cheat, and a grep cannot guard it — the method is a string in a
+    // request line, and the guard would have to name every method it does not want. So it
+    // is asserted on the wire, by a server that records what it was asked.
+    let mock = MockGame::start(vec![Reply::Body(IN_PROGRESS)]);
+    let mut poller = mock.poller();
+    for _ in 0..3 {
+        poller.poll_once();
+    }
+    // And the client on its own, which is the other way into the same endpoint.
+    let _ = localplay_events::lol::LoopbackClient::for_endpoint_with_root(
+        mock.endpoint(),
+        &mock.root_pem,
+    )
+    .expect("pinned to the mock's root")
+    .get();
+
+    let requests = mock.requests();
+    assert!(!requests.is_empty(), "the mock saw the polls: {requests:?}");
+    for request in &requests {
+        assert!(
+            request.starts_with("GET "),
+            "the Live Client Data API is read-only, and the client asked for {request:?}"
+        );
+    }
 }
 
 #[test]

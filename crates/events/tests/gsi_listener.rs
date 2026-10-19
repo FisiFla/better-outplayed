@@ -8,15 +8,22 @@
 //! Asserted:
 //! * a POST with the configured token is accepted and yields the expected events;
 //! * a wrong token, or no auth block, is rejected and yields nothing (fail closed);
+//! * a wrong token is rejected *before* the body is parsed, however large the body is;
 //! * a malformed body yields nothing, does not panic and does not stop the listener;
+//! * the game is served while a peer holds a connection open;
+//! * a listener pinned to one game refuses the other game's payload;
 //! * the listener binds loopback only and refuses anything else.
+
+// An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
+// exemption does not reach it: the same rule, stated here.
+#![allow(clippy::unwrap_used)]
 
 use localplay_events::gsi::{self, GsiConfig, GsiListener};
 use localplay_events::{EventKind, GameEvent};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CS2_COMPETITIVE: &str = include_str!("fixtures/gsi_cs2_competitive.json");
 const CS2_MENU: &str = include_str!("fixtures/gsi_cs2_menu.json");
@@ -33,9 +40,17 @@ struct Harness {
 
 impl Harness {
     fn start() -> Self {
+        Self::start_with(GsiConfig::new(0, TOKEN))
+    }
+
+    /// A listener pinned to one game: the app id the payload has to name.
+    fn pinned_to(app_id: u32) -> Self {
+        Self::start_with(GsiConfig::new(0, TOKEN).pinned_to(app_id))
+    }
+
+    fn start_with(config: GsiConfig) -> Self {
         let (sink, events) = channel();
-        let listener =
-            gsi::spawn(GsiConfig::new(0, TOKEN), sink).expect("the listener starts on a free port");
+        let listener = gsi::spawn(config, sink).expect("the listener starts on a free port");
         Self { listener, events }
     }
 
@@ -241,13 +256,35 @@ fn a_malformed_body_yields_nothing_and_does_not_stop_the_listener() {
     let harness = Harness::start();
     let addr = harness.addr();
 
+    for body in ["not json at all", "{", "[]", ""] {
+        let response = post(addr, "/gsi", body);
+        assert_eq!(
+            status_of(&response),
+            400,
+            "{body:?} must be refused, got {response}"
+        );
+    }
+
+    // A document that carries no token is refused as unauthorised, whatever else is wrong
+    // with it: the token gate comes before the document is parsed, so the answer is 403
+    // rather than 400. What matters either way is that nothing is derived.
     for body in [
-        "not json at all",
-        "{",
-        "{\"provider\": {\"appid\": 730}, \"map\": {\"round\": \"five\"}}",
-        "[]",
-        "",
-        "{\"auth\":{\"token\":\"fixture-token-not-a-secret\"", // truncated mid-token
+        r#"{"provider": {"appid": 730}, "map": {"round": "five"}}"#,
+        r#"{"auth": {"kind": "cs2"}}"#,
+    ] {
+        let response = post(addr, "/gsi", body);
+        assert_eq!(
+            status_of(&response),
+            403,
+            "{body:?} must be refused, got {response}"
+        );
+    }
+
+    // A document that carries the right token and is broken anyway is malformed: now that
+    // the token has been accepted, the body is worth parsing.
+    for body in [
+        r#"{"auth":{"token":"fixture-token-not-a-secret""#, // truncated mid-token
+        r#"{"auth":{"token":"fixture-token-not-a-secret"},"map":{"round":"five"}}"#,
     ] {
         let response = post(addr, "/gsi", body);
         assert_eq!(
@@ -390,5 +427,103 @@ fn a_flood_of_connections_is_answered_429_and_the_listener_recovers() {
         status_of(&post(addr, "/gsi", "{}")),
         403,
         "served again (403: no token)"
+    );
+}
+
+#[test]
+fn a_wrong_token_is_refused_before_the_body_is_parsed() {
+    // The body is a megabyte of JSON that the document parser would reject: the round is
+    // a string where a number belongs, so a parse-first gate answers 400. The token gate
+    // comes first, so the answer is 403 and the body is never turned into a document.
+    //
+    // This is the difference between a peer that can make the recorder parse megabytes
+    // and one that cannot: a web page in the user's browser can POST here with a
+    // `text/plain` content type, which is a CORS "simple request" and is not preflighted.
+    let harness = Harness::start();
+    let addr = harness.addr();
+
+    let mut body =
+        String::from(r#"{"auth":{"token":"not-the-token"},"map":{"round":"five"},"junk":["#);
+    while body.len() < 1024 * 1024 {
+        body.push_str(r#""yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy","#);
+    }
+    body.push_str(r#"""]}"#);
+
+    let started = Instant::now();
+    let response = post(addr, "/gsi", &body);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status_of(&response),
+        403,
+        "the token is checked first, so the body is never parsed: {response}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "and the refusal is prompt, not the cost of a parse: {elapsed:?}"
+    );
+    assert!(
+        harness.drained().is_empty(),
+        "a refused payload derives nothing"
+    );
+
+    // The listener is unharmed: the game still gets through.
+    assert_eq!(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)), 200);
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
+}
+
+#[test]
+fn the_game_is_served_while_a_peer_holds_a_connection_open() {
+    // A peer that opens a connection and then says nothing holds a reader for the whole
+    // request deadline. The accept loop used to serve connections one at a time, so a
+    // handful of such connections kept the game's own POST from being accepted at all:
+    // the recorder kept running and the feature it exists for was silent.
+    let harness = Harness::start();
+    let addr = harness.addr();
+
+    let mut held = Vec::new();
+    for _ in 0..gsi::WORKERS - 1 {
+        let mut stream = TcpStream::connect(addr).expect("loopback connects");
+        // A head that never ends: the reader waits for the rest of it.
+        stream
+            .write_all(b"POST /gsi HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .expect("the head is sent");
+        held.push(stream);
+    }
+    // Give the readers a moment to take the connections.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let response = post(addr, "/gsi", CS2_COMPETITIVE);
+    let elapsed = started.elapsed();
+    assert_eq!(status_of(&response), 200, "the game is served: {response}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the game waited {elapsed:?} for a reader; a held connection must not hold the game"
+    );
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
+
+    // The held connections are closed, so the readers they occupy are free again.
+    drop(held);
+}
+
+#[test]
+fn a_listener_pinned_to_one_game_refuses_a_payload_from_another() {
+    // The token travels in the game's `cfg` directory, where any local account can read
+    // it. Pinning the listener to one game means a token lifted from the other game's
+    // installed file cannot forge this one's events.
+    let harness = Harness::pinned_to(730);
+    let addr = harness.addr();
+
+    assert_eq!(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)), 200);
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
+
+    assert_eq!(
+        status_of(&post(addr, "/gsi", DOTA_IN_GAME)),
+        403,
+        "a Dota payload is not this listener's game"
+    );
+    assert!(
+        harness.drained().is_empty(),
+        "and it derives nothing: the scoreboard in it is not the watched player's"
     );
 }

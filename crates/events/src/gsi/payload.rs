@@ -12,6 +12,16 @@
 //! * A player's kills live in `player.match_stats` in Counter-Strike and directly on `player`
 //!   in Dota 2, under the same names. [`Player::kills`], [`Player::deaths`] and
 //!   [`Player::assists`] answer for both.
+//!
+//! # The `auth` block is read on its own
+//!
+//! The token gate needs the `auth` block and nothing else, and a body can be two megabytes
+//! of a scoreboard. So [`auth_token`] reads the block without parsing the rest of the
+//! document: the parser walks the body until it finds `auth` and stops there, and the rest
+//! is never turned into a value. The full document is parsed only after the token has been
+//! accepted. Without that, an unauthenticated peer could make the recorder parse megabytes
+//! per request, and a cross-origin `POST` from a web page in the user's browser is
+//! unauthenticated by construction.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,6 +36,98 @@ pub fn parse(body: &[u8]) -> Result<GsiSnapshot, serde_json::Error> {
     let object: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(body)?;
     serde_json::from_value(serde_json::Value::Object(object.into_iter().collect()))
+}
+
+/// What a GSI document's `auth` block says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthToken {
+    /// The document carries this token.
+    Present(String),
+    /// The document is a JSON object with no `auth.token`: there is nothing to compare
+    /// against, so the request is refused.
+    Absent,
+    /// The document is not a readable JSON object, so it has no `auth` block in it. The
+    /// reason is not carried: the body is attacker-controlled until the token is accepted,
+    /// and a parser's message can quote it.
+    Unreadable,
+}
+
+/// How much of a body the token probe looks at.
+///
+/// The game sends the `auth` block first — it is the block the installed file declares, and
+/// it is the first key in every payload this project has seen — so the token is within the
+/// first few dozen bytes. The bound is what keeps the gate cheap: without it, a peer who
+/// sends two megabytes of JSON with no `auth` block in it would make the recorder walk all
+/// of it, and the walk is exactly what an unauthenticated peer gets to spend.
+///
+/// A body whose `auth` block is further in than this is refused. The game does not send
+/// one, and a refusal is loud: the listener answers `400` and says so in the log, rather
+/// than a game that silently posts into the void.
+pub const PROBE_BYTES: usize = 64 * 1024;
+
+/// The token in a GSI POST body's `auth` block, read without parsing the rest of the body.
+///
+/// The whole document is parsed only once the token has been accepted; this is the cheap
+/// look that comes first, and it is cheap in two ways: it stops at the `auth` block, so the
+/// rest of the body is never turned into values, and it never reads past [`PROBE_BYTES`].
+///
+/// The first `auth` block wins. A body carrying two is not something the game sends, and
+/// the document that is finally parsed is the authority on the token anyway
+/// ([`crate::gsi::token_matches`]), so a body that hides a second block behind the first
+/// is refused rather than believed.
+pub fn auth_token(body: &[u8]) -> AuthToken {
+    let window = &body[..body.len().min(PROBE_BYTES)];
+    let mut found: Option<BTreeMap<String, String>> = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(window);
+    let outcome =
+        serde::Deserializer::deserialize_any(&mut deserializer, AuthVisitor { found: &mut found });
+    match found {
+        Some(auth) => match auth.get("token").cloned() {
+            Some(token) => AuthToken::Present(token),
+            None => AuthToken::Absent,
+        },
+        // The document was read to its end without an `auth` block: it is a document, and it
+        // carries no token.
+        None => match outcome {
+            Ok(()) => AuthToken::Absent,
+            Err(_) => AuthToken::Unreadable,
+        },
+    }
+}
+
+/// A visitor that reads a document's `auth` block and stops there.
+///
+/// The block is handed back through a slot rather than through the visitor's value, because
+/// the value of a document whose reading was cut short is an error: the parser insists on
+/// the closing brace of a map it has already read, and the whole point is to stop before the
+/// rest of the document.
+struct AuthVisitor<'a> {
+    found: &'a mut Option<BTreeMap<String, String>>,
+}
+
+impl<'de, 'a> serde::de::Visitor<'de> for AuthVisitor<'a> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a GSI document")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "auth" {
+                *self.found = Some(map.next_value()?);
+                // The block is all the gate needs. The rest of the document is left unread,
+                // so a two-megabyte payload costs a few bytes of parsing. The error is the
+                // signal to stop: the value of a document that was not read to its end is
+                // not a value.
+                return Err(serde::de::Error::custom("the auth block was read"));
+            }
+            // Everything else is skipped without being built: a document the size of the
+            // attacker's choosing must not become values before the token has been checked.
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(())
+    }
 }
 
 /// One GSI document.
@@ -313,5 +415,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cs2.kills(), Some(0), "a real zero is a value");
+    }
+
+    #[test]
+    fn the_auth_block_is_read_without_the_rest_of_the_document() {
+        // The gate reads the block and stops: the rest of the body is not parsed, so a
+        // document that is broken *after* the block still yields its token. The full parse
+        // is what rejects it, later.
+        assert_eq!(
+            auth_token(br#"{"auth":{"token":"abc"},"map":{"round":"five"}}"#),
+            AuthToken::Present("abc".to_string())
+        );
+        assert_eq!(
+            auth_token(br#"{"auth":{"token":"abc"},"map":"#),
+            AuthToken::Present("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn a_document_without_a_token_says_so() {
+        assert_eq!(
+            auth_token(br#"{"provider":{"appid":730}}"#),
+            AuthToken::Absent
+        );
+        assert_eq!(auth_token(br#"{"auth":{"kind":"cs2"}}"#), AuthToken::Absent);
+        assert_eq!(auth_token(b"{}"), AuthToken::Absent);
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_document_has_no_token() {
+        // The reason is not carried: the body is attacker-controlled until the token has
+        // been accepted, and a parser's message can quote it.
+        for body in [
+            &b"not json at all"[..],
+            &b"["[..],
+            &b""[..],
+            &b"{\"auth\":"[..],
+            &b"{\"auth\":{\"token\":1}}"[..],
+        ] {
+            assert_eq!(auth_token(body), AuthToken::Unreadable, "got for {body:?}");
+        }
     }
 }

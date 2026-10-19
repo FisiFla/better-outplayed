@@ -195,7 +195,7 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     if msg.message == WM_HOTKEY {
-                        let index = (msg.wParam.0 as usize).saturating_sub(1);
+                        let index = msg.wParam.0.saturating_sub(1);
                         if tx.send(index).is_err() {
                             break;
                         }
