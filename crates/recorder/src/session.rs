@@ -5,7 +5,8 @@
 //! spare, so it scans the same directory names with the same [`localplay_replay::scanner`]
 //! functions and never evicts. The bypass is structural (there is no cap to pass), and the scan,
 //! sequence reservation and clip window are [`localplay_replay`]'s public pieces
-//! ([`SegmentLedger`], [`scanner`], [`window`], [`ClipSplicer`]); nothing here re-implements a
+//! ([`SegmentLedger`], [`scanner`], [`window`], [`localplay_replay::splice::ClipSplicer`]);
+//! nothing here re-implements a
 //! concatenation.
 //!
 //! ```text
@@ -25,7 +26,7 @@ use anyhow::{bail, Context, Result};
 use localplay_media::{edit, FfmpegBinaries, MediaInfo};
 use localplay_replay::ledger::{Segment, SegmentLedger};
 use localplay_replay::scanner::{self, newly_complete, next_segment_number};
-use localplay_replay::splice::{ClipMetadata, ClipSplicer};
+use localplay_replay::splice::ClipMetadata;
 use localplay_replay::window;
 use localplay_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
@@ -121,7 +122,24 @@ impl SessionRing {
             self.ledger.push(Segment {
                 seq,
                 file,
-                start_ms: seq * self.segment_ms,
+                start_ms: seq.saturating_mul(self.segment_ms),
+                // The segment's length is NOMINAL: the segment muxer is told a length, and the
+                // file it writes holds a little less (with `-fps_mode passthrough` the last
+                // frame of a segment arrives one frame interval before the boundary, measured
+                // at ~940ms of media per 1000ms segment at 10fps). So this ledger's clock runs
+                // ahead of the real media by up to one frame interval per segment — about 3% of
+                // the timeline at 30fps and 10% at 10fps.
+                //
+                // The RAM ring is the reference behaviour: its fragments are measured from their
+                // own sample tables, so its clock is the real one. A session's clock is nominal
+                // because a segment's file is a whole number of seconds by construction and
+                // measuring it would mean probing every segment on every scan.
+                //
+                // What this costs: "30s of pre-roll" is 30s of *nominal* media in a session and
+                // 30s of real media in a buffer, and the post-roll wait is expressed in the
+                // ledger's clock, so it can be satisfied while the last frames of the post-roll
+                // are still unwritten. The budget is sized for that (see `POST_ROLL_MARGIN` and
+                // the segment term in the engine's post-roll budget).
                 duration_ms: self.segment_ms,
                 bytes,
             });
@@ -172,8 +190,14 @@ impl SessionRing {
         &self.bin
     }
 
+    /// The directory the clips are written into.
+    pub fn clips_dir(&self) -> &Path {
+        &self.clips_dir
+    }
+
     /// Extract a clip around `trigger_ms` from the session's own footage: the ring's trigger, using the
-    /// same [`ClipSplicer::splice`] with a window from this ledger and the same truncated-pre-roll warning.
+    /// same [`localplay_replay::splice::ClipSplicer::splice`] with a window from this ledger and
+    /// the same truncated-pre-roll warning.
     pub fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
         self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
     }
@@ -186,10 +210,30 @@ impl SessionRing {
         pre_ms: u64,
         post_ms: u64,
     ) -> Result<ClipMetadata> {
+        let out = self.clips_dir.join(format!("{stem}.mp4"));
+        let source = self.clip_source(trigger_ms, pre_ms, post_ms)?;
+        source.splice(&self.bin, &out, &self.encoder)
+    }
+
+    /// The footage a clip around `trigger_ms` is cut from.
+    ///
+    /// The window is resolved here and only the *segments* travel on, so the concatenation can
+    /// run on a thread of its own: a session's footage is files, and reading them costs the
+    /// recording nothing.
+    ///
+    /// The window's start is the resolved one — the first segment that overlaps the request —
+    /// because that is where the clip's first frame really is. The requested start is only a
+    /// bound on it, and dating a clip by the request is off by up to one segment.
+    pub(crate) fn clip_source(
+        &self,
+        trigger_ms: u64,
+        pre_ms: u64,
+        post_ms: u64,
+    ) -> Result<crate::ClipSource> {
         let win = window::resolve(
             &self.ledger,
             // `trigger_ms` is run-relative; the ledger's timeline is absolute.
-            self.origin_ms + trigger_ms,
+            self.origin_ms.saturating_add(trigger_ms),
             pre_ms,
             post_ms,
         )
@@ -197,17 +241,14 @@ impl SessionRing {
         if win.truncated_front {
             tracing::warn!(
                 "only {}ms of pre-roll was buffered for a {}ms request",
-                win.segments.first().map(|_| win.duration_ms()).unwrap_or(0),
+                win.duration_ms(),
                 pre_ms
             );
         }
-        let out = self.clips_dir.join(format!("{stem}.mp4"));
-        if self.microphone {
-            // A clip from a session with a microphone must keep that track, like the session file (see `finalise`).
-            finalise(&self.bin, &out, &win.segments, &self.encoder, true)
-        } else {
-            ClipSplicer::splice(&self.bin, &win, &out, &self.encoder)
-        }
+        Ok(crate::ClipSource::Segments {
+            window: win,
+            multitrack: self.microphone,
+        })
     }
 }
 
@@ -254,7 +295,7 @@ pub fn segments_on_disk(dir: &Path, segment_ms: u64) -> Result<Vec<Segment>> {
             Segment {
                 seq,
                 file,
-                start_ms: seq * segment_ms,
+                start_ms: seq.saturating_mul(segment_ms),
                 duration_ms: segment_ms,
                 bytes: std::fs::metadata(dir.join(format!("seg-{seq:06}.mp4")))
                     .map(|m| m.len())
@@ -895,7 +936,9 @@ mod tests {
             segments: segments.clone(),
             truncated_front: false,
         };
-        let meta = ClipSplicer::splice(&bin(), &window, &spliced, "libx264").expect("the splice");
+        let meta =
+            localplay_replay::splice::ClipSplicer::splice(&bin(), &window, &spliced, "libx264")
+                .expect("the splice");
         assert_eq!(
             audio_stream_count(&bin(), &spliced),
             Some(2),

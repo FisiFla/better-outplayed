@@ -225,9 +225,15 @@ pub struct CleanupReport {
 /// the config and the clock. Silent when idle, since it runs at startup and every
 /// [`crate::CLEANUP_INTERVAL`]. The returned [`RetentionOutcome`] holds what the pass measured, so
 /// callers and tests need not reconstruct it from log lines.
+///
+/// `clips_dir` is the directory the clips live in, and it is read as well as the index: a clip
+/// whose index write failed is on disk and in that directory, and the policy plans over the rows.
+/// Without the directory the orphans would be invisible — never counted, never evicted, never
+/// reported — and the directory could grow past its cap without bound.
 pub fn cleanup_pass(
     store: &Store,
     storage: &StorageSection,
+    clips_dir: &Path,
     report: &mut CleanupReport,
 ) -> RetentionOutcome {
     let policy = RetentionPolicy {
@@ -303,11 +309,58 @@ pub fn cleanup_pass(
         );
     }
 
+    // The files in the clips directory that no row names: a clip whose index write failed is
+    // on disk and in the library's directory, but the policy plans over the rows. They are
+    // counted against the cap and named, so the directory cannot grow past it unnoticed.
+    let orphans = orphan_clips(clips_dir, &clips);
+    let orphan_bytes: u64 = orphans.iter().map(|(_, bytes)| bytes).sum();
+    if !orphans.is_empty() {
+        tracing::warn!(
+            "storage policy: {} file(s) in {} are not in the index ({} bytes): the index write \
+             failed for them, so the policy cannot manage them. They count against the cap, and \
+             only the user can remove them.",
+            orphans.len(),
+            clips_dir.display(),
+            orphan_bytes
+        );
+    }
+
     // A cap that immune members alone exceed (favourites, a running session) can never be met, so the
     // shortfall is what the user must act on. Warn only when it appears or changes.
-    report_clips_shortfall(report, policy.clips.max_total_bytes, &plan, &outcome);
+    report_clips_shortfall(
+        report,
+        policy.clips.max_total_bytes,
+        &plan,
+        &outcome,
+        orphan_bytes,
+    );
     report_sessions_shortfall(report, policy.sessions.max_total_bytes, &plan, &outcome);
     outcome
+}
+
+/// The clips in the directory that no row names, with their sizes.
+///
+/// A clip is kept when its index write fails — the user asked for it — but then nothing in the
+/// index knows about it: it is not in the library, and the storage policy, which plans over the
+/// rows, cannot see it either. These are those files.
+fn orphan_clips(clips_dir: &Path, rows: &[localplay_store::Clip]) -> Vec<(PathBuf, u64)> {
+    let named: std::collections::HashSet<&Path> =
+        rows.iter().map(|row| row.path.as_path()).collect();
+    let mut orphans = Vec::new();
+    let Ok(entries) = std::fs::read_dir(clips_dir) else {
+        // A directory that cannot be read holds nothing this pass can account for; the clip
+        // rows are still planned over.
+        return orphans;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || named.contains(path.as_path()) {
+            continue;
+        }
+        let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        orphans.push((path, bytes));
+    }
+    orphans
 }
 
 /// The clips cap's unsatisfiable case (see [`cleanup_pass`]).
@@ -316,19 +369,25 @@ fn report_clips_shortfall(
     cap: u64,
     plan: &localplay_store::retention::RetentionPlan,
     outcome: &RetentionOutcome,
+    orphan_bytes: u64,
 ) {
-    if outcome.clips.cap_met {
+    // The directory's real size: the rows the policy planned over, plus the files no row
+    // names. The cap is about the directory, so the orphans count.
+    let held = outcome.clips.bytes_after.saturating_add(orphan_bytes);
+    if outcome.clips.cap_met && held <= cap {
         report.last_clips_shortfall = None;
-    } else if report.last_clips_shortfall != Some(plan.clips.over_cap_by_bytes) {
+        return;
+    }
+    let shortfall = plan.clips.over_cap_by_bytes.max(held.saturating_sub(cap));
+    if report.last_clips_shortfall != Some(shortfall) {
         tracing::warn!(
-            "storage policy: storage.max_total_bytes ({cap}) cannot be satisfied — the \
-             favourited clips alone exceed it by {} bytes, and favourites are exempt from \
-             both rules, so nothing is deleted for it. The clips directory holds {} bytes. \
-             Raise storage.max_total_bytes or un-favourite some clips.",
-            plan.clips.over_cap_by_bytes,
-            outcome.clips.bytes_after
+            "storage policy: storage.max_total_bytes ({cap}) cannot be satisfied — the clips \
+             directory holds {held} bytes, {shortfall} over the cap, and nothing can be deleted \
+             for it: favourites are exempt from both rules, and {orphan_bytes} of those bytes \
+             are in files the index does not name. Raise storage.max_total_bytes, un-favourite \
+             some clips, or remove the unindexed files by hand."
         );
-        report.last_clips_shortfall = Some(plan.clips.over_cap_by_bytes);
+        report.last_clips_shortfall = Some(shortfall);
     }
 }
 
@@ -637,7 +696,7 @@ mod tests {
         // Room for one of the two clips, and a session store with nothing in it.
         let storage = storage(&clips_dir, 1_000, &dir.path().join("sessions"), 1 << 30);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
 
         let rows = store.list_clips().unwrap();
         assert_eq!(rows.len(), 1, "the cap allows one of the two clips");
@@ -661,7 +720,7 @@ mod tests {
         assert!(outcome.clips.cap_met, "the clips cap is met after the pass");
 
         // A second pass must leave the survivor alone: this pass runs every `CLEANUP_INTERVAL`, so it must be a no-op once the library fits.
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
         assert_eq!(store.list_clips().unwrap().len(), 1);
         assert!(survivor.is_file(), "an idle pass deletes nothing");
         assert_eq!(outcome.deleted(), 0);
@@ -722,7 +781,7 @@ mod tests {
         // Each cap allows exactly one (the favourite) and nothing more.
         let storage = storage(&clips_dir, 1_000, &sessions_dir, 1_000);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
 
         assert_eq!(store.list_clips().unwrap().len(), 1, "one clip survives");
         assert!(
@@ -793,7 +852,7 @@ mod tests {
 
         let storage = storage(&clips_dir, 100, &sessions_dir, 100);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
 
         assert_eq!(
             outcome.deleted(),
@@ -824,14 +883,14 @@ mod tests {
             .is_none());
 
         // The report is remembered (an identical pass does not change it); once the immunity is gone the next pass evicts both classes.
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
         assert_eq!(outcome.deleted(), 0, "still nothing to do: {outcome:?}");
         assert_eq!(report.last_sessions_shortfall, Some(1_900));
 
         // The recording ends and the clip is un-favourited, so the policy now has something it may delete.
         store.end_session(running, 9_000, None, 2_000, 0).unwrap();
         store.set_favourite(clip_id, false).unwrap();
-        let outcome = cleanup_pass(&store, &storage, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
         assert_eq!(
             outcome.deleted(),
             2,

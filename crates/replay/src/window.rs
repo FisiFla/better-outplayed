@@ -32,6 +32,16 @@ impl SegmentWindow {
     pub fn duration_ms(&self) -> u64 {
         self.segments.iter().map(|s| s.duration_ms).sum()
     }
+
+    /// Where the window really starts, on the ledger's timeline.
+    ///
+    /// Not the requested start: a window is cut at segment boundaries, and the first segment
+    /// that overlaps the request begins at or *before* it. A caller that dates a clip by the
+    /// request rather than by this number is off by up to one segment, which is exactly the
+    /// error the index row and the chapter offsets must not carry.
+    pub fn start_ms(&self) -> u64 {
+        self.segments.first().map(|s| s.start_ms).unwrap_or(0)
+    }
 }
 
 /// Resolve `[trigger_ms - pre_ms, trigger_ms + post_ms]` against the ledger.
@@ -46,7 +56,9 @@ pub fn resolve(
     }
 
     let available_ms = ledger.span_ms();
-    let needed_ms = trigger_ms + post_ms;
+    // Saturating: the request comes from a configuration and a trigger, and a window that
+    // overflows the timeline must fail as "no post-roll", not wrap into the past.
+    let needed_ms = trigger_ms.saturating_add(post_ms);
     if available_ms < needed_ms {
         return Err(WindowError::PostRollUnavailable {
             needed_ms,
@@ -99,6 +111,20 @@ mod tests {
         let w = resolve(&ledger(20), 10_000, 5_000, 5_000).unwrap();
         assert_eq!(w.seqs(), vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert!(!w.truncated_front);
+    }
+
+    #[test]
+    fn the_window_starts_at_the_first_segment_it_selected() {
+        // The request begins half a second into a segment, so the segment that covers it
+        // starts before the request does.
+        let w = resolve(&ledger(20), 10_500, 5_000, 5_000).unwrap();
+        assert_eq!(w.seqs(), vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            w.start_ms(),
+            5_000,
+            "the window starts where its first segment starts, not where the request did: the \
+             index row and the chapter offsets are measured from the clip's first frame"
+        );
     }
 
     #[test]

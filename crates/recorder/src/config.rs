@@ -11,7 +11,7 @@ use serde::Deserialize;
 /// `[recorder]`: which recording this run is.
 ///
 /// Its own section because the mode is what the engine is asked to do, not a property of the ring
-/// or the storage policy: the scratch cap applies to one mode only, and only one produces a session file.
+/// or the storage policy: the RAM cap applies to one mode only, and only one produces a session file.
 ///
 /// ```toml
 /// [recorder]
@@ -32,7 +32,7 @@ pub struct RecorderSection {
 /// * [`RecordingMode::ReplayBuffer`]: a bounded RAM ring of the last few minutes; a hotkey or game
 ///   event splices a clip out of it, older footage is dropped at `buffer.ram_cap_bytes`, and
 ///   nothing is written until a clip is asked for.
-/// * [`RecordingMode::FullSession`]: segments go into a per-session directory that the scratch cap
+/// * [`RecordingMode::FullSession`]: segments go into a per-session directory that the RAM cap
 ///   does not apply to (evicting the oldest segment of a long recording would delete footage the
 ///   user asked for); stopping losslessly concatenates them into one `session-<timestamp>.mp4`.
 ///
@@ -66,7 +66,7 @@ impl RecordingMode {
         }
     }
 
-    /// Whether this mode writes a session file and keeps its segments free of the scratch cap.
+    /// Whether this mode writes a session file and keeps its segments free of the RAM cap.
     pub fn is_full_session(self) -> bool {
         matches!(self, RecordingMode::FullSession)
     }
@@ -118,11 +118,14 @@ pub struct MicSection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BufferSection {
     /// Media time kept before a trigger.
+    #[serde(deserialize_with = "clamp_seconds")]
     pub pre_seconds: u64,
     /// Media time kept after a trigger.
+    #[serde(deserialize_with = "clamp_seconds")]
     pub post_seconds: u64,
     /// Length of one scratch segment, also the keyframe interval, so a clip is a lossless
     /// concatenation of whole segments.
+    #[serde(deserialize_with = "clamp_seconds")]
     pub segment_time: u64,
     /// Empty means `<app data dir>/scratch`.
     pub scratch_dir: String,
@@ -135,23 +138,48 @@ pub struct BufferSection {
     pub ram_cap_bytes: u64,
     /// The longest pre-roll a single clip may ask for, in seconds; `0` means `pre_seconds`. It sizes
     /// the ring so a long-clip hotkey can reach further back. Larger requests are clamped, not errors.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "clamp_seconds")]
     pub max_pre_seconds: u64,
     /// The longest post-roll a single clip may ask for, in seconds; `0` means `post_seconds`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "clamp_seconds")]
     pub max_post_seconds: u64,
 }
 
 impl BufferSection {
     /// The pre-roll ceiling in milliseconds: the larger of `pre_seconds` and `max_pre_seconds`.
+    ///
+    /// Saturating: the seconds come from a file, and a hand-edited one must not wrap the
+    /// millisecond arithmetic into the past.
     pub fn max_pre_ms(&self) -> u64 {
-        self.pre_seconds.max(self.max_pre_seconds) * 1000
+        self.pre_seconds
+            .max(self.max_pre_seconds)
+            .saturating_mul(1000)
     }
 
     /// The post-roll ceiling in milliseconds: the larger of `post_seconds` and `max_post_seconds`.
+    ///
+    /// Saturating, like [`BufferSection::max_pre_ms`].
     pub fn max_post_ms(&self) -> u64 {
-        self.post_seconds.max(self.max_post_seconds) * 1000
+        self.post_seconds
+            .max(self.max_post_seconds)
+            .saturating_mul(1000)
     }
+}
+
+/// The longest window the configuration may ask for, in seconds.
+///
+/// A day. The number is a *request*: what can actually be held is bounded by the ring's caps
+/// (the RAM budget, the pre-roll window), so a larger one changes nothing but the arithmetic. The
+/// clamp is here so a hand-edited file cannot overflow the millisecond arithmetic downstream.
+pub const MAX_WINDOW_SECONDS: u64 = 86_400;
+
+/// A window length from the configuration, clamped to [`MAX_WINDOW_SECONDS`].
+///
+/// The clamp is arithmetic on a number that has already been parsed, and the point is to bound
+/// it before the millisecond arithmetic downstream sees it.
+fn clamp_seconds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let seconds = u64::deserialize(deserializer)?;
+    Ok(seconds.min(MAX_WINDOW_SECONDS))
 }
 
 /// 256 MiB. See [`BufferSection::ram_cap_bytes`] for why it is not larger.
@@ -315,6 +343,34 @@ output_size = \"\"
         assert!(
             err.to_string().contains("adapt_fps"),
             "the error names the key that is wrong: {err}"
+        );
+    }
+
+    /// A hand-edited file cannot overflow the millisecond arithmetic: the window lengths are
+    /// clamped when they are parsed, not when they are multiplied.
+    #[test]
+    fn an_absurd_window_is_clamped_when_it_is_parsed() {
+        #[derive(Debug, Deserialize)]
+        struct File {
+            buffer: BufferSection,
+        }
+        let text = format!(
+            "{MINIMAL}\n[buffer]\npre_seconds = {huge}\npost_seconds = {huge}\n\
+             segment_time = {huge}\nscratch_dir = \"\"\n",
+            huge = u64::MAX
+        );
+        let file: File = toml::from_str(&text).expect("a file with absurd windows parses");
+        assert_eq!(
+            file.buffer.pre_seconds, MAX_WINDOW_SECONDS,
+            "the request is clamped at parse time"
+        );
+        assert_eq!(file.buffer.post_seconds, MAX_WINDOW_SECONDS);
+        assert_eq!(file.buffer.segment_time, MAX_WINDOW_SECONDS);
+        // And the arithmetic below it cannot overflow: a day of milliseconds is far inside u64.
+        assert_eq!(
+            file.buffer.max_pre_ms(),
+            MAX_WINDOW_SECONDS * 1000,
+            "the ceiling in milliseconds is exact"
         );
     }
 

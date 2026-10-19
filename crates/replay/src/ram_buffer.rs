@@ -137,6 +137,15 @@ impl MemoryWindow<'_> {
         }
     }
 
+    /// Where the window really starts, on the ring's timeline.
+    ///
+    /// Not the requested start: the window is cut at fragment boundaries, and the first
+    /// fragment that overlaps the request begins at or *before* it. A caller that dates a clip
+    /// by the request rather than by this number is off by up to one fragment.
+    pub fn start_ms(&self) -> u64 {
+        self.segments.first().map(|s| s.start_ms).unwrap_or(0)
+    }
+
     /// How many audio tracks the footage carries, which `edit::audio_titles` needs because a
     /// `-c copy` to a file loses the names the encoder set.
     pub fn audio_tracks(&self) -> usize {
@@ -542,6 +551,33 @@ mod tests {
         assert!(
             window.duration_ms() >= 1_000,
             "the window covers media time"
+        );
+    }
+
+    #[test]
+    fn a_window_starts_at_the_first_fragment_it_selected() {
+        let ring = ring_of(5);
+        let closed: Vec<u64> = ring
+            .segments()
+            .filter(|s| s.is_closed())
+            .map(|s| s.start_ms)
+            .collect();
+        assert!(
+            closed.len() >= 3,
+            "need a few closed segments, got {closed:?}"
+        );
+
+        // A range that begins between two fragments: the window starts at the fragment that
+        // covers it, which is the one before the request's own start.
+        let start = closed[1] + 100;
+        let window = ring
+            .window(start, closed[2] + 1)
+            .expect("a window over the middle");
+        assert_eq!(
+            window.start_ms(),
+            closed[1],
+            "the window starts where its first fragment starts, not where the request did: the \
+             index row and the chapter offsets are measured from the clip's first frame"
         );
     }
 

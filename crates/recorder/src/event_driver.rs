@@ -293,19 +293,57 @@ pub fn act_on_event_in(
     event: GameEvent,
     window: ClipWindow,
 ) -> Result<Option<RecordedClip>> {
-    if event.is_highlight() {
-        let described = format!("{} {}", event.source, event.kind);
+    act_on_event_at(
+        recorder,
+        TimedEvent {
+            event,
+            at_ms: recorder.media_now_ms(),
+        },
+        window,
+    )
+}
+
+/// A derived event and the media time it arrived at.
+///
+/// The time is sampled when the event *arrives*, not when it is acted on. A burst is coalesced
+/// before its clip is cut — up to 60% of the pre-roll, which is 18 seconds at the default
+/// `pre_seconds` — and a marker stamped at the end of that wait lands that long after the
+/// moment it describes. The arrival time is the only honest answer, and it is the one the
+/// clip's chapter and the `events` row are written with.
+#[derive(Debug, Clone)]
+pub struct TimedEvent {
+    /// The event itself.
+    pub event: GameEvent,
+    /// The recorder's media timeline position when the event arrived.
+    ///
+    /// The media timeline, not the wall clock: the footage is measured on it, so a marker
+    /// stamped with it lands next to the clip that covers the moment.
+    pub at_ms: u64,
+}
+
+/// [`act_on_event_in`] with the moment the event happened.
+pub fn act_on_event_at(
+    recorder: &Recorder,
+    timed: TimedEvent,
+    window: ClipWindow,
+) -> Result<Option<RecordedClip>> {
+    if timed.event.is_highlight() {
+        let described = format!("{} {}", timed.event.source, timed.event.kind);
         recorder
-            .clip_now_in(ClipReason::GameEvent(event), window)
+            .clip_now_in_at(
+                ClipReason::GameEvent(timed.event),
+                window,
+                Some(timed.at_ms),
+            )
             .map(|clip| {
                 tracing::info!("the {described} clip is {}", clip.metadata.path.display());
                 Some(clip)
             })
             .with_context(|| format!("taking a clip for a {described} event"))
     } else {
-        let described = format!("{} {}", event.source, event.kind);
+        let described = format!("{} {}", timed.event.source, timed.event.kind);
         recorder
-            .note_event(event)
+            .note_event_at(timed.event, Some(timed.at_ms))
             .map(|id| {
                 tracing::info!("recorded the {described} marker as event #{id}");
                 None
@@ -342,7 +380,16 @@ impl Coalesce {
 
 /// Everything in one burst, `first` included, in arrival order. Markers arriving meanwhile are
 /// collected but neither extend nor end the burst; the channel closing ends it.
-fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> Vec<GameEvent> {
+///
+/// Each member carries the media time it arrived at: the burst is waited out before the clip is
+/// cut, and a marker stamped with the request's instant would name the end of the wait rather
+/// than the moment the event happened.
+fn gather_burst(
+    first: TimedEvent,
+    rx: &Receiver<GameEvent>,
+    policy: &Policy,
+    media_now: &dyn Fn() -> u64,
+) -> Vec<TimedEvent> {
     let c = policy.coalesce;
     let started = std::time::Instant::now();
     let mut last_highlight = started;
@@ -360,7 +407,10 @@ fn gather_burst(first: GameEvent, rx: &Receiver<GameEvent>, policy: &Policy) -> 
                 if policy.clips(&event) {
                     last_highlight = std::time::Instant::now();
                 }
-                burst.push(event);
+                burst.push(TimedEvent {
+                    event,
+                    at_ms: media_now(),
+                });
             }
             Err(_) => return burst,
         }
@@ -375,20 +425,26 @@ pub fn act_on_burst(
     rx: &Receiver<GameEvent>,
     policy: &Policy,
 ) -> Result<Option<RecordedClip>> {
-    if !policy.clips(&first) {
+    // The moment the first event arrived: the caller received it just before calling, and the
+    // burst it belongs to may not be cut for another whole coalescing window.
+    let first = TimedEvent {
+        event: first,
+        at_ms: recorder.media_now_ms(),
+    };
+    if !policy.clips(&first.event) {
         // A marker, or a highlight the player muted: recorded on the timeline, no footage.
         return recorder
-            .note_event(first)
+            .note_event_at(first.event, Some(first.at_ms))
             .map(|_| None)
             .context("recording a game-event marker");
     }
-    let mut burst = gather_burst(first, rx, policy).into_iter();
+    let mut burst = gather_burst(first, rx, policy, &|| recorder.media_now_ms()).into_iter();
     let head = burst.next().expect("a burst always holds its first event");
-    let window = policy.window_for(head.source);
-    let result = act_on_event_in(recorder, head, window);
+    let window = policy.window_for(head.event.source);
+    let result = act_on_event_at(recorder, head, window);
     for rest in burst {
         // Marker-only: the clip above already covers these moments.
-        if let Err(err) = recorder.note_event(rest) {
+        if let Err(err) = recorder.note_event_at(rest.event, Some(rest.at_ms)) {
             tracing::warn!("a burst event could not be recorded as a marker: {err:#}");
         }
     }
@@ -488,6 +544,11 @@ mod tests {
         )
     }
 
+    /// An event with the media time it arrived at.
+    fn timed(event: GameEvent, at_ms: u64) -> TimedEvent {
+        TimedEvent { event, at_ms }
+    }
+
     fn quick() -> Policy {
         Policy {
             coalesce: Coalesce {
@@ -570,7 +631,7 @@ mod tests {
         for _ in 0..4 {
             tx.send(kill()).unwrap();
         }
-        let burst = gather_burst(kill(), &rx, &quick());
+        let burst = gather_burst(timed(kill(), 0), &rx, &quick(), &|| 0);
         assert_eq!(
             burst.len(),
             5,
@@ -585,7 +646,7 @@ mod tests {
         let mut policy = quick();
         policy.coalesce.max = Duration::from_secs(3_600);
         let (_tx, rx) = mpsc::channel::<GameEvent>();
-        assert_eq!(gather_burst(kill(), &rx, &policy).len(), 1);
+        assert_eq!(gather_burst(timed(kill(), 0), &rx, &policy, &|| 0).len(), 1);
     }
 
     #[test]
@@ -599,7 +660,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let burst = gather_burst(kill(), &rx, &quick());
+        let burst = gather_burst(timed(kill(), 0), &rx, &quick(), &|| 0);
         assert!(
             burst.len() > 1,
             "the burst gathered the stream until the cut"

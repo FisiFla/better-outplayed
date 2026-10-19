@@ -20,7 +20,6 @@
 
 use anyhow::{bail, Context, Result};
 use localplay_media::FfmpegBinaries;
-use localplay_replay::splice::ClipSplicer;
 use localplay_replay::{MemoryRingBuffer, MemoryStats};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -72,7 +71,7 @@ impl SinkFeed {
 
 /// Record the first reason the session file stopped growing.
 fn record_sink_failure(slot: &Arc<Mutex<Option<String>>>, why: String) {
-    let mut guard = slot.lock().expect("the sink failure slot");
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_none() {
         tracing::error!(
             "the session file stopped growing: {why}. The replay buffer keeps working, but the              saved session will end where it stopped"
@@ -200,7 +199,7 @@ impl MemoryRing {
                     );
                 }
             })
-            .expect("spawning the in-memory ring's reader thread");
+            .context("spawning the in-memory ring's reader thread")?;
         Ok(Self {
             shared,
             failure,
@@ -267,7 +266,12 @@ impl MemoryRing {
         if let Some(writer) = self.sink_writer.take() {
             let _ = writer.join();
         }
-        match self.failure.lock().expect("the failure slot").clone() {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
             Some(why) => bail!("the in-memory ring's reader stopped early: {why}"),
             None => Ok(()),
         }
@@ -295,6 +299,11 @@ impl MemoryRing {
         &self.bin
     }
 
+    /// The directory the clips are written into.
+    pub fn clips_dir(&self) -> &Path {
+        &self.clips_dir
+    }
+
     /// [`MemoryRing::trigger`] with this clip's own pre- and post-roll, already clamped to what the ring can hold.
     pub fn trigger_window(
         &self,
@@ -303,7 +312,32 @@ impl MemoryRing {
         pre_ms: u64,
         post_ms: u64,
     ) -> Result<localplay_replay::splice::ClipMetadata> {
-        if let Some(why) = self.failure.lock().expect("the failure slot").clone() {
+        let out = self.clips_dir.join(format!("{stem}.mp4"));
+        let source = self.clip_source(trigger_ms, pre_ms, post_ms)?;
+        source.splice(&self.bin, &out, &self.encoder)
+    }
+
+    /// The footage a clip around `trigger_ms` is cut from, lifted out of the ring.
+    ///
+    /// The bytes are copied out from under the ring's lock and the window's own numbers travel
+    /// with them, so the splice can run on a thread of its own: ffmpeg takes as long as the clip
+    /// is long, and the ring has to keep filling while it does (see the module note).
+    ///
+    /// The window's start is the *resolved* one — the first fragment that overlaps the request —
+    /// because that is where the clip's first frame really is. The requested start is only a
+    /// bound on it, and dating a clip by the request is off by up to one fragment.
+    pub(crate) fn clip_source(
+        &self,
+        trigger_ms: u64,
+        pre_ms: u64,
+        post_ms: u64,
+    ) -> Result<crate::ClipSource> {
+        if let Some(why) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
             bail!(
                 "the in-memory ring stopped reading the encoder's stream, so there is no footage \
                  to clip: {why}"
@@ -313,7 +347,7 @@ impl MemoryRing {
         let end = trigger_ms.saturating_add(post_ms);
 
         // Assemble under the lock, splice outside it (see the module note).
-        let (bytes, audio_tracks, window_ms, held_ms, oldest_ms, newest_ms) = {
+        let (bytes, audio_tracks, duration_ms, window_start_ms, held_ms, oldest_ms, newest_ms) = {
             let ring = self.lock()?;
             let held_ms = ring.span_ms();
             let oldest_ms = ring.segments().next().map(|s| s.start_ms).unwrap_or(0);
@@ -332,11 +366,11 @@ impl MemoryRing {
                     pre_ms
                 );
             }
-            let window_ms = window.duration_ms();
             (
                 window.assemble(),
                 window.audio_tracks(),
-                window_ms,
+                window.duration_ms(),
+                window.start_ms(),
                 held_ms,
                 oldest_ms,
                 newest_ms,
@@ -345,13 +379,18 @@ impl MemoryRing {
 
         // What was asked for, what the ring held and what the window spans: what a short clip is diagnosed from.
         tracing::info!(
-            "clip from RAM: trigger={trigger_ms}ms window=[{start}ms, {end}ms) selected={window_ms}ms \
+            "clip from RAM: trigger={trigger_ms}ms window=[{start}ms, {end}ms) selected={duration_ms}ms \
              held={held_ms}ms footage=[{oldest_ms}ms, {newest_ms}ms] bytes={}",
             bytes.len()
         );
 
-        let out = self.clips_dir.join(format!("{stem}.mp4"));
-        ClipSplicer::splice_stream(&self.bin, bytes, &out, &self.encoder, audio_tracks)
+        Ok(crate::ClipSource::Stream {
+            bytes,
+            audio_tracks,
+            duration_ms,
+            // The ring's own origin, so the position is on the same timeline as a session's.
+            start_ms: self.origin_ms().saturating_add(window_start_ms),
+        })
     }
 }
 
@@ -414,7 +453,7 @@ fn read_until_eof(
 
 /// Record and log the first reason the reader stopped, and stay quiet about later ones.
 fn record_failure(slot: &Arc<Mutex<Option<String>>>, why: String) {
-    let mut guard = slot.lock().expect("the failure slot");
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_none() {
         tracing::error!(
             "the in-memory replay ring has stopped: {why}. Recording continues, but no clip can \

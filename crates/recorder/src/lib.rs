@@ -25,7 +25,7 @@
 //! # Modes, microphone, game watcher
 //!
 //! * [`RecordingMode`]: [`RecordingMode::ReplayBuffer`] (default) or [`RecordingMode::FullSession`],
-//!   which writes a per-session directory exempt from the scratch cap and concatenates it into
+//!   which writes a per-session directory exempt from the RAM cap and concatenates it into
 //!   one `session-<timestamp>.mp4` at stop (see [`session`]). Both open a `sessions` row managed
 //!   by retention.
 //! * Microphone ([`MicSection`], off by default): a second audio input, so clips carry two audio
@@ -38,10 +38,38 @@
 //! [`RecorderConfig`] has one defaulted field ([`RecorderConfig::audio_bitrate_kbps`]) because the
 //! desktop shell constructs it field by field; other settings travel in [`RecorderOptions`].
 //!
+//! # The media timeline
+//!
+//! Everything a trigger, a marker or a clip's chapter is measured on is the *ledger's* clock,
+//! never the wall clock's: the footage is measured on it, so a position on it names a moment of
+//! the recording. The two clocks are close, and the engine logs the difference when a recording
+//! starts, but they are not the same clock:
+//!
+//! * The RAM ring's clock is **measured**: a fragment's length comes from its own sample table,
+//!   so the ring's position is the real media time.
+//! * A session's clock is **nominal**: a segment is a whole number of seconds by construction, so
+//!   the ledger's position runs ahead of the real media by up to one frame interval per segment
+//!   (about 3% of the timeline at 30fps, 10% at 10fps), and it lags the wall clock by up to a
+//!   whole segment because a segment counts only once a later one exists.
+//!
+//! So "30s of pre-roll" is 30s of *real* media in a replay buffer and 30s of *nominal* media in
+//! a session, and the post-roll wait is sized for the difference (see [`POST_ROLL_MARGIN`] and
+//! the engine's post-roll budget). The RAM path is the reference behaviour.
+//!
 //! # Invariants that must not regress
 //!
 //! * The trigger is expressed in the ring's media time (`span_ms`), never the wall clock, and the
 //!   post-roll budget is `post_ms + margin`; a wall-clock trigger could ask for footage not yet written.
+//! * A recording's index connection is given back on **every** failure, not only when a recording
+//!   ends: without it one failed start would end auto-record for the life of the process.
+//! * The clip's splice runs off the pump thread. On it, the pump stops for as long as ffmpeg
+//!   takes, and the frames that follow carry a timestamp a whole splice later — a frozen picture
+//!   in the recording, at every clip.
+//! * An event is stamped with the media time of the moment it *arrived*, not of the moment its
+//!   clip was cut: a burst is coalesced before the clip is made, and that wait can run for most
+//!   of the pre-roll.
+//! * A clip is dated by the frame it really starts on — the resolved window's start, not the
+//!   requested one — because the index row and the chapter offsets are measured from that frame.
 //! * The pacer decides before the frame is materialised, and non-due frames are drained with
 //!   [`CaptureBackend::discard_pending`] so the GPU readback is skipped.
 //! * The encoder is smoke-tested before any capture backend exists, so an unusable encoder never
@@ -51,11 +79,15 @@
 //!   be evicted.
 //! * Cleanup runs at startup and every [`CLEANUP_INTERVAL`], over clips and sessions independently
 //!   ([`cleanup_pass`]).
-//! * The status line (`frames= segments= bytes= span= dropped= dropped_audio= dropped_mic=
-//!   skipped= fps=`) stays observable, and counters stay readable from other threads.
+//! * The status line (`frames= segments= bytes= span= evicted= dropped= dropped_audio=
+//!   dropped_mic= skipped= fps=`) stays observable, and counters stay readable from other threads.
 //! * One writer thread per input: the pump submits video, game audio and microphone into the
 //!   encoder's per-input queues, never writing two inputs synchronously
 //!   ([`pump_once_counted_with_mic`]).
+
+// Test bodies may unwrap; production code may not. Scoped to the test build of this crate, so
+// it cannot hide an unwrap in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod config;
 pub mod config_schema;
@@ -97,8 +129,8 @@ use localplay_events::process::{GamesSection, PresenceChange, WatchHandle};
 use localplay_events::{CaptureClock, GameEvent};
 use localplay_media::{edit, FfmpegBinaries};
 use localplay_replay::buffer::{BufferConfig, BufferStats};
-use localplay_replay::splice::ClipMetadata;
-use localplay_store::Store;
+use localplay_replay::splice::{ClipMetadata, ClipSplicer};
+use localplay_store::{Event, Store};
 use memory_ring::MemoryRing;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -224,6 +256,41 @@ pub struct RecorderOptions {
     pub games: GamesSection,
     /// The game a driver detected, written into the `sessions` row; `None` for a person-started recording.
     pub game: Option<String>,
+    /// A test hook: the recording starts that must fail (see [`FailStarts`]).
+    ///
+    /// The field does not exist outside this crate's own tests, so a front-end cannot set it.
+    #[cfg(test)]
+    pub fail_starts: FailStarts,
+}
+
+/// A test hook: how many of the next recording starts fail, and why.
+///
+/// Production has none: a start is refused only by a real failure. The hook exists because the
+/// rule it guards — a failed start must not take the recorder's index connection with it — is
+/// invisible otherwise: a start that fails *before* it takes the store proves nothing.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct FailStarts(Arc<Mutex<usize>>);
+
+#[cfg(test)]
+impl FailStarts {
+    /// The next `count` starts fail.
+    pub fn next(count: usize) -> Self {
+        Self(Arc::new(Mutex::new(count)))
+    }
+
+    /// Whether this start must fail, and the reason it does.
+    fn fail(&self) -> Option<&'static str> {
+        let mut remaining = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        Some("the test made this start fail")
+    }
 }
 
 // `Default` is the replay buffer, no microphone, no watcher, no game.
@@ -416,7 +483,10 @@ pub struct Recorder {
     commands: Arc<Mutex<Option<Sender<Command>>>>,
     /// The engine thread of a recording this `Recorder` started itself. Games mode leaves this
     /// `None`: the supervisor owns the thread ([`Recorder::stop`] signals the supervisor instead).
-    thread: Mutex<Option<JoinHandle<Store>>>,
+    ///
+    /// The handle yields the store the thread was given, so a game-driven recorder can hand it
+    /// to the next recording; `None` means the thread ended without one (see [`Prepared::begin`]).
+    thread: Mutex<Option<JoinHandle<Option<Store>>>>,
     /// The game-presence supervisor, if a front-end asked for one. `None` is what guarantees that
     /// with `auto_record = false` nothing is watched.
     supervisor: Mutex<Option<Supervisor>>,
@@ -425,6 +495,13 @@ pub struct Recorder {
     mode: RecordingMode,
     /// Whether this recorder was started with a microphone track ([`MicSection::enabled`]).
     mic: bool,
+    /// How long a clip request may take before the caller gives up.
+    ///
+    /// The post-roll wait and the splice are both bounded, and the bound is what lets
+    /// [`Recorder::clip_now_in`] give up rather than wait for ever: the index writes that
+    /// follow them are not bounded at all, and a locked database or a dead mount would
+    /// otherwise hang the caller for good.
+    clip_budget: Duration,
 }
 
 /// A request from a caller on another thread to the pump loop.
@@ -433,12 +510,22 @@ enum Command {
     Clip {
         reason: ClipReason,
         window: ClipWindow,
+        /// When the event happened, on the media timeline, when the caller knew it.
+        ///
+        /// A burst of events is coalesced before the clip is cut, and the coalescing can run
+        /// for most of the pre-roll: the request instant is then long after the moment the
+        /// event describes, and a marker stamped with it points at the wrong second of the
+        /// recording. `None` means "now", which is right for a hotkey and wrong for an event.
+        event_at_ms: Option<u64>,
         reply: Sender<Result<RecordedClip>>,
     },
     /// Record an event that did not ask for a clip (a game or round boundary). The reply is
     /// the `events` row's id, so a caller can tell that it landed.
     Note {
         event: GameEvent,
+        /// When the event happened, on the media timeline, when the caller knew it. `None`
+        /// means "now": the same reason as [`Command::Clip::event_at_ms`].
+        at_ms: Option<u64>,
         reply: Sender<Result<i64>>,
     },
     /// Flush the encoder and end the loop.
@@ -449,6 +536,11 @@ enum Command {
 ///
 /// The fields are independent and none gates a memory access, so `Relaxed` is sufficient and no
 /// reader can block the capture loop.
+///
+/// The two lifecycle flags are the exception: `running` and `watching` are written once per
+/// recording and read by other threads, and they are read and written with `SeqCst` so a reader
+/// that asks "is it running?" never sees a stale answer after a stop. They gate nothing either —
+/// a reader that sees a stale `running` still reads the counters, which are independent.
 #[derive(Debug)]
 struct SharedStatus {
     running: AtomicBool,
@@ -456,6 +548,13 @@ struct SharedStatus {
     segments: AtomicU64,
     bytes: AtomicU64,
     span_ms: AtomicU64,
+    /// The ledger's position on the media timeline, in ms: where the recording stands *now*.
+    ///
+    /// Published on every pump so a caller on another thread can stamp an event with the media
+    /// time of the moment it happened. The engine's own clock is the ledger's, and the ledger's
+    /// span only moves when a segment is finished, so this is up to one segment behind the wall
+    /// clock — the same clock the footage is measured on, which is what a marker must use.
+    media_ms: AtomicU64,
     dropped: AtomicU64,
     dropped_audio: AtomicU64,
     skipped: AtomicU64,
@@ -489,6 +588,7 @@ impl SharedStatus {
             segments: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             span_ms: AtomicU64::new(0),
+            media_ms: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             dropped_audio: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -658,14 +758,14 @@ impl Recorder {
 
         // 2. The storage policy, once, over clips and sessions, so a previous run's leftovers are managed now.
         let mut cleanup = CleanupReport::default();
-        cleanup_pass(&store, &cfg.storage, &mut cleanup);
+        cleanup_pass(&store, &cfg.storage, &clips_dir, &mut cleanup);
 
         // 2b. Crash recovery, before this run creates anything recovery could confuse for its own.
         let recovery = session::recover_sessions(
             &store,
             &sessions_dir,
             &cfg.bin,
-            cfg.buffer.segment_time * 1000,
+            cfg.buffer.segment_time.saturating_mul(1000),
             &cfg.encode.codec,
         );
         log_recovery(&recovery);
@@ -678,6 +778,9 @@ impl Recorder {
         let mode = opts.mode;
         let mic = opts.mic.enabled;
         let game = opts.game.clone();
+        let clip_budget = clip_budget(&cfg);
+        #[cfg(test)]
+        let fail_starts = opts.fail_starts.clone();
         let prepared = Prepared {
             cfg,
             opts,
@@ -687,6 +790,8 @@ impl Recorder {
             scratch_dir,
             clips_dir,
             sessions_dir,
+            #[cfg(test)]
+            fail_starts,
         };
 
         match presence {
@@ -700,6 +805,7 @@ impl Recorder {
                     status,
                     mode,
                     mic,
+                    clip_budget,
                 })
             }
             Some((changes, watch)) => {
@@ -718,6 +824,7 @@ impl Recorder {
                     status,
                     mode,
                     mic,
+                    clip_budget,
                 })
             }
         }
@@ -732,7 +839,7 @@ impl Recorder {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         RecorderStatus {
-            running: status.running.load(Ordering::Relaxed),
+            running: status.running.load(Ordering::SeqCst),
             frames: status.frames.load(Ordering::Relaxed),
             segments: status.segments.load(Ordering::Relaxed),
             bytes: status.bytes.load(Ordering::Relaxed),
@@ -748,7 +855,7 @@ impl Recorder {
             },
             mode: self.mode,
             game: status.game(),
-            watching_games: status.watching.load(Ordering::Relaxed),
+            watching_games: status.watching.load(Ordering::SeqCst),
             skipped: status.skipped.load(Ordering::Relaxed),
             fps: f64::from_bits(status.fps.load(Ordering::Relaxed)),
             configured_fps: status.configured_fps.load(Ordering::Relaxed) as u32,
@@ -787,18 +894,47 @@ impl Recorder {
 
     /// [`Recorder::clip_now_with`] with this clip's own [`ClipWindow`] (short/long hotkeys, per-game lengths).
     pub fn clip_now_in(&self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
+        self.clip_now_in_at(reason, window, None)
+    }
+
+    /// [`Recorder::clip_now_in`] with the moment the trigger happened, when the caller knows it.
+    ///
+    /// `event_at_ms` is on the recorder's media timeline (see [`Recorder::media_now_ms`]), and it
+    /// is what the clip's marker and its chapter are stamped with. A burst of game events is
+    /// coalesced before the clip is cut, and the coalescing can run for most of the pre-roll:
+    /// without this the marker points at the request instant, which is up to the whole
+    /// coalescing window later than the moment it describes.
+    pub fn clip_now_in_at(
+        &self,
+        reason: ClipReason,
+        window: ClipWindow,
+        event_at_ms: Option<u64>,
+    ) -> Result<RecordedClip> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
             .send(Command::Clip {
                 reason,
                 window,
+                event_at_ms,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?;
-        // Cannot hang: if the loop stops first its receiver drops this command and reply, giving a disconnection error.
-        answer
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip"))?
+        // A deadline, not an open wait. The post-roll and the splice are bounded, but the
+        // index writes that follow them are not: a SQLite write on a locked file, a filesystem
+        // call on a network drive, a `canonicalize` on a dead mount. A caller that waits for
+        // ever on a recorder that has stopped answering is a caller that never returns.
+        match answer.recv_timeout(self.clip_budget) {
+            Ok(result) => result
+                .map_err(|_| anyhow::anyhow!("the recorder stopped before it could take the clip")),
+            Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "the recorder did not answer the clip request within {}ms: it is busy, or the \
+                 write that follows the clip is stuck",
+                self.clip_budget.as_millis()
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the recorder stopped before it could take the clip"
+            )),
+        }
     }
 
     /// Record a derived event that did not ask for a clip, and return its `events` row id.
@@ -807,13 +943,49 @@ impl Recorder {
     /// timeline but are not worth a clip. `at` is the trigger's position on the ring's media timeline,
     /// the same clock as a clip's `started_at`; `clip_id` is NULL. Blocking but cheap: one INSERT.
     pub fn note_event(&self, event: GameEvent) -> Result<i64> {
+        self.note_event_at(event, None)
+    }
+
+    /// [`Recorder::note_event`] with the moment the event happened, on the media timeline.
+    ///
+    /// `at_ms` is what the row is stamped with, so a marker names the second of the recording
+    /// it belongs to and not the second the request was made. `None` means "now", which is
+    /// right for a caller that has no earlier knowledge and wrong for a coalesced burst.
+    pub fn note_event_at(&self, event: GameEvent, at_ms: Option<u64>) -> Result<i64> {
         let (reply, answer) = mpsc::channel();
         self.command_sender()?
-            .send(Command::Note { event, reply })
+            .send(Command::Note {
+                event,
+                at_ms,
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("the recorder stopped before it could note the event"))?;
-        answer
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the recorder stopped before it could note the event"))?
+        match answer.recv_timeout(self.clip_budget) {
+            Ok(result) => result.map_err(|_| {
+                anyhow::anyhow!("the recorder stopped before it could note the event")
+            }),
+            Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "the recorder did not answer the event request within {}ms: the index write is \
+                 stuck",
+                self.clip_budget.as_millis()
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the recorder stopped before it could note the event"
+            )),
+        }
+    }
+
+    /// The recording's position on the media timeline, in ms.
+    ///
+    /// The clock the footage is measured on — the ledger's, not the wall clock's — so a caller
+    /// that stamps an event with it puts the event where it happened on the recording's own
+    /// timeline, next to the clips and the other events.
+    ///
+    /// It is the position of the last pump, so it trails the moment of the call by up to one
+    /// pump interval; in session mode it also trails by up to a segment, because that ledger
+    /// counts only finished segments (see [`session`]).
+    pub fn media_now_ms(&self) -> u64 {
+        self.status.media_ms.load(Ordering::Relaxed)
     }
 
     /// The command channel of the recording running now, or the error when there is none.
@@ -883,13 +1055,13 @@ impl Recorder {
     /// Whether the loop thread is still running; `false` for an armed recorder waiting for a game
     /// (see [`Recorder::is_armed`]).
     pub fn is_running(&self) -> bool {
-        self.status.running.load(Ordering::Relaxed)
+        self.status.running.load(Ordering::SeqCst)
     }
 
     /// Whether a game watcher is running and a recording will begin when a watched game does
     /// (`[games] auto_record` was on at start).
     pub fn is_armed(&self) -> bool {
-        self.status.watching.load(Ordering::Relaxed)
+        self.status.watching.load(Ordering::SeqCst)
     }
 }
 
@@ -918,6 +1090,13 @@ struct Prepared {
     vendor: Option<Vendor>,
     /// Taken by a recording when it begins and given back when it ends: one SQLite connection
     /// (`Send` but not `Sync`), moved between the engine thread and the games-mode supervisor.
+    ///
+    /// Given back on **every** failure too, not only when a recording ends. The store is the
+    /// recorder's only connection to the index, and a start that failed after taking it would
+    /// leave the recorder with none: the next game would fail at once with "this recorder's
+    /// store is already in a recording", and auto-record would be dead for the life of the
+    /// process after a single transient failure (a probe timeout, a locked database, a capture
+    /// session another application holds).
     store: Option<Store>,
     /// The shared scratch directory (ring mode's segments, and where the clip path looks).
     scratch_dir: PathBuf,
@@ -925,13 +1104,54 @@ struct Prepared {
     clips_dir: PathBuf,
     /// The sessions area: session mode's segment directories and concatenated files.
     sessions_dir: PathBuf,
+    /// A test hook: the starts that must fail (see [`FailStarts`]).
+    #[cfg(test)]
+    fail_starts: FailStarts,
 }
 
 /// A recording that is running: where its commands go, and the thread that runs it.
 struct Active {
     commands: Sender<Command>,
     /// The engine thread, which hands the store back when it ends.
-    thread: JoinHandle<Store>,
+    thread: JoinHandle<Option<Store>>,
+}
+
+/// The recorder's index connection, on its way into a recording.
+///
+/// A recording takes the store out of [`Prepared`] and gives it back when it ends. This is the
+/// way back for the *other* ending: a start that failed after taking it. The guard holds the
+/// store until the recording takes it, and puts it back when the start fails — so the next
+/// recording finds a store instead of a recorder that can never record again.
+struct StoreGuard<'a> {
+    /// The store, until the recording takes it.
+    store: Option<Store>,
+    /// Where it goes back to.
+    slot: &'a mut Option<Store>,
+}
+
+impl StoreGuard<'_> {
+    /// The store, for the steps that need it before the recording owns it.
+    fn store(&self) -> Result<&Store> {
+        self.store
+            .as_ref()
+            .context("this recording already has the store")
+    }
+
+    /// The store, for the recording that takes it.
+    fn take(&mut self) -> Result<Store> {
+        self.store
+            .take()
+            .context("this recording already has the store")
+    }
+}
+
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        // Only when the recording did not take it: whoever is left holding it keeps it.
+        if let Some(store) = self.store.take() {
+            *self.slot = Some(store);
+        }
+    }
 }
 
 impl Prepared {
@@ -945,17 +1165,51 @@ impl Prepared {
         measure: &dyn Fn(&EncodeConfig) -> Result<ThroughputMeasurement>,
         status: &Arc<SharedStatus>,
     ) -> Result<Active> {
-        // Cloned once per recording to keep the borrow checker out of the rest of this function.
-        let cfg = self.cfg.clone();
-        let mode = self.opts.mode;
         let store = self
             .store
             .take()
             .context("this recorder's store is already in a recording")?;
+        // The store is out of `self` from here on, so every failure below has to give it back.
+        // The guard does that: it hands the store to `returned` when the recording that took it
+        // failed, and this function puts it back where the next recording finds it.
+        let mut returned: Option<Store> = None;
+        let result = {
+            let mut guard = StoreGuard {
+                store: Some(store),
+                slot: &mut returned,
+            };
+            self.begin_recording(&mut guard, game, measure, status)
+        };
+        if let Some(store) = returned {
+            self.store = Some(store);
+        }
+        result
+    }
+
+    /// The handshake itself, with the store in hand.
+    ///
+    /// Everything that can fail happens here, and the store moves into the engine only at the
+    /// very end — so a failure at any point gives it back (see [`StoreGuard`]).
+    fn begin_recording(
+        &mut self,
+        guard: &mut StoreGuard<'_>,
+        game: Option<String>,
+        measure: &dyn Fn(&EncodeConfig) -> Result<ThroughputMeasurement>,
+        status: &Arc<SharedStatus>,
+    ) -> Result<Active> {
+        // The test hook fires here, with the store already taken: that is the point of it (see
+        // `FailStarts`).
+        #[cfg(test)]
+        if let Some(why) = self.fail_starts.fail() {
+            bail!("{why}");
+        }
+        // Cloned once per recording to keep the borrow checker out of the rest of this function.
+        let cfg = self.cfg.clone();
+        let mode = self.opts.mode;
         let buffer_cfg = BufferConfig {
-            pre_ms: cfg.buffer.pre_seconds * 1000,
-            post_ms: cfg.buffer.post_seconds * 1000,
-            segment_ms: cfg.buffer.segment_time * 1000,
+            pre_ms: cfg.buffer.pre_seconds.saturating_mul(1000),
+            post_ms: cfg.buffer.post_seconds.saturating_mul(1000),
+            segment_ms: cfg.buffer.segment_time.saturating_mul(1000),
             clips_dir: self.clips_dir.clone(),
         };
 
@@ -1071,9 +1325,11 @@ impl Prepared {
                         ram_cap_bytes: cfg.buffer.ram_cap_bytes,
                         // The duration cap is what a trigger can ask for: the window plus one segment, so an unlucky
                         // fragment boundary cannot truncate a clip. The buffer's length is the user's `pre_seconds`.
-                        cap_ms: cfg.buffer.max_pre_ms()
-                            + cfg.buffer.max_post_ms()
-                            + buffer_cfg.segment_ms,
+                        cap_ms: cfg
+                            .buffer
+                            .max_pre_ms()
+                            .saturating_add(cfg.buffer.max_post_ms())
+                            .saturating_add(buffer_cfg.segment_ms),
                         pre_ms: buffer_cfg.pre_ms,
                         post_ms: buffer_cfg.post_ms,
                         encoder: encode_cfg.encoder_name().to_string(),
@@ -1109,6 +1365,21 @@ impl Prepared {
             }
         }
         tracing::info!("encoding with {encoder_name}");
+        // Which clock this recording's media timeline runs on, and how far it is from the wall
+        // clock. The two are not the same clock, and the difference is not zero: the RAM ring
+        // measures its fragments, a session's ledger is segment-aligned, and a session's span
+        // also lags the wall clock by the segment ffmpeg is still appending to.
+        tracing::info!(
+            "media clock: {kind}; the ledger stands at {span}ms of media, {elapsed}ms of wall \
+             clock have passed since the recording began (one segment is {segment}ms)",
+            kind = match mode {
+                RecordingMode::ReplayBuffer => "measured from the ring's own fragments",
+                RecordingMode::FullSession => "nominal, aligned to the segment length",
+            },
+            span = ledger.span_ms().unwrap_or(0),
+            elapsed = now_ms().saturating_sub(session_started_ms),
+            segment = buffer_cfg.segment_ms,
+        );
         *status.encoder.lock().unwrap_or_else(|p| p.into_inner()) = Some(encoder_name.clone());
         // Read the pacer's rate back out of the spawned encoder rather than `encode_cfg.fps` a second
         // time, so the pacer cannot pace to a number the child was not told. Read before the encoder
@@ -1142,8 +1413,8 @@ impl Prepared {
         // `started_at` is the wall clock (ages the session, named the directory); `media_epoch_ms` is where
         // the ledger stands now, the origin of an event's `at`. Using the wall clock as the epoch put
         // events of a session that adopted older segments in the wrong place on the scrubber.
-        let media_epoch_ms = (ledger.origin_ms() + ledger.span_ms()?) as i64;
-        let session = match store.start_session(
+        let media_epoch_ms = (ledger.origin_ms().saturating_add(ledger.span_ms()?)) as i64;
+        let session = match guard.store()?.start_session(
             game.as_deref(),
             if save_session {
                 RecordingMode::FullSession.store_mode()
@@ -1172,7 +1443,7 @@ impl Prepared {
             },
             segment_dir.display(),
             if own_dir {
-                " (the scratch cap does not apply)"
+                " (the RAM cap does not apply)"
             } else {
                 ""
             }
@@ -1198,7 +1469,9 @@ impl Prepared {
             if let Some(audio) = audio.as_mut() {
                 let _ = audio.stop();
             }
-            let _ = store.end_session(session, now_ms(), None, 0, 0);
+            if let Ok(store) = guard.store() {
+                let _ = store.end_session(session, now_ms(), None, 0, 0);
+            }
             if own_dir {
                 session::remove_session_dir(&segment_dir);
             }
@@ -1206,11 +1479,17 @@ impl Prepared {
         }
 
         let (commands, inbox) = mpsc::channel();
+        // The store moves into the engine here, and nowhere earlier: every failure above it
+        // still finds the store in the guard, and gives it back (see `StoreGuard`).
         let engine = Engine {
             pre_ms: buffer_cfg.pre_ms,
             post_ms: buffer_cfg.post_ms,
             max_pre_ms: cfg.buffer.max_pre_ms(),
             max_post_ms: cfg.buffer.max_post_ms(),
+            // The length of one segment, in ms. The post-roll budget is sized from it: a
+            // ledger trusts a segment only once a later one exists, so its span lags the wall
+            // clock by up to a whole segment (see `POST_ROLL_MARGIN`).
+            segment_ms: buffer_cfg.segment_ms,
             // Only the RAM budget is carried: a replay buffer has no scratch directory to cap.
             ram_cap_bytes: cfg.buffer.ram_cap_bytes,
             storage: cfg.storage.clone(),
@@ -1230,7 +1509,7 @@ impl Prepared {
             sessions_dir: self.sessions_dir.clone(),
             size_warning_reported: false,
             encoder_name,
-            store,
+            store: guard.take()?,
             clock: CaptureClock::new(),
             status: Arc::clone(status),
             rate: RateMeter::new(RATE_WINDOW),
@@ -1245,15 +1524,41 @@ impl Prepared {
             last_counted_dropped: 0,
             last_warned_dropped: 0,
             last_drop_warning: None,
+            // The clips still being spliced, off the pump thread.
+            pending_clips: Vec::new(),
         };
         status.publish_recording(decision.configured(), encoder_fps, mic_port);
         status.set_game(game);
         status.running.store(true, Ordering::SeqCst);
 
-        let thread = std::thread::Builder::new()
+        // The engine is handed to its thread through a slot rather than moved into the closure:
+        // a spawn that fails then hands the engine back, and with it the store. Losing the
+        // store would leave the recorder with no way to index anything, for the rest of the
+        // process (see `StoreGuard`).
+        let slot = Arc::new(Mutex::new(Some(engine)));
+        let taken = Arc::clone(&slot);
+        let thread = match std::thread::Builder::new()
             .name("localplay-recorder".to_string())
-            .spawn(move || engine.run(inbox))
-            .context("spawning the recording thread")?;
+            .spawn(move || {
+                // The engine is in the slot before the thread starts, so the `None` case cannot
+                // happen: it would mean a thread with nothing to run.
+                taken
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .map(|engine| engine.run(inbox))
+            }) {
+            Ok(thread) => thread,
+            Err(err) => {
+                // The engine is still in the slot: take the store back out of it.
+                if let Some(engine) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    let Engine { store, .. } = engine;
+                    self.store = Some(store);
+                }
+                status.running.store(false, Ordering::SeqCst);
+                return Err(err).context("spawning the recording thread");
+            }
+        };
 
         Ok(Active { commands, thread })
     }
@@ -1306,7 +1611,7 @@ fn spawn_supervisor(
                 prepared.opts.mode
             );
 
-            let mut running: Option<(String, JoinHandle<Store>)> = None;
+            let mut running: Option<(String, JoinHandle<Option<Store>>)> = None;
             while !flag.load(Ordering::SeqCst) {
                 match presence.recv_timeout(SUPERVISOR_TICK) {
                     Ok(PresenceChange::Started(game)) => {
@@ -1365,14 +1670,23 @@ fn spawn_supervisor(
                         // Clearing the command channel drops the engine's last sender, ending its loop; the join waits for the shutdown work.
                         *commands.lock().unwrap_or_else(|p| p.into_inner()) = None;
                         match thread.join() {
-                            Ok(store) => {
+                            Ok(Some(store)) => {
                                 prepared.store = Some(store);
                                 // The retention pass between game sessions manages the session that just ended.
                                 let mut report = CleanupReport::default();
                                 if let Some(store) = &prepared.store {
-                                    cleanup_pass(store, &prepared.cfg.storage, &mut report);
+                                    cleanup_pass(
+                                        store,
+                                        &prepared.cfg.storage,
+                                        &prepared.clips_dir,
+                                        &mut report,
+                                    );
                                 }
                             }
+                            Ok(None) => tracing::error!(
+                                "the recording thread for {game} ended without handing the index \
+                                 back; the next game cannot be recorded"
+                            ),
                             Err(_) => tracing::error!(
                                 "the recording thread for {game} panicked; its session row is \
                                  left for the next start to recover"
@@ -1389,7 +1703,7 @@ fn spawn_supervisor(
             if let Some((name, thread)) = running.take() {
                 tracing::info!("stopping the recording of {name}: the recorder is shutting down");
                 *commands.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                if let Ok(store) = thread.join() {
+                if let Ok(Some(store)) = thread.join() {
                     prepared.store = Some(store);
                 }
             }
@@ -1442,6 +1756,13 @@ struct Engine {
     /// The ceilings a per-clip [`ClipWindow`] is clamped to (`[buffer] max_*_seconds`).
     max_pre_ms: u64,
     max_post_ms: u64,
+    /// The length of one segment, in ms.
+    ///
+    /// The post-roll budget is sized from it. A ledger trusts a segment only once a strictly
+    /// later one exists (ffmpeg appends to the newest segment), so its span lags the wall
+    /// clock by up to a whole segment: the post-roll cannot arrive before that, and a budget
+    /// that ignored it would time out on every clip of a session with a long segment.
+    segment_ms: u64,
     /// The in-memory ring's byte budget, carried so the ring is checked against the configured number.
     ram_cap_bytes: u64,
     storage: StorageSection,
@@ -1494,6 +1815,8 @@ struct Engine {
     effective_fps: u32,
     /// The last rate a window closed on, published on every pump and logged on every tick.
     achieved: f64,
+    /// The clips whose splice is running on its own thread (see [`PendingClip`]).
+    pending_clips: Vec<PendingClip>,
     /// Time spent inside the capture backend, accumulated over the run
     /// ([`localplay_recorder::pump::PumpCounts::capture`]): the GPU readback cost, reported against wall clock.
     capture_time: Duration,
@@ -1507,6 +1830,114 @@ struct Engine {
     /// The dropped count as of the last warning, to tell "still dropping" from "dropped once, an hour ago".
     last_warned_dropped: u64,
     last_drop_warning: Option<Instant>,
+}
+
+/// A clip whose splice is running on its own thread.
+///
+/// The splice is ffmpeg's, and ffmpeg takes as long as the clip is long. Run on the pump thread
+/// it would stop the pump: the capture backend is not drained, the encoder's queue fills and
+/// drops the frames it cannot take, and because the media clock is the wall clock the frames
+/// that follow the splice carry a timestamp a whole splice later — a frozen picture in the
+/// recording, at every clip, for as long as the splice took.
+///
+/// So the splice runs on a thread of its own and the pump keeps running under it. The caller's
+/// contract is unchanged: the answer comes when the file exists.
+struct PendingClip {
+    /// The caller waiting for the answer.
+    reply: Sender<Result<RecordedClip>>,
+    /// The splice and the chapter write, on their own thread.
+    worker: JoinHandle<Result<ClipMetadata>>,
+    /// The trigger's position on the media timeline: when the event happened, not when the
+    /// request was handled.
+    at_ms: u64,
+    /// The clip's first frame on the media timeline, from the resolved window.
+    started_at_ms: u64,
+    /// Why the clip was taken, for the `events` row.
+    reason: ClipReason,
+}
+
+/// Clears the running flag when the engine thread ends, however it ends.
+///
+/// The flag is set before the thread is spawned, so a panic in the loop would otherwise leave
+/// the recorder claiming to run for ever: a front-end that polls `status()` would show a
+/// recording that no longer exists, and would wait for a stop that never comes.
+struct RunningGuard(Arc<SharedStatus>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Splice a clip and write its chapters, on a thread of its own.
+///
+/// The chapters are written here rather than on the pump thread because they are a second
+/// ffmpeg pass over the whole file: leaving them on the pump thread would keep the hole the
+/// splice used to punch.
+///
+/// The events are the ones the pump thread read before the splice started, so a marker
+/// recorded while the splice ran is not a chapter of this clip.
+fn splice_clip(
+    bin: FfmpegBinaries,
+    source: ClipSource,
+    out: PathBuf,
+    encoder: String,
+    events: Vec<Event>,
+    trigger: Option<(String, u64)>,
+    started_at_ms: u64,
+) -> Result<ClipMetadata> {
+    let mut clip = source.splice(&bin, &out, &encoder)?;
+    // The chapters, at the offsets the clip really starts on: the resolved window's start, and
+    // the clip's own length rather than the window's.
+    let trigger = trigger.as_ref().map(|(kind, at)| (kind.as_str(), *at));
+    let chapters = clip_chapters(&events, trigger, started_at_ms, clip.duration_ms);
+    if chapters.is_empty() {
+        return Ok(clip);
+    }
+    match edit::add_chapters(&bin, &out, &chapters, clip.duration_ms) {
+        Ok(()) => {
+            if let Ok(meta) = std::fs::metadata(&out) {
+                clip.size_bytes = meta.len();
+            }
+            tracing::info!("marked {} chapters in {}", chapters.len(), out.display());
+        }
+        Err(err) => tracing::warn!(
+            "could not add chapters to {} ({err:#}); the clip is kept without them",
+            out.display()
+        ),
+    }
+    Ok(clip)
+}
+
+/// How long a clip request may take: the post-roll wait plus the splice.
+///
+/// Both are bounded, and the bound is what lets the caller give up instead of waiting for
+/// ever on a request whose tail (the index writes) is not bounded at all.
+fn clip_budget(cfg: &RecorderConfig) -> Duration {
+    let segment_ms = cfg.buffer.segment_time.saturating_mul(1000);
+    // The post-roll wait, as the engine sizes it: the longest post-roll the configuration
+    // allows, plus the segment lag the ledger carries, plus the margin.
+    let post_roll = Duration::from_millis(
+        cfg.buffer
+            .max_post_ms()
+            .saturating_add(segment_ms.saturating_mul(2))
+            .saturating_add(POST_ROLL_MARGIN.as_millis() as u64),
+    );
+    // The splice: a stream copy of the biggest window the configuration can ask for, so the
+    // budget is derived from the bytes it moves (the media crate's own rule). The estimate is
+    // doubled: the encoder's rate control overshoots its target (measured at ~1.9x), and a
+    // budget that expires while the copy is still running would report a failure for a clip
+    // that was about to exist.
+    let window_ms = cfg
+        .buffer
+        .max_pre_ms()
+        .saturating_add(cfg.buffer.max_post_ms());
+    let window_bytes = window_ms
+        .saturating_mul(u64::from(cfg.encode.bitrate_kbps))
+        .saturating_mul(2)
+        .saturating_div(8)
+        .saturating_div(1000);
+    post_roll + edit::copy_budget(window_bytes)
 }
 
 /// The segments a recording's trigger and shutdown work against.
@@ -1574,6 +2005,19 @@ impl Ledger {
         Ok(self.stats()?.span_ms)
     }
 
+    /// Fragments the ring has dropped off the front to stay inside its caps.
+    ///
+    /// Zero for a session: a session's segments are written to disk and the storage policy, not the
+    /// ring, decides what is deleted. For the memory ring this is the count of fragments evicted
+    /// oldest-first to stay inside `buffer.ram_cap_bytes` or the pre-roll window — the number that
+    /// says the cap *bit* rather than merely that it was never reached.
+    fn evicted(&self) -> Result<u64> {
+        match self {
+            Ledger::Memory(ring) => Ok(ring.stats()?.evicted),
+            Ledger::Session(_) => Ok(0),
+        }
+    }
+
     /// The ledger's own position of this run's zero.
     fn origin_ms(&self) -> u64 {
         match self {
@@ -1614,17 +2058,93 @@ impl Ledger {
         }
     }
 
-    /// Splice a clip around `trigger_ms` out of this ledger's footage.
-    fn trigger(
-        &self,
-        trigger_ms: u64,
-        stem: &str,
-        pre_ms: u64,
-        post_ms: u64,
-    ) -> Result<ClipMetadata> {
+    /// The directory the clips are written into.
+    fn clips_dir(&self) -> &Path {
         match self {
-            Ledger::Memory(ring) => ring.trigger_window(trigger_ms, stem, pre_ms, post_ms),
-            Ledger::Session(session) => session.trigger_window(trigger_ms, stem, pre_ms, post_ms),
+            Ledger::Memory(ring) => ring.clips_dir(),
+            Ledger::Session(session) => session.clips_dir(),
+        }
+    }
+
+    /// The footage a clip around `trigger_ms` is cut from, and where that footage starts.
+    ///
+    /// The window is resolved here, not at the splice: the resolution reads the ledger, and
+    /// the ledger belongs to this thread. What comes back owns its data — the ring's bytes are
+    /// copied out from under its lock, a session's segments are file names — so the splice can
+    /// run on another thread.
+    fn clip_source(&self, trigger_ms: u64, pre_ms: u64, post_ms: u64) -> Result<ClipSource> {
+        match self {
+            Ledger::Memory(ring) => ring.clip_source(trigger_ms, pre_ms, post_ms),
+            Ledger::Session(session) => session.clip_source(trigger_ms, pre_ms, post_ms),
+        }
+    }
+}
+
+/// A clip's footage, lifted out of the ledger so the splice can run on another thread.
+///
+/// The RAM ring's bytes are copied out from under the ring's lock and the session's segments
+/// are file names, so neither borrows the ledger: both are theirs to take to a worker.
+pub(crate) enum ClipSource {
+    /// The ring's fragments, assembled into one fragmented-MP4 stream.
+    Stream {
+        bytes: Vec<u8>,
+        /// How many audio tracks the footage carries, so the copy can name them again.
+        audio_tracks: usize,
+        /// Where the clip's first frame is, on the media timeline.
+        start_ms: u64,
+        /// How much media the window covers.
+        duration_ms: u64,
+    },
+    /// The session's whole segments, concatenated losslessly.
+    Segments {
+        window: localplay_replay::window::SegmentWindow,
+        /// Whether the session carries a microphone track: the concatenation must keep it.
+        multitrack: bool,
+    },
+}
+
+impl ClipSource {
+    /// Where the clip's first frame is, on the media timeline.
+    ///
+    /// The *resolved* window's start, not the requested one: the window selects whole segments
+    /// and fragments, so the first selected one begins at or before the request. Dating a clip
+    /// by the request is off by up to one segment, and the index row and the chapter offsets
+    /// both carry that error.
+    fn start_ms(&self) -> u64 {
+        match self {
+            ClipSource::Stream { start_ms, .. } => *start_ms,
+            ClipSource::Segments { window, .. } => window.start_ms(),
+        }
+    }
+
+    /// How much media the window covers.
+    fn duration_ms(&self) -> u64 {
+        match self {
+            ClipSource::Stream { duration_ms, .. } => *duration_ms,
+            ClipSource::Segments { window, .. } => window.duration_ms(),
+        }
+    }
+
+    /// The clip's file, written losslessly.
+    ///
+    /// The RAM path remuxes the assembled stream; the session path concatenates its whole
+    /// segments. Both are `-c copy`, and both may run on a thread of their own.
+    fn splice(self, bin: &FfmpegBinaries, out: &Path, encoder: &str) -> Result<ClipMetadata> {
+        match self {
+            ClipSource::Stream {
+                bytes,
+                audio_tracks,
+                ..
+            } => ClipSplicer::splice_stream(bin, bytes, out, encoder, audio_tracks),
+            ClipSource::Segments { window, multitrack } => {
+                if multitrack {
+                    // A clip from a session with a microphone must keep that track, like the
+                    // session file (see `session::finalise`).
+                    session::finalise(bin, out, &window.segments, encoder, true)
+                } else {
+                    ClipSplicer::splice(bin, &window, out, encoder)
+                }
+            }
         }
     }
 }
@@ -1636,6 +2156,10 @@ impl Engine {
     /// Everything is closed before it returns: encoder flushed, sources stopped, `sessions` row
     /// ended and, in full-session mode, the session file written.
     fn run(mut self, commands: Receiver<Command>) -> Store {
+        // The running flag is cleared when this returns, however it returns: it is set before
+        // the thread is spawned, so a panic in the loop would otherwise leave the recorder
+        // claiming to run for ever.
+        let _running = RunningGuard(Arc::clone(&self.status));
         // Tell capture what the encoder accepts (textures or pixels) before it starts; capture remembers
         // the answer for the session it builds. One question with one answer: a mismatch leaves an
         // encoder with pixels it refuses or a texture it cannot use.
@@ -1652,20 +2176,31 @@ impl Engine {
                 Ok(Command::Clip {
                     reason,
                     window,
+                    event_at_ms,
                     reply,
                 }) => {
-                    let taken = self.take_clip(reason, window);
-                    // The caller may have given up (window closed, test finished); not the loop's business.
-                    let _ = reply.send(taken);
+                    // The splice runs on its own thread, so the failure is reported here and
+                    // the clip itself is answered when its file exists.
+                    if let Err(err) = self.take_clip(reason, window, event_at_ms, reply.clone()) {
+                        let _ = reply.send(Err(err));
+                    }
                 }
-                Ok(Command::Note { event, reply }) => {
-                    let noted = self.note_event(&event);
+                Ok(Command::Note {
+                    event,
+                    at_ms,
+                    reply,
+                }) => {
+                    let noted = self.note_event(&event, at_ms);
                     let _ = reply.send(noted);
                 }
                 Err(TryRecvError::Empty) => {}
                 // Every `Recorder` was dropped: stop instead of capturing for nobody.
                 Err(TryRecvError::Disconnected) => break,
             }
+
+            // A clip whose splice has finished is answered here, so the caller waits for the
+            // file and not for the loop to notice it.
+            self.advance_clips();
 
             if let Err(err) = self.pump() {
                 self.fail(err);
@@ -1681,11 +2216,15 @@ impl Engine {
             }
         }
 
+        // A clip that was still being spliced when the loop ended is finished now: the file
+        // is written, and so is its index row. The recording is over, but the clip the user
+        // asked for exists.
+        self.finish_pending_clips();
+
         // Flush and shut down; best effort on the failure path, since the encoder may be what failed.
         if let Err(err) = self.shutdown() {
             self.fail(err);
         }
-        self.status.running.store(false, Ordering::SeqCst);
         self.store
     }
 
@@ -1703,7 +2242,7 @@ impl Engine {
     }
 
     /// The ~200ms tick: scan the ledger, publish and log status, keep the session row's size current,
-    /// enforce the scratch cap (ring mode only), warn about a starving encoder, and run the storage
+    /// report how much the ring has evicted, warn about a starving encoder, and run the storage
     /// policy on its own interval.
     fn tick(&mut self, last_cleanup: &mut Instant) -> Result<()> {
         self.ledger.scan().context("scanning for new segments")?;
@@ -1746,13 +2285,16 @@ impl Engine {
         };
 
         tracing::debug!(
-            "frames={} segments={} bytes={} span={}ms dropped={} dropped_audio={} \
+            "frames={} segments={} bytes={} span={}ms evicted={} dropped={} dropped_audio={} \
              dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}% {}",
             self.frames,
             stats.segments,
             // Same buffered-bytes number the status publishes, so line and panel agree.
             buffered,
             stats.span_ms,
+            // Fragments the ring dropped off the front to stay inside its RAM cap. Zero in session
+            // mode, where the storage policy does the deleting.
+            self.ledger.evicted()?,
             dropped,
             self.encoder.dropped_audio_blocks(),
             self.encoder.dropped_mic_audio_blocks(),
@@ -1810,14 +2352,29 @@ impl Engine {
 
         // Periodic storage-policy pass on the same tick; `cleanup_pass` is silent when there is nothing to do.
         if last_cleanup.elapsed() >= CLEANUP_INTERVAL {
-            cleanup_pass(&self.store, &self.storage, &mut self.cleanup);
+            cleanup_pass(
+                &self.store,
+                &self.storage,
+                self.ledger.clips_dir(),
+                &mut self.cleanup,
+            );
             *last_cleanup = Instant::now();
         }
         Ok(())
     }
 
     /// The trigger path, run on the loop thread because it pumps.
-    fn take_clip(&mut self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
+    ///
+    /// The post-roll wait and the window resolution happen here; the splice and the chapter
+    /// write do not (see [`PendingClip`]). The caller is answered when the file exists, as
+    /// before — only the thread the work happens on has changed.
+    fn take_clip(
+        &mut self,
+        reason: ClipReason,
+        window: ClipWindow,
+        event_at_ms: Option<u64>,
+        reply: Sender<Result<RecordedClip>>,
+    ) -> Result<()> {
         let (pre_ms, post_ms) =
             window.resolve(self.pre_ms, self.post_ms, self.max_pre_ms, self.max_post_ms);
         // The trigger is "now" on the ledger's media timeline, not the wall clock. The clocks only agree
@@ -1829,7 +2386,7 @@ impl Engine {
         //
         // `pre_seconds` therefore means seconds of recorded footage; clips splice whole segments, so a
         // clip can run up to one segment past the request but never short of it. If the buffer holds less
-        // than `pre_ms`, the ring's `trigger` warns and splices the truncated front.
+        // than `pre_ms`, the ring's `clip_source` warns and splices the truncated front.
         let trigger_ms = self.ledger.span_ms()?;
         // Wall clock, telemetry only (logged beside the media value; `drift` should sit still). Mixing
         // the two clocks is what made the post-roll unreachable, so nothing below reads it.
@@ -1841,11 +2398,11 @@ impl Engine {
             wall_ms as i64 - trigger_ms as i64
         );
 
-        // Wait for the post-roll to be written before splicing. The budget is `post_ms` plus a margin,
-        // never a constant: those media seconds stay invisible to the ring until ffmpeg finishes the
-        // segment carrying them (see `POST_ROLL_MARGIN`).
-        let need_ms = trigger_ms + post_ms;
-        let budget = Duration::from_millis(post_ms) + POST_ROLL_MARGIN;
+        // Wait for the post-roll to be written before splicing. The budget is the post-roll plus
+        // the segment lag plus a margin, never a constant: those media seconds stay invisible to
+        // the ring until ffmpeg finishes the segment carrying them (see `POST_ROLL_MARGIN`).
+        let need_ms = trigger_ms.saturating_add(post_ms);
+        let budget = self.post_roll_budget(post_ms);
         // One wait loop for both modes and the microphone (see `pump_until_span_on`).
         let counts = pump_until_span_on(
             &mut self.pacer,
@@ -1859,8 +2416,117 @@ impl Engine {
         )?;
         self.account(counts);
 
+        // The window, resolved: the footage the clip is cut from, and where it starts. The start
+        // is the resolved one — the first segment or fragment that overlaps the request — because
+        // that is where the clip's first frame really is. The request is only a bound on it.
+        let source = self.ledger.clip_source(trigger_ms, pre_ms, post_ms)?;
+        let started_at_ms = source.start_ms();
+        // The event's own moment, when the caller knew it. A burst of game events is coalesced
+        // before the clip is cut, and the coalescing can run for most of the pre-roll: the
+        // request instant is then long after the moment the event describes, and a marker
+        // stamped with it would point at the wrong second of the recording.
+        let at_ms = match event_at_ms {
+            Some(at_ms) => at_ms,
+            None => self.ledger.origin_ms().saturating_add(trigger_ms),
+        };
+
+        // The events in the clip's span, for its chapters. Read before the splice, so the
+        // chapters are known when the file is written: a marker recorded while the splice ran
+        // is not a chapter of this clip, which is a fraction of a second of a long recording.
+        let events = self.clip_events(started_at_ms, source.duration_ms());
+        // The event that asked for the clip, as the chapter's kind and position.
+        let trigger = reason
+            .event()
+            .map(|event| (event.kind.as_tag().to_string(), at_ms));
+
         let stem = format!("clip-{}", unix_millis());
-        let mut clip = self.ledger.trigger(trigger_ms, &stem, pre_ms, post_ms)?;
+        let out = self.ledger.clips_dir().join(format!("{stem}.mp4"));
+        let bin = self.ledger.bin().clone();
+        let encoder = self.encoder_name.clone();
+        // The splice, on a thread of its own: ffmpeg takes as long as the clip is long, and the
+        // pump must keep running while it does.
+        let worker = std::thread::Builder::new()
+            .name("localplay-splice".to_string())
+            .spawn(move || splice_clip(bin, source, out, encoder, events, trigger, started_at_ms))
+            .context("spawning the clip's splice thread")?;
+        self.pending_clips.push(PendingClip {
+            reply,
+            worker,
+            at_ms,
+            started_at_ms,
+            reason,
+        });
+        Ok(())
+    }
+
+    /// How long the post-roll wait may take.
+    ///
+    /// The post-roll itself, plus twice the segment length, plus the margin. The segment term
+    /// is the ledger's trust lag: a segment counts only once a strictly later one exists (the
+    /// file ledger's "ffmpeg appends to the newest segment"), so the span lags the wall clock
+    /// by up to a whole segment and the post-roll cannot arrive before that. A budget without
+    /// the term timed out on every clip of a session with a long segment, and the user's clip
+    /// was lost.
+    fn post_roll_budget(&self, post_ms: u64) -> Duration {
+        Duration::from_millis(
+            post_ms
+                .saturating_add(self.segment_ms.saturating_mul(2))
+                .saturating_add(POST_ROLL_MARGIN.as_millis() as u64),
+        )
+    }
+
+    /// The events in the clip's span, for its chapters.
+    ///
+    /// Best effort: a failure is logged and the clip is written without chapters, because the
+    /// clip is what the user asked for.
+    fn clip_events(&self, started_at_ms: u64, duration_ms: u64) -> Vec<Event> {
+        let end_ms = started_at_ms.saturating_add(duration_ms);
+        match self
+            .store
+            .events_in_range(self.session, started_at_ms, end_ms)
+        {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::warn!("no chapters for the clip: reading its events failed: {err:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Answer the clips that are ready.
+    ///
+    /// The loop calls this on every pass, so a finished splice is noticed within a frame
+    /// interval and the caller is answered without waiting for the recording to stop.
+    fn advance_clips(&mut self) {
+        let Some(index) = self
+            .pending_clips
+            .iter()
+            .position(|pending| pending.worker.is_finished())
+        else {
+            return;
+        };
+        let pending = self.pending_clips.swap_remove(index);
+        let reply = pending.reply.clone();
+        match self.finish_clip(pending) {
+            Ok(clip) => {
+                let _ = reply.send(Ok(clip));
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err));
+            }
+        }
+    }
+
+    /// The index writes, once the clip's file exists.
+    ///
+    /// The file is written by the splice thread; the index is written here, because the store
+    /// belongs to this thread and is not shareable.
+    fn finish_clip(&mut self, pending: PendingClip) -> Result<RecordedClip> {
+        let clip = match pending.worker.join() {
+            Ok(Ok(clip)) => clip,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err(anyhow::anyhow!("the clip's splice thread panicked")),
+        };
         tracing::info!(
             "wrote {} ({}ms, {} bytes, encoder={})",
             clip.path.display(),
@@ -1869,15 +2535,7 @@ impl Engine {
             clip.encoder
         );
 
-        // `started_at_ms` is on the ledger's timeline (`ledger_origin_ms` plus the run-relative
-        // window start), the timeline the footage and the events are measured on.
-        let started_at_ms = self.ledger.origin_ms() + trigger_ms.saturating_sub(pre_ms);
-        let at_ms = self.ledger.origin_ms() + trigger_ms;
-        // Before indexing, so the row records the final size.
-        let trigger = reason.event().map(|event| (event.kind.as_tag(), at_ms));
-        self.write_chapters(&mut clip, started_at_ms, trigger);
-
-        let id = index_clip(&self.store, &clip, started_at_ms);
+        let id = index_clip(&self.store, &clip, pending.started_at_ms);
         // The clip carries its recording session's game so the library can filter without a join. Best effort.
         if let Some(id) = id {
             if let Ok(Some(game)) = self
@@ -1895,9 +2553,9 @@ impl Engine {
         // `at` is the trigger instant (`pre_ms` into the clip), so the marker lands on the moment that
         // caused it. A failed insert is reported, not fatal: the clip file is on disk either way.
         let session_id = Some(self.session);
-        let recorded = match reason.event() {
-            Some(event) => index_event(&self.store, event, at_ms, id, session_id),
-            None => index_bookmark(&self.store, at_ms, id, session_id),
+        let recorded = match pending.reason.event() {
+            Some(event) => index_event(&self.store, event, pending.at_ms, id, session_id),
+            None => index_bookmark(&self.store, pending.at_ms, id, session_id),
         };
         if let Err(err) = recorded {
             tracing::error!(
@@ -1910,58 +2568,35 @@ impl Engine {
         Ok(RecordedClip {
             metadata: clip,
             id,
-            started_at_ms,
+            started_at_ms: pending.started_at_ms,
         })
     }
 
-    /// Mark the clip's game events as MP4 chapters. Best effort: the clip is already saved, so a
-    /// failure is logged and the clip kept as written.
+    /// Finish the clips that were still being spliced when the recording ended.
     ///
-    /// Only events indexed by now are marked; one that happens during the post-roll is still
-    /// queued behind this clip and is not in the file.
-    fn write_chapters(
-        &self,
-        clip: &mut ClipMetadata,
-        started_at_ms: u64,
-        trigger: Option<(&str, u64)>,
-    ) {
-        let end_ms = started_at_ms.saturating_add(clip.duration_ms);
-        let events = match self
-            .store
-            .events_in_range(self.session, started_at_ms, end_ms)
-        {
-            Ok(events) => events,
-            Err(err) => {
-                let path = clip.path.display();
-                tracing::warn!("no chapters for {path}: reading its events failed: {err:#}");
-                return;
-            }
-        };
-        let chapters = clip_chapters(&events, trigger, started_at_ms, clip.duration_ms);
-        if chapters.is_empty() {
-            return;
-        }
-        match edit::add_chapters(self.ledger.bin(), &clip.path, &chapters, clip.duration_ms) {
-            Ok(()) => {
-                if let Ok(meta) = std::fs::metadata(&clip.path) {
-                    clip.size_bytes = meta.len();
-                }
-                tracing::info!(
-                    "marked {} chapters in {}",
-                    chapters.len(),
-                    clip.path.display()
-                );
-            }
-            Err(err) => tracing::warn!(
-                "could not add chapters to {} ({err:#}); the clip is kept without them",
-                clip.path.display()
-            ),
+    /// The recording is over, but the clip the user asked for exists: the file is written and
+    /// its index row with it.
+    fn finish_pending_clips(&mut self) {
+        while let Some(pending) = self.pending_clips.pop() {
+            let reply = pending.reply.clone();
+            let outcome = self.finish_clip(pending);
+            let _ = reply.send(outcome);
         }
     }
 
     /// Record an event that did not ask for a clip (see [`Recorder::note_event`]).
-    fn note_event(&mut self, event: &GameEvent) -> Result<i64> {
-        let at_ms = self.ledger.origin_ms() + self.ledger.span_ms()?;
+    ///
+    /// `at_ms` is the event's own moment when the caller knew it, and "now" otherwise: the
+    /// moment the request was handled is right for a marker nobody coalesced and wrong for one
+    /// that waited in a burst.
+    fn note_event(&mut self, event: &GameEvent, at_ms: Option<u64>) -> Result<i64> {
+        let at_ms = match at_ms {
+            Some(at_ms) => at_ms,
+            None => self
+                .ledger
+                .origin_ms()
+                .saturating_add(self.ledger.span_ms()?),
+        };
         index_event(&self.store, event, at_ms, None, Some(self.session))
     }
 
@@ -2004,6 +2639,9 @@ impl Engine {
         // Accumulated where every pump's counts pass: the steady-state loop and the post-roll wait.
         self.capture_time += counts.capture;
         self.submit_time += counts.submit;
+        // Where the recording stands on the media timeline, published for the callers that stamp
+        // an event with the moment it happened (see `Recorder::media_now_ms`).
+        self.publish_media_position();
         // Frames that reached ffmpeg: submitted minus what the bounded queue dropped. This, not `frames=`,
         // is the achieved rate. The count is cumulative, so only new drops come out of the meter.
         let dropped = self.encoder.dropped_frames();
@@ -2031,6 +2669,22 @@ impl Engine {
         // Telemetry only: an unreadable ring contributes no media position, so the result is the wall
         // clock alone, which is visibly wrong rather than quietly plausible (the reader's error is logged once).
         self.clock.ms_at(Instant::now()) as i64 - self.ledger.span_ms().unwrap_or(0) as i64
+    }
+
+    /// Publish where the recording stands on the media timeline.
+    ///
+    /// The ledger's position, not the wall clock's: the footage is measured on the ledger's
+    /// clock, so an event stamped with it lands next to the clip that covers it. A ledger that
+    /// cannot be read contributes no position, and the published value stays where it was: a
+    /// stale position is better than a jump to zero.
+    fn publish_media_position(&self) {
+        let Ok(span) = self.ledger.span_ms() else {
+            return;
+        };
+        self.status.media_ms.store(
+            self.ledger.origin_ms().saturating_add(span),
+            Ordering::Relaxed,
+        );
     }
 
     /// Flush the encoder, close the sources, and close the session.
@@ -2066,13 +2720,20 @@ impl Engine {
             None => Ok(()),
         };
         let session = self.finish_session();
-        flushed
-            .and(scanned)
-            .and(ledger)
-            .and(audio)
-            .and(capture)
-            .and(mic)
-            .and(session)
+        // Every step ran, and every failure is reported. `Result::and` keeps only the *first*
+        // error, and the one the recovery pass needs is often the last: a session that could
+        // not be concatenated was invisible whenever the encoder flush also failed.
+        let failures: Vec<String> = [flushed, scanned, ledger, audio, capture, mic, session]
+            .into_iter()
+            .filter_map(|step| step.err().map(|err| format!("{err:#}")))
+            .collect();
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "the recording did not shut down cleanly: {}",
+            failures.join("; ")
+        ))
     }
 
     /// Close this recording's `sessions` row, concatenating a full session first.
@@ -2464,7 +3125,7 @@ fn build_encode_config(
     native_size: (u32, u32),
 ) -> Result<EncodeConfig> {
     let output_size = parse_output_size(&cfg.encode.output_size)?.unwrap_or(native_size);
-    let segment_ms = cfg.buffer.segment_time * 1000;
+    let segment_ms = cfg.buffer.segment_time.saturating_mul(1000);
 
     // Mutable only on Windows, where the hybrid sets `video`; the guard is unconditional so a configuration this platform cannot honour is refused here, not at capture time.
     #[cfg_attr(not(windows), allow(unused_mut))]

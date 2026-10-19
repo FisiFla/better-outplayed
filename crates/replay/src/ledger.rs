@@ -17,8 +17,12 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Where the segment ends on the timeline.
+    ///
+    /// Saturating: the numbers come from a configuration and a file, and a segment that
+    /// overflowed the timeline would end before it starts.
     pub fn end_ms(&self) -> u64 {
-        self.start_ms + self.duration_ms
+        self.start_ms.saturating_add(self.duration_ms)
     }
 }
 

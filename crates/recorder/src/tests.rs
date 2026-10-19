@@ -366,11 +366,15 @@ fn a_clip_records_why_it_was_taken() {
         kill_row.clip_id, evented.id,
         "linked to the clip it produced"
     );
-    assert_eq!(
-        kill_row.at_ms,
-        evented.started_at_ms + PRE_SECONDS * 1000,
-        "the event's `at` is the trigger instant, which is `pre_seconds` into the clip \
-         (the clip starts earlier than the moment that caused it)"
+    // The event's `at` is the trigger instant, and the trigger is inside the clip: at most a
+    // pre-roll's worth of media before it, and at least a segment less (the clip starts at the
+    // first whole fragment that covers the request, and that fragment can begin before it).
+    let into_the_clip = kill_row.at_ms.saturating_sub(evented.started_at_ms);
+    assert!(
+        into_the_clip <= PRE_SECONDS * 1000
+            && into_the_clip + SEGMENT_SECONDS * 1000 >= PRE_SECONDS * 1000,
+        "the event's `at` is the trigger instant, which is inside the clip's pre-roll: \
+         {into_the_clip}ms into a {PRE_SECONDS}s pre-roll"
     );
     assert!(
         kill_row
@@ -442,12 +446,21 @@ fn a_clip_records_why_it_was_taken() {
     // The kill is a chapter at the trigger instant; the hotkey clip, whose only event is its
     // bookmark, is left without chapters.
     let bin = recorder_bin(&app_data_dir);
+    let chapters = chapter_starts(&evented.metadata.path, &bin);
+    let kill_at = chapters
+        .iter()
+        .find(|(_, title)| title == "Kill")
+        .map(|(at, _)| *at)
+        .expect("the kill is a chapter of the clip it asked for");
     assert_eq!(
-        chapter_starts(&evented.metadata.path, &bin),
-        [
-            (0, edit::LEAD_IN_TITLE.to_string()),
-            (PRE_SECONDS * 1000, "Kill".to_string())
-        ]
+        chapters.first().map(|(_, title)| title.as_str()),
+        Some(edit::LEAD_IN_TITLE),
+        "the lead-in chapter, because the kill is later than the clip's first frame: {chapters:?}"
+    );
+    assert!(
+        kill_at <= PRE_SECONDS * 1000 && kill_at + SEGMENT_SECONDS * 1000 >= PRE_SECONDS * 1000,
+        "the kill's chapter is where the trigger was, within a segment of the pre-roll: {kill_at}ms \
+         into the clip"
     );
     assert!(chapter_starts(&manual.metadata.path, &bin).is_empty());
     let row = clips
@@ -730,6 +743,7 @@ fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
         },
         games: GamesSection::default(),
         game: None,
+        fail_starts: FailStarts::default(),
     }
 }
 
@@ -1352,6 +1366,339 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
     let file = PathBuf::from(other.final_path.clone().expect("with its session file"));
     assert!(file.is_file(), "{file:?} exists");
     assert_eq!(stream_counts(&file, &bin), (1, 1));
+}
+
+/// A start that fails must not take the recorder's index connection with it.
+///
+/// The store is the recorder's only connection to the index, and a recording takes it for the
+/// length of the recording. A start that failed *after* taking it used to leave the recorder
+/// with none: the next game would fail at once with "this recorder's store is already in a
+/// recording", and one transient failure (a probe timeout, a locked database, a capture session
+/// another application holds) would end auto-record for the life of the process.
+///
+/// So: the first game start fails, and the second one must record.
+#[test]
+fn a_start_that_fails_does_not_take_the_next_one_with_it() {
+    let (_tmp, app_data_dir) = application_data_dir("failed-start");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    // The first start fails, after it has taken the store.
+    opts.fail_starts = FailStarts::next(1);
+
+    let (presence, changes) = mpsc::channel();
+    let recorder = Recorder::start_inner(
+        stub_config(&app_data_dir),
+        opts,
+        // The supervisor builds the shipping probe itself; this panicking closure proves it is
+        // not called.
+        &|_cfg: &EncodeConfig| {
+            panic!("the injected measurement belongs to a recording `start` begins itself")
+        },
+        Some((changes, None)),
+    )
+    .expect("the armed recorder starts");
+
+    let game = WatchedGame::by_process("Dota 2", "dota2.exe");
+    presence
+        .send(PresenceChange::Started(game.clone()))
+        .expect("telling the recorder");
+
+    // The first start fails, and says why.
+    let failed = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the failed start to be reported",
+        |s| s.error.is_some(),
+    );
+    let why = failed.error.clone().unwrap_or_default();
+    assert!(
+        why.contains("the test made this start fail"),
+        "the failure must be reported as it happened: {why}"
+    );
+    assert!(!failed.running, "and nothing is being recorded: {failed:?}");
+
+    // The second game starts. It cannot record without the store, so a recording that begins
+    // is the proof that the store came back.
+    presence
+        .send(PresenceChange::Started(game.clone()))
+        .expect("telling the recorder");
+    let recording = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the second game's recording",
+        |s| s.running,
+    );
+    assert!(
+        recording.running,
+        "the second game is recorded: {recording:?}"
+    );
+    assert_eq!(recording.game.as_deref(), Some("Dota 2"), "{recording:?}");
+
+    recorder.stop().expect("stop must succeed");
+}
+
+/// A clip's splice must not punch a hole in the recording.
+///
+/// The splice is ffmpeg's, and ffmpeg takes as long as the clip is long. Run on the pump thread
+/// it stops the pump: the capture backend is not drained, the encoder's queue fills, and because
+/// the media clock is the wall clock the frames that follow carry a timestamp a whole splice
+/// later — a frozen picture in the recording, at every clip, for as long as the splice took.
+///
+/// The splice is made slow on purpose (a wrapper that waits before the in-memory remux), so
+/// the hole it would leave is seconds long and the next clip's own frames show it.
+#[cfg(unix)]
+#[test]
+fn a_clip_does_not_punch_a_hole_in_the_recording() {
+    /// How long the wrapped splice takes. Long enough to be unmistakable in the frame
+    /// timestamps, short enough to keep the test quick.
+    const SPLICE_DELAY: Duration = Duration::from_secs(2);
+    /// The longest gap between two frames of a clip that is whole.
+    ///
+    /// The stub records at 10fps, so the frames are 100ms apart; half a second is five frames,
+    /// which is jitter no loaded runner produces and a two-second hole is twenty.
+    const WHOLE_CLIP_GAP_MS: u64 = 500;
+
+    let (_tmp, app_data_dir) = application_data_dir("splice-hole");
+    let mut cfg = stub_config(&app_data_dir);
+    // A pre-roll long enough to cover the hole the slow splice would leave.
+    cfg.buffer.pre_seconds = 6;
+    let bin = cfg.bin.clone();
+    // The recorder's ffmpeg is a wrapper that waits before the in-memory remux.
+    cfg.bin.ffmpeg = slow_splice_wrapper(&bin.ffmpeg, SPLICE_DELAY);
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= 6_000,
+    );
+
+    // The first clip: its splice is the slow one.
+    let started = Instant::now();
+    let first = recorder.clip_now().expect("the first clip");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= SPLICE_DELAY,
+        "the wrapper must have made the splice slow, or the test proves nothing: {elapsed:?}"
+    );
+
+    // The footage the splice interrupted is inside a fragment, and a fragment is only
+    // ingested once the next one starts: wait for the ring to hold it.
+    wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the interrupted footage to be indexed",
+        |s| s.span_ms >= 10_000,
+    );
+    // The second clip, whose window covers the moment the first splice ran.
+    let second = recorder.clip_now().expect("the second clip");
+    recorder.stop().expect("stop must succeed");
+    assert!(first.metadata.path.is_file(), "the first clip is on disk");
+    assert!(second.metadata.path.is_file(), "the second clip is on disk");
+
+    // The frames of the second clip, and the gaps between them. A recording that kept running
+    // under the splice has no gap at all; one that froze for the splice has a hole exactly
+    // that long.
+    let gaps = frame_gaps(&second.metadata.path, &bin);
+    assert!(
+        gaps.len() > 10,
+        "the clip must carry a run of frames: {} gaps",
+        gaps.len()
+    );
+    let biggest = gaps.iter().copied().max().unwrap_or(0);
+    assert!(
+        biggest < WHOLE_CLIP_GAP_MS,
+        "the recording froze for {biggest}ms while the clip was spliced, so the footage has a \
+         hole in it: {gaps:?}"
+    );
+}
+
+/// An ffmpeg wrapper that waits before the in-memory remux, and passes everything else through.
+///
+/// The recorder's ffmpeg is the encoder's *and* the splicer's, so the wrapper has to tell them
+/// apart: the remux reads a fragmented stream from a pipe and copies it (`-i pipe:0 -c copy`),
+/// while the encoder reads raw pixels from a pipe (`-f rawvideo -i pipe:0`) and encodes them.
+/// Only the first is the splice this test wants to slow down.
+#[cfg(unix)]
+fn slow_splice_wrapper(real_ffmpeg: &Path, delay: Duration) -> PathBuf {
+    let dir = tempfile::tempdir().expect("a temp dir for the wrapper");
+    let path = dir.path().join("slow-splice-ffmpeg");
+    let script = format!(
+        "#!/bin/sh\n\
+         # Waits before the in-memory remux, so a test can prove the recorder keeps pumping\n\
+         # while a clip is spliced. Every other invocation goes straight through.\n\
+         is_pipe=\n\
+         is_copy=\n\
+         is_raw=\n\
+         for arg in \"$@\"; do\n\
+         \x20 [ \"$arg\" = \"pipe:0\" ] && is_pipe=1\n\
+         \x20 [ \"$arg\" = \"copy\" ] && is_copy=1\n\
+         \x20 [ \"$arg\" = \"rawvideo\" ] && is_raw=1\n\
+         done\n\
+         if [ -n \"$is_pipe\" ] && [ -n \"$is_copy\" ] && [ -z \"$is_raw\" ]; then\n\
+         \x20 sleep {seconds}\n\
+         fi\n\
+         exec \"{ffmpeg}\" \"$@\"\n",
+        seconds = delay.as_secs(),
+        ffmpeg = real_ffmpeg.display(),
+    );
+    std::fs::write(&path, script).expect("writing the wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("making the wrapper executable");
+    }
+    // The directory has to outlive the path: the recorder runs the wrapper for the whole test.
+    std::mem::forget(dir);
+    path
+}
+
+/// The gaps between the video frames of a file, in ms.
+///
+/// The frames' own timestamps, which is the media timeline: a recording that stopped for a
+/// while has a gap here, however seamless the picture looks.
+fn frame_gaps(path: &Path, bin: &FfmpegBinaries) -> Vec<u64> {
+    let output = std::process::Command::new(&bin.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("running ffprobe");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let times: Vec<f64> = text
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .collect();
+    times
+        .windows(2)
+        .map(|pair| ((pair[1] - pair[0]) * 1000.0).round() as u64)
+        .collect()
+}
+
+/// A burst's events are marked at the moment they happened, not when the burst was cut.
+///
+/// A burst is coalesced before its clip is cut — up to 60% of the pre-roll, which is 18
+/// seconds at the default `pre_seconds`. The marker and the chapter must name the moment the
+/// event describes, not the moment the request was made: with the request's instant, a kill at
+/// the start of a burst is stamped at the end of it, and the chapter lands seconds away from
+/// the play it names.
+#[test]
+fn a_burst_event_is_marked_at_the_moment_it_happened() {
+    use crate::event_driver::{act_on_burst, Coalesce, Policy};
+
+    /// How long the burst waits before it settles. Long enough that the two instants — the
+    /// arrival and the cut — are far apart on any clock.
+    const BURST_WAIT: Duration = Duration::from_secs(3);
+    /// How far the mark may sit from the arrival: the media clock moves a fragment at a time
+    /// (about a second), so the two samples of it cannot be closer than that.
+    const ARRIVAL_SLACK_MS: i64 = 1_500;
+
+    let (_tmp, app_data_dir) = application_data_dir("burst-marker");
+    let mut cfg = stub_config(&app_data_dir);
+    // A pre-roll long enough to hold the event the burst waited for.
+    cfg.buffer.pre_seconds = 5;
+    let db_path = cfg.db_path();
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= (5 + POST_SECONDS) * 1000,
+    );
+
+    // The event happens now. The burst waits for the rest of it, and the clip is cut at the
+    // end of that wait — three seconds later.
+    let arrived_at = recorder.media_now_ms();
+    let (_tx, rx) = mpsc::channel::<GameEvent>();
+    let kill = GameEvent::bare(localplay_events::Source::Lol, EventKind::Kill);
+    let policy = Policy {
+        coalesce: Coalesce {
+            quiet: BURST_WAIT,
+            max: BURST_WAIT * 3,
+        },
+        muted: Vec::new(),
+        lol: ClipWindow::default(),
+        gsi: ClipWindow::default(),
+    };
+    let clip = act_on_burst(&recorder, kill, &rx, &policy)
+        .expect("the burst is acted on")
+        .expect("a highlight takes a clip");
+    recorder.stop().expect("stop must succeed");
+
+    // The marker the burst left: the moment the event arrived.
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let events = store.list_events().expect("the events");
+    let marker = events
+        .iter()
+        .find(|event| event.kind == "kill")
+        .expect("the kill's row");
+    let drift = marker.at_ms as i64 - arrived_at as i64;
+    assert!(
+        drift.abs() <= ARRIVAL_SLACK_MS,
+        "the marker must be stamped with the moment the event arrived ({arrived_at}ms), not the \
+         moment the burst was cut: the row says {}ms",
+        marker.at_ms
+    );
+
+    // And the chapter in the clip: the moment inside the footage, which is the arrival and not
+    // the request. The request is the end of the pre-roll, three seconds later.
+    let chapters = chapter_starts(&clip.metadata.path, &recorder_bin(&app_data_dir));
+    let kill_at = chapters
+        .iter()
+        .find(|(_, title)| title == "Kill")
+        .map(|(at, _)| *at)
+        .expect("the kill is a chapter of the clip it asked for");
+    assert!(
+        kill_at < 3_500,
+        "the chapter must be where the event happened, not at the end of the pre-roll: {chapters:?}"
+    );
+}
+
+/// The post-roll wait must survive a ledger whose span lags the wall clock by a whole segment.
+///
+/// A ledger trusts a segment only once a strictly later one exists (ffmpeg appends to the
+/// newest segment), so the span it reports lags the wall clock by up to one segment, and the
+/// post-roll cannot arrive before that. A budget of `post_ms + margin` could not be met with a
+/// long segment: every clip failed with "timed out waiting for post-roll" and the clip the
+/// user asked for was lost.
+#[test]
+fn a_long_segment_does_not_make_the_post_roll_wait_time_out() {
+    const SEGMENT: u64 = 10;
+
+    let (_tmp, app_data_dir) = application_data_dir("long-segment");
+    let mut cfg = stub_config(&app_data_dir);
+    // A segment ten seconds long: the ledger's span moves in ten-second steps.
+    cfg.buffer.segment_time = SEGMENT;
+    cfg.buffer.post_seconds = 2;
+    // A full session, whose ledger is the one that trusts a segment only once a later one
+    // exists (the file ledger's rule: ffmpeg appends to the newest segment).
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::FullSession, false))
+        .expect("the session recorder starts");
+
+    // The first segment is trusted only once a second one exists, ten seconds later.
+    wait_for(
+        &recorder,
+        Duration::from_secs(60),
+        "the first segment to be trusted",
+        |s| s.span_ms >= 9_000,
+    );
+
+    // And the post-roll: the span has to reach the trigger plus the post-roll, which takes
+    // another whole segment. A budget of `post + margin` would time out here.
+    let clip = recorder
+        .clip_now()
+        .expect("the post-roll must arrive inside the budget");
+    assert!(clip.metadata.path.is_file(), "the clip is on disk");
+    recorder.stop().expect("stop must succeed");
 }
 
 #[test]
