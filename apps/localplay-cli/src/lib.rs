@@ -40,6 +40,10 @@
 //! nothing enumerates windows; the trigger is an in-process call on the engine's media-time path,
 //! and it produces the hotkey's own log lines.
 
+// Test bodies may unwrap and may chunk by a constant; production code may do neither.
+// Scoped to the test build of this crate, so it cannot hide either in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
+
 pub mod config;
 
 use anyhow::{bail, Context, Result};

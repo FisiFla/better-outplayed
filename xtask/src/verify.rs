@@ -13,6 +13,18 @@
 //! enumerates windows.** The self-test flag is the whole mechanism, and it is a function call
 //! inside the process under test. That property is the reason the harness exists.
 //!
+//! # What the exit code means
+//!
+//! A check that *failed* fails the run. A check that could not be performed does not —
+//! unless `--strict` is given. That asymmetry is deliberate: the harness exists to be run
+//! on machines that cannot perform half of it (a development host with no GPU encoder, a
+//! runner with no desktop), and a report that says plainly what was not judged is worth
+//! more than a refusal to produce one. `--strict` is for the caller who wants the absence
+//! of evidence to be as loud as the evidence of a defect.
+//!
+//! Either way the report's verdict line carries the count of what was not judged, so a
+//! green verdict is never a statement about checks that did not run.
+//!
 //! # What it cannot do, and says so
 //!
 //! Every check it cannot perform is listed in the report as *not performed* with the reason,
@@ -52,25 +64,29 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 ///
 /// Stated in the report verbatim, because a measurement without its configuration is not
 /// evidence. Not the shipping defaults (`config.example.toml`): chosen so that one run under
-/// two minutes exercises the clip path, the scratch cap, eviction and a steady-state window.
+/// two minutes exercises the clip path, the RAM cap, eviction and a steady-state window.
 struct RunConfig {
     pre_seconds: u64,
     post_seconds: u64,
     segment_time: u64,
-    scratch_cap_bytes: u64,
+    /// The ring's RAM budget: `buffer.ram_cap_bytes`, the only cap the engine has.
+    ///
+    /// There is no disk cap. The replay buffer holds its footage in RAM and writes nothing to
+    /// the disk while it is only buffering, so a "scratch cap" would have had nothing to bound.
+    ram_cap_bytes: u64,
     fps: u32,
     bitrate_kbps: u32,
     audio_bitrate_kbps: u32,
 }
 
 /// The one configuration this harness runs with. `segment_time = 1` makes cuts snap to a 1 s
-/// grid (+-0.5 s tolerance); the 16 MiB cap is small enough that a ~45 s run of ~1.0 MB/s must
-/// evict, and large enough to hold several times the 8 s window.
+/// grid (+-0.5 s tolerance); the 16 MiB RAM budget is small enough that a ~45 s run of ~1.0 MB/s
+/// must evict, and large enough to hold several times the 8 s window.
 const RUN_CONFIG: RunConfig = RunConfig {
     pre_seconds: 5,
     post_seconds: 3,
     segment_time: 1,
-    scratch_cap_bytes: 16 * 1024 * 1024,
+    ram_cap_bytes: 16 * 1024 * 1024,
     fps: 30,
     bitrate_kbps: 8_000,
     audio_bitrate_kbps: 128,
@@ -89,7 +105,7 @@ impl RunConfig {
              pre_seconds = {pre}\n\
              post_seconds = {post}\n\
              segment_time = {segment}\n\
-             scratch_cap_bytes = {cap}\n\
+             ram_cap_bytes = {cap}\n\
              scratch_dir = \"\"\n\
              \n\
              [encode]\n\
@@ -119,7 +135,7 @@ impl RunConfig {
             pre = self.pre_seconds,
             post = self.post_seconds,
             segment = self.segment_time,
-            cap = self.scratch_cap_bytes,
+            cap = self.ram_cap_bytes,
             bitrate = self.bitrate_kbps,
             fps = self.fps,
             audio_bitrate = self.audio_bitrate_kbps,
@@ -145,6 +161,8 @@ struct Options {
     no_build: bool,
     cli: Option<PathBuf>,
     clean_work: bool,
+    /// Whether a check that could not be performed counts as a failure. See [`run_failed`].
+    strict: bool,
 }
 
 fn usage() -> String {
@@ -168,6 +186,10 @@ options:
                        host with no GPU encoder (a development host). Checks that need
                        the real capture/encoder path are then reported as not performed.
   --clean-work         remove the work directory after the report is written
+  --strict             also exit non-zero when a check could not be performed, not only
+                       when one failed. Off by default: the harness exists to run on
+                       machines that cannot perform half of it, so a skipped check is
+                       reported rather than punished — unless the caller asks otherwise.
 "
     .to_string()
 }
@@ -181,6 +203,7 @@ fn parse_options(args: &[String], repo: &Path) -> Result<Options> {
         no_build: false,
         cli: None,
         clean_work: false,
+        strict: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -206,6 +229,7 @@ fn parse_options(args: &[String], repo: &Path) -> Result<Options> {
             "--dev-software-encoder" => opts.dev_software = true,
             "--no-build" => opts.no_build = true,
             "--clean-work" => opts.clean_work = true,
+            "--strict" => opts.strict = true,
             other => bail!("unexpected argument {other:?}\n\n{}", usage()),
         }
     }
@@ -459,12 +483,14 @@ pub fn verify_command(args: &[String]) -> Result<()> {
     }
     let repo = crate::repo_root();
     let opts = parse_options(args, &repo)?;
+    let strict = opts.strict;
     let mut session = Session::new(opts, repo);
     session.execute();
-    let (path, failed) = session.write_report()?;
-    if failed > 0 {
+    let (path, tally) = session.write_report()?;
+    if run_failed(tally, strict) {
         bail!(
-            "{failed} check(s) failed; the report is {}\n{}",
+            "{}; the report is {}\n{}",
+            failure_reason(tally),
             path.display(),
             session.console_summary()
         );
@@ -473,26 +499,92 @@ pub fn verify_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-impl Session {
-    fn console_summary(&self) -> String {
-        let passed = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::Pass))
-            .count();
-        let failed = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::Fail(_)))
-            .count();
-        let skipped = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::NotPerformed(_)))
-            .count();
+/// How many checks came out each way.
+///
+/// Counted once, at the end of the run, so the report, the console summary and the exit
+/// code cannot disagree about what the run found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tally {
+    passed: usize,
+    failed: usize,
+    not_performed: usize,
+}
+
+/// The word the report leads with.
+///
+/// A run that could not perform some of its checks is not a plain "PASS", and a reader who
+/// reads only the verdict must not over-read it: the count of what was *not* judged is
+/// therefore part of the verdict, not a footnote under it.
+fn verdict(tally: Tally) -> String {
+    match (tally.failed, tally.not_performed) {
+        (0, 0) => "PASS (on this machine, this run)".to_string(),
+        (0, skipped) => {
+            format!("PASS with {skipped} check(s) not performed (on this machine, this run)")
+        }
+        _ => "FAIL".to_string(),
+    }
+}
+
+/// Whether a finished run should exit non-zero.
+///
+/// A check that *failed* always fails the run. A check that could not be performed fails it
+/// only under `--strict`, and that asymmetry is deliberate: the harness exists to be run on
+/// machines that cannot perform half of it — a development host with no GPU encoder, a
+/// runner with no desktop — and a run that refuses to produce a report is worse than a
+/// report that says plainly what was not judged. `--strict` is for the caller who wants
+/// the absence of evidence to be as loud as the evidence of a defect.
+fn run_failed(tally: Tally, strict: bool) -> bool {
+    tally.failed > 0 || (strict && tally.not_performed > 0)
+}
+
+/// The one line that says why the run failed.
+///
+/// Only called when [`run_failed`] says so, so there are exactly two reasons to be here:
+/// a check failed, or a strict run found a check it could not perform.
+fn failure_reason(tally: Tally) -> String {
+    if tally.failed > 0 {
+        format!("{} check(s) failed", tally.failed)
+    } else {
         format!(
-            "verify: {passed} passed, {failed} failed, {skipped} not performed\nreport: {}",
-            self.opts.report.display()
+            "--strict: {} check(s) could not be performed, and a strict run counts that as a \
+             failure",
+            tally.not_performed
+        )
+    }
+}
+
+impl Session {
+    /// The run's own count of what it found.
+    fn tally(&self) -> Tally {
+        Tally {
+            passed: self
+                .checks
+                .iter()
+                .filter(|c| matches!(c.outcome, Outcome::Pass))
+                .count(),
+            failed: self
+                .checks
+                .iter()
+                .filter(|c| matches!(c.outcome, Outcome::Fail(_)))
+                .count(),
+            not_performed: self
+                .checks
+                .iter()
+                .filter(|c| matches!(c.outcome, Outcome::NotPerformed(_)))
+                .count(),
+        }
+    }
+
+    fn console_summary(&self) -> String {
+        let tally = self.tally();
+        format!(
+            "verify: {verdict} — {passed} passed, {failed} failed, {skipped} not performed\n\
+             report: {report}",
+            verdict = verdict(tally),
+            passed = tally.passed,
+            failed = tally.failed,
+            skipped = tally.not_performed,
+            report = self.opts.report.display()
         )
     }
 
@@ -549,9 +641,8 @@ impl Session {
                 "criterion 2 (what makes the eviction evidence real)",
                 "the work directory is empty before the run",
                 format!("could not remove {}: {err}", dir.display()),
-                "a run that adopts a previous scratch directory continues its segment \
-                 numbering, and then `the lowest segment number is not 0` would be true \
-                 without any eviction having happened",
+                "a run that adopts a previous run's index and clips would report against \
+                 them, and the eviction and clip checks would be measuring the wrong run",
             ),
         }
     }
@@ -835,7 +926,7 @@ impl Session {
             "configuration (written by the harness, not the machine's own config):\n\n```toml\n{}\n```\n\n\
              command: `{}`\n\nRUST_LOG=debug; the application data directory was redirected to \
              `{}` so the run could not touch the real `%LOCALAPPDATA%\\localplay` (and so the \
-             scratch/eviction numbers below belong to this run alone).",
+             RAM and eviction numbers below belong to this run alone).",
             RUN_CONFIG.to_toml("auto"),
             run.command,
             app_data.display()
@@ -1199,29 +1290,37 @@ impl Session {
                 );
             }
 
-            // --- the scratch cap and eviction -----------------------------------------
-            let cap = RUN_CONFIG.scratch_cap_bytes;
+            // --- the RAM cap and eviction ----------------------------------------------
+            //
+            // The replay buffer is held in RAM: it writes nothing to the disk while it is only
+            // buffering, so there is no scratch directory to measure and no disk cap to enforce.
+            // What the engine has is `buffer.ram_cap_bytes`, and what it reports is the RAM the
+            // ring holds (`bytes=`) and how many fragments it has dropped to stay inside it
+            // (`evicted=`).
+            let cap = RUN_CONFIG.ram_cap_bytes;
             let max_bytes = parsed.iter().map(|(_, s)| s.bytes).max().unwrap_or(0);
-            let violated = run.find("scratch cap violated");
+            let evicted = parsed.iter().map(|(_, s)| s.evicted).max().unwrap_or(0);
+            let violated = run.find("over its RAM budget");
             let measured = format!(
-                "max bytes= {max_bytes} against a {cap} cap ({} status samples); the ledger is \
-                 `BufferStats.bytes_on_disk`, not `du` on the directory",
+                "max bytes= {max_bytes} against a {cap}-byte RAM cap ({} status samples); \
+                 `bytes=` is the RAM the ring holds, and the engine fails the run outright if \
+                 the ring ever goes over",
                 parsed.len()
             );
             if violated.is_none() && max_bytes <= cap {
                 self.pass(
-                    "scratch_cap",
-                    "the scratch cap held for the whole run",
+                    "ram_cap",
+                    "the ring stayed inside its RAM cap for the whole run",
                     "criterion 2",
-                    "bytes= never exceeds the configured cap",
+                    "bytes= never exceeds the configured RAM cap",
                     &measured,
                 );
             } else {
                 self.fail(
-                    "scratch_cap",
-                    "the scratch cap held for the whole run",
+                    "ram_cap",
+                    "the ring stayed inside its RAM cap for the whole run",
                     "criterion 2",
-                    "bytes= never exceeds the configured cap",
+                    "bytes= never exceeds the configured RAM cap",
                     &measured,
                     violated
                         .map(|l| l.text.trim().to_string())
@@ -1231,77 +1330,48 @@ impl Session {
                 );
             }
 
-            // The engine's directories hang off `<base>/localplay` (the CLI's `app_data_dir()`); `app_data`
-            // here is the base the harness redirected.
-            let scratch = app_data.join("localplay").join("scratch");
-            match segments_on_disk(&scratch) {
-                Ok(numbers) if !numbers.is_empty() => {
-                    let lowest = numbers.iter().min().copied().unwrap_or(0);
-                    let highest = numbers.iter().max().copied().unwrap_or(0);
-                    let measured = format!(
-                        "{} segments in {}, seg-{lowest:06} … seg-{highest:06} (the newest file is \
-                         the segment ffmpeg may still be appending to, and is deliberately not \
-                         indexed yet)",
-                        numbers.len(),
-                        scratch.display()
-                    );
-                    if lowest > 0 {
-                        self.pass(
-                            "eviction",
-                            "the cap evicted oldest-first (the lowest surviving segment is not 0)",
-                            "criterion 2",
-                            "lowest segment number > 0",
-                            &measured,
-                        );
-                    } else if max_bytes >= cap {
-                        // The cap *was* reached and nothing was evicted: a real defect.
-                        self.fail(
-                            "eviction",
-                            "the cap evicted oldest-first (the lowest surviving segment is not 0)",
-                            "criterion 2",
-                            "lowest segment number > 0",
-                            &measured,
-                            "the ledger reached the cap but every segment written since \
-                             seg-000000 is still on disk: nothing was evicted",
-                        );
-                    } else {
-                        // The run was too small to fill the ring: the harness's own configuration, not a defect. A PASS
-                        // here would be a claim about code that never ran.
-                        self.not_performed(
-                            "eviction",
-                            "the cap evicted oldest-first (the lowest surviving segment is not 0)",
-                            "criterion 2",
-                            "lowest segment number > 0",
-                            &measured,
-                            format!(
-                                "the ring never reached the {cap}-byte cap (max bytes= \
-                                 {max_bytes}), so no eviction was possible in this run: raise \
-                                 --seconds, or lower the cap. An unsoaked ring proves nothing \
-                                 about criterion 2"
-                            ),
-                        );
-                    }
-                }
-                Ok(_) => self.not_performed(
+            // The ring's own eviction count is the evidence: it counts the fragments dropped off
+            // the front to stay inside the cap. There is no segment directory to look at — the
+            // replay buffer writes nothing to the disk while it is only buffering.
+            let measured = format!(
+                "{evicted} fragments evicted oldest-first, a peak of {max_bytes} bytes against a \
+                 {cap}-byte RAM cap ({} status samples)",
+                parsed.len()
+            );
+            if evicted > 0 {
+                self.pass(
                     "eviction",
-                    "the cap evicted oldest-first (the lowest surviving segment is not 0)",
+                    "the cap evicted oldest-first (the ring dropped fragments off the front)",
                     "criterion 2",
-                    "lowest segment number > 0",
-                    format!("no seg-*.mp4 under {}", scratch.display()),
+                    "evicted= > 0 once the ring reached its cap",
+                    &measured,
+                );
+            } else if max_bytes >= cap {
+                // The cap *was* reached and nothing was evicted: a real defect.
+                self.fail(
+                    "eviction",
+                    "the cap evicted oldest-first (the ring dropped fragments off the front)",
+                    "criterion 2",
+                    "evicted= > 0 once the ring reached its cap",
+                    &measured,
+                    "the ring reached its cap but nothing was evicted: the oldest footage is still \
+                     held, so the ring can grow without bound",
+                );
+            } else {
+                // The run was too small to fill the ring: the harness's own configuration, not a
+                // defect. A PASS here would be a claim about code that never ran.
+                self.not_performed(
+                    "eviction",
+                    "the cap evicted oldest-first (the ring dropped fragments off the front)",
+                    "criterion 2",
+                    "evicted= > 0 once the ring reached its cap",
+                    &measured,
                     format!(
-                        "the scratch directory was empty after the run (the engine removes it on \
-                         exit; frames_flowing shows segments were written), and the ring peaked \
-                         at {max_bytes} of {cap} bytes, so eviction was not exercised"
+                        "the ring never reached the {cap}-byte cap (max bytes= {max_bytes}), so no \
+                         eviction was possible in this run: raise --seconds, or lower the cap. An \
+                         unsoaked ring proves nothing about criterion 2"
                     ),
-                ),
-                Err(err) => self.not_performed(
-                    "eviction",
-                    "the cap evicted oldest-first (the lowest surviving segment is not 0)",
-                    "criterion 2",
-                    "lowest segment number > 0",
-                    format!("could not read {}: {err:#}", scratch.display()),
-                    "the scratch directory could not be listed",
-                ),
+                );
             }
 
             // --- WASAPI endpoint and the silence detector -----------------------------
@@ -2195,28 +2265,11 @@ impl Session {
         })
     }
 
-    /// Write the report, and report how many checks failed.
-    fn write_report(&mut self) -> Result<(PathBuf, usize)> {
-        let passed = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::Pass))
-            .count();
-        let failed = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::Fail(_)))
-            .count();
-        let not_performed = self
-            .checks
-            .iter()
-            .filter(|c| matches!(c.outcome, Outcome::NotPerformed(_)))
-            .count();
-        let verdict = if failed == 0 {
-            "PASS (on this machine, this run)"
-        } else {
-            "FAIL"
-        };
+    /// Write the report, and hand back what the run found.
+    fn write_report(&mut self) -> Result<(PathBuf, Tally)> {
+        let tally = self.tally();
+        let (passed, failed, not_performed) = (tally.passed, tally.failed, tally.not_performed);
+        let verdict = verdict(tally);
 
         let mut md = String::new();
         md.push_str("# localplay verification report\n\n");
@@ -2224,7 +2277,7 @@ impl Session {
             "- **Generated**: {} UTC\n- **By**: `cargo xtask verify` (see `xtask/src/verify.rs`)\n\
              - **Verdict**: **{verdict}** — {passed} passed, {failed} failed, {not_performed} not performed\n\
              - **Host**: {} {}\n- **Repository**: {} at {}\n\
-             - **Windows-path checks judged?**: {}\n",
+             - **Windows-path checks judged?**: {}\n- **Strict?**: {}\n",
             rfc3339_utc(now_ms()),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -2235,6 +2288,13 @@ impl Session {
             } else {
                 "no — the synthetic stub capture and/or the development software encoder ran; \
                  checks that need the real path are reported but not judged"
+            },
+            if self.opts.strict {
+                "yes — a check that could not be performed counts as a failure, so this run \
+                 could only have passed with every check performed"
+            } else {
+                "no — a check that could not be performed is reported, not failed; the count \
+                 above says how many there were"
             }
         ));
         md.push_str(
@@ -2285,7 +2345,7 @@ impl Session {
              - **Checks marked _not performed_ above.** Each names its reason; they are not \
              silent.\n\n\
              What the harness *does* establish is in the table: the encoder probe, the run's own \
-             rate and timeline numbers, the scratch cap and eviction, the clip the trigger \
+             rate and timeline numbers, the RAM cap and eviction, the clip the trigger \
              produced (duration, streams, codec, drift, audio level, one decoded frame), and the \
              criterion-7 startup failure.\n",
         );
@@ -2301,6 +2361,9 @@ impl Session {
         }
         if self.opts.no_build {
             invocation.push_str(" --no-build");
+        }
+        if self.opts.strict {
+            invocation.push_str(" --strict");
         }
         md.push_str(&format!(
             "\n## How to reproduce\n\n```console\n$ {invocation}\n```\n"
@@ -2338,7 +2401,7 @@ impl Session {
                 ),
             }
         }
-        Ok((report, failed))
+        Ok((report, tally))
     }
 }
 
@@ -2380,6 +2443,8 @@ struct Status {
     segments: u64,
     bytes: u64,
     span_ms: u64,
+    /// Fragments the ring dropped off the front to stay inside its RAM cap.
+    evicted: u64,
     dropped: u64,
     dropped_audio: u64,
     skipped: u64,
@@ -2397,6 +2462,11 @@ fn parse_status(line: &str) -> Option<Status> {
         segments: field(line, "segments")?.parse().ok()?,
         bytes: field(line, "bytes")?.parse().ok()?,
         span_ms: field(line, "span")?.parse().ok()?,
+        // Optional: a status line from a build that does not report eviction is not a parse
+        // failure, it is a run that cannot say whether anything was evicted.
+        evicted: field(line, "evicted")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         dropped: field(line, "dropped")?.parse().ok()?,
         dropped_audio: field(line, "dropped_audio")?.parse().ok()?,
         skipped: field(line, "skipped")?.parse().ok()?,
@@ -2646,25 +2716,6 @@ fn newest_clip(dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// The numbers of the `seg-NNNNNN.mp4` files on disk.
-fn segments_on_disk(dir: &Path) -> Result<Vec<u64>> {
-    let mut numbers = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Some(rest) = name.strip_prefix("seg-") {
-            if let Some(number) = rest.strip_suffix(".mp4") {
-                if let Ok(number) = number.parse() {
-                    numbers.push(number);
-                }
-            }
-        }
-    }
-    numbers.sort_unstable();
-    Ok(numbers)
-}
-
 /// The codec family an encoder id belongs to, as ffprobe would report it.
 ///
 /// ffprobe prints `h264`, never `h264_nvenc` or `libx264`, so the codec check compares
@@ -2753,8 +2804,12 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
     use windows_sys::Win32::System::Threading::GetProcessTimes;
 
     let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // `cb` is the size of the struct, and the API checks it: set it in the initializer rather
+    // than by assignment, so the value and the allocation cannot drift apart.
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
     // SAFETY: the handle comes from a live `Child` this function is called on, and both
     // callees only write into the structs passed by pointer.
     let (cpu_s, rss_bytes) = unsafe {
@@ -2993,8 +3048,8 @@ mod tests {
     #[test]
     fn the_status_line_is_parsed_field_by_field() {
         let line = "2026-09-23T19:20:27.157909Z DEBUG localplay_recorder: frames=1814 \
-                    segments=57 bytes=37795772 span=57000ms dropped=1183 dropped_audio=12 \
-                    skipped=2048 fps=24.1/24 configured=30";
+                    segments=57 bytes=37795772 span=57000ms evicted=3 dropped=1183 \
+                    dropped_audio=12 skipped=2048 fps=24.1/24 configured=30";
         let status = parse_status(line).expect("the engine's own line must parse");
         assert_eq!(
             status,
@@ -3003,6 +3058,7 @@ mod tests {
                 segments: 57,
                 bytes: 37795772,
                 span_ms: 57000,
+                evicted: 3,
                 dropped: 1183,
                 dropped_audio: 12,
                 skipped: 2048,
@@ -3013,8 +3069,8 @@ mod tests {
         );
         // A line without `configured=` still parses: the declared rate is the fallback.
         let older = parse_status(
-            "frames=1 segments=2 bytes=3 span=4ms dropped=0 \
-                                  dropped_audio=0 skipped=0 fps=29.9/30",
+            "frames=1 segments=2 bytes=3 span=4ms evicted=0 \
+                                  dropped=0 dropped_audio=0 skipped=0 fps=29.9/30",
         )
         .expect("an older status line still parses");
         assert_eq!((older.declared, older.configured), (30, 30));
@@ -3155,6 +3211,7 @@ mod tests {
         assert_eq!(opts.work_dir, repo.join("target/verify/work"));
         assert_eq!(opts.seconds, DEFAULT_SECONDS);
         assert!(!opts.dev_software && !opts.no_build && !opts.clean_work);
+        assert!(!opts.strict);
 
         let opts = parse_options(
             &[
@@ -3164,6 +3221,7 @@ mod tests {
                 "/tmp/r.md",
                 "--dev-software-encoder",
                 "--clean-work",
+                "--strict",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -3174,6 +3232,7 @@ mod tests {
         assert_eq!(opts.seconds, 90);
         assert_eq!(opts.report, PathBuf::from("/tmp/r.md"));
         assert!(opts.dev_software && opts.clean_work);
+        assert!(opts.strict);
     }
 
     #[test]
@@ -3203,6 +3262,7 @@ mod tests {
                 no_build: false,
                 cli: None,
                 clean_work: false,
+                strict: false,
             },
             PathBuf::from("/repo"),
         );
@@ -3215,5 +3275,67 @@ mod tests {
         assert!(session
             .console_summary()
             .contains("1 passed, 1 failed, 1 not performed"));
+    }
+
+    #[test]
+    fn a_run_that_skipped_checks_does_not_call_itself_a_plain_pass() {
+        // The verdict is the line a reader skims. A run that could not judge half of its
+        // checks must not read as a plain PASS, and the count of what was not judged has to
+        // be in the verdict itself rather than in a footnote under it.
+        assert_eq!(
+            verdict(Tally {
+                passed: 9,
+                failed: 0,
+                not_performed: 0
+            }),
+            "PASS (on this machine, this run)"
+        );
+        assert_eq!(
+            verdict(Tally {
+                passed: 9,
+                failed: 0,
+                not_performed: 7
+            }),
+            "PASS with 7 check(s) not performed (on this machine, this run)"
+        );
+        assert_eq!(
+            verdict(Tally {
+                passed: 9,
+                failed: 1,
+                not_performed: 7
+            }),
+            "FAIL"
+        );
+    }
+
+    #[test]
+    fn only_a_strict_run_fails_over_a_check_that_could_not_be_performed() {
+        // The default is lenient, and deliberately so: the harness exists to run on machines
+        // that cannot perform half of it, and a run that refuses to report is worse than a
+        // report that says what was not judged. `--strict` is the caller that wants the
+        // absence of evidence to be as loud as the evidence of a defect.
+        let skipped = Tally {
+            passed: 3,
+            failed: 0,
+            not_performed: 7,
+        };
+        assert!(!run_failed(skipped, false));
+        assert!(run_failed(skipped, true));
+
+        let failed = Tally {
+            passed: 3,
+            failed: 1,
+            not_performed: 0,
+        };
+        assert!(run_failed(failed, false));
+        assert!(run_failed(failed, true));
+
+        let clean = Tally {
+            passed: 3,
+            failed: 0,
+            not_performed: 0,
+        };
+        assert!(!run_failed(clean, false));
+        assert!(!run_failed(clean, true));
     }
 }

@@ -1,51 +1,106 @@
 # Continuous integration for localplay.
 #
 # ---------------------------------------------------------------------------
-# RUNNER
+# RUNNERS
 # ---------------------------------------------------------------------------
-# `macos-latest` is this project's development host: the Windows only code is
-# cross-checked from macOS and the desktop frontend is built there, so CI runs
-# on the same kind of machine a developer does. There is deliberately no Windows
-# runner: the Windows-only code (WASAPI loopback, Windows Graphics Capture) cannot
-# be exercised headlessly in any case, and the store/CLI/desktop crates cannot be
-# cross-checked on *any* host without an MSVC C toolchain (below).
+# Five jobs on three runners, and *what each runner is for* matters as much as what
+# runs on it:
+#
+#   - `macos-latest` is this project's development host. The Windows-only code is
+#     cross-checked from there, the desktop frontend is built there, and the macOS
+#     bundle is produced there.
+#   - `windows-latest` is the only runner that *executes* the Windows code: the whole
+#     workspace test suite runs there natively, and the NSIS installer is built there.
+#   - `ubuntu-latest` runs the dependency and secret audits, which need neither a
+#     desktop nor a GPU.
+#
+# No runner here can capture. A hosted runner has no GPU encoder and no interactive
+# desktop, so the checks that need either are skipped by the tests themselves, honestly,
+# rather than faked.
 #
 # ---------------------------------------------------------------------------
-# WHAT THIS JOB COVERS
+# THE `test` JOB (macos-latest)
 # ---------------------------------------------------------------------------
-#   - the whole Rust workspace test suite, with the software-encoder feature the
-#     suite needs;
-#   - `cargo check` of the cross-checkable crates for `x86_64-pc-windows-msvc`:
-#     type / API / ownership checking of the Windows-only code from macOS. `check`
-#     does not link, so no MSVC toolchain is required, only the target's std;
+# WHAT IT COVERS
+#
+#   - the whole Rust workspace test suite, with the software-encoder feature the suite
+#     needs;
+#   - `cargo fmt --check`, so the tree keeps the shape `cargo fmt` gives it;
+#   - `cargo clippy` over the workspace and over the desktop shell, with warnings fatal;
+#   - `cargo check` *and* `cargo clippy` of the cross-checkable crates for
+#     `x86_64-pc-windows-msvc`: type / API / ownership checking and linting of the
+#     Windows-only code, from macOS. Neither links, so no MSVC toolchain is required,
+#     only the target's std;
 #   - the desktop frontend: clean install, typecheck (`svelte-check`), unit tests
 #     (`vitest`) and a production build; and then the desktop shell's own Rust tests;
-#   - `cargo clippy` over the workspace (warnings surfaced, not fatal — see below).
+#   - the verification harness, in software-encoder mode, as a *report* rather than as a
+#     gate.
 #
-# ---------------------------------------------------------------------------
-# WHAT THIS JOB DOES NOT COVER
-# ---------------------------------------------------------------------------
-#   - No Windows runtime verification. Not one line of the WASAPI or WGC backends
-#     is *executed* here; they are only compiled. A green run says nothing about
-#     how the app behaves on a real machine.
+# WHAT IT DOES NOT COVER
+#
+#   - No Windows runtime verification *in this job*. Not one line of the WASAPI or WGC
+#     backends is *executed* here; they are only compiled and linted. A green run says
+#     nothing about how the app behaves on a real machine. (The `windows` job below is
+#     where the Windows code actually runs — and even there the capture path is not
+#     exercised, because a hosted runner has no GPU encoder and no interactive desktop.)
 #
 #     (Those paths HAVE now been observed producing a clip — a 2026-09-24 session on
 #     the developer's own Windows box, recorded in documented form in
 #     `docs/verification-status.md` §10, together with the three test defects it
-#     found and the one thing still broken there. That session was a human running
-#     the suite and a capture by hand. This job still executes none of it, and that
-#     is the point: green here is a statement about macOS and about the Windows
-#     code's *type* correctness, and nothing more.)
+#     found and the one thing still broken there. That session was a human running the
+#     suite and a capture by hand. This workflow still executes none of it, and that
+#     is the point: green here is a statement about macOS, about the Windows code's
+#     *type* correctness and its lint-cleanliness, and nothing more.)
 #   - No GUI window. No window is opened, the screen is never captured and no input
 #     is synthesised — the desktop command layer is driven with the Tauri runtime
 #     mocked, exactly as the crate is designed to be testable without a window.
 #   - `localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell
 #     are excluded from the Windows cross-check *from this host*: they depend on
 #     rusqlite's bundled SQLite, whose C source cannot be built for MSVC from macOS.
-#     They are not unverifiable on Windows, only unverifiable from here — §10 of
+#     They are not unverifiable on Windows, only unverifiable from here — the `windows`
+#     job below builds, tests and lints them there, and §10 of
 #     `docs/verification-status.md` records the whole workspace, bundled SQLite
 #     included, building *and its tests running* on the Windows box. What this job
 #     cannot do is carry that check; it needs a Windows runner or a human.
+#   - The verification harness is not a gate here. On a hosted runner half its checks
+#     cannot be performed at all — no GPU encoder, no interactive desktop — and the
+#     harness says so per check rather than pretending otherwise. The step therefore
+#     runs non-blocking and its report is uploaded as an artefact: what it buys is that
+#     the harness keeps building and its report stays fresh, which is what makes it
+#     evidence rather than a script nobody has run in a year.
+#
+# ---------------------------------------------------------------------------
+# THE OTHER JOBS
+# ---------------------------------------------------------------------------
+#   - `windows` (windows-latest): the same workspace test suite, run natively on the
+#     target the Windows code is written for; the desktop shell's tests; and the clippy
+#     run that lints every `#[cfg(windows)]` block — the store, the recorder, the CLI
+#     and the desktop shell included, which cannot be cross-checked from macOS. This is
+#     the only job that executes the Windows code.
+#   - `supply-chain` (ubuntu-latest): `cargo deny` over both workspaces, the anti-cheat
+#     API guard, the npm audit and the secret scan.
+#   - `package` (macos-latest): a real bundle — the ffmpeg sidecar fetched and
+#     checksum-verified, the frontend built, Tauri bundling — and then the assertion
+#     that what came out carries the *pinned* sidecar, not merely a file with the right
+#     name.
+#   - `package-windows` (windows-latest): the NSIS installer, built and inspected but
+#     never published (docs/packaging.md §5.7).
+#
+# ---------------------------------------------------------------------------
+# ACTION PINS
+# ---------------------------------------------------------------------------
+# Every action is pinned to a full commit SHA, with the human-readable version beside it.
+# A mutable major tag (`@v7`) is a moving target that can be repointed at new code
+# without any change in this file, which is exactly what pinning is meant to prevent.
+# Refresh one with:
+#
+#   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
+#
+# `dtolnay/rust-toolchain` is the awkward one: `stable` is a *branch*, not a version, and
+# the action installs whatever `stable` is on the day the job runs. Pinning the branch's
+# head pins the action's own code; the Rust version it installs stays whatever the
+# channel says. Pin `toolchain: 1.<x>.<y>` in the `with:` block instead if the exact
+# compiler ever has to be frozen.
 
 name: CI
 
@@ -63,6 +118,9 @@ concurrency:
 
 permissions:
   contents: read
+  # The secret scan reads the pull request's diff to narrow the search. Read-only: this
+  # workflow writes nothing back to the repository, not even a review comment.
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -73,17 +131,17 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
         with:
           # Add the cross-check target's std here; no MSVC linker is needed because
-          # `cargo check` stops before linking.
+          # `cargo check` and `cargo clippy` both stop before linking.
           targets: x86_64-pc-windows-msvc
 
       - name: Cache the Rust builds
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Two workspaces: the repo's own (target/) and the desktop shell's, which
           # is a separate workspace rooted at apps/desktop/src-tauri.
@@ -92,11 +150,24 @@ jobs:
             apps/desktop/src-tauri -> target
 
       - name: Set up Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Formatting
+        # The tree is rustfmt-clean (`style: cargo fmt`, 53b0f27) and this keeps it that
+        # way, so an unformatted diff is caught here rather than in a review.
+        #
+        # The desktop shell is its own workspace, so it is checked separately — and
+        # *without* `--all`, on purpose: `--all` reaches into the path-dependency crates
+        # under `crates/`, which are not members of that workspace, and formats them with
+        # the wrong edition, which reports diffs that are not diffs. The root workspace
+        # above is the one that checks those crates, with their own edition.
+        run: |
+          cargo fmt --all -- --check
+          cd apps/desktop/src-tauri && cargo fmt --check
 
       - name: Install ffmpeg
         # The workspace and desktop tests splice, probe and software-encode with a real
@@ -154,12 +225,68 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: cargo test
 
-      - name: Clippy (fatal; test-body unwraps are allowed)
-        # `unwrap_used` is warn-level workspace-wide so production code is flagged; the many
-        # intentional unwraps in test bodies are allowed here rather than blessed one by one.
+      - name: Clippy (fatal)
+        # Warnings are fatal, and no lint is switched off on the command line.
+        #
+        # `unwrap_used` is warn-level workspace-wide so that production code is flagged,
+        # and it stays that way: a `-A clippy::unwrap_used` on the command line would
+        # override the `[lints]` table for the whole build, so "production code may not
+        # unwrap" would be a rule that exists only in a developer's local run. Test
+        # bodies are exempted *structurally* instead — a crate root carries
+        # `#![cfg_attr(test, allow(clippy::unwrap_used))]`, and an integration test,
+        # which is a crate of its own, carries the file-level equivalent — so the
+        # exemption lives in the source, applies to the test build only, and cannot be
+        # widened from here. `chunks_exact_to_as_chunks` is allowed the same way, for
+        # the same reason.
+        #
+        # The feature flag is the one the test suite above uses, and it is not optional
+        # here: `EncodeConfig::for_tests_software` is `#[cfg(any(test, feature = ...))]`
+        # in the *library*, so the integration tests that call it do not compile
+        # without it — an integration test is its own crate, and `cfg(test)` does not
+        # reach the library it links.
         run: |
-          cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings
-          cd apps/desktop/src-tauri && cargo clippy --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings
+          cargo clippy --workspace --all-targets --features localplay-encoder/test-encoders -- -D warnings
+          cd apps/desktop/src-tauri && cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (Windows target; cross-checkable crates only)
+        # The crates the cross-check above covers, *linted* instead of merely
+        # type-checked. `cargo check` applies no lints at all, so without this the
+        # `#[cfg(windows)]` code — 52 blocks across 16 files, the WASAPI and WGC
+        # backends among them — is compiled out on a macOS host and never linted
+        # anywhere: the only Windows runner ran no clippy either. Clippy does not
+        # link, so this needs the target's std and no MSVC toolchain, exactly like the
+        # check above.
+        run: >-
+          cargo clippy
+          -p localplay-capture -p localplay-encoder -p localplay-events
+          -p localplay-replay -p localplay-media -p xtask
+          --features localplay-encoder/test-encoders
+          --all-targets
+          --target x86_64-pc-windows-msvc
+          -- -D warnings
+
+      - name: Verification harness (software encoder; report, not a gate)
+        # The harness drives the real clip path and writes a report a human can read and
+        # attach to an issue. Half of its checks need a GPU encoder and an interactive
+        # desktop, neither of which a hosted runner has, so those checks are *reported,
+        # not judged* — and the run still exits 0, which is why this step is
+        # `continue-on-error` and not a gate.
+        #
+        # What it buys is that the harness keeps compiling and its report stays fresh.
+        # A harness that stopped building would stop being evidence, and an evidence
+        # machine nobody runs is a machine nobody believes. The report is uploaded
+        # below so the run is inspectable after the fact.
+        continue-on-error: true
+        run: cargo xtask verify --dev-software-encoder --seconds 30
+
+      - name: Upload the verification report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-report
+          path: target/verify/report.md
+          # The harness may have failed before writing anything; that is a result too.
+          if-no-files-found: warn
 
   # Executes the Windows code that needs no GPU: bundled SQLite on MSVC, the store,
   # recorder, CLI and the desktop shell's command layer. Hosted runners have no
@@ -169,14 +296,14 @@ jobs:
     name: Windows tests (no GPU)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -193,31 +320,58 @@ jobs:
       - name: Desktop shell Rust tests
         working-directory: apps/desktop/src-tauri
         run: cargo test
+      - name: Clippy (workspace)
+        # The host target here *is* `x86_64-pc-windows-msvc`, so this lints the
+        # `#[cfg(windows)]` code of every crate — the store, the recorder and the CLI
+        # included, which cannot be cross-checked from macOS because rusqlite's bundled
+        # SQLite needs an MSVC C toolchain. The same rules as the macOS job: warnings
+        # are fatal and no lint is switched off on the command line. The feature flag
+        # is the one the test suite above uses, for the reason given there.
+        run: cargo clippy --workspace --all-targets --features localplay-encoder/test-encoders -- -D warnings
+      - name: Clippy (desktop shell)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
 
   supply-chain:
     name: Dependency audit and secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           manifest-path: Cargo.toml
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           manifest-path: apps/desktop/src-tauri/Cargo.toml
           arguments: --config deny.toml
       - name: Anti-cheat API guard
         run: scripts/check-forbidden-apis.sh
-      - name: npm audit (production dependencies)
+      - name: npm audit
+        # Both audits, not just the production ones. `--omit=dev` excluded exactly the
+        # packages that *execute during CI* — vite, vitest, playwright, esbuild,
+        # svelte-check, @tauri-apps/cli — and a compromised build-time dependency is the
+        # realistic npm supply-chain threat: it runs with the workflow's own credentials
+        # and can rewrite what CI then builds. npm's default audit level is `low` and
+        # `npm audit` exits non-zero on any finding at or above it, so no
+        # `--audit-level` is needed. Both audits are clean today, so this costs nothing.
         working-directory: apps/desktop
-        run: npm audit --omit=dev
-      - uses: gitleaks/gitleaks-action@v3
+        run: npm audit
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The review-comment feature needs `pull-requests: write`, which this workflow
+          # does not grant — it is `contents: read` and `pull-requests: read` — so the
+          # comment would fail with a 403 and be downgraded to a warning. The scan
+          # itself is unaffected; the comment is switched off on purpose rather than
+          # left silently broken.
+          GITLEAKS_ENABLE_COMMENTS: "false"
 
   # Gap 5.7 in docs/packaging.md: bundling was never exercised by CI, so a change that broke it
   # was caught by hand or not at all. This job builds a real bundle — the ffmpeg sidecars fetched
@@ -233,20 +387,20 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
 
       - name: Cache the Rust builds
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
 
       - name: Set up Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -287,47 +441,94 @@ jobs:
         working-directory: apps/desktop
         run: npm run tauri -- build --bundles app
 
-      - name: Check the bundle carries the sidecar
+      - name: Check the bundle carries the pinned sidecar
+        # The bundle must carry the *pinned* ffmpeg, not merely a file called "ffmpeg":
+        # the only `ffmpeg` in this bundle is the one the step above hand-copied from
+        # Homebrew, and the artifact that is actually pinned and checksum-verified is
+        # `ffmpeg.exe`. The chain is checked end to end — the archive the fetch step
+        # downloaded must still hash to the value `xtask/sidecars.toml` records, the file
+        # extracted from that archive must be byte for byte the one in the bundle, and
+        # the host pair must be there too, because the host pair is what an installed
+        # application discovers.
         run: |
           set -euo pipefail
           app=$(find apps/desktop/src-tauri/target/release/bundle -maxdepth 2 -name '*.app' | head -1)
           test -n "$app" || { echo "no .app was bundled"; exit 1; }
           echo "bundled: $app"
-          ffmpeg=$(find "$app" -type f -name 'ffmpeg' | head -1)
-          test -n "$ffmpeg" || {
-            echo "the bundle carries no ffmpeg sidecar; it contains:"
-            find "$app" -type f | head -40
-            exit 1
+
+          for name in ffmpeg ffprobe ffmpeg.exe ffprobe.exe; do
+            found=$(find "$app" -type f -name "$name" | head -1)
+            test -n "$found" || {
+              echo "the bundle carries no $name; it contains:"
+              find "$app" -type f | head -40
+              exit 1
+            }
+            echo "$name: $found"
+          done
+
+          # The pin, read from the manifest: the sha256 recorded for the Windows entry.
+          # Parsed with awk rather than a TOML tool: the runner has none, and the block
+          # structure of the file is simple enough to read this way. The order of the two
+          # keys inside a block does not matter.
+          pin=$(awk '
+            function flush() { if (target == "x86_64-pc-windows-msvc" && sha != "") { print sha; exit } }
+            /^\[\[platform\]\]/ { flush(); target = ""; sha = ""; next }
+            /^target[[:space:]]*=/ { target = $3; gsub(/"/, "", target); next }
+            /^sha256[[:space:]]*=/ { sha = $3; gsub(/"/, "", sha); next }
+            END { flush() }
+          ' xtask/sidecars.toml)
+          test -n "$pin" || { echo "no recorded sha256 for x86_64-pc-windows-msvc"; exit 1; }
+
+          # The archive the fetch step downloaded, hashed again and compared with the pin.
+          archive=$(ls target/sidecars/x86_64-pc-windows-msvc.* 2>/dev/null | head -1 || true)
+          test -n "$archive" || { echo "the fetch left no archive behind"; exit 1; }
+          actual=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          test "$actual" = "$pin" || {
+            echo "the fetched archive does not match the pin"; exit 1;
           }
-          echo "sidecar: $ffmpeg"
+          echo "archive: $archive  sha256 $actual  (matches the pin)"
+
+          # And the file that archive produced, which is what the bundle must carry.
+          bundled=$(find "$app" -type f -name 'ffmpeg.exe' | head -1)
+          extracted=$(shasum -a 256 binaries/ffmpeg.exe | cut -d' ' -f1)
+          inbundle=$(shasum -a 256 "$bundled" | cut -d' ' -f1)
+          test "$inbundle" = "$extracted" || {
+            echo "the bundled ffmpeg.exe is not the file the pinned archive produced"; exit 1;
+          }
+          echo "the bundled ffmpeg.exe is byte for byte the file the pinned archive produced"
 
   # The Windows installer, built and inspected but never published (docs/packaging.md §5.7).
   #
   # Safe to run on a pull request: `permissions: contents: read` (set above), no secrets, no
   # artifact upload and no release step. The installer is checked, not shipped — it carries an
-  # ffmpeg pair that is only fetched, checksum-verified, for this job. It runs on PRs and by
-  # hand, not on every push, because a Windows runner plus a release build is the slowest job
-  # here.
+  # ffmpeg pair that is only fetched, checksum-verified, for this job. It runs on pull requests,
+  # on pushes to main and by hand; a push to a topic branch is skipped, because a Windows
+  # runner plus a release build is the slowest job here and the same installer is built again
+  # when the branch merges. The gate exists so that the *only* job asserting `ffmpeg.exe` is
+  # in the NSIS archive is not one that never runs on a push to main.
   package-windows:
     name: Bundle (Windows NSIS installer)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
 
       - name: Cache the Rust builds
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
 
       - name: Set up Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm

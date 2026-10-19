@@ -1,4 +1,9 @@
 //! Export never re-encodes: lossless edits preserve the streams they copy.
+
+// An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
+// exemption does not reach it: the same rule, stated here.
+#![allow(clippy::unwrap_used)]
+
 use localplay_media::{edit, probe::MediaInfo, FfmpegBinaries};
 use std::process::Command;
 

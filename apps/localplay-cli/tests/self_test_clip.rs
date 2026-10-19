@@ -18,6 +18,8 @@
 //! Nothing here sends, simulates or injects a keyboard or mouse event; the trigger is an
 //! in-process call, and an assertion below pins the log line that says so.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_cli::{run_buffer_with, BufferOptions};
 use localplay_media::{FfmpegBinaries, MediaInfo};
 use std::io::Write;

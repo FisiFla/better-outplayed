@@ -9,6 +9,10 @@
 //! against it, and `splice` is the lossless cut both paths share. `buffer` keeps only the two
 //! values the recorder exchanges with a ring.
 
+// Test bodies may unwrap and may chunk by a constant; production code may do neither.
+// Scoped to the test build of this crate, so it cannot hide either in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
+
 pub mod buffer;
 pub mod ledger;
 pub mod ram_buffer;

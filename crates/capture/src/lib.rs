@@ -1,5 +1,9 @@
 //! Frame and audio sources.
 
+// Test bodies may unwrap and may chunk by a constant; production code may do neither.
+// Scoped to the test build of this crate, so it cannot hide either in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
+
 use std::time::Duration;
 
 pub mod platform;

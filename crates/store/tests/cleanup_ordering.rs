@@ -8,6 +8,8 @@
 //! disagree with the index (a missing file, a failing unlink) and the case that must delete
 //! nothing (a plan id whose row is already gone).
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
 use localplay_store::{NewClip, Store};
 use std::path::PathBuf;

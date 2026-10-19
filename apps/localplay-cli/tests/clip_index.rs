@@ -12,6 +12,8 @@
 //! Needs ffmpeg on `PATH` with a working libx264 (see `post_roll.rs` on why the test-encoders
 //! feature is guaranteed by the dev-dependency rather than a `cfg` gate).
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};

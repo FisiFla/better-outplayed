@@ -17,8 +17,26 @@ allow = [
 ]
 
 [bans]
+# Duplicates are warned about, not denied: `hashbrown` arrives twice through rusqlite's
+# vendored SQLite, and pinning one version of it is a rusqlite decision, not ours.
 multiple-versions = "warn"
+# A wildcard requirement is a version nobody reviewed. It stays allowed because
+# cargo-deny cannot tell a wildcard from a workspace inheritance (`localplay-media.workspace
+# = true` is not a wildcard, but it reads as one), and denying it would fail the audit on
+# the project's own manifests.
 wildcards = "allow"
+# The zero-egress claim is only as good as the graph behind it: the League module is the one
+# place allowed to build an HTTP client, and nothing else is. Denying the clients themselves
+# means a future dependency cannot quietly add one, which the source-tree guard
+# (`crates/events/tests/no_egress.rs`) cannot see — it reads our code, not the graph.
+#
+# `reqwest` and `hyper` are deliberately *not* on this list: `tauri` itself depends on
+# `reqwest`, so denying them would fail the desktop shell's own audit for a crate the
+# project does not choose. The guard for the app's own egress stays where it can see it —
+# in the source tree.
+deny = [
+  "attohttpc", "isahc", "surf", "ureq",
+]
 
 [sources]
 unknown-registry = "deny"

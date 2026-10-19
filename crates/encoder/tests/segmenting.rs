@@ -2,6 +2,11 @@
 //!
 //! Fed in real time: the media timeline is the wall clock (see `localplay_encoder::ffmpeg`), so
 //! a burst of stubbed frames encodes as a few milliseconds of media.
+
+// An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
+// exemption does not reach it: the same rule, stated here.
+#![allow(clippy::unwrap_used)]
+
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};

@@ -24,6 +24,10 @@
 //! [`EventKind::is_highlight`] is the only policy in the way, so a 30-round Counter-Strike
 //! match does not write 60 clips.
 
+// Test bodies may unwrap and may chunk by a constant; production code may do neither.
+// Scoped to the test build of this crate, so it cannot hide either in shipped code.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
+
 use std::fmt;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};

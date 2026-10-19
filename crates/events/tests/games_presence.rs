@@ -17,6 +17,10 @@
 //! Not proven: the Windows enumeration itself (see `process.rs`). The only socket touched is
 //! the Live Client Data API source on `127.0.0.1:2999`, refused when no game runs.
 
+// An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
+// exemption does not reach it: the same rule, stated here.
+#![allow(clippy::unwrap_used)]
+
 use localplay_events::process::{
     default_watch, GamePresence, GameWatcher, GamesSection, Presence, ProcessWatcher, Signal,
     WatchedGame,

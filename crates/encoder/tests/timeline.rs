@@ -49,6 +49,8 @@
 //! genuinely cannot be asked to do something (a post-roll from a deliberately starved encoder),
 //! assert the guarantee that holds (the pre-roll already on disk) and say which half is best-effort.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame, PixelFormat};
 use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};

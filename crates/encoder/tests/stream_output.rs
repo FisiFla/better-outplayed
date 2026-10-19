@@ -12,6 +12,8 @@
 //! Fed in real time, as in `segmenting.rs`: the media timeline is the wall clock, so a burst of
 //! stubbed frames is a few milliseconds of media.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
 use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
 use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};

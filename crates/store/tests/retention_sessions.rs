@@ -11,6 +11,8 @@
 //!
 //! Every path lives in a temp directory under the workspace's `target/`.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
 use localplay_store::retention::{
     execute_retention, plan_retention, RetentionPlan, RetentionPolicy, RetentionRules, Subject,

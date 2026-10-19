@@ -9,6 +9,8 @@
 //! Fed in real time like every other end-to-end test: video is timestamped from arrival and audio
 //! from the sample count, so a burst would encode as a few milliseconds of media.
 
+// The test bodies use `unwrap()` throughout; production code does not.
+#![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use localplay_capture::stub::{StubCapture, StubConfig};
 use localplay_capture::{AudioBuffer, AudioFormat, CaptureBackend};
 use localplay_encoder::{
