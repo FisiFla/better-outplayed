@@ -98,6 +98,9 @@ versions. For what has and has not been *verified* on real hardware, read
   the webview can no longer widen the asset protocol's read scope to any path it names.
 
 ### Fixed
+- **The webview can no longer forge log lines.** The frontend's own log command flattened its
+  input to one line and capped it, and every frontend line is tagged `[webview]`, so a newline
+  in the text can no longer end the log line and have the rest of it read as a backend entry.
 - Dependabot bumps applied together with the code changes they needed (2026-10-16).
 - **A failed recording start no longer bricks games mode.** The recorder took its single
   SQLite connection out of the struct before the fallible half of the start handshake and only

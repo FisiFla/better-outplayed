@@ -1106,21 +1106,61 @@ pub fn run() {
 ///
 /// Deliberately trivial: what arrives from the webview is untrusted text, so it is only logged,
 /// never parsed or acted on.
+///
+/// Untrusted text still has to be *safe* text. A newline in the message would end the log line
+/// and let the rest of it read as a backend line, and an unbounded message would churn the
+/// rotation set. So the text is flattened to one line and capped, and the line is tagged as the
+/// webview's so a forged backend line is distinguishable from a real one.
 #[tauri::command]
 fn log_from_frontend(level: String, message: String, detail: Option<String>) {
     let detail = detail.unwrap_or_default();
     let detail = detail.trim();
+    let message = flatten_for_log(&message);
+    let detail = flatten_for_log(detail);
     match level.as_str() {
         "error" => {
-            tracing::error!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::error!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
         "warn" => {
-            tracing::warn!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::warn!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
         _ => {
-            tracing::info!(target: "localplay_desktop::frontend", "{message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::info!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
     }
+}
+
+/// The longest webview line the log will take, in characters.
+const FRONTEND_LOG_MAX_CHARS: usize = 2_000;
+
+/// Flatten untrusted text into one safe log line: control characters (a newline among them)
+/// become spaces, runs of whitespace collapse, and the result is capped.
+fn flatten_for_log(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(FRONTEND_LOG_MAX_CHARS));
+    let mut last_was_space = false;
+    for ch in text.chars() {
+        if out.chars().count() >= FRONTEND_LOG_MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        if ch.is_control() || ch == '\u{7f}' {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        out.push(ch);
+        last_was_space = false;
+    }
+    out.trim().to_string()
 }
 
 /// Install the tray and start the two threads that keep it (and the hotkey) live. Called once,
@@ -2051,6 +2091,31 @@ mod tests {
         assert!(
             !state.clips_dir_allowed(&picked.join("..").join("elsewhere").to_string_lossy()),
             "and not a path that climbs out of it"
+        );
+    }
+
+    #[test]
+    fn a_frontend_log_line_cannot_smuggle_a_second_line() {
+        let forged = flatten_for_log("clip failed\n2026-10-19 12:00:00 ERROR backend: the disk is full");
+        assert!(
+            !forged.contains('\n') && !forged.contains('\r'),
+            "a newline in the webview's text must not end the log line: {forged:?}"
+        );
+        assert!(
+            forged.contains("the disk is full"),
+            "but the text itself is kept: {forged:?}"
+        );
+        assert_eq!(forged.matches("  ").count(), 0, "and runs of space collapse");
+    }
+
+    #[test]
+    fn a_frontend_log_line_is_capped() {
+        let long = "x".repeat(FRONTEND_LOG_MAX_CHARS * 2);
+        let capped = flatten_for_log(&long);
+        assert!(
+            capped.chars().count() <= FRONTEND_LOG_MAX_CHARS + 1,
+            "the cap plus the ellipsis: {} characters",
+            capped.chars().count()
         );
     }
 }
