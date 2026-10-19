@@ -17,7 +17,6 @@
     SettingsDto,
     SettingsUpdate,
   } from '../types';
-  import { open } from '@tauri-apps/plugin-dialog';
   import { QUALITY_OPTIONS, captureUpdate, deviceOptions, monitorIndex } from '../settings';
 
   interface Props {
@@ -28,6 +27,13 @@
     /** A command is in flight; the apply buttons are held while it is. */
     busy?: boolean;
     onApply: (update: SettingsUpdate) => void;
+    /**
+     * Open the OS folder picker for the clips directory, through the backend.
+     *
+     * The backend runs the picker so that the directory it returns is one it has
+     * approved for the asset-protocol read scope.
+     */
+    onChooseClipsDir: () => Promise<string>;
     /** The active microphones and outputs; empty lists leave only "Windows default". */
     audioDevices?: AudioDevices;
     /** Re-read the device list, so a device plugged in after launch shows up. */
@@ -43,6 +49,7 @@
     recording = null,
     busy = false,
     onApply,
+    onChooseClipsDir,
     audioDevices = { inputs: [], outputs: [] },
     onRefreshAudioDevices = () => {},
     gsiTargets = [],
@@ -100,16 +107,17 @@
   }
 
   /**
-   * The native folder picker. Cancelling — or running somewhere with no Tauri
-   * runtime, like the screenshot harness — resolves to no directory, and the draft
-   * is left alone rather than cleared.
+   * The native folder picker, run by the backend.
+   *
+   * The backend runs it rather than the window so that the folder it returns is one it
+   * has *approved*: only a directory the user picked in the OS dialog is added to the
+   * asset-protocol read scope, so a path typed into the panel cannot widen what the
+   * webview may read. Cancelling — or running somewhere with no Tauri runtime, like the
+   * screenshot harness — resolves to no directory, and the draft is left alone rather
+   * than cleared.
    */
   async function browseClipsDir() {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: 'Choose the clips directory',
-    }).catch(() => null);
+    const selected = await onChooseClipsDir().catch(() => null);
     if (typeof selected === 'string') clipsDir = selected;
   }
 

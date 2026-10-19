@@ -109,6 +109,35 @@ export function resolveSelection(
 }
 
 /**
+ * The thumbnails of the clips that are still listed.
+ *
+ * A clip removed by the storage policy — or by a retention pass over the sessions — takes
+ * its cached picture with it, but the map of them is held by the window and nothing else
+ * ever empties it. Pruned against the clips that still exist, it cannot grow without bound
+ * over a window that is left open all day.
+ *
+ * The map is returned unchanged when nothing was dropped, so a refresh that finds the same
+ * library does not churn the rows that show these pictures.
+ */
+export function pruneThumbnails(
+  thumbnails: Record<number, string>,
+  clipIds: readonly number[],
+): Record<number, string> {
+  const live = new Set(clipIds);
+  const kept: Record<number, string> = {};
+  let dropped = 0;
+  for (const [id, url] of Object.entries(thumbnails)) {
+    const key = Number(id);
+    if (live.has(key)) {
+      kept[key] = url;
+    } else {
+      dropped += 1;
+    }
+  }
+  return dropped === 0 ? thumbnails : kept;
+}
+
+/**
  * What to tell the user after `delete_clip`, in terms of what actually happened.
  *
  * The four outcomes are the four states the Rust command can report, and three of them are

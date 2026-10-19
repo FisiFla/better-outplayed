@@ -1,0 +1,107 @@
+// @vitest-environment jsdom
+/**
+ * The library grid's keyboard navigation.
+ *
+ * The grid is `auto-fill`, so how many columns it has depends on the window's width — and
+ * the count is measured rather than read on every key press, because reading it forces a
+ * synchronous layout. What is tested here is that the count is right, and that it is
+ * measured again when the window changes.
+ */
+
+import { mount, tick, unmount } from 'svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import ClipList from './ClipList.svelte';
+import { toClipView } from '../clips';
+import type { ClipView } from '../clips';
+import type { ClipDto } from '../types';
+
+function clip(id: number): ClipView {
+  const dto: ClipDto = {
+    id, path: `/c/${id}.mp4`, started_at_ms: 0, duration_ms: 12_345, size_bytes: 812 * 1024,
+    codec: 'h264', favourite: false, created_at_ms: 1_756_000_000_000, title: null, game: null,
+    tags: [],
+  };
+  return toClipView(dto, (path) => `asset://${path}`);
+}
+
+describe('the clip grid', () => {
+  let app: ReturnType<typeof mount> | undefined;
+  /** The grid's laid-out columns, as the browser would report them. */
+  let layout: string;
+
+  beforeEach(() => {
+    layout = '200px 200px 200px';
+    vi.spyOn(window, 'getComputedStyle').mockImplementation(
+      () =>
+        ({
+          gridTemplateColumns: layout,
+        }) as unknown as CSSStyleDeclaration,
+    );
+  });
+
+  afterEach(() => {
+    if (app) void unmount(app);
+    app = undefined;
+    vi.restoreAllMocks();
+    document.body.innerHTML = '';
+  });
+
+  async function mountGrid(count: number): Promise<HTMLElement> {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(ClipList, {
+      target,
+      props: {
+        clips: Array.from({ length: count }, (_, i) => clip(i + 1)),
+        thumbnails: {},
+        selectedId: null,
+        onSelect: () => {},
+        onFavourite: () => {},
+        onDelete: () => {},
+        onCopy: () => {},
+        onReveal: () => {},
+        onDragOut: () => {},
+      },
+    });
+    // The grid is measured in an effect, so the component has to be given a tick before
+    // the count is known.
+    await tick();
+    return target;
+  }
+
+  function rows(target: HTMLElement): HTMLButtonElement[] {
+    return [...target.querySelectorAll<HTMLButtonElement>('button.row')];
+  }
+
+  it('moves down a whole row of cards at a time', async () => {
+    const target = await mountGrid(6);
+    const cards = rows(target);
+    cards[0]?.focus();
+    cards[0]?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    // Three columns, so a row down is three cards along.
+    expect(document.activeElement).toBe(cards[3]);
+  });
+
+  it('measures the grid again when the window is resized', async () => {
+    const target = await mountGrid(6);
+    const cards = rows(target);
+    layout = '200px 200px';
+    window.dispatchEvent(new Event('resize'));
+    cards[0]?.focus();
+    cards[0]?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    // The window narrowed, so the grid has two columns now.
+    expect(document.activeElement).toBe(cards[2]);
+  });
+
+  it('does not measure the grid again for every arrow key', async () => {
+    const target = await mountGrid(6);
+    const getStyle = vi.mocked(window.getComputedStyle);
+    getStyle.mockClear();
+    const cards = rows(target);
+    cards[0]?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    // Measuring the grid forces a synchronous layout, which is not something a key press
+    // should do: the count is cached, and read again only when the window changes.
+    expect(getStyle).not.toHaveBeenCalled();
+  });
+});

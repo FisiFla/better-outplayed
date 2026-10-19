@@ -31,6 +31,33 @@ export const KEYBOARD_STEP_MS = 100;
 /** The distance one arrow-key press moves a handle when Shift is held. */
 export const KEYBOARD_COARSE_STEP_MS = 1_000;
 
+/** The distance one PageUp / PageDown press moves a handle. */
+export const KEYBOARD_PAGE_MS = 10_000;
+
+/**
+ * The keys a trim handle answers.
+ *
+ * The ARIA slider pattern asks for Home and End as well as the arrows: a handle that can
+ * only be moved a hundred milliseconds at a time cannot be put where it belongs without
+ * holding a key down for a minute.
+ */
+const HANDLE_KEYS = [
+  'ArrowLeft',
+  'ArrowRight',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+] as const;
+
+/** One of the keys a trim handle answers. */
+type HandleKey = (typeof HANDLE_KEYS)[number];
+
+/** Whether a key is one a trim handle answers. */
+function isHandleKey(key: string): key is HandleKey {
+  return (HANDLE_KEYS as readonly string[]).includes(key);
+}
+
 function wholeMs(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.round(value);
@@ -109,6 +136,43 @@ export function nudgeHandle(
   const current = clampRange(range, durationMs);
   const from = handle === 'start' ? current.startMs : current.endMs;
   return dragHandle(current, handle, from + deltaMs, durationMs);
+}
+
+/**
+ * The range a key press on a trim handle produces, or `null` for a key it does not answer.
+ *
+ * `Home` and `End` are the slider's own ends — the very start and the very end of the
+ * clip — and `PageUp` and `PageDown` move a page at a time, for a user who knows where
+ * they are going and does not want to hold a key down. The selection stays legal
+ * throughout: a handle cannot cross the other, so `End` on the start handle lands as late
+ * as the range allows rather than at the end of the clip.
+ */
+export function handleKeyRange(
+  range: TrimRange,
+  handle: 'start' | 'end',
+  key: string,
+  durationMs: number,
+  coarse = false,
+): TrimRange | null {
+  if (!isHandleKey(key)) return null;
+  const duration = Math.max(0, wholeMs(durationMs));
+  if (duration === 0) return null;
+  const current = clampRange(range, duration);
+  const step = coarse ? KEYBOARD_COARSE_STEP_MS : KEYBOARD_STEP_MS;
+  switch (key) {
+    case 'ArrowLeft':
+      return nudgeHandle(current, handle, -step, duration);
+    case 'ArrowRight':
+      return nudgeHandle(current, handle, step, duration);
+    case 'PageUp':
+      return nudgeHandle(current, handle, -KEYBOARD_PAGE_MS, duration);
+    case 'PageDown':
+      return nudgeHandle(current, handle, KEYBOARD_PAGE_MS, duration);
+    case 'Home':
+      return dragHandle(current, handle, 0, duration);
+    case 'End':
+      return dragHandle(current, handle, duration, duration);
+  }
 }
 
 export type RangeValidation =

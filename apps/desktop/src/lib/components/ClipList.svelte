@@ -44,7 +44,7 @@
   }: Props = $props();
 
   /** Where the primary button went down on a row, until it is released or becomes a drag. */
-  let press: { id: number; x: number; y: number } | null = null;
+  let press: { id: number; x: number; y: number } | null = $state(null);
 
   function pointerMove(event: PointerEvent) {
     if (press === null) return;
@@ -59,6 +59,27 @@
   let menuFor = $state<number | null>(null);
   let confirming = $state(false);
   let list = $state<HTMLUListElement>();
+
+  /**
+   * How many columns the grid is laid out in.
+   *
+   * Read off the laid-out grid rather than counted from the CSS, because the grid is
+   * `auto-fill`: the number depends on the window's width. It is measured when the grid
+   * is laid out and again whenever the window is resized, because reading it forces a
+   * synchronous layout — which is not something an arrow key should do.
+   */
+  let columns = $state(1);
+
+  $effect(() => {
+    const element = list;
+    if (!element) return;
+    const measure = () => {
+      columns = Math.max(1, getComputedStyle(element).gridTemplateColumns.split(' ').length);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  });
 
   function closeMenu(refocus = false) {
     const id = menuFor;
@@ -95,10 +116,9 @@
     if (menuFor !== null && !(event.target as Element).closest('.menu-wrap')) closeMenu();
   }
 
-  /** Arrow keys move between cards; the column count is read off the laid-out grid. */
+  /** Arrow keys move between cards; the column count is the one the grid was laid out with. */
   function cardKey(event: KeyboardEvent, index: number) {
     if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
-    const columns = getComputedStyle(list!).gridTemplateColumns.split(' ').length;
     const target = gridIndex(index, event.key as NavKey, clips.length, columns);
     if (target < 0) return;
     event.preventDefault();

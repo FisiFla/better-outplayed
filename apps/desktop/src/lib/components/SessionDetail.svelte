@@ -24,6 +24,7 @@
   import type { SessionView } from '../sessions';
   import { markerColor } from '../markers';
   import { formatBytes, formatPrecise } from '../time';
+  import { validateRange } from '../trim';
   import type { MatchDto, SessionEvent, TrimRange } from '../types';
 
   interface Props {
@@ -55,6 +56,18 @@
 
   const blocker = $derived(extractionBlocker(session));
   const extractable = $derived(canExtract(session));
+  /**
+   * Whether the range can be cut, by the same rule the clip page uses.
+   *
+   * One rule for both places a cut is asked for: a selection the command would refuse is
+   * not offered here either, and the reason is shown rather than discovered as an error.
+   */
+  const validation = $derived(validateRange(range, session.durationMs));
+
+  /** Cut the selection, but only one the command will accept. */
+  function extract() {
+    if (validation.ok) onExtract(validation.range);
+  }
 
   // A change of axis resets both, so neither can be left sitting past the end of a shorter
   // recording. Reads only the session's length, so it cannot re-trigger itself.
@@ -120,8 +133,8 @@
       <button
         type="button"
         class="primary"
-        disabled={!extractable || busy || range.endMs <= range.startMs}
-        onclick={() => onExtract(range)}
+        disabled={!extractable || busy || !validation.ok}
+        onclick={extract}
       >
         <Icon name="scissors" size={14} />
         {busy ? 'Working…' : 'Extract clip'}
@@ -131,6 +144,10 @@
         ({formatPrecise(range.endMs - range.startMs)})
       </span>
     </div>
+
+    {#if !validation.ok}
+      <p class="invalid">{validation.reason}</p>
+    {/if}
 
     {#if blocker !== null}
       <p class="blocked">{blocker}</p>
@@ -341,6 +358,10 @@
 
   .range {
     font: var(--t-small);
+  }
+
+  .invalid {
+    color: var(--warn);
   }
 
   .blocked {

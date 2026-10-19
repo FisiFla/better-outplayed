@@ -6,6 +6,7 @@ import {
   filterClips,
   gameOptions,
   parseTagInput,
+  pruneThumbnails,
   shouldStartDrag,
   tagOptions,
   resolveSelection,
@@ -307,6 +308,22 @@ describe("parseTagInput", () => {
       "clutch play",
     ]);
     expect(parseTagInput("")).toEqual([]);
+  });
+});
+
+describe("pruneThumbnails", () => {
+  it("drops the pictures of clips that are no longer listed", () => {
+    // A clip removed by the storage policy takes its cached picture with it, and nothing
+    // else ever empties the map the window holds.
+    expect(pruneThumbnails({ 1: "asset://1.jpg", 2: "asset://2.jpg" }, [1])).toEqual({
+      1: "asset://1.jpg",
+    });
+    expect(pruneThumbnails({ 1: "asset://1.jpg" }, [])).toEqual({});
+  });
+
+  it("keeps the map as it is when every clip is still listed", () => {
+    const thumbnails = { 1: "asset://1.jpg", 2: "asset://2.jpg" };
+    expect(pruneThumbnails(thumbnails, [2, 1])).toBe(thumbnails);
   });
 });
 

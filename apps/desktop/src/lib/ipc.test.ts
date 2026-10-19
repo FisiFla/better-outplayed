@@ -137,6 +137,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.appStatus()),
       await wireName(() => tauriIpc.getSettings()),
       await wireName(() => tauriIpc.updateSettings({ fps: 30 })),
+      await wireName(() => tauriIpc.chooseClipsDir()),
       await wireName(() => tauriIpc.health()),
       await wireName(() => tauriIpc.gsiTargets()),
       await wireName(() => tauriIpc.listAudioDevices()),

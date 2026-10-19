@@ -4,7 +4,15 @@ import { mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import type { ClipSource } from './lib/ipc';
-import type { ClipDto, RecordingStatus, SessionDto, SettingsDto, StorageStats } from './lib/types';
+import type {
+  ClipDto,
+  MatchDto,
+  RecordingStatus,
+  SessionDto,
+  SessionEvent,
+  SettingsDto,
+  StorageStats,
+} from './lib/types';
 
 // The real module reaches for the Tauri runtime, which does not exist under jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -20,6 +28,18 @@ const session: SessionDto = {
   id: 1, game: 'Valorant', mode: 'session', started_at_ms: 1_700_000_000_000,
   ended_at_ms: 1_700_000_600_000, final_path: '/s/1.mp4', size_bytes: 9_000_000,
   favourite: false, scratch_dir: '/s/scratch', duration_ms: 600_000,
+};
+const sessionEvent: SessionEvent = {
+  id: 1, kind: 'kill', offset_ms: 120_000, payload: null, clip_id: null,
+};
+const sessionMatch: MatchDto = {
+  index: 0, start_ms: 0, end_ms: 600_000, complete: true, start_inferred: false,
+  game_mode: 'Ranked', map: 'Ascent', result: 'Win',
+  scoreboard: [
+    { name: 'Player', champion: 'Jett', team: 'Blue', kills: 21, deaths: 12, assists: 5, cs: 240, ward_score: 3, is_local: true },
+    { name: 'Other', champion: 'Sova', team: 'Red', kills: 14, deaths: 18, assists: 9, cs: 180, ward_score: 1, is_local: false },
+  ],
+  events: [sessionEvent],
 };
 const stats: StorageStats = {
   clip_count: 1, total_bytes: 5_000_000, missing_count: 0, favourite_count: 0, favourite_bytes: 0,
@@ -45,7 +65,8 @@ function fakeSource(): ClipSource {
     listClips: () => Promise.resolve([clip]),
     storageStats: () => Promise.resolve(stats),
     listSessions: () => Promise.resolve([session]),
-    sessionEvents: () => Promise.resolve([]),
+    sessionEvents: () => Promise.resolve([sessionEvent]),
+    sessionMatches: () => Promise.resolve([sessionMatch]),
     sessionDetail: () => Promise.resolve(session),
     getSettings: () => Promise.resolve(settings),
     recordingStatus: () => Promise.resolve(recording),
@@ -137,6 +158,31 @@ describe('accessibility (axe)', () => {
     target.querySelector<HTMLButtonElement>('[data-region="clip-grid"] button.row')?.click();
     await settle();
     expect(target.querySelector('[data-region="clip-page"]')).not.toBeNull();
+    expect(await violations(target)).toEqual([]);
+  });
+
+  it('a session page has no axe violations', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(App, { target, props: { source: fakeSource() } });
+    await settle();
+    const item = [...target.querySelectorAll<HTMLButtonElement>('nav button')].find((b) =>
+      b.textContent?.includes('Sessions'),
+    );
+    expect(item, 'rail item Sessions').toBeDefined();
+    item!.click();
+    await settle();
+    // Open a session, so the detail pane really holds its markers, its match timeline and
+    // its scoreboard — the parts of this window no other case looks at.
+    const row = target.querySelector<HTMLButtonElement>('[data-region="session-list"] button.row');
+    expect(row, 'a session in the list').not.toBeNull();
+    row!.click();
+    await settle();
+    const page = target.querySelector('[data-region="session-page"]');
+    // Not vacuous: the pane is really on screen and has the session's content in it.
+    expect(page?.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(page?.querySelector('table.markers')).not.toBeNull();
+    expect(page?.querySelector('table.score')).not.toBeNull();
     expect(await violations(target)).toEqual([]);
   });
 

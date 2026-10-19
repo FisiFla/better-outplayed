@@ -18,11 +18,12 @@
    */
   import {
     KEYBOARD_COARSE_STEP_MS,
+    KEYBOARD_PAGE_MS,
     KEYBOARD_STEP_MS,
     dragHandle,
     fractionToMs,
+    handleKeyRange,
     msToPercent,
-    nudgeHandle,
     rangeLengthLabel,
     rangeLabel,
     rangePercents,
@@ -53,8 +54,8 @@
   let dragging = $state<'start' | 'end' | 'playhead' | null>(null);
   /** Where the current gesture started, so a marker click can be told from a scrub. */
   let gestureStart = $state<{ x: number; y: number } | null>(null);
-  /** The marker the current gesture began on, if it began on one. */
-  let pressedMarker = $state<SessionEvent | null>(null);
+  /** The offset of the marker the current gesture began on, if it began on one. */
+  let pressedMarkerMs = $state<number | null>(null);
 
   const percents = $derived(rangePercents(range, durationMs));
   const playheadPercent = $derived(msToPercent(playheadMs, durationMs));
@@ -79,24 +80,59 @@
     onRangeChange(dragHandle(range, kind, ms, durationMs));
   }
 
-  function begin(kind: 'start' | 'end' | 'playhead', event: PointerEvent) {
-    if (disabled) return;
+  /**
+   * Take the pointer, so that a gesture which leaves the element it started on keeps
+   * being delivered to the track.
+   */
+  function capture(event: PointerEvent) {
     event.preventDefault();
-    dragging = kind;
     // Capture on the track, not on the handle: a drag that leaves the handle — which every
     // drag past the opposite handle does — must keep being delivered here.
     track?.setPointerCapture(event.pointerId);
+  }
+
+  function begin(kind: 'start' | 'end' | 'playhead', event: PointerEvent) {
+    if (disabled) return;
+    dragging = kind;
+    capture(event);
     apply(kind, event);
+  }
+
+  /**
+   * The offset of the marker a press landed on, if it landed on one.
+   *
+   * A marker does not stop the press — a drag that starts on one scrubs like any other —
+   * so the track is the one that sees the press, and it reads the marker back out of the
+   * button it landed on. One handler for the whole gesture, and no way for the track and
+   * the marker to disagree about which of them was pressed.
+   */
+  function markerOffsetAt(event: PointerEvent): number | null {
+    const target = event.target;
+    if (!(target instanceof Element)) return null;
+    const offset = target.closest<HTMLElement>('button.marker')?.dataset['offset'];
+    if (offset === undefined) return null;
+    const ms = Number(offset);
+    return Number.isFinite(ms) ? ms : null;
   }
 
   /**
    * Begin a gesture on the track itself: a scrub, or — if it started on a marker — a press
    * that may turn out to be a click. Which one it was is decided on release, by distance.
    */
-  function beginPlayhead(event: PointerEvent, marker: SessionEvent | null) {
+  function beginPlayhead(event: PointerEvent) {
     if (disabled) return;
+    const markerMs = markerOffsetAt(event);
     gestureStart = { x: event.clientX, y: event.clientY };
-    pressedMarker = marker;
+    pressedMarkerMs = markerMs;
+    if (markerMs !== null) {
+      // A press on a marker does not scrub to the pointer. The marker's own lead-in is
+      // where the user asked to be, and scrubbing to the pointer first would move the
+      // playhead twice — out to the marker and back to the lead-in. A drag that starts on
+      // a marker still scrubs, from the first pointer move onwards.
+      dragging = 'playhead';
+      capture(event);
+      return;
+    }
     begin('playhead', event);
   }
 
@@ -107,32 +143,27 @@
   function onPointerUp(event: PointerEvent) {
     if (dragging === null) return;
     const start = gestureStart;
-    const marker = pressedMarker;
+    const markerMs = pressedMarkerMs;
     dragging = null;
     gestureStart = null;
-    pressedMarker = null;
+    pressedMarkerMs = null;
     if (track?.hasPointerCapture(event.pointerId)) {
       track.releasePointerCapture(event.pointerId);
     }
     // A press that did not travel is a click: on a marker it seeks to that marker's lead-in,
     // not to the pixel under the cursor. Without this the click would have scrubbed to the
     // pointer and left the marker — the thing the user aimed at — unused.
-    if (marker !== null && start !== null && isClick(start, { x: event.clientX, y: event.clientY })) {
-      onSeek(seekTargetMs(marker.offset_ms));
+    if (markerMs !== null && start !== null && isClick(start, { x: event.clientX, y: event.clientY })) {
+      onSeek(seekTargetMs(markerMs));
     }
   }
 
   function onHandleKey(handle: 'start' | 'end', event: KeyboardEvent) {
-    const step = event.shiftKey ? KEYBOARD_COARSE_STEP_MS : KEYBOARD_STEP_MS;
-    if (event.key === 'ArrowLeft') {
-      onRangeChange(nudgeHandle(range, handle, -step, durationMs));
-    } else if (event.key === 'ArrowRight') {
-      onRangeChange(nudgeHandle(range, handle, step, durationMs));
-    } else {
-      return;
-    }
-    // Arrow keys scroll the pane otherwise.
+    const next = handleKeyRange(range, handle, event.key, durationMs, event.shiftKey);
+    if (next === null) return;
+    // The arrow keys scroll the pane otherwise, and Home and End jump the view.
     event.preventDefault();
+    onRangeChange(next);
   }
 </script>
 
@@ -146,7 +177,7 @@
   <div
     class="track"
     bind:this={track}
-    onpointerdown={(event) => beginPlayhead(event, null)}
+    onpointerdown={(event) => beginPlayhead(event)}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
@@ -155,19 +186,19 @@
     <div class="selection" style="left: {percents.left}%; width: {percents.width}%"></div>
 
     {#each placed as marker (marker.event.id)}
+      <!--
+        The marker carries its own offset and no handler of its own: the track owns the
+        gesture, so a drag that starts on a marker scrubs like any other and the track
+        reads the marker back out of this button when the press lands on it.
+      -->
       <button
         class="marker"
         style="left: {marker.percent}%; --marker: {marker.color}"
         type="button"
+        data-offset={marker.event.offset_ms}
         title="{marker.label} at {formatPrecise(marker.event.offset_ms)}"
         aria-label="Marker: {marker.label} at {formatPrecise(marker.event.offset_ms)}"
         disabled={disabled}
-        onpointerdown={(event) => {
-          // Deliberately NOT stopped: the track still begins its drag, so a drag that starts
-          // on a marker scrubs like any other. `onPointerUp` tells the two apart by distance,
-          // which is what makes a marker both clickable and draggable past.
-          beginPlayhead(event, marker.event);
-        }}
       ></button>
     {/each}
 
@@ -213,6 +244,8 @@
   <p class="hint muted">
     Drag the track to scrub. Drag the two handles to set the trim range; focus one and use
     the arrow keys for a {KEYBOARD_STEP_MS}ms step, or Shift for {KEYBOARD_COARSE_STEP_MS}ms.
+    Home and End put a handle at either end of the clip, PageUp and PageDown move it
+    {KEYBOARD_PAGE_MS}ms.
     {#if placed.length > 0}
       Click a marker to seek to just before it ({placed.length} on this session's timeline).
     {/if}

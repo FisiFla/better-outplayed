@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  KEYBOARD_COARSE_STEP_MS,
+  KEYBOARD_PAGE_MS,
   KEYBOARD_STEP_MS,
   MIN_TRIM_MS,
   clampRange,
   dragHandle,
   fractionToMs,
   fullRange,
+  handleKeyRange,
   msToPercent,
   nudgeHandle,
   rangeLabel,
@@ -206,6 +209,70 @@ describe("nudgeHandle", () => {
       startMs: 2_900,
       endMs: 3_000,
     });
+  });
+});
+
+describe("handleKeyRange", () => {
+  const range = { startMs: 1_000, endMs: 30_000 };
+
+  it("moves a handle by one step for the arrow keys, and by a coarse step with Shift", () => {
+    expect(handleKeyRange(range, "start", "ArrowRight", 60_000)).toEqual({
+      startMs: 1_100,
+      endMs: 30_000,
+    });
+    expect(handleKeyRange(range, "end", "ArrowLeft", 60_000)).toEqual({
+      startMs: 1_000,
+      endMs: 29_900,
+    });
+    expect(handleKeyRange(range, "start", "ArrowRight", 60_000, true)).toEqual({
+      startMs: 1_000 + KEYBOARD_COARSE_STEP_MS,
+      endMs: 30_000,
+    });
+  });
+
+  it("moves a handle a page at a time for PageUp and PageDown", () => {
+    expect(handleKeyRange(range, "end", "PageUp", 60_000)).toEqual({
+      startMs: 1_000,
+      endMs: 30_000 - KEYBOARD_PAGE_MS,
+    });
+    expect(handleKeyRange(range, "end", "PageDown", 60_000)).toEqual({
+      startMs: 1_000,
+      endMs: 30_000 + KEYBOARD_PAGE_MS,
+    });
+  });
+
+  it("puts a handle at either end of the clip for Home and End", () => {
+    expect(handleKeyRange(range, "start", "Home", 60_000)).toEqual({
+      startMs: 0,
+      endMs: 30_000,
+    });
+    expect(handleKeyRange(range, "end", "End", 60_000)).toEqual({
+      startMs: 1_000,
+      endMs: 60_000,
+    });
+  });
+
+  it("keeps the selection legal when a handle is sent to an end", () => {
+    // The end of the clip is not a place the start handle can be: it would cross the other
+    // handle, and the command refuses an inverted range.
+    expect(handleKeyRange(range, "start", "End", 60_000)).toEqual({
+      startMs: 30_000 - MIN_TRIM_MS,
+      endMs: 30_000,
+    });
+    expect(handleKeyRange(range, "end", "Home", 60_000)).toEqual({
+      startMs: 1_000,
+      endMs: 1_000 + MIN_TRIM_MS,
+    });
+  });
+
+  it("answers no key it does not know", () => {
+    expect(handleKeyRange(range, "start", "a", 60_000)).toBeNull();
+    expect(handleKeyRange(range, "start", "ArrowUp", 60_000)).toBeNull();
+  });
+
+  it("answers nothing for a clip with no duration", () => {
+    expect(handleKeyRange(range, "start", "Home", 0)).toBeNull();
+    expect(handleKeyRange(range, "start", "ArrowRight", 0)).toBeNull();
   });
 });
 

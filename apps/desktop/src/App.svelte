@@ -29,6 +29,7 @@
     gameOptions,
     isFiltering,
     NO_FILTER,
+    pruneThumbnails,
     tagOptions,
     thumbnailAtMs,
     toClipViews,
@@ -122,6 +123,15 @@
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let loaded = $state(false);
+  /**
+   * Counts the refreshes, so that an older one can be recognised when it lands.
+   *
+   * A refresh reads the whole library, and two of them overlap whenever a poll and a
+   * command run at once. The list is a last-writer-wins assignment, so without this the
+   * slower of the two would win — and a clip saved from the hotkey would vanish from the
+   * library until the next event.
+   */
+  let refreshSeq = 0;
 
   /** Search text, game and tag filters over the library list. */
   let filter = $state<ClipFilter>(NO_FILTER);
@@ -135,13 +145,19 @@
   );
 
   async function refresh() {
+    // Only the newest refresh may write: an older one that lands late is stale.
+    const token = ++refreshSeq;
     try {
       const [rows, storage, sessionRows] = await Promise.all([
         source.listClips(),
         source.storageStats(),
         source.listSessions(),
       ]);
+      if (token !== refreshSeq) return;
       clips = toClipViews(rows, source.assetUrl);
+      // A clip removed by the storage policy leaves its cached thumbnail behind; the map is
+      // pruned against the clips that are still listed, so it cannot grow without bound.
+      thumbnails = pruneThumbnails(thumbnails, clips.map((clip) => clip.id));
       stats = storage;
       sessions = toSessionViews(sessionRows);
       // An open clip or session that is no longer listed was deleted — here or by a retention
@@ -157,9 +173,10 @@
       }
       error = null;
     } catch (err) {
+      if (token !== refreshSeq) return;
       error = errorMessage(err);
     } finally {
-      loaded = true;
+      if (token === refreshSeq) loaded = true;
     }
   }
 
@@ -687,6 +704,7 @@
               {recording}
               {busy}
               onApply={updateSettings}
+              onChooseClipsDir={() => source.chooseClipsDir()}
             />
           {/if}
         </section>

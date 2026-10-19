@@ -101,6 +101,15 @@ export interface ClipSource {
    */
   updateSettings(update: SettingsUpdate): Promise<UpdateSettingsOutcome>;
   /**
+   * The native folder picker, run by the backend, for the clips directory.
+   *
+   * The backend runs it rather than the window so that the folder it returns is one it
+   * has *approved*: only a directory the user picked in the OS dialog is ever added to
+   * the asset-protocol read scope, so a path typed into the panel cannot widen what the
+   * webview may read. The chosen path comes back for the panel to show and apply.
+   */
+  chooseClipsDir(): Promise<string>;
+  /**
    * Recording, through the same engine the CLI drives (`localplay-recorder`). These four
    * are the only commands that make the shell capture anything, and none of them is
    * called by this window on its own initiative: the user presses the button.
@@ -205,6 +214,7 @@ export const tauriIpc: ClipSource = {
   getSettings: () => invoke<SettingsDto>('get_settings'),
   updateSettings: (update: SettingsUpdate) =>
     invoke<UpdateSettingsOutcome>('update_settings', { update }),
+  chooseClipsDir: () => invoke<string>('choose_clips_dir'),
   health: () => invoke<Health>('health'),
   gsiTargets: () => invoke<GsiTarget[]>('gsi_targets'),
   listAudioDevices: () => invoke<AudioDevices>('list_audio_devices'),
