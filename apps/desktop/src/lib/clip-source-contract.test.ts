@@ -37,7 +37,7 @@ function interfaceMethods(): string[] {
 
 /** The method names the screenshot harness's fake source implements. */
 function fakeMethods(): string[] {
-  const start = SHOTS_MJS.indexOf('globalThis.__localplayClipSource = {');
+  const start = SHOTS_MJS.indexOf('globalThis.__replayedClipSource = {');
   expect(start, 'the harness must install a fake clip source').toBeGreaterThan(-1);
   const block = SHOTS_MJS.slice(start, SHOTS_MJS.indexOf('\n  };', start));
   const names = new Set<string>();

@@ -11,7 +11,7 @@
  * be met" verdict reads as a warning. Those are properties of pixels, so this script makes
  * pixels: it builds the frontend, serves `dist/` over HTTP, loads it in headless Chromium
  * with the Tauri IPC replaced by a mock (the seam in `src/main.ts`, armed with
- * `?test-clip-source=1` plus a `globalThis.__localplayClipSource`), drives the real UI with
+ * `?test-clip-source=1` plus a `globalThis.__replayedClipSource`), drives the real UI with
  * real pointer events, and writes PNGs to `<repo>/target/desktop-shots/`.
  *
  * Every PNG is then decoded (`./png-stats.mjs`) and asserted to be non-blank, and every
@@ -124,7 +124,7 @@ function partitionErrors(errors) {
 // fixtures — the mock ClipSource's data
 // ---------------------------------------------------------------------------------------
 
-const CLIPS_DIR = 'C:\\Users\\player\\Videos\\localplay\\clips';
+const CLIPS_DIR = 'C:\\Users\\player\\Videos\\replayed\\clips';
 const THUMBS_DIR = `${CLIPS_DIR}\\thumbs`;
 /** Fixed so two runs produce the same dates; the panel renders these in local time. */
 const NEWEST_MS = Date.parse('2026-09-23T19:24:00Z');
@@ -202,10 +202,10 @@ function statsFor(clips, overrides = {}) {
  */
 const APP_STATUS = {
   hotkey: { chord: 'Ctrl+F8', installed: true, error: null },
-  config_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\config.toml',
+  config_path: 'C:\\Users\\player\\AppData\\Local\\replayed\\config.toml',
   config_exists: true,
   close_hint:
-    'Closing this window hides localplay in the tray; recording keeps running. Quit from the ' +
+    'Closing this window hides replayed in the tray; recording keeps running. Quit from the ' +
     'tray menu when you are done.',
 };
 
@@ -221,7 +221,7 @@ const APP_STATUS_NO_HOTKEY = {
     installed: false,
     error:
       'the chord Ctrl+F8 could not be registered (RegisterHotKey failed: the hot key is ' +
-      'already registered). Another application — or another localplay (the CLI and this app ' +
+      'already registered). Another application — or another replayed (the CLI and this app ' +
       'cannot both hold one chord) — already owns it. Nothing will happen when Ctrl+F8 is ' +
       'pressed. Close the other application, or set a different [hotkeys] clip in config.toml ' +
       'and restart.',
@@ -295,7 +295,7 @@ const MISSING_FILES_FIXTURE = {
 /**
  * A running recorder's status, exactly as `recording_status` publishes it.
  *
- * The numbers are the shape `localplay-recorder` gives (see its `RecorderStatus`): 12
+ * The numbers are the shape `replayed-recorder` gives (see its `RecorderStatus`): 12
  * completed one-second segments, 480 frames submitted, a rate measured over the last
  * second, and the 320 frames the pacer skipped *without* a GPU readback. `drift_ms` is
  * positive because media time lags real time on capture hardware — the reason the trigger
@@ -374,10 +374,10 @@ const SESSION_SESSIONS = [
     mode: 'session',
     started_at_ms: NEWEST_MS - 125 * MINUTE,
     ended_at_ms: NEWEST_MS - 63 * MINUTE,
-    final_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions-out\\session-7.mp4',
+    final_path: 'C:\\Users\\player\\AppData\\Local\\replayed\\sessions-out\\session-7.mp4',
     size_bytes: 2_254_000_000,
     favourite: false,
-    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-7',
+    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\replayed\\sessions\\session-7',
     duration_ms: 3_723_000,
   },
   {
@@ -389,7 +389,7 @@ const SESSION_SESSIONS = [
     final_path: null,
     size_bytes: 41_943_040,
     favourite: false,
-    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-8',
+    scratch_dir: 'C:\\Users\\player\\AppData\\Local\\replayed\\sessions\\session-8',
     duration_ms: 0,
   },
 ];
@@ -482,10 +482,10 @@ const LONG_SESSIONS = Array.from({ length: 10 }, (_, i) => {
     mode: i % 4 === 0 ? 'buffer' : 'session',
     started_at_ms: NEWEST_MS - (i + 1) * 5 * 60 * MINUTE,
     ended_at_ms: running ? null : NEWEST_MS - i * 5 * 60 * MINUTE,
-    final_path: running || i % 4 === 0 ? null : `C:\\Users\\player\\AppData\\Local\\localplay\\sessions-out\\session-${300 + i}.mp4`,
+    final_path: running || i % 4 === 0 ? null : `C:\\Users\\player\\AppData\\Local\\replayed\\sessions-out\\session-${300 + i}.mp4`,
     size_bytes: 500_000_000 + i * 100_000_000,
     favourite: i === 2,
-    scratch_dir: `C:\\Users\\player\\AppData\\Local\\localplay\\sessions\\session-${300 + i}`,
+    scratch_dir: `C:\\Users\\player\\AppData\\Local\\replayed\\sessions\\session-${300 + i}`,
     duration_ms: running ? 0 : 3_000_000 + i * 60_000,
   };
 });
@@ -550,14 +550,14 @@ function installMockSource(fixture) {
     watch_titles: ['League of Legends', 'Counter-Strike 2', 'Dota 2'],
     defaulted: [],
     config_exists: true,
-    config_path: 'C:\\Users\\player\\localplay\\config.toml',
+    config_path: 'C:\\Users\\player\\replayed\\config.toml',
     ...(fixture.settings ?? {}),
   };
   const find = (id) => clips.find((c) => c.id === id);
   const notFound = (id) => ({ code: 'clip_not_found', message: `clip #${id} is not in the index` });
   const basename = (p) => String(p).split(/[\\/]/).pop() ?? '';
 
-  globalThis.__localplayClipSource = {
+  globalThis.__replayedClipSource = {
     async listClips() {
       return clips.map((c) => ({ ...c }));
     },
@@ -720,7 +720,7 @@ function installMockSource(fixture) {
         disk: { path: fixture.clipsDir, free_bytes: 200 * 1024 ** 3, total_bytes: 931 * 1024 ** 3 },
         event_sources: [],
         recent_errors: [],
-        log_path: 'C:\\Users\\player\\AppData\\Local\\localplay\\logs\\better-outplayed.log',
+        log_path: 'C:\\Users\\player\\AppData\\Local\\replayed\\logs\\replayed.log',
       };
     },
     async gsiTargets() {
@@ -1797,12 +1797,12 @@ const states = [
       );
       check(
         this.name,
-        panelText.includes('hides localplay in the tray'),
+        panelText.includes('hides replayed in the tray'),
         'and says what closing the window does',
       );
       check(
         this.name,
-        panelText.includes('Config: C:\\Users\\player\\AppData\\Local\\localplay\\config.toml'),
+        panelText.includes('Config: C:\\Users\\player\\AppData\\Local\\replayed\\config.toml'),
         'and names the config file this process read',
       );
 
@@ -1883,7 +1883,7 @@ const states = [
       check(this.name, text.includes('already registered'), 'and carries the reason the registration failed');
       check(
         this.name,
-        text.includes('another localplay'),
+        text.includes('another replayed'),
         'including the second-instance case: the CLI and the app cannot both hold one chord',
       );
 
@@ -2264,7 +2264,7 @@ function msFromStamp(stamp) {
 // ---------------------------------------------------------------------------------------
 
 async function main() {
-  log('localplay desktop — headless render');
+  log('replayed desktop — headless render');
   log(`  shots go to ${shotsDir}`);
 
   if (installBrowserOnly) {

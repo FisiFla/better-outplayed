@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn upgrading_a_populated_database_backs_it_up_first_and_keeps_two() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("localplay.db");
+        let db = dir.path().join("replayed.db");
         {
             let s = Store::open(&db).unwrap();
             s.migrate().unwrap();
@@ -1199,7 +1199,7 @@ mod tests {
 
     /// Two writers on one database file wait for the lock instead of failing on it.
     ///
-    /// The desktop shell and the recorder are separate processes on the same `localplay.db`, and
+    /// The desktop shell and the recorder are separate processes on the same `replayed.db`, and
     /// SQLite's default busy timeout is zero: a write that meets the other connection's lock
     /// fails with `SQLITE_BUSY` at once. The recorder's answer to that is to log an error and
     /// carry on, which leaves the clip's file on disk with no row naming it: invisible in the
@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn two_writers_on_one_database_wait_for_the_lock_instead_of_failing() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("localplay.db");
+        let db = dir.path().join("replayed.db");
         let first = Store::open(&db).unwrap();
         first.migrate().unwrap();
         let second = Store::open(&db).unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
     #[test]
     fn a_v1_database_is_upgraded_in_place_and_loses_no_rows() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let path = dir.path().join("localplay.db");
+        let path = dir.path().join("replayed.db");
         let store = v1_database(&path);
         assert_eq!(
             store.schema_version().expect("version"),
@@ -2325,7 +2325,7 @@ mod tests {
     #[test]
     fn a_v1_database_gains_the_v5_columns_backfills_the_game_and_loses_no_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("localplay.db");
+        let db = dir.path().join("replayed.db");
         let store = v1_database(&db);
         store.migrate().unwrap();
         assert_eq!(store.schema_version().unwrap(), 5);

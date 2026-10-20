@@ -6,5 +6,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
 
 fn main() {
-    localplay_desktop::run()
+    replayed_desktop::run()
 }

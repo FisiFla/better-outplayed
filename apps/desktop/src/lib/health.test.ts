@@ -20,7 +20,7 @@ function health(overrides: Partial<Health> = {}): Health {
     disk: { path: 'C:\\clips', free_bytes: 100 * 1024 ** 3, total_bytes: 500 * 1024 ** 3 },
     event_sources: [],
     recent_errors: [],
-    log_path: 'C:\\logs\\better-outplayed.log',
+    log_path: 'C:\\logs\\replayed.log',
     ...overrides,
   };
 }

@@ -30,7 +30,7 @@
 //!   by retention.
 //! * Microphone ([`MicSection`], off by default): a second audio input, so clips carry two audio
 //!   tracks. If it cannot start, the recording fails at start rather than producing a silent voice track.
-//! * Game watcher ([`localplay_events::process::GamesSection`], `[games] auto_record`, off by
+//! * Game watcher ([`replayed_events::process::GamesSection`], `[games] auto_record`, off by
 //!   default): a recording starts and stops with a watched game. With it off no watcher thread
 //!   exists at all.
 //!
@@ -118,21 +118,21 @@ pub use pump::{
 };
 
 use anyhow::{bail, Context, Result};
-use localplay_capture::platform::{default_video_backend, game_audio_backend};
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::wasapi_mic::{StubMicrophone, MICROPHONE_FORMAT};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::probe::select_vendor;
-use localplay_encoder::{
+use memory_ring::MemoryRing;
+use replayed_capture::platform::{default_video_backend, game_audio_backend};
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::wasapi_mic::{StubMicrophone, MICROPHONE_FORMAT};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::probe::select_vendor;
+use replayed_encoder::{
     EncodeConfig, Encoder, FfmpegEncoder, MicAudioSpec, ThroughputMeasurement, Vendor, VideoCodec,
 };
-use localplay_events::process::{GamesSection, PresenceChange, WatchHandle};
-use localplay_events::{CaptureClock, GameEvent};
-use localplay_media::{edit, FfmpegBinaries};
-use localplay_replay::buffer::{BufferConfig, BufferStats};
-use localplay_replay::splice::{ClipMetadata, ClipSplicer};
-use localplay_store::{Event, Store};
-use memory_ring::MemoryRing;
+use replayed_events::process::{GamesSection, PresenceChange, WatchHandle};
+use replayed_events::{CaptureClock, GameEvent};
+use replayed_media::{edit, FfmpegBinaries};
+use replayed_replay::buffer::{BufferConfig, BufferStats};
+use replayed_replay::splice::{ClipMetadata, ClipSplicer};
+use replayed_store::{Event, Store};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -164,7 +164,7 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 /// Where the frames come from.
 ///
 /// [`Sources::Platform`] is the shipping path (WGC and WASAPI loopback on Windows; stubs elsewhere,
-/// and `localplay_capture::platform` refuses a stub fallback on Windows). [`Sources::Stub`] selects
+/// and `replayed_capture::platform` refuses a stub fallback on Windows). [`Sources::Stub`] selects
 /// the synthetic sources explicitly for tests and is never reachable from a config file.
 #[derive(Debug, Clone, Copy)]
 pub enum Sources {
@@ -175,12 +175,12 @@ pub enum Sources {
 /// Everything [`Recorder::start`] needs, resolved by the front-end.
 ///
 /// Sections are `config.toml`'s verbatim; the recorder applies the "empty means default" path rule
-/// itself so both front-ends resolve `scratch/`, `clips/` and `localplay.db` identically.
+/// itself so both front-ends resolve `scratch/`, `clips/` and `replayed.db` identically.
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
     /// Where ffmpeg and ffprobe live, discovered by the front-end.
     pub bin: FfmpegBinaries,
-    /// The application data directory; `scratch/`, `clips/` and `localplay.db` live here unless overridden.
+    /// The application data directory; `scratch/`, `clips/` and `replayed.db` live here unless overridden.
     pub app_data_dir: PathBuf,
     pub buffer: BufferSection,
     pub encode: EncodeSection,
@@ -191,7 +191,7 @@ pub struct RecorderConfig {
     ///
     /// Lives here, not in [`EncodeSection`], so `[audio]` stays that setting's only home. `None` (the
     /// desktop shell does not parse `[audio]`) resolves to
-    /// [`localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] in [`build_encode_config`].
+    /// [`replayed_encoder::DEFAULT_AUDIO_BITRATE_KBPS`] in [`build_encode_config`].
     pub audio_bitrate_kbps: Option<u32>,
     /// `[audio] enabled`: whether this recording carries the game-audio track.
     ///
@@ -228,7 +228,7 @@ impl RecorderConfig {
 
     /// The clip index both this engine and the desktop shell open.
     pub fn db_path(&self) -> PathBuf {
-        self.app_data_dir.join("localplay.db")
+        self.app_data_dir.join("replayed.db")
     }
 }
 
@@ -701,10 +701,10 @@ impl Recorder {
         // The shipping measurement; binaries are cloned so the probe does not borrow `cfg` while it moves into `start_inner`.
         let bin = cfg.bin.clone();
         let measure = move |encode_cfg: &EncodeConfig| {
-            localplay_encoder::throughput::measure_sustainable_fps(
+            replayed_encoder::throughput::measure_sustainable_fps(
                 &bin,
                 encode_cfg,
-                localplay_encoder::throughput::PROBE_BUDGET,
+                replayed_encoder::throughput::PROBE_BUDGET,
             )
         };
         if !opts.games.watching() {
@@ -721,13 +721,13 @@ impl Recorder {
     /// [`Recorder::start`] with the throughput measurement injected (a `cfg(test)` hook).
     ///
     /// Lets a test hand in a measurement and assert what the pipeline did with it; production passes
-    /// [`localplay_encoder::throughput::measure_sustainable_fps`]. The injected measurement applies
+    /// [`replayed_encoder::throughput::measure_sustainable_fps`]. The injected measurement applies
     /// only to the recording this call starts; a game-driven recorder measures with the shipping probe.
     ///
     /// # The one rate
     ///
     /// [`FpsDecision::effective`] is written into `encode_cfg.fps` once, and both consumers read that
-    /// field: [`spawn_encoder`] (its `-framerate`, via `localplay_encoder::video_input_args`, the
+    /// field: [`spawn_encoder`] (its `-framerate`, via `replayed_encoder::video_input_args`, the
     /// same function the probe used) and the [`FramePacer`]. The pacer therefore admits exactly what
     /// the encoder was told; computing the two separately is how the declared rate once diverged from
     /// the delivered one. `tests::the_pacer_and_the_encoder_are_told_the_same_rate` guards it.
@@ -1254,7 +1254,7 @@ impl Prepared {
         // Game-audio presence is asked of the configuration once (`game_audio`), here and in the encoder config.
         let game_audio = cfg.game_audio();
         // Tracks are named by position and a one-track container's track is `Game Audio`
-        // (`localplay_media::edit::audio_titles`), so a microphone without game audio would be
+        // (`replayed_media::edit::audio_titles`), so a microphone without game audio would be
         // mislabelled. Refused here before anything opens; the encoder refuses it too as a backstop.
         if !game_audio && self.opts.mic.enabled {
             bail!(
@@ -1311,7 +1311,7 @@ impl Prepared {
             RecordingMode::ReplayBuffer => {
                 // Fragmented MP4 on stdout: no file is written while buffering. `scratch_dir` is left
                 // unconsumed (it is session mode's segment directory).
-                encode_cfg.output = localplay_encoder::EncodeOutput::FragmentedStream;
+                encode_cfg.output = replayed_encoder::EncodeOutput::FragmentedStream;
                 let (mut enc, name) = spawn_encoder(&cfg.bin, &encode_cfg)?;
                 let stream = enc.take_output_stream().context(
                     "a fragmented-stream encoder must expose its output pipe, or the ring \
@@ -1539,7 +1539,7 @@ impl Prepared {
         let slot = Arc::new(Mutex::new(Some(engine)));
         let taken = Arc::clone(&slot);
         let thread = match std::thread::Builder::new()
-            .name("localplay-recorder".to_string())
+            .name("replayed-recorder".to_string())
             .spawn(move || {
                 // The engine is in the slot before the thread starts, so the `None` case cannot
                 // happen: it would mean a thread with nothing to run.
@@ -1568,7 +1568,7 @@ impl Prepared {
 /// The game watcher's driver: one recording per game session, in the configured mode.
 ///
 /// Owns the presence changes, the watcher's handle (dropping it stops the watcher), the prepared
-/// start state and the running recording. Detection belongs to `localplay-events`; what a
+/// start state and the running recording. Detection belongs to `replayed-events`; what a
 /// detection means for recording is here.
 struct Supervisor {
     stop: Arc<AtomicBool>,
@@ -1601,7 +1601,7 @@ fn spawn_supervisor(
     // Armed as this returns, so "is this recorder watching?" right after `start` is not a race.
     status.watching.store(true, Ordering::SeqCst);
     let thread = std::thread::Builder::new()
-        .name("localplay-games".to_string())
+        .name("replayed-games".to_string())
         .spawn(move || {
             // Kept alive for the whole loop: dropping the handle stops the watcher.
             let _watch = watch;
@@ -1626,10 +1626,10 @@ fn spawn_supervisor(
                         // The shipping measurement: this recording begins on this thread, not the caller's.
                         let bin = prepared.cfg.bin.clone();
                         let measure = move |encode_cfg: &EncodeConfig| {
-                            localplay_encoder::throughput::measure_sustainable_fps(
+                            replayed_encoder::throughput::measure_sustainable_fps(
                                 &bin,
                                 encode_cfg,
-                                localplay_encoder::throughput::PROBE_BUDGET,
+                                replayed_encoder::throughput::PROBE_BUDGET,
                             )
                         };
                         match prepared.begin(Some(game.name.clone()), &measure, &status) {
@@ -1730,7 +1730,7 @@ fn build_microphone(sources: Sources, device: &str) -> Result<Box<dyn AudioBacke
             MICROPHONE_FORMAT,
             MIC_BLOCK_MS,
         ))),
-        Sources::Platform => localplay_capture::wasapi_mic::microphone_backend(device),
+        Sources::Platform => replayed_capture::wasapi_mic::microphone_backend(device),
     }
 }
 
@@ -1819,7 +1819,7 @@ struct Engine {
     /// The clips whose splice is running on its own thread (see [`PendingClip`]).
     pending_clips: Vec<PendingClip>,
     /// Time spent inside the capture backend, accumulated over the run
-    /// ([`localplay_recorder::pump::PumpCounts::capture`]): the GPU readback cost, reported against wall clock.
+    /// ([`replayed_recorder::pump::PumpCounts::capture`]): the GPU readback cost, reported against wall clock.
     capture_time: Duration,
     /// Time spent inside the encoder's submit, i.e. waiting for its bounded queue to drain.
     submit_time: Duration,
@@ -2098,7 +2098,7 @@ pub(crate) enum ClipSource {
     },
     /// The session's whole segments, concatenated losslessly.
     Segments {
-        window: localplay_replay::window::SegmentWindow,
+        window: replayed_replay::window::SegmentWindow,
         /// Whether the session carries a microphone track: the concatenation must keep it.
         multitrack: bool,
     },
@@ -2264,7 +2264,7 @@ impl Engine {
         let dropped = self.encoder.dropped_frames();
 
         // `dropped=` / `dropped_audio=` are the encoder's counts of discarded video frames / audio blocks
-        // (queue full; see `localplay-encoder`); a drop in audio is a sound hole, so they are separate.
+        // (queue full; see `replayed-encoder`); a drop in audio is a sound hole, so they are separate.
         // `frames=` + `skipped=` is the source's own rate; `fps=` is the achieved rate over `RATE_WINDOW`,
         // printed against the pipeline rate; `configured=` differs from it exactly when the startup probe
         // measured less and adaptation is on. `capture=` is a share of wall clock, split into copy vs wait
@@ -2326,7 +2326,7 @@ impl Engine {
         // pipeline rate: the machine cannot encode that rate now, despite the startup measurement. Make it
         // loud: each dropped frame holds the previous picture. It is not a timeline warning, since the
         // media clock is the frames' arrival timestamps (`-fps_mode passthrough`, see
-        // `localplay_encoder::ffmpeg`) and `span=` keeps tracking the wall clock.
+        // `replayed_encoder::ffmpeg`) and `span=` keeps tracking the wall clock.
         let dropped_since_last = dropped.saturating_sub(self.last_warned_dropped);
         let warn_due = self
             .last_drop_warning
@@ -2447,7 +2447,7 @@ impl Engine {
         // The splice, on a thread of its own: ffmpeg takes as long as the clip is long, and the
         // pump must keep running while it does.
         let worker = std::thread::Builder::new()
-            .name("localplay-splice".to_string())
+            .name("replayed-splice".to_string())
             .spawn(move || splice_clip(bin, source, out, encoder, events, trigger, started_at_ms))
             .context("spawning the clip's splice thread")?;
         self.pending_clips.push(PendingClip {
@@ -2957,7 +2957,7 @@ fn resolve_encoder(
 ///
 /// It turns "capture runs at 24fps" into a measured fact about this machine at this resolution.
 /// It is not the timeline guarantee: the media timeline is the frames' arrival timestamps and does
-/// not depend on this measurement (see `localplay_encoder::throughput`). Adapting saves the capture
+/// not depend on this measurement (see `replayed_encoder::throughput`). Adapting saves the capture
 /// work of frames that would be dropped and warns before recording rather than after. The
 /// effective rate is printed, never the configured one when they differ.
 ///
@@ -3064,7 +3064,7 @@ impl RecorderConfig {
 fn build_sources(
     sources: Sources,
     capture_section: &CaptureSection,
-    watch: &[localplay_events::process::WatchedGame],
+    watch: &[replayed_events::process::WatchedGame],
     fps: u32,
     game_audio: bool,
 ) -> Result<(Box<dyn CaptureBackend>, Option<Box<dyn AudioBackend>>)> {
@@ -3081,7 +3081,7 @@ fn build_sources(
                 // The same snapshot the game watcher takes, so the audio follows the game it detects.
                 let watch = watch.to_vec();
                 let find_game = Box::new(move || {
-                    localplay_events::process::running_game_pid(&watch).unwrap_or_else(|e| {
+                    replayed_events::process::running_game_pid(&watch).unwrap_or_else(|e| {
                         tracing::debug!(error = %e, "could not look for the game process");
                         None
                     })
@@ -3173,7 +3173,7 @@ fn build_encode_config(
     // every path so the file records what the config says.
     encode_cfg.audio_bitrate_kbps = cfg
         .audio_bitrate_kbps
-        .unwrap_or(localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
+        .unwrap_or(replayed_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
 
     // Whether the game-audio track exists, from the same rule the capture backends used
     // (`RecorderConfig::game_audio`): `false` declares no audio input and no loopback listener.
@@ -3191,7 +3191,7 @@ fn build_encode_config(
     // record no video.
     #[cfg(windows)]
     let openable = vendor.is_some()
-        && localplay_encoder::mft::can_encode_with_textures(
+        && replayed_encoder::mft::can_encode_with_textures(
             codec,
             native_size,
             cfg.encode.bitrate_kbps,
@@ -3236,7 +3236,7 @@ fn build_encode_config(
     if zero_copy {
         #[cfg(windows)]
         {
-            encode_cfg.video = localplay_encoder::VideoInput::EncodedBitstream;
+            encode_cfg.video = replayed_encoder::VideoInput::EncodedBitstream;
             // Said out loud because it changes what the child does with video: it copies rather than encodes,
             // and the keyframe interval is the MFT's, not ffmpeg's.
             tracing::info!(

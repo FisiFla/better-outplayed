@@ -6,7 +6,7 @@
 //!
 //! The global hotkey cannot fire off Windows, so the CLI's capture loop cannot be driven from a
 //! test here. Everything the hotkey branch does after its post-roll wait is driven with the
-//! engine's own calls: the in-memory ring's `trigger` to splice, `localplay_recorder::index_clip`
+//! engine's own calls: the in-memory ring's `trigger` to splice, `replayed_recorder::index_clip`
 //! to index, and the policy functions to evict.
 //!
 //! Needs ffmpeg on `PATH` with a working libx264 (see `post_roll.rs` on why the test-encoders
@@ -14,14 +14,14 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
-use localplay_recorder::{pump_until_span_on, FramePacer};
-use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
-use localplay_store::Store;
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::memory_ring::{MemoryRing, RingSetup};
+use replayed_recorder::{pump_until_span_on, FramePacer};
+use replayed_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
+use replayed_store::Store;
 use std::time::Duration;
 
 const WIDTH: u32 = 64;
@@ -109,14 +109,14 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
 
     // The code under test: the clip becomes a row.
     let db_dir = tempfile::tempdir().expect("a temp dir for the index");
-    let store = Store::open(&db_dir.path().join("localplay.db")).expect("open the clip index");
+    let store = Store::open(&db_dir.path().join("replayed.db")).expect("open the clip index");
     store.migrate().expect("migrate the clip index");
 
     // The window's start on the ring's own clock. An in-memory ring starts at zero every run, so
     // the trigger instant and the footage are already on the same timeline.
     let started_at_ms = trigger_ms.saturating_sub(PRE_MS);
     let id =
-        localplay_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
+        replayed_recorder::index_clip(&store, &clip, started_at_ms).expect("the clip is indexed");
 
     let rows = store.list_clips().expect("list the indexed clips");
     assert_eq!(rows.len(), 1, "one clip, one row");

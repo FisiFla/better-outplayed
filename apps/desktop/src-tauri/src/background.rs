@@ -14,13 +14,13 @@
 //!
 //! # The one hotkey implementation
 //!
-//! The chord is parsed and registered by `localplay_events::hotkey`, the module the CLI installs
+//! The chord is parsed and registered by `replayed_events::hotkey`, the module the CLI installs
 //! from the same `config.toml`, through [`install_hotkey`]. A registration failure (the chord
-//! is somebody else's, including a second localplay) is returned as data the window and the
+//! is somebody else's, including a second replayed) is returned as data the window and the
 //! tray can both show.
 
 use crate::commands::{CommandError, RecordedClipDto, RecordingStatusDto};
-use localplay_events::hotkey::{self, Hotkey};
+use replayed_events::hotkey::{self, Hotkey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -75,7 +75,7 @@ impl HotkeyStatus {
 /// * this build has no global hotkey ([`hotkey::supported`] is false off Windows), said out
 ///   loud rather than showing a chord that cannot fire;
 /// * `RegisterHotKey` refused it: the chord is held by another application or another
-///   localplay. The error (composed in `crates/events/src/hotkey.rs`) names the chord and the
+///   replayed. The error (composed in `crates/events/src/hotkey.rs`) names the chord and the
 ///   likely owner.
 pub fn install_hotkey(
     config_value: &str,
@@ -141,7 +141,7 @@ pub fn install_hotkey(
         Ok(indices) => {
             let (tx, rx) = std::sync::mpsc::channel();
             let forwarder = std::thread::Builder::new()
-                .name("localplay-hotkey-actions".into())
+                .name("replayed-hotkey-actions".into())
                 .spawn(move || {
                     while let Ok(index) = indices.recv() {
                         if let Some(action) = actions.get(index) {
@@ -274,23 +274,23 @@ impl TrayView<'_> {
     pub fn tooltip(&self) -> String {
         let mut text = match self.tray_state() {
             TrayState::Attention if !self.hotkey.installed => format!(
-                "better-outplayed — the clip hotkey {} is NOT installed. Open the window for why; \
+                "replayed — the clip hotkey {} is NOT installed. Open the window for why; \
                  the tray menu still records and saves clips.",
                 self.hotkey.chord
             ),
             TrayState::Attention => format!(
-                "better-outplayed — the recorder stopped: {}",
+                "replayed — the recorder stopped: {}",
                 self.status
                     .error
                     .as_deref()
                     .unwrap_or("no reason was reported")
             ),
             TrayState::Recording => format!(
-                "better-outplayed — recording. Press {} to take a clip.",
+                "replayed — recording. Press {} to take a clip.",
                 self.hotkey.chord
             ),
             TrayState::Idle => format!(
-                "better-outplayed — not recording. Press {} for a clip once recording is on.",
+                "replayed — not recording. Press {} for a clip once recording is on.",
                 self.hotkey.chord
             ),
         };
@@ -373,7 +373,7 @@ impl MenuAction {
             MenuAction::SaveClip => "Save clip now".to_string(),
             MenuAction::OpenConfig if view.config_exists => "Open config file".to_string(),
             MenuAction::OpenConfig => "Open the config folder".to_string(),
-            MenuAction::Quit => "Quit better-outplayed".to_string(),
+            MenuAction::Quit => "Quit replayed".to_string(),
         }
     }
 
@@ -524,7 +524,7 @@ pub fn close_action() -> CloseAction {
 
 /// What the window tells its user before the first close, so "the app disappeared" is not a
 /// mystery. Shown in the recorder panel.
-pub const CLOSE_HINT: &str = "Closing this window hides localplay in the tray; recording keeps \
+pub const CLOSE_HINT: &str = "Closing this window hides replayed in the tray; recording keeps \
                               running. Quit from the tray menu when you are done.";
 
 // ---------------------------------------------------------------------------------------
@@ -537,9 +537,9 @@ pub const CLOSE_HINT: &str = "Closing this window hides localplay in the tray; r
 /// The name of the value this application owns under the user's Run key.
 ///
 /// The product's name rather than the binary's: the Run key is shared and user-visible, and
-/// `localplay` is a name a user may have given an entry of their own. Nothing else in that
+/// `replayed` is a name a user may have given an entry of their own. Nothing else in that
 /// key is touched, so an entry a user added by hand survives.
-pub const AUTOSTART_VALUE: &str = "better-outplayed";
+pub const AUTOSTART_VALUE: &str = "replayed";
 
 /// The per-user Run key: no elevation, no machine-wide change, and the first place a Windows
 /// user looks to see what starts with their session.
@@ -680,7 +680,7 @@ fn is_absent(output: &RegOutput) -> bool {
 /// The executable path a `reg query` reported for `value`, if the value is present.
 ///
 /// `reg query` prints one line per value:
-/// `    localplay    REG_SZ    C:\path with spaces\localplay.exe`
+/// `    replayed    REG_SZ    C:\path with spaces\replayed.exe`
 /// and exits non-zero when the key or value is absent, in which case there is nothing to parse.
 fn registered_path(output: &str, value: &str) -> Option<String> {
     output.lines().find_map(|line| {
@@ -840,7 +840,7 @@ fn remove_entry(
 #[cfg(windows)]
 pub fn apply_autostart(enabled: bool, exe: &Path) -> Result<AutostartOutcome, String> {
     let mut run = |argv: &[String]| -> Result<RegOutput, String> {
-        let output = localplay_media::sidecar_command("reg")
+        let output = replayed_media::sidecar_command("reg")
             .args(argv)
             .output()
             .map_err(|err| format!("reg.exe could not be run: {err}"))?;
@@ -982,7 +982,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn status(running: bool, error: Option<&str>) -> RecordingStatusDto {
-        let mut status = RecordingStatusDto::from(localplay_recorder::RecorderStatus::stopped());
+        let mut status = RecordingStatusDto::from(replayed_recorder::RecorderStatus::stopped());
         status.running = running;
         status.error = error.map(str::to_string);
         status
@@ -1395,7 +1395,7 @@ mod tests {
             MenuAction::OpenConfig.label(&no_file),
             "Open the config folder"
         );
-        assert_eq!(MenuAction::Quit.label(&shown), "Quit better-outplayed");
+        assert_eq!(MenuAction::Quit.label(&shown), "Quit replayed");
         assert!(
             MenuAction::Quit.separator_before(),
             "quit is set apart from the rest"
@@ -1459,11 +1459,11 @@ mod tests {
 
         assert_eq!(
             view(&idle, &hotkey, true).tooltip(),
-            "better-outplayed — not recording. Press Ctrl+F8 for a clip once recording is on."
+            "replayed — not recording. Press Ctrl+F8 for a clip once recording is on."
         );
         assert_eq!(
             view(&recording, &hotkey, true).tooltip(),
-            "better-outplayed — recording. Press Ctrl+F8 to take a clip."
+            "replayed — recording. Press Ctrl+F8 to take a clip."
         );
         let stopped = view(&broken, &hotkey, true).tooltip();
         assert!(stopped.contains("the encoder exited"), "{stopped}");
@@ -1603,7 +1603,7 @@ mod tests {
     #[test]
     fn the_config_item_opens_the_file_and_reports_the_path() {
         let shell = FakeShell {
-            config_path: PathBuf::from("C:\\Users\\player\\AppData\\Local\\localplay\\config.toml"),
+            config_path: PathBuf::from("C:\\Users\\player\\AppData\\Local\\replayed\\config.toml"),
             ..FakeShell::default()
         };
 
@@ -1684,11 +1684,11 @@ mod tests {
     fn the_run_key_command_has_the_shape_windows_expects() {
         // `reg.exe` on the per-user Run key, the executable quoted because an install path may contain
         // spaces. Idempotent by `/f`, so a moved install is repaired.
-        let exe = Path::new(r"C:\Program Files\localplay\localplay.exe");
+        let exe = Path::new(r"C:\Program Files\replayed\replayed.exe");
 
         assert_eq!(
             reg_argv(RegCommand::Query, AUTOSTART_VALUE, exe),
-            vec!["query", RUN_KEY, "/v", "better-outplayed"]
+            vec!["query", RUN_KEY, "/v", "replayed"]
         );
         assert_eq!(
             reg_argv(RegCommand::Enable, AUTOSTART_VALUE, exe),
@@ -1696,17 +1696,17 @@ mod tests {
                 "add",
                 RUN_KEY,
                 "/v",
-                "better-outplayed",
+                "replayed",
                 "/t",
                 "REG_SZ",
                 "/d",
-                r#""C:\Program Files\localplay\localplay.exe""#,
+                r#""C:\Program Files\replayed\replayed.exe""#,
                 "/f",
             ]
         );
         assert_eq!(
             reg_argv(RegCommand::Disable, AUTOSTART_VALUE, exe),
-            vec!["delete", RUN_KEY, "/v", "better-outplayed", "/f"]
+            vec!["delete", RUN_KEY, "/v", "replayed", "/f"]
         );
 
         assert!(
@@ -1718,7 +1718,7 @@ mod tests {
         // The value's name is the product's, not the binary's: the Run key is shared and
         // user-visible, and a name a user may have given an entry of their own is not ours to
         // overwrite or delete.
-        assert_eq!(AUTOSTART_VALUE, "better-outplayed");
+        assert_eq!(AUTOSTART_VALUE, "replayed");
     }
 
     /// The message `reg.exe` prints for a key or value that is not there.
@@ -1768,7 +1768,7 @@ mod tests {
 
     #[test]
     fn autostart_writes_the_entry_when_the_config_asks_for_it() {
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let reg = FakeReg::new(None);
         let mut run = reg.runner();
 
@@ -1785,8 +1785,8 @@ mod tests {
     #[test]
     fn autostart_leaves_a_correct_entry_alone() {
         // The common case on every start after the first: no registry write at all.
-        let exe = Path::new(r"C:\localplay\localplay.exe");
-        let reg = FakeReg::new(Some(r#""C:\localplay\localplay.exe""#));
+        let exe = Path::new(r"C:\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(r#""C:\replayed\replayed.exe""#));
         let mut run = reg.runner();
 
         let outcome = sync_autostart(true, exe, &mut run).unwrap();
@@ -1803,8 +1803,8 @@ mod tests {
     fn autostart_repairs_an_entry_that_points_somewhere_else() {
         // The app moved, or an older install wrote it: `enabled = true` must end with the entry naming
         // this executable.
-        let exe = Path::new(r"D:\games\localplay\localplay.exe");
-        let reg = FakeReg::new(Some(r#""C:\old\localplay.exe""#));
+        let exe = Path::new(r"D:\games\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(r#""C:\old\replayed.exe""#));
         let mut run = reg.runner();
 
         assert_eq!(
@@ -1816,8 +1816,8 @@ mod tests {
 
     #[test]
     fn autostart_removes_the_entry_when_the_config_says_false() {
-        let exe = Path::new(r"C:\localplay\localplay.exe");
-        let reg = FakeReg::new(Some(r#""C:\localplay\localplay.exe""#));
+        let exe = Path::new(r"C:\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(r#""C:\replayed\replayed.exe""#));
         let mut run = reg.runner();
 
         let outcome = sync_autostart(false, exe, &mut run).unwrap();
@@ -1830,7 +1830,7 @@ mod tests {
     fn autostart_never_touches_the_key_when_there_is_nothing_to_remove() {
         // `false` on a machine that never had one: no delete, so no chance of removing an entry this
         // app did not write.
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let reg = FakeReg::new(None);
         let mut run = reg.runner();
 
@@ -1865,7 +1865,7 @@ mod tests {
     fn a_registry_failure_is_reported_rather_than_treated_as_absent() {
         // A `reg.exe` that cannot run at all must not be read as "there is no entry", which would make
         // a failed read look like "nothing to do".
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let mut run = |_: &[String]| Err("reg.exe could not be run: not found".to_string());
 
         let err = sync_autostart(true, exe, &mut run).unwrap_err();
@@ -1877,7 +1877,7 @@ mod tests {
         // The read that would have said "there is no entry" failed, so the entry may well be
         // there. The delete is idempotent, so it is attempted: an entry that survived a failed
         // read while the app claimed it was in sync is the failure this rules out.
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let calls = RefCell::new(Vec::new());
         let mut run = |argv: &[String]| -> Result<RegOutput, String> {
             calls
@@ -1900,7 +1900,7 @@ mod tests {
     fn a_query_that_failed_is_an_error_when_autostart_is_wanted() {
         // The other way round: the entry's state is unknown and something is about to be written
         // over it, so the sync says what it could not read instead of guessing.
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let mut run = |_: &[String]| Err("reg.exe exited with 1: access is denied".to_string());
 
         let err = sync_autostart(true, exe, &mut run).unwrap_err();
@@ -1912,7 +1912,7 @@ mod tests {
     fn an_entry_that_points_at_another_program_is_left_alone() {
         // The Run key is shared: a value with this application's name that names somebody else's
         // program is theirs, and `/f` would overwrite it and a delete would take it away.
-        let exe = Path::new(r"C:\localplay\localplay.exe");
+        let exe = Path::new(r"C:\replayed\replayed.exe");
         let theirs = r#""C:\Users\victim\Scripts\recorder.exe""#;
 
         let reg = FakeReg::new(Some(theirs));
@@ -1932,8 +1932,8 @@ mod tests {
     fn an_install_that_moved_is_still_recognised_as_this_applications_entry() {
         // The check is on the binary's name, not on the whole path: a moved install is this
         // application's entry and is repaired, not left behind as somebody else's.
-        let exe = Path::new(r"D:\games\localplay\localplay.exe");
-        let reg = FakeReg::new(Some(r#""C:\old\localplay.exe""#));
+        let exe = Path::new(r"D:\games\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(r#""C:\old\replayed.exe""#));
         let mut run = reg.runner();
 
         assert_eq!(
@@ -1952,7 +1952,7 @@ mod tests {
         // The Windows half of `apply_autostart` is deliberately not exercised: `enabled = true` writes
         // the real Run key of whoever ran the tests. It is compiled by the Windows cross-check
         // (`cargo check --target x86_64-pc-windows-msvc`).
-        let outcome = apply_autostart(true, Path::new("/usr/local/bin/localplay")).unwrap();
+        let outcome = apply_autostart(true, Path::new("/usr/local/bin/replayed")).unwrap();
 
         match outcome {
             AutostartOutcome::NotApplicable(why) => {

@@ -23,7 +23,7 @@ const assetUrl = (path: string) =>
 function clip(overrides: Partial<ClipDto> = {}): ClipDto {
   return {
     id: 1,
-    path: "/home/player/.local/share/localplay/clips/clip-1.mp4",
+    path: "/home/player/.local/share/replayed/clips/clip-1.mp4",
     started_at_ms: 0,
     duration_ms: 12_345,
     size_bytes: 812 * 1024,
@@ -43,7 +43,7 @@ describe("basename", () => {
   // name as its whole path.
   it.each([
     ["/home/player/clips/clip-1.mp4", "clip-1.mp4"],
-    ["C:\\Users\\player\\Videos\\localplay\\clip.mp4", "clip.mp4"],
+    ["C:\\Users\\player\\Videos\\replayed\\clip.mp4", "clip.mp4"],
     ["C:\\mixed\\separators/clip.mp4", "clip.mp4"],
     ["clip.mp4", "clip.mp4"],
     ["", ""],
@@ -81,10 +81,10 @@ describe("toClipView", () => {
     expect(view.id).toBe(1);
     expect(view.name).toBe("clip-1.mp4");
     expect(view.path).toBe(
-      "/home/player/.local/share/localplay/clips/clip-1.mp4",
+      "/home/player/.local/share/replayed/clips/clip-1.mp4",
     );
     expect(view.assetUrl).toBe(
-      assetUrl("/home/player/.local/share/localplay/clips/clip-1.mp4"),
+      assetUrl("/home/player/.local/share/replayed/clips/clip-1.mp4"),
     );
     expect(view.durationMs).toBe(12_345);
     expect(view.durationLabel).toBe("0:12.3");

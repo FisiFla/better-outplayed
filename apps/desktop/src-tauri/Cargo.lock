@@ -2080,119 +2080,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
-name = "localplay-capture"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
- "windows 0.62.2",
- "windows-core 0.62.2",
-]
-
-[[package]]
-name = "localplay-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "drag",
- "fs4",
- "localplay-capture",
- "localplay-encoder",
- "localplay-events",
- "localplay-media",
- "localplay-recorder",
- "localplay-store",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-single-instance",
- "tempfile",
- "toml 1.1.8+spec-1.1.0",
- "toml_edit 0.25.17+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "localplay-encoder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-media",
- "tracing",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "localplay-events"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "getrandom 0.4.3",
- "native-tls",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.21",
- "tracing",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "localplay-media"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "localplay-recorder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-encoder",
- "localplay-events",
- "localplay-media",
- "localplay-replay",
- "localplay-store",
- "serde",
- "toml 1.1.8+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "localplay-replay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-media",
- "serde",
- "thiserror 2.0.21",
- "toml 1.1.8+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "localplay-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rusqlite",
- "tracing",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3154,6 +3041,119 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "replayed-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "replayed-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "drag",
+ "fs4",
+ "replayed-capture",
+ "replayed-encoder",
+ "replayed-events",
+ "replayed-media",
+ "replayed-recorder",
+ "replayed-store",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "toml 1.1.8+spec-1.1.0",
+ "toml_edit 0.25.17+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "replayed-encoder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-media",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "replayed-events"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.4.3",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.21",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "replayed-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "replayed-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-encoder",
+ "replayed-events",
+ "replayed-media",
+ "replayed-replay",
+ "replayed-store",
+ "serde",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "replayed-replay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-media",
+ "serde",
+ "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "replayed-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tracing",
+]
 
 [[package]]
 name = "reqwest"

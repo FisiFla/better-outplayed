@@ -5,13 +5,13 @@
 
 use crate::config::StorageSection;
 use anyhow::{Context, Result};
-use localplay_events::GameEvent;
-use localplay_media::edit::Chapter;
-use localplay_replay::splice::ClipMetadata;
-use localplay_store::retention::{
+use replayed_events::GameEvent;
+use replayed_media::edit::Chapter;
+use replayed_replay::splice::ClipMetadata;
+use replayed_store::retention::{
     execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
 };
-use localplay_store::{Event, NewClip, NewEvent, Store};
+use replayed_store::{Event, NewClip, NewEvent, Store};
 use std::path::{Path, PathBuf};
 
 /// Wall-clock now, in ms since the Unix epoch: the clock `clips.created_at` and the storage age rule use.
@@ -140,7 +140,7 @@ fn chapter_title(kind: &str) -> String {
 
 /// The `events.kind` a manual clip records, so the timeline shows the moment the user chose.
 ///
-/// The tag is the vocabulary the scrubber colours by (`localplay-store` passes it through
+/// The tag is the vocabulary the scrubber colours by (`replayed-store` passes it through
 /// verbatim) and is deliberately not a [`GameEvent`]: only a keypress produced it.
 pub const BOOKMARK_KIND: &str = "bookmark";
 
@@ -343,7 +343,7 @@ pub fn cleanup_pass(
 /// A clip is kept when its index write fails — the user asked for it — but then nothing in the
 /// index knows about it: it is not in the library, and the storage policy, which plans over the
 /// rows, cannot see it either. These are those files.
-fn orphan_clips(clips_dir: &Path, rows: &[localplay_store::Clip]) -> Vec<(PathBuf, u64)> {
+fn orphan_clips(clips_dir: &Path, rows: &[replayed_store::Clip]) -> Vec<(PathBuf, u64)> {
     let named: std::collections::HashSet<&Path> =
         rows.iter().map(|row| row.path.as_path()).collect();
     let mut orphans = Vec::new();
@@ -367,7 +367,7 @@ fn orphan_clips(clips_dir: &Path, rows: &[localplay_store::Clip]) -> Vec<(PathBu
 fn report_clips_shortfall(
     report: &mut CleanupReport,
     cap: u64,
-    plan: &localplay_store::retention::RetentionPlan,
+    plan: &replayed_store::retention::RetentionPlan,
     outcome: &RetentionOutcome,
     orphan_bytes: u64,
 ) {
@@ -396,7 +396,7 @@ fn report_clips_shortfall(
 fn report_sessions_shortfall(
     report: &mut CleanupReport,
     cap: u64,
-    plan: &localplay_store::retention::RetentionPlan,
+    plan: &replayed_store::retention::RetentionPlan,
     outcome: &RetentionOutcome,
 ) {
     if outcome.sessions.cap_met {
@@ -482,11 +482,11 @@ mod tests {
     /// An open index in a temp directory, plus the directory holding it.
     fn index_dir() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let store = open_clip_index(&dir.path().join("localplay.db")).expect("open the index");
+        let store = open_clip_index(&dir.path().join("replayed.db")).expect("open the index");
         (dir, store)
     }
 
-    /// The schema version this build's store writes, read from the store itself: `localplay-store`'s
+    /// The schema version this build's store writes, read from the store itself: `replayed-store`'s
     /// `SCHEMA_VERSION` is private, and a hard-coded number broke when the store bumped it. A fresh
     /// in-memory database migrates through the same path as a file one.
     fn store_schema_version() -> i32 {
@@ -498,13 +498,13 @@ mod tests {
     #[test]
     fn the_clip_index_is_created_migrated_and_reopened_in_place() {
         let (dir, store) = index_dir();
-        let db = dir.path().join("localplay.db");
+        let db = dir.path().join("replayed.db");
         assert!(db.is_file(), "opening the index creates the database file");
         assert_eq!(
             store.schema_version().unwrap(),
             store_schema_version(),
             "opening the index migrates it to the store's own current schema version \
-             (`localplay-store` keeps that number private; see `store_schema_version`)"
+             (`replayed-store` keeps that number private; see `store_schema_version`)"
         );
 
         let path = dir.path().join("clip-1.mp4");
@@ -525,7 +525,7 @@ mod tests {
         let session = reopened
             .start_session(
                 None,
-                localplay_store::SESSION_MODE_BUFFER,
+                replayed_store::SESSION_MODE_BUFFER,
                 1_000,
                 "scratch",
                 0,
@@ -609,9 +609,9 @@ mod tests {
         let clip_id =
             index_clip(&store, &metadata(path, 500), 30_000).expect("the clip is indexed");
 
-        let kill = localplay_events::GameEvent::new(
-            localplay_events::Source::Lol,
-            localplay_events::EventKind::Kill,
+        let kill = replayed_events::GameEvent::new(
+            replayed_events::Source::Lol,
+            replayed_events::EventKind::Kill,
             // One line of JSON, as the payload column holds.
             serde_json::json!({ "source": "lol", "killer": "Ahri" }),
         );
@@ -632,9 +632,9 @@ mod tests {
         assert!(events[0].payload.as_deref().unwrap_or("").contains("Ahri"));
 
         // A marker: recorded, no clip.
-        let marker = localplay_events::GameEvent::bare(
-            localplay_events::Source::Gsi,
-            localplay_events::EventKind::RoundStart,
+        let marker = replayed_events::GameEvent::bare(
+            replayed_events::Source::Gsi,
+            replayed_events::EventKind::RoundStart,
         );
         index_event(&store, &marker, 40_000, None, None).expect("a marker is written too");
         let events = store.list_events().unwrap();
@@ -651,9 +651,9 @@ mod tests {
     fn an_event_for_a_clip_that_does_not_exist_is_reported_rather_than_written() {
         // The foreign key is the store's; this checks the failure comes back as an error rather than being dropped.
         let (_dir, store) = index_dir();
-        let event = localplay_events::GameEvent::bare(
-            localplay_events::Source::Lol,
-            localplay_events::EventKind::Kill,
+        let event = replayed_events::GameEvent::bare(
+            replayed_events::Source::Lol,
+            replayed_events::EventKind::Kill,
         );
         assert!(index_event(&store, &event, 1_000, Some(7), None).is_err());
         assert!(store.list_events().unwrap().is_empty());
@@ -757,7 +757,7 @@ mod tests {
             let id = store
                 .start_session(
                     Some("Dota 2"),
-                    localplay_store::SESSION_MODE_SESSION,
+                    replayed_store::SESSION_MODE_SESSION,
                     i * 1_000,
                     &scratch.display().to_string(),
                     0,
@@ -842,7 +842,7 @@ mod tests {
         let running = store
             .start_session(
                 None,
-                localplay_store::SESSION_MODE_SESSION,
+                replayed_store::SESSION_MODE_SESSION,
                 1_000,
                 &scratch.display().to_string(),
                 0,

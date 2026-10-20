@@ -40,7 +40,7 @@ Conventions used below:
 - Log lines are timestamped and printed to **stdout** by default.
 - Lines shown as `key=value` are structured tracing fields (e.g.
   `width=1920 height=1080`); the values are the numbers you record.
-- `%LOCALAPPDATA%\localplay\` is the app data directory: `config.toml`, `scratch\`, and
+- `%LOCALAPPDATA%\replayed\` is the app data directory: `config.toml`, `scratch\`, and
   `clips\` live there unless the config overrides `scratch_dir` / `clips_dir`.
 
 ---
@@ -87,7 +87,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-in-interact
 ### 0.1 Build a release binary
 
 ```powershell
-cargo build --release --bin localplay-cli
+cargo build --release --bin replayed-cli
 ```
 
 Release matters for criterion 6 — a debug build's CPU and memory are not representative
@@ -136,7 +136,7 @@ hevc_qsv     not advertised
 
 ### 0.3 Configure
 
-If `%LOCALAPPDATA%\localplay\config.toml` does not exist, the CLI runs with the built-in
+If `%LOCALAPPDATA%\replayed\config.toml` does not exist, the CLI runs with the built-in
 example defaults (`pre_seconds = 30`, `post_seconds = 5`, `fps = 60`,
 `segment_time = 1`, `ram_cap_bytes = 268435456`, `vendor = "auto"`). To change
 anything, copy `config.example.toml` there and edit it. At minimum:
@@ -145,7 +145,7 @@ anything, copy `config.example.toml` there and edit it. At minimum:
 - `encode.fps`, `buffer.pre_seconds`, `buffer.post_seconds`, `buffer.segment_time`,
   `buffer.ram_cap_bytes` — as you want them for the runs below.
 
-`localplay` never reads configuration from environment variables.
+`replayed` never reads configuration from environment variables.
 
 ### 0.4 Turn on the debug log
 
@@ -156,15 +156,15 @@ $env:RUST_LOG = "debug"            # PowerShell
 # or, in cmd.exe:  set RUST_LOG=debug
 ```
 
-For the ledger line alone (much less noise) use `$env:RUST_LOG = "localplay_recorder=debug"`.
+For the ledger line alone (much less noise) use `$env:RUST_LOG = "replayed_recorder=debug"`.
 The status line is emitted by the recording engine (`crates/recorder`), which both the CLI
 and the desktop shell drive, so its tracing target is that crate's — the CLI's own lines
-(`clip index …`, `buffering …`) keep `localplay_cli`.
+(`clip index …`, `buffering …`) keep `replayed_cli`.
 
 To keep a transcript, run everything through a file. For example:
 
 ```powershell
-cargo run --release -p localplay-cli -- buffer 2>&1 | Tee-Object -FilePath run.log
+cargo run --release -p replayed-cli -- buffer 2>&1 | Tee-Object -FilePath run.log
 ```
 
 ---
@@ -175,7 +175,7 @@ cargo run --release -p localplay-cli -- buffer 2>&1 | Tee-Object -FilePath run.l
 
 ```powershell
 $env:RUST_LOG = "debug"
-cargo run --release -p localplay-cli -- buffer
+cargo run --release -p replayed-cli -- buffer
 ```
 
 Leave it running. This is also the process you use for criteria 2 and 3–6.
@@ -209,7 +209,7 @@ At startup, on stdout:
   reduced it.
 
 Nothing is written to the disk while the buffer runs. `seg-000000.mp4`,
-`seg-000001.mp4`, … do **not** appear in `%LOCALAPPDATA%\localplay\scratch\` — the ring
+`seg-000001.mp4`, … do **not** appear in `%LOCALAPPDATA%\replayed\scratch\` — the ring
 holds its footage in RAM and writes nothing until a clip is saved. (A full *session*
 recording does write segments, into `sessions\`.)
 
@@ -362,14 +362,14 @@ failure.
 **Command (recommended: the self-test trigger)**
 
 ```powershell
-cargo run --release -p localplay-cli -- buffer --self-test-clip-after 45
+cargo run --release -p replayed-cli -- buffer --self-test-clip-after 45
 ```
 
 `--self-test-clip-after <SECONDS>` is a **verification aid, not a feature**. Once the ring
 holds `SECONDS` of media — and never before it holds a full pre-roll plus post-roll — it
 calls the *same* media-time trigger the hotkey calls (`Recorder::clip_now`), exactly once,
 logs the same lines, and stops. It sends, simulates and injects **no** keyboard or mouse
-input, and it does not enumerate windows. `localplay-cli --help` says so too.
+input, and it does not enumerate windows. `replayed-cli --help` says so too.
 
 **Why not just press the key from a script.** It used to be done that way, with
 `keybd_event`. This machine runs kernel-level anti-cheat, and synthetic input injection is
@@ -402,7 +402,7 @@ wrote <path> (<duration_ms>ms, <size_bytes> bytes, encoder=<name>)
 ```
 
 - `<path>` ends with `clip-<unix_seconds>.mp4` and the file exists in
-  `%LOCALAPPDATA%\localplay\clips\`.
+  `%LOCALAPPDATA%\replayed\clips\`.
 - The **wall-clock delta from the trigger to the `wrote` line** is **less than
   `post_seconds + 2 s`**. The trigger→write path includes waiting out the rest of the
   post-roll, up to 50 ms of polling granularity, and the splice; the 2 s budget is on top
@@ -436,7 +436,7 @@ by hand (press it and watch for the same `hotkey pressed:` line).
 **Command**
 
 ```powershell
-ffprobe -v error -show_format -of json "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"
+ffprobe -v error -show_format -of json "%LOCALAPPDATA%\replayed\clips\clip-<ts>.mp4"
 ```
 
 Read `format.duration` (seconds).
@@ -471,7 +471,7 @@ tolerance of `35.0`. Do not confuse `format.duration` with a per-`stream` `durat
 **Command**
 
 ```powershell
-ffprobe -v error -show_streams -show_format -of json "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"
+ffprobe -v error -show_streams -show_format -of json "%LOCALAPPDATA%\replayed\clips\clip-<ts>.mp4"
 ```
 
 Compare against the encoder the CLI logged: the `encoder=<name>` field on the `wrote …`
@@ -520,11 +520,11 @@ the expected, correct match. The `_nvenc`/`_qsv`/`_amf` suffix appears only in t
 **Command** (PowerShell, while the buffer is running and has settled)
 
 ```powershell
-$x1 = Get-Process localplay-cli
+$x1 = Get-Process replayed-cli
 $cpu1 = $x1.TotalProcessorTime.TotalSeconds
 $t1 = Get-Date
 Start-Sleep -Seconds 60
-$x2 = Get-Process localplay-cli
+$x2 = Get-Process replayed-cli
 $cpu2 = $x2.TotalProcessorTime.TotalSeconds
 
 "cores used : {0}" -f [math]::Round(($cpu2-$cpu1)/((Get-Date)-$t1).TotalSeconds, 3)
@@ -546,7 +546,7 @@ first 30–60 s), not during startup.
 - RSS = `WorkingSet64` (bytes); the threshold is 400 MB = `419430400` bytes.
 - Task Manager's **CPU** column is normalised across all cores — multiply its reading by
   your logical-processor count to get "% of one core". `Get-Counter`'s
-  `\Process(localplay-cli)\% Processor Time` reports `100` = one core, so the threshold
+  `\Process(replayed-cli)\% Processor Time` reports `100` = one core, so the threshold
   there is `< 5`. Task Manager's **Memory (active private working set)** column is the
   figure to compare against 400 MB.
 
@@ -575,9 +575,9 @@ this criterion, and both must be checked:
    encoder list was the only check.
 
 ```powershell
-# in %LOCALAPPDATA%\localplay\config.toml set:
+# in %LOCALAPPDATA%\replayed\config.toml set:
 #   vendor = "nvenc"
-cargo run --release -p localplay-cli -- buffer
+cargo run --release -p replayed-cli -- buffer
 ```
 
 **Expected observation (PASS)**
@@ -594,7 +594,7 @@ cargo run --release -p localplay-cli -- buffer
   run it: that list names every encoder ffmpeg was built with, including ones whose
   vendor runtime is not installed. Install the GPU vendor runtime (NVIDIA driver / Intel
   graphics driver / AMD Adrenalin), or set encode.vendor to a vendor this machine has.
-  localplay will not fall back to CPU encoding because it would cost game performance.
+  replayed will not fall back to CPU encoding because it would cost game performance.
   ```
 
   and for the advertised-but-unusable case, where the encoder's own failure is included:
@@ -603,7 +603,7 @@ cargo run --release -p localplay-cli -- buffer
   Error: no usable hardware encoder. Tried in order — h264_amf: advertised, but it could
   not encode a single frame: [h264_amf @ 0x…] DLL amfrt64.dll failed to open | Error
   while opening encoder for output stream #0:0 — … . Install the GPU vendor runtime …
-  localplay will not fall back to CPU encoding because it would cost game performance.
+  replayed will not fall back to CPU encoding because it would cost game performance.
   ```
 
 - With `vendor = "auto"` the message lists **every** vendor tried, in order
@@ -647,10 +647,10 @@ in the log line `encoding with h264_qsv`.
 **Command**
 
 ```powershell
-ffprobe -v error -show_streams -show_format -of json "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"
+ffprobe -v error -show_streams -show_format -of json "%LOCALAPPDATA%\replayed\clips\clip-<ts>.mp4"
 ```
 
-Then play the clip — e.g. `ffplay "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"`, or any
+Then play the clip — e.g. `ffplay "%LOCALAPPDATA%\replayed\clips\clip-<ts>.mp4"`, or any
 player — and listen.
 
 **Expected observation (PASS)**
@@ -721,7 +721,7 @@ settings first, or there is nothing to check.
 3. Probe the clip's audio stream:
 
    ```powershell
-   ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 "%LOCALAPPDATA%\localplay\clips\clip-<ts>.mp4"
+   ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 "%LOCALAPPDATA%\replayed\clips\clip-<ts>.mp4"
    ```
 
 **Expected observation (PASS)** — all three:

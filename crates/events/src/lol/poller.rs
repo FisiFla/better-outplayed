@@ -115,7 +115,7 @@ impl LolPoller {
                         // unreadable poll is not the end of a game.
                         if self.quiet.note(Condition::Unreadable(format!("{err}"))) {
                             tracing::warn!(
-                                "the League Live Client answered a body localplay cannot read \
+                                "the League Live Client answered a body replayed cannot read \
                                  ({err}); still watching"
                             );
                         }
@@ -221,7 +221,7 @@ pub fn spawn(config: LolConfig, sink: EventSink) -> anyhow::Result<LolHandle> {
     );
 
     let thread = std::thread::Builder::new()
-        .name("localplay-lol".to_string())
+        .name("replayed-lol".to_string())
         .spawn(move || {
             while !flag.load(Ordering::SeqCst) {
                 let started = Instant::now();

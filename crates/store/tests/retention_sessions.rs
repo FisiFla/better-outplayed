@@ -13,11 +13,11 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
-use localplay_store::retention::{
+use replayed_store::cleanup::{plan_cleanup, CleanupPolicy};
+use replayed_store::retention::{
     execute_retention, plan_retention, RetentionPlan, RetentionPolicy, RetentionRules, Subject,
 };
-use localplay_store::{NewClip, NewEvent, Store, SESSION_MODE_SESSION};
+use replayed_store::{NewClip, NewEvent, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,7 +47,7 @@ fn temp_dir() -> tempfile::TempDir {
     // Canonicalised so a failure message names `<workspace>/target/...` rather than a `../..` walk.
     let target = std::fs::canonicalize(&target).unwrap_or(target);
     tempfile::Builder::new()
-        .prefix("localplay-store-retention-")
+        .prefix("replayed-store-retention-")
         .tempdir_in(&target)
         .expect("a temp dir under target/")
 }
@@ -100,7 +100,7 @@ impl Fixture {
         let dir = temp_dir();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("clips")).expect("create the clips dir");
-        let db_path = root.join("localplay.db");
+        let db_path = root.join("replayed.db");
         let store = Store::open(&db_path).expect("open the index");
         store.migrate().expect("migrate the index");
         Self {

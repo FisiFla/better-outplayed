@@ -1,7 +1,7 @@
 //! CS2 / Dota 2: Valve Game State Integration.
 //!
 //! A listener on `127.0.0.1` that consumes the JSON the game POSTs, derives events and hands
-//! them to a driver. The user installs the generated `gamestate_integration_localplay.cfg`
+//! them to a driver. The user installs the generated `gamestate_integration_replayed.cfg`
 //! into the game's `cfg` directory; the application never writes there ([`integration`]
 //! produces the text only).
 //!
@@ -502,7 +502,7 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
         })
         .collect();
     let thread = std::thread::Builder::new()
-        .name("localplay-gsi".to_string())
+        .name("replayed-gsi".to_string())
         .spawn(move || serve(listener, &config, &sink, &flag))
         .context("spawning the GSI thread")?;
 
@@ -563,7 +563,7 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Arc
         let sink = sink.clone();
         let flag = Arc::clone(stop);
         let reader = std::thread::Builder::new()
-            .name(format!("localplay-gsi-{n}"))
+            .name(format!("replayed-gsi-{n}"))
             .spawn(move || read_loop(&queue, &config, &sink, &state, &flag))
             .with_context(|| format!("spawning the GSI reader thread {n}"));
         match reader {
@@ -897,7 +897,7 @@ impl Counters {
         if self.refused == 1 {
             tracing::info!(
                 "the GSI listener refused a request: {reject}. This is normal for anything \
-                 other than the game's own POST; localplay answers it with HTTP {}.",
+                 other than the game's own POST; replayed answers it with HTTP {}.",
                 reject.status()
             );
         } else {
@@ -912,7 +912,7 @@ impl Counters {
         if self.refused_tokens == 1 {
             tracing::warn!(
                 "the GSI listener rejected a payload whose token does not match. Install the \
-                 generated gamestate_integration_localplay.cfg into the game's cfg directory \
+                 generated gamestate_integration_replayed.cfg into the game's cfg directory \
                  (it carries the token) and restart the game."
             );
         } else {

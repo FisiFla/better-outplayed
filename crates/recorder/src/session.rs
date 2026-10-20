@@ -2,10 +2,10 @@
 //! concatenation at stop, and recovery of a session a crash left behind.
 //!
 //! [`SessionRing`] is deliberately not a replay ring: a four-hour session has no oldest segment to
-//! spare, so it scans the same directory names with the same [`localplay_replay::scanner`]
+//! spare, so it scans the same directory names with the same [`replayed_replay::scanner`]
 //! functions and never evicts. The bypass is structural (there is no cap to pass), and the scan,
-//! sequence reservation and clip window are [`localplay_replay`]'s public pieces
-//! ([`SegmentLedger`], [`scanner`], [`window`], [`localplay_replay::splice::ClipSplicer`]);
+//! sequence reservation and clip window are [`replayed_replay`]'s public pieces
+//! ([`SegmentLedger`], [`scanner`], [`window`], [`replayed_replay::splice::ClipSplicer`]);
 //! nothing here re-implements a
 //! concatenation.
 //!
@@ -23,12 +23,12 @@
 
 use crate::index::now_ms;
 use anyhow::{bail, Context, Result};
-use localplay_media::{edit, FfmpegBinaries, MediaInfo};
-use localplay_replay::ledger::{Segment, SegmentLedger};
-use localplay_replay::scanner::{self, newly_complete, next_segment_number};
-use localplay_replay::splice::ClipMetadata;
-use localplay_replay::window;
-use localplay_store::{Session, Store, SESSION_MODE_SESSION};
+use replayed_media::{edit, FfmpegBinaries, MediaInfo};
+use replayed_replay::ledger::{Segment, SegmentLedger};
+use replayed_replay::scanner::{self, newly_complete, next_segment_number};
+use replayed_replay::splice::ClipMetadata;
+use replayed_replay::window;
+use replayed_store::{Session, Store, SESSION_MODE_SESSION};
 use std::path::{Path, PathBuf};
 
 /// Attempts at claiming a unique session directory name before giving up.
@@ -68,7 +68,7 @@ impl SessionRing {
     pub fn open(
         bin: &FfmpegBinaries,
         dir: &Path,
-        cfg: &localplay_replay::buffer::BufferConfig,
+        cfg: &replayed_replay::buffer::BufferConfig,
         microphone: bool,
         encoder: String,
     ) -> Result<Self> {
@@ -196,7 +196,7 @@ impl SessionRing {
     }
 
     /// Extract a clip around `trigger_ms` from the session's own footage: the ring's trigger, using the
-    /// same [`localplay_replay::splice::ClipSplicer::splice`] with a window from this ledger and
+    /// same [`replayed_replay::splice::ClipSplicer::splice`] with a window from this ledger and
     /// the same truncated-pre-roll warning.
     pub fn trigger(&self, trigger_ms: u64, stem: &str) -> Result<ClipMetadata> {
         self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
@@ -355,7 +355,7 @@ pub fn session_file_path(sessions_dir: &Path, started_at_ms: i64) -> PathBuf {
 /// takes the list from [`segments_on_disk`] (or [`SessionRing::scan_all`]).
 ///
 /// Shares the splicer's lossless path (`check_concat_layout`, `write_concat_list`,
-/// `concat_lossless_sized` in `localplay_media::edit`) so a fix to `-map 0` (microphone tracks)
+/// `concat_lossless_sized` in `replayed_media::edit`) so a fix to `-map 0` (microphone tracks)
 /// or to the size-scaled timeout lands in both callers. What this adds for a session: a partial
 /// output is deleted rather than left occupying the space its retry needs, and a session with a
 /// microphone has its audio-stream count verified afterwards.
@@ -483,7 +483,7 @@ pub fn finalise_part(
 /// A second probe because [`MediaInfo`] reports only the first video and first audio stream and
 /// cannot tell whether the microphone survived.
 fn audio_stream_count(bin: &FfmpegBinaries, path: &Path) -> Option<usize> {
-    let output = localplay_media::sidecar_command(&bin.ffprobe)
+    let output = replayed_media::sidecar_command(&bin.ffprobe)
         .args([
             "-v",
             "error",
@@ -826,7 +826,7 @@ pub(crate) fn layout_test_segments(dir: &Path, audio: usize) -> Result<Vec<Segme
     std::fs::create_dir_all(dir)?;
     for seq in 0..2u64 {
         let out = dir.join(format!("seg-{seq:06}.mp4"));
-        let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
+        let mut cmd = replayed_media::sidecar_command(&bin.ffmpeg);
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -866,7 +866,7 @@ pub(crate) fn layout_test_segments(dir: &Path, audio: usize) -> Result<Vec<Segme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localplay_store::SESSION_MODE_BUFFER;
+    use replayed_store::SESSION_MODE_BUFFER;
 
     /// The ffmpeg on `PATH`.
     fn bin() -> FfmpegBinaries {
@@ -874,8 +874,8 @@ mod tests {
     }
 
     /// The ring configuration the tests open with: the engine's `BufferConfig` shape with these tests' segment length and window.
-    fn session_cfg(clips_dir: &Path) -> localplay_replay::buffer::BufferConfig {
-        localplay_replay::buffer::BufferConfig {
+    fn session_cfg(clips_dir: &Path) -> replayed_replay::buffer::BufferConfig {
+        replayed_replay::buffer::BufferConfig {
             pre_ms: 2_000,
             post_ms: 1_000,
             segment_ms: 1_000,
@@ -932,12 +932,12 @@ mod tests {
 
         // The splicer: what a clip out of a session is cut with.
         let spliced = dir.path().join("spliced.mp4");
-        let window = localplay_replay::window::SegmentWindow {
+        let window = replayed_replay::window::SegmentWindow {
             segments: segments.clone(),
             truncated_front: false,
         };
         let meta =
-            localplay_replay::splice::ClipSplicer::splice(&bin(), &window, &spliced, "libx264")
+            replayed_replay::splice::ClipSplicer::splice(&bin(), &window, &spliced, "libx264")
                 .expect("the splice");
         assert_eq!(
             audio_stream_count(&bin(), &spliced),

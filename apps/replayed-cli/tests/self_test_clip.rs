@@ -5,7 +5,7 @@
 //! trigger and `wrote ...` lines, and stops. The hotkey itself needs Windows; everything either
 //! side of it is tested here.
 //!
-//! Drives the real command in-process ([`localplay_cli::run_buffer_with`]) with the real engine,
+//! Drives the real command in-process ([`replayed_cli::run_buffer_with`]) with the real engine,
 //! a real ffmpeg encoder and a real ring over the synthetic capture/audio sources.
 //! `--dev-software-encoder` (libx264) makes that possible on a host with no GPU encoder; it is
 //! reachable because this package's dev dependencies enable `test-encoders`, which no shipping
@@ -20,8 +20,8 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_cli::{run_buffer_with, BufferOptions};
-use localplay_media::{FfmpegBinaries, MediaInfo};
+use replayed_cli::{run_buffer_with, BufferOptions};
+use replayed_media::{FfmpegBinaries, MediaInfo};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};

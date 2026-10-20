@@ -110,7 +110,7 @@ export interface ClipSource {
    */
   chooseClipsDir(): Promise<string>;
   /**
-   * Recording, through the same engine the CLI drives (`localplay-recorder`). These four
+   * Recording, through the same engine the CLI drives (`replayed-recorder`). These four
    * are the only commands that make the shell capture anything, and none of them is
    * called by this window on its own initiative: the user presses the button.
    */

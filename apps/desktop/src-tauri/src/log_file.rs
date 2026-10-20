@@ -164,9 +164,9 @@ mod tests {
     }
 
     /// The env var that turns a test run into the "holder" half of the test below.
-    const HOLDER_ENV: &str = "LOCALPLAY_LOG_LOCK_HOLDER";
-    const HOLDER_LOG_ENV: &str = "LOCALPLAY_LOG_LOCK_LOG";
-    const HOLDER_READY_ENV: &str = "LOCALPLAY_LOG_LOCK_READY";
+    const HOLDER_ENV: &str = "REPLAYED_LOG_LOCK_HOLDER";
+    const HOLDER_LOG_ENV: &str = "REPLAYED_LOG_LOCK_LOG";
+    const HOLDER_READY_ENV: &str = "REPLAYED_LOG_LOCK_READY";
 
     /// The child half of [`a_second_holder_of_the_log_is_told_so`].
     ///

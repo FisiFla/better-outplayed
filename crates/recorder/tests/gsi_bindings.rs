@@ -9,7 +9,7 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
-use localplay_recorder::event_driver::{
+use replayed_recorder::event_driver::{
     start_event_sources, EventSources, EventsSection, GameClipSection, SourceState, GSI_CFG_NAME,
 };
 
@@ -58,7 +58,7 @@ fn token(dir: &Path, game: &str) -> String {
 }
 
 /// The report of the GSI source.
-fn gsi_report(sources: &EventSources) -> &localplay_recorder::event_driver::SourceReport {
+fn gsi_report(sources: &EventSources) -> &replayed_recorder::event_driver::SourceReport {
     sources
         .reports
         .iter()
@@ -398,7 +398,7 @@ fn the_migrated_token_file_is_owner_only_like_the_one_it_came_from() {
     let dir = tempfile::tempdir().expect("a temp dir");
     // The legacy file was written by the application, so it is owner-only; the migration
     // copies the file, mode and all, so the token does not become world-readable on the way.
-    localplay_events::gsi::load_or_create_token(&dir.path().join("gsi-token.txt"))
+    replayed_events::gsi::load_or_create_token(&dir.path().join("gsi-token.txt"))
         .expect("the legacy token");
     start_event_sources(dir.path(), &events(free_port(), true));
     for game in [CS2, DOTA2] {

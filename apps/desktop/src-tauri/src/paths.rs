@@ -25,7 +25,7 @@ impl std::fmt::Display for PathRefusal {
         f.write_str(match self {
             PathRefusal::NotAbsoluteAndClean => "the path is relative or contains `..`",
             PathRefusal::Unresolvable => "the path's directory could not be resolved",
-            PathRefusal::Outside => "the path is outside the directories localplay manages",
+            PathRefusal::Outside => "the path is outside the directories replayed manages",
         })
     }
 }
@@ -88,7 +88,7 @@ pub fn ensure_new_file_within(root: &Path, path: &Path) -> Result<PathBuf, PathR
 }
 
 /// Whether `name` is `session-<digits>` with an optional `-<digits>` suffix and, for a file, the
-/// `.mp4` extension: what `localplay_recorder::session` names its directories and files. A
+/// `.mp4` extension: what `replayed_recorder::session` names its directories and files. A
 /// configured `sessions_dir` may be anywhere, so this shape (not the location) identifies a
 /// session artifact outside the app data directory.
 pub fn is_session_name(name: &str, file: bool) -> bool {

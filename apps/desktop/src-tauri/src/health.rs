@@ -7,7 +7,7 @@
 //!
 //! The application does not write into game installation directories on its own. The installer
 //! runs only when the user presses the button, writes exactly one file
-//! (`gamestate_integration_localplay.cfg`), and never takes the destination from the webview:
+//! (`gamestate_integration_replayed.cfg`), and never takes the destination from the webview:
 //! the command receives a game (`cs2` or `dota2`), the install directory is found here from
 //! Steam's own library list, and the final path goes through
 //! [`crate::paths::ensure_new_file_within`] against the Steam root before a byte is written, so
@@ -38,16 +38,16 @@
 //! leave a truncated cfg behind.
 
 use crate::commands::{CommandError, ErrorCode};
-use localplay_events::gsi;
-use localplay_recorder::event_driver::{SourceReport, SourceState, GSI_GAME_CS2, GSI_GAME_DOTA2};
-use localplay_recorder::{GsiBinding, RecorderStatus};
+use replayed_events::gsi;
+use replayed_recorder::event_driver::{SourceReport, SourceState, GSI_GAME_CS2, GSI_GAME_DOTA2};
+use replayed_recorder::{GsiBinding, RecorderStatus};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The file name both games read.
 ///
 /// The recorder's own name for it, so the two halves cannot drift apart.
-pub const GSI_CFG_NAME: &str = localplay_recorder::event_driver::GSI_CFG_NAME;
+pub const GSI_CFG_NAME: &str = replayed_recorder::event_driver::GSI_CFG_NAME;
 
 // ---------------------------------------------------------------------------------------
 // Game directories
@@ -608,7 +608,7 @@ pub fn read_recent_problems(log_path: &Path, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localplay_recorder::GsiGameInfo;
+    use replayed_recorder::GsiGameInfo;
 
     /// A fixed token, not a credential: the digits of pi in hex, the same in every test.
     /// The real one is generated from the OS entropy source at run time. `gitleaks:allow`

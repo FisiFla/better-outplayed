@@ -69,8 +69,8 @@
 
 use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat, VideoInput};
 use anyhow::{bail, Context, Result};
-use localplay_capture::{AudioBuffer, Frame};
-use localplay_media::FfmpegBinaries;
+use replayed_capture::{AudioBuffer, Frame};
+use replayed_media::FfmpegBinaries;
 use std::ffi::OsString;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -137,7 +137,7 @@ const AUDIO_QUEUE_BLOCKS: usize = 300;
 ///
 /// Named because the microphone input is declared by the same function ([`audio_input_args`]),
 /// so both inputs share one clock discipline mechanically. These are the pipeline's published
-/// values (`localplay_capture::AudioFormat::default`), not settings.
+/// values (`replayed_capture::AudioFormat::default`), not settings.
 const GAME_AUDIO_SAMPLE_RATE: u32 = 48_000;
 const GAME_AUDIO_CHANNELS: u16 = 2;
 
@@ -178,7 +178,7 @@ pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
         "-s".to_string(),
         format!("{}x{}", cfg.source_size.0, cfg.source_size.1),
     ]);
-    // The nominal rate: one number for this argument and the pacer (`localplay_recorder::FpsDecision`).
+    // The nominal rate: one number for this argument and the pacer (`replayed_recorder::FpsDecision`).
     args.extend(["-framerate".to_string(), cfg.fps.to_string()]);
     // Timestamps are each frame's arrival time, which keeps `segments * segment_time` real seconds
     // even when capture delivers at a rate other than `cfg.fps`. Video only: audio's timeline is the
@@ -192,7 +192,7 @@ pub fn video_input_args(cfg: &EncodeConfig) -> Vec<String> {
 /// produced by this process rather than by ffmpeg.
 ///
 /// The hybrid's video half: a hardware encoder MFT takes the captured texture from VRAM
-/// (`localplay_encoder::mft`), so a few hundred kilobytes a second of H.264 cross the pipe
+/// (`replayed_encoder::mft`), so a few hundred kilobytes a second of H.264 cross the pipe
 /// instead of ~2 GB/s of raw pixels.
 ///
 /// The timeline flag is the same as in [`video_input_args`]: an elementary stream carries no
@@ -413,10 +413,10 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
                 .iter()
                 .map(OsString::from),
         );
-        // The tag strings come from `localplay-media`, which applies the same names again when it
+        // The tag strings come from `replayed-media`, which applies the same names again when it
         // concatenates segments (`-c copy` does not carry per-stream metadata); two literals could drift
         // and leave a track anonymous.
-        for (index, title) in localplay_media::edit::audio_titles(2).iter().enumerate() {
+        for (index, title) in replayed_media::edit::audio_titles(2).iter().enumerate() {
             args.push(format!("-metadata:s:a:{index}").into());
             args.push(format!("title={title}").into());
         }
@@ -561,7 +561,7 @@ impl FfmpegEncoder {
             .unwrap_or_default();
 
         // A microphone with no game audio is refused like the scaling case above. Audio tracks are named
-        // by position (`localplay_media::edit::audio_titles`: `Game Audio`, then `Microphone`), so this
+        // by position (`replayed_media::edit::audio_titles`: `Game Audio`, then `Microphone`), so this
         // would produce a one-track file labelled `Game Audio` that carries a voice. Refused rather than
         // relabelled.
         if !cfg.game_audio && cfg.mic_audio.is_some() {
@@ -592,7 +592,7 @@ impl FfmpegEncoder {
             .as_ref()
             .map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
 
-        let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
+        let mut cmd = replayed_media::sidecar_command(&bin.ffmpeg);
         cmd
             // The whole argument list is built in [`ffmpeg_args`] so what a test asserts is what the child
             // is spawned with.
@@ -818,7 +818,7 @@ impl Encoder for FfmpegEncoder {
         }
 
         // The caller cannot check whether the frame has pixels at all. A frame whose pixels stayed in
-        // VRAM has an empty `data` by design (`localplay_capture::Frame`); writing it would feed ffmpeg
+        // VRAM has an empty `data` by design (`replayed_capture::Frame`); writing it would feed ffmpeg
         // a zero-length frame that it reads as the next frame's leading bytes, a stream desync that
         // surfaces as corruption seconds later. Refuse it explicitly.
         if !frame.has_pixels() {
@@ -1100,7 +1100,7 @@ impl FfmpegEncoder {
     #[cfg(windows)]
     fn encode_texture(
         &mut self,
-        texture: localplay_capture::GpuTexture,
+        texture: replayed_capture::GpuTexture,
         _pts: Duration,
     ) -> Result<Vec<u8>> {
         if let Some(mft) = self.mft.as_ref() {
@@ -2246,7 +2246,7 @@ mod tests {
     #[test]
     fn a_frame_without_pixels_is_refused_rather_than_written_as_nothing() {
         use crate::VideoCodec;
-        use localplay_capture::{Frame, PixelFormat};
+        use replayed_capture::{Frame, PixelFormat};
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = EncodeConfig::for_tests_software(
@@ -2303,7 +2303,7 @@ mod tests {
     #[test]
     fn a_dead_writer_reports_ffmpegs_exit_status_and_stderr() {
         use crate::VideoCodec;
-        use localplay_capture::{Frame, PixelFormat};
+        use replayed_capture::{Frame, PixelFormat};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2400,7 +2400,7 @@ mod tests {
             .expect("the listener's address")
             .port();
 
-        let mut client = localplay_media::sidecar_command(&bin.ffmpeg)
+        let mut client = replayed_media::sidecar_command(&bin.ffmpeg)
             .args([
                 "-hide_banner",
                 "-loglevel",

@@ -28,7 +28,7 @@ export const MARKER_LEAD_MS = 3_000;
  * The colour each tag is drawn in.
  *
  * A tag that is not in here is **not** hidden and **not** an error — it is drawn in the
- * neutral colour. `localplay-store` passes `events.kind` through verbatim and knows no
+ * neutral colour. `replayed-store` passes `events.kind` through verbatim and knows no
  * vocabulary (spec §5.5), so a tag this build has never heard of is a marker that exists.
  * A palette that threw, or one that skipped unknown tags, would let an unrecognised game
  * integration silently delete its own timeline.

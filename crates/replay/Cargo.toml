@@ -1,20 +1,20 @@
 [package]
-name = "localplay-replay"
+name = "replayed-replay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-localplay-media = { path = "../media" }
+replayed-media = { path = "../media" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-localplay-capture = { path = "../capture" }
-localplay-encoder = { path = "../encoder" }
+replayed-capture = { path = "../capture" }
+replayed-encoder = { path = "../encoder" }
 # The RAM-clip test reads ffprobe's stream tags to prove a saved clip's audio track is named
 # rather than anonymous, which is a JSON shape and not worth reinventing.
 serde_json.workspace = true
@@ -23,7 +23,7 @@ tracing-subscriber.workspace = true
 
 # Forwards to the encoder's feature so the pipeline is testable off-Windows.
 [features]
-test-encoders = ["localplay-encoder/test-encoders"]
+test-encoders = ["replayed-encoder/test-encoders"]
 
 [lints]
 workspace = true

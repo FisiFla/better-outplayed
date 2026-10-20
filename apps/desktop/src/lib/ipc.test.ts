@@ -269,7 +269,7 @@ describe('a command that fails', () => {
 
 describe('assetUrl', () => {
   it('turns a path into an asset-protocol URL rather than a file URL', () => {
-    const path = 'C:\\Users\\player\\AppData\\Local\\localplay\\clips\\clip-1.mp4';
+    const path = 'C:\\Users\\player\\AppData\\Local\\replayed\\clips\\clip-1.mp4';
     expect(tauriIpc.assetUrl(path)).toBe(mockedConvert.mock.results[0]?.value);
     expect(mockedConvert).toHaveBeenCalledWith(path);
     expect(tauriIpc.assetUrl(path)).not.toContain('file://');

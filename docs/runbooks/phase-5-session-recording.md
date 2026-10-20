@@ -34,7 +34,7 @@ poll_ms = 2500
 ```
 
 `[recorder] mode`, `[mic]` and `[games]` travel into the engine in
-`localplay_recorder::RecorderOptions`, not as fields on `RecorderConfig`: the desktop shell
+`replayed_recorder::RecorderOptions`, not as fields on `RecorderConfig`: the desktop shell
 is a separate workspace that builds a `RecorderConfig` field by field, so a new required
 field there would break a crate this change does not own. `Recorder::start` is
 `start_with_options(cfg, RecorderOptions::default())` — buffer mode, no microphone, nothing
@@ -45,9 +45,9 @@ watched — so every existing caller keeps the behaviour it had.
 ```sh
 export CARGO_HOME="$PWD/target/cargo-home"
 run() {  # $1 = app dir name, $2 = config file, rest = extra flags
-  dir="target/phase5-e2e/$1"; rm -rf "$dir"; mkdir -p "$dir/localplay"
-  cp "$2" "$dir/localplay/config.toml"
-  LOCALAPPDATA="$PWD/$dir" RUST_LOG=info cargo run -q -p localplay-cli --features test-encoders -- \
+  dir="target/phase5-e2e/$1"; rm -rf "$dir"; mkdir -p "$dir/replayed"
+  cp "$2" "$dir/replayed/config.toml"
+  LOCALAPPDATA="$PWD/$dir" RUST_LOG=info cargo run -q -p replayed-cli --features test-encoders -- \
     buffer --dev-software-encoder --dev-stub-sources --self-test-clip-after 4 "$@"
 }
 run buffer  target/phase5-e2e/config-buffer.toml
@@ -63,25 +63,25 @@ microphone backend and a stub selected implicitly would be worse than an error. 
 Observed (excerpts of real runs):
 
 ```
-INFO localplay_recorder: session #1 opened (session): segments in .../sessions/session-1790211072 (the scratch cap does not apply)
-INFO localplay_recorder: hotkey pressed: media=4000ms wall=7030ms (drift 3030ms); waiting for post-roll
-INFO localplay_recorder::index: indexed clip #1 (media t=2000ms, 3187ms, 1023170 bytes, libx264): .../clips/clip-1790211080.mp4
-INFO localplay_recorder: session #1 finalised: .../sessions/session-1790211072.mp4 (8051ms, 2122859 bytes) concatenated from 9 segment(s); 2132516 bytes of temporary segments removed
+INFO replayed_recorder: session #1 opened (session): segments in .../sessions/session-1790211072 (the scratch cap does not apply)
+INFO replayed_recorder: hotkey pressed: media=4000ms wall=7030ms (drift 3030ms); waiting for post-roll
+INFO replayed_recorder::index: indexed clip #1 (media t=2000ms, 3187ms, 1023170 bytes, libx264): .../clips/clip-1790211080.mp4
+INFO replayed_recorder: session #1 finalised: .../sessions/session-1790211072.mp4 (8051ms, 2122859 bytes) concatenated from 9 segment(s); 2132516 bytes of temporary segments removed
 ```
 
 and, with `[mic] enabled = true`:
 
 ```
-INFO localplay_recorder: capture geometry 1280x720 at 10fps (frame counter starts at 0), plus a microphone track on port Some(59590)
-INFO localplay_recorder::session: session .../clips/clip-1790211174.mp4 carries 2 audio tracks (game audio + microphone)
-INFO localplay_recorder::session: session .../sessions/session-1790211166.mp4 carries 2 audio tracks (game audio + microphone)
+INFO replayed_recorder: capture geometry 1280x720 at 10fps (frame counter starts at 0), plus a microphone track on port Some(59590)
+INFO replayed_recorder::session: session .../clips/clip-1790211174.mp4 carries 2 audio tracks (game audio + microphone)
+INFO replayed_recorder::session: session .../sessions/session-1790211166.mp4 carries 2 audio tracks (game audio + microphone)
 ```
 
 `ffprobe` on those files: `video audio audio` for both the clip and the session file
 (1 video + 2 audio). The cleanup pass, with 1 KB caps, on the next start:
 
 ```
-INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(s), reclaimed 3330354 bytes;
+INFO replayed_recorder::index: storage policy: deleted 1 clip(s) and 1 session(s), reclaimed 3330354 bytes;
      the clips directory now holds 0 bytes against its 1000 byte cap, and the session store 0 bytes against its 1000 byte cap
 ```
 
@@ -91,7 +91,7 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
   the session's ledger never evicts, and the bounded ring that used to be the one with a cap is
   memory-backed now — see §12 of the verification ledger).
 * At stop the segments are concatenated with `-c copy` into `sessions/session-<start>.mp4`
-  and the temporary segments are removed. The concatenation is `localplay_media::edit`'s —
+  and the temporary segments are removed. The concatenation is `replayed_media::edit`'s —
   `check_concat_layout` → `write_concat_list` → `concat_lossless_sized`, the same three steps
   `ClipSplicer::splice` takes, so a clip and a session cannot diverge. It was once a private
   copy here, for two measured reasons that no longer exist: the splicer's ffmpeg invocation
@@ -99,7 +99,7 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
   microphone track was dropped from every microphone-enabled *clip*), and
   `edit::concat_lossless` bounded the copy with a fixed 60 s timeout, which a multi-GB session
   on a slow volume exceeds — and would then fail again on every retry. Both now live in
-  `localplay-media`, where one implementation serves both callers: `-map 0` keeps every
+  `replayed-media`, where one implementation serves both callers: `-map 0` keeps every
   stream, a **pre-flight stream-layout check** refuses a segment that disagrees with the first
   rather than letting `-map 0` silently truncate a track, and the budget is derived from the
   bytes being copied. The list format, the Windows `\\?\` path normalisation
@@ -110,7 +110,7 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
   is kept**, the `sessions` row is left running (`ended_at IS NULL` — a running session is
   never evicted, so retention cannot delete footage that has no session file), and the error
   is returned by `stop()`. The next start's recovery pass finishes the job once there is
-  room. *Run here* for the failure path (`cargo test -p localplay-recorder` — a session whose
+  room. *Run here* for the failure path (`cargo test -p replayed-recorder` — a session whose
   segments are unreadable); *not verified* against a real full disk.
 * **A crash mid-session** leaves a running row and a directory of segments. The next start
   concatenates them into the file the session would have written, closes the row with the
@@ -122,7 +122,7 @@ INFO localplay_recorder::index: storage policy: deleted 1 clip(s) and 1 session(
 1. **Buffer-mode session rows share one scratch directory.** Their `size_bytes` is "the bytes
    the ring holds", so two buffer sessions can count the same segments. Full-session rows are
    exact (their own directory).
-2. **The 4K sustained-rate issue is closed** ([issue #1](https://github.com/FisiFla/better-outplayed/issues/1),
+2. **The 4K sustained-rate issue is closed** ([issue #1](https://github.com/FisiFla/replayed/issues/1),
    closed): the zero-copy path sustains 59.6 of 60 fps with no dropped frames at 3.1–4.0% of
    one core (ledger §13, §15). A full session
    records at whatever rate the machine sustains; the media timeline is the frames' arrival
@@ -139,7 +139,7 @@ they are gone — and because the first two were fixed by one change, and the re
 * **Clips taken with the microphone on, in buffer mode, carried only the game audio.** The
   ring's trigger splices clips with `ClipSplicer::splice`, whose concat had no `-map`, so the
   second audio track was dropped; the engine warned about it at start. `-map 0` is now in
-  `localplay_media::edit::concat_lossless`, which the splicer calls, so a buffer-mode clip
+  `replayed_media::edit::concat_lossless`, which the splicer calls, so a buffer-mode clip
   keeps both tracks — confirmed on real Windows hardware, where the clip came back with three
   streams (`video, audio, audio`). The warning is gone because the thing it warned about is.
 * **A session's audio tracks were unnamed.** `-map 0` kept the tracks, and the encoder *did*
@@ -161,7 +161,7 @@ they are gone — and because the first two were fixed by one change, and the re
 5. **Windows-only paths are unrun.** `microphone_backend()` (WASAPI communications endpoint)
    has never executed; the game watcher's process enumeration has never executed. The game
    watcher's *driving* half (start/stop recording on presence changes) is run here.
-6. **`localplay-recorder` and `localplay-cli` are not cross-checkable for
-   `x86_64-pc-windows-msvc`** — they depend on `localplay-store` → bundled rusqlite C, which
+6. **`replayed-recorder` and `replayed-cli` are not cross-checkable for
+   `x86_64-pc-windows-msvc`** — they depend on `replayed-store` → bundled rusqlite C, which
    cannot be built for MSVC from macOS. The recorder's new code has no `#[cfg(windows)]` of
-   its own (the platform rule lives in `localplay-capture`), so what this costs is small.
+   its own (the platform rule lives in `replayed-capture`), so what this costs is small.

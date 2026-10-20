@@ -49,7 +49,7 @@ fn repo_root() -> PathBuf {
 }
 
 /// Where the extracted sidecars go: next to the executable in a packaged build, and next to
-/// the repository root in a checkout, where `localplay-media`'s development fallback finds it.
+/// the repository root in a checkout, where `replayed-media`'s development fallback finds it.
 fn binaries_dir() -> PathBuf {
     repo_root().join("binaries")
 }
@@ -109,7 +109,7 @@ fn sidecars_command(args: &[String]) -> Result<()> {
 }
 
 fn probe_encoders() -> Result<()> {
-    let bin = localplay_media::FfmpegBinaries::discover(None)
+    let bin = replayed_media::FfmpegBinaries::discover(None)
         .context("locating ffmpeg; is it on PATH, or in the sidecar directory?")?;
     print!("{}", probe::probe(&bin)?.render());
     Ok(())

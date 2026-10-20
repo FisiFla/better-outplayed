@@ -22,7 +22,7 @@ pub struct ClipboardCommand {
 }
 
 /// The environment variable that carries the path to the clipboard script.
-pub const CLIP_PATH_ENV: &str = "LOCALPLAY_CLIP_PATH";
+pub const CLIP_PATH_ENV: &str = "REPLAYED_CLIP_PATH";
 
 /// The command that puts `path` on the clipboard as a file (so Explorer, Finder, Discord and
 /// mail clients paste the video itself, not its path as text). `None` where this build has no
@@ -43,7 +43,7 @@ pub fn clipboard_command(path: &Path, manager: FileManager) -> Option<ClipboardC
             program: "osascript".to_string(),
             args: [
                 "-e",
-                "set p to system attribute \"LOCALPLAY_CLIP_PATH\"",
+                "set p to system attribute \"REPLAYED_CLIP_PATH\"",
                 "-e",
                 "set the clipboard to (POSIX file p)",
             ]
@@ -61,7 +61,7 @@ pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
     let spec = clipboard_command(path, FileManager::current()).ok_or_else(|| {
         "copying a file to the clipboard is not supported on this platform".to_string()
     })?;
-    let output = localplay_media::sidecar_command(&spec.program)
+    let output = replayed_media::sidecar_command(&spec.program)
         .args(&spec.args)
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
         .output()

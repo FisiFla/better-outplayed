@@ -1,4 +1,4 @@
-better-outplayed
+replayed
 Copyright (c) 2026 FisiFla
 
 Licensed under either of
@@ -19,5 +19,5 @@ file.
     the full text is in the repository as LICENSE-MIT, and at
     http://opensource.org/licenses/MIT
 
-The repository is at https://github.com/FisiFla/better-outplayed, and the third-party
+The repository is at https://github.com/FisiFla/replayed, and the third-party
 notices are at apps/desktop/THIRD_PARTY_NOTICES.md in it.

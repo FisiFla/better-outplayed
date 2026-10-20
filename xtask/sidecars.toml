@@ -1,6 +1,6 @@
 # xtask/sidecars.toml
 #
-# The ffmpeg sidecars localplay ships. No binary is committed: this file is the *pin* — a
+# The ffmpeg sidecars replayed ships. No binary is committed: this file is the *pin* — a
 # URL plus the SHA-256 of the archive that URL is expected to serve — and
 # `cargo xtask sidecars fetch` downloads the archive, checks it against the recorded hash,
 # and extracts only the paths in `binaries` into <repo>/binaries/ (gitignored).
@@ -11,7 +11,7 @@
 # project's own download instructions, and review the diff before committing it. Every later
 # fetch is then checked against it and fails loudly on a mismatch instead of extracting.
 #
-# LGPL ffmpeg builds only: localplay never uses libx264/libx265, so GPL builds are
+# LGPL ffmpeg builds only: replayed never uses libx264/libx265, so GPL builds are
 # unnecessary and would impose GPL obligations on the distributed app (README).
 #
 # The pin is BtbN's `-lgpl` variant. BtbN's README describes it as "Lacking libraries that
@@ -36,7 +36,7 @@
 [[platform]]
 target = "x86_64-pc-windows-msvc"
 # BtbN/FFmpeg-Builds, the `win64-lgpl` variant — the build that lacks the GPL-only
-# encoders localplay has no use for. See the note above on why this is not Gyan's build.
+# encoders replayed has no use for. See the note above on why this is not Gyan's build.
 archive_url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-9.0.zip"
 # Recorded with `cargo xtask sidecars record`, reviewed in the PR. `fetch` refuses to run
 # while this still reads RECORD_ME.

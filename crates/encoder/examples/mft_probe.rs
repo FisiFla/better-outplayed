@@ -6,7 +6,7 @@
 //! encoder MFT, or one that refuses the handshake, cannot take the zero-copy path at all.
 //!
 //! ```text
-//! cargo run --release -p localplay-encoder --example mft_probe
+//! cargo run --release -p replayed-encoder --example mft_probe
 //! ```
 
 #[cfg(windows)]
@@ -14,16 +14,16 @@ fn main() -> anyhow::Result<()> {
     // `-- hevc` asks the same questions about HEVC: which MFTs produce it, and whether the ARGB32
     // handshake survives its different profile and level.
     let codec = if std::env::args().any(|arg| arg.eq_ignore_ascii_case("hevc")) {
-        localplay_encoder::VideoCodec::Hevc
+        replayed_encoder::VideoCodec::Hevc
     } else {
-        localplay_encoder::VideoCodec::H264
+        replayed_encoder::VideoCodec::H264
     };
     // The probes ask about formats and sizes, not rates, so they use the example's own bitrate and
     // frame rate; the recording path passes `encode.bitrate_kbps` and the effective fps instead.
     const BITRATE_KBPS: u32 = 20_000;
     const FPS: u32 = 60;
     // Unfiltered, so "no encoder for this codec" is distinguishable from "the filter is wrong".
-    match localplay_encoder::mft::list_hardware_video_encoders() {
+    match replayed_encoder::mft::list_hardware_video_encoders() {
         Ok(names) => {
             println!(
                 "--- every hardware video encoder MFT here, unfiltered: {} ---",
@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         Err(err) => println!("could not list encoder MFTs: {err:#}"),
     }
     println!("--- asking about {codec:?} ---");
-    let encoders = localplay_encoder::mft::probe_hardware_encoders(codec)?;
+    let encoders = replayed_encoder::mft::probe_hardware_encoders(codec)?;
     println!("hardware {codec:?} encoder MFTs: {}", encoders.len());
     for encoder in &encoders {
         println!(
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             .any(|s| s.starts_with("RGB32") || s.starts_with("ARGB32"))
     });
     println!("any encoder takes BGRA/ARGB directly: {takes_bgra}");
-    match localplay_encoder::mft::probe_video_processors() {
+    match replayed_encoder::mft::probe_video_processors() {
         Ok(processors) if processors.is_empty() => {
             println!("video processor MFTs (for a GPU-side colour conversion): none")
         }
@@ -88,31 +88,31 @@ fn main() -> anyhow::Result<()> {
         let size = (3840u32, 2160u32);
         // The device is the probe's own; in the real pipeline it is capture's, which is why
         // `MftEncoder::open` takes one rather than making its own.
-        let device = localplay_encoder::mft::create_capture_kind_device()?;
+        let device = replayed_encoder::mft::create_capture_kind_device()?;
 
         // For HEVC the format is the question. The H.264 encoder takes the BGRA texture below and
         // converts inside itself; the HEVC one refuses it (`0xC00D6D76`, MF_E_UNSUPPORTED_D3D_TYPE:
         // "the input type is not supported for D3D device"). Ask the encoder which type it wants rather
         // than guessing at attributes; the capture handover must produce NV12 for HEVC.
-        if codec == localplay_encoder::VideoCodec::Hevc {
+        if codec == replayed_encoder::VideoCodec::Hevc {
             println!("\n--- what the encoder says it offers ---");
-            for (what, value) in localplay_encoder::mft::probe_available_types(codec, size)? {
+            for (what, value) in replayed_encoder::mft::probe_available_types(codec, size)? {
                 println!("  {what}\n     -> {value}");
             }
             println!("\n--- and at what size it stops accepting a D3D texture ---");
-            for (what, value) in localplay_encoder::mft::probe_size_ceiling(codec)? {
+            for (what, value) in replayed_encoder::mft::probe_size_ceiling(codec)? {
                 println!("  {what}\n     -> {value}");
             }
             println!("\n--- and whether the order of the two types matters ---");
-            for (what, value) in localplay_encoder::mft::probe_ordering(codec, size)? {
+            for (what, value) in replayed_encoder::mft::probe_ordering(codec, size)? {
                 println!("  {what}\n     -> {value}");
             }
         }
 
         // If the encoder still refuses, find out what it objects to, one attribute at a time.
-        if codec == localplay_encoder::VideoCodec::Hevc {
+        if codec == replayed_encoder::VideoCodec::Hevc {
             println!("\n--- which attribute of the output type it objects to ---");
-            for (what, verdict) in localplay_encoder::mft::probe_output_types(codec, size)? {
+            for (what, verdict) in replayed_encoder::mft::probe_output_types(codec, size)? {
                 println!("  {what}\n     -> {verdict}");
             }
         }
@@ -124,7 +124,7 @@ fn main() -> anyhow::Result<()> {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
         );
         match nv12.and_then(|texture| {
-            localplay_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS, FPS)
+            replayed_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS, FPS)
         }) {
             Ok(encoder) => println!(
                 "an NV12 texture opens: {} taking {}",
@@ -134,7 +134,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         println!("\n--- which GPU ---");
-        for (index, name) in localplay_encoder::mft::describe_adapters()
+        for (index, name) in replayed_encoder::mft::describe_adapters()
             .into_iter()
             .enumerate()
         {
@@ -147,9 +147,9 @@ fn main() -> anyhow::Result<()> {
         }
         println!(
             "  capture-kind device: {}",
-            localplay_encoder::mft::adapter_description(&device)
+            replayed_encoder::mft::adapter_description(&device)
         );
-        match localplay_encoder::mft::MftEncoder::open(
+        match replayed_encoder::mft::MftEncoder::open(
             &device,
             size,
             codec,
@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
                     "opened {} for {size:?}, taking {} input, on adapter {}",
                     encoder.encoder_name,
                     encoder.input_format,
-                    localplay_encoder::mft::adapter_description(encoder.device())
+                    replayed_encoder::mft::adapter_description(encoder.device())
                 );
                 if !encoder.input_format.starts_with("RGB32")
                     && !encoder.input_format.starts_with("ARGB32")
@@ -226,7 +226,7 @@ fn main() -> anyhow::Result<()> {
                 match sink.finish() {
                     Ok(fmp4) => {
                         println!("ffmpeg produced {} bytes of fragmented MP4", fmp4.len());
-                        match localplay_media::FragmentSplitter::new().push(&fmp4) {
+                        match replayed_media::FragmentSplitter::new().push(&fmp4) {
                             Ok(fragments) => println!(
                                 "the project's own splitter sees {} fragment(s): {:?}",
                                 fragments.len(),
@@ -273,7 +273,7 @@ impl FfmpegSink {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
-        let bin = localplay_media::FfmpegBinaries::discover(None).context("ffmpeg on PATH")?;
+        let bin = replayed_media::FfmpegBinaries::discover(None).context("ffmpeg on PATH")?;
         let mut child = Command::new(&bin.ffmpeg)
             .args([
                 "-hide_banner",

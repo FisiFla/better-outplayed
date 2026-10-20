@@ -1,9 +1,9 @@
 {
-  "name": "localplay-desktop",
+  "name": "replayed-desktop",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "localplay desktop shell (Tauri v2 + Svelte 5) — Phase 2 session review UI",
+  "description": "replayed desktop shell (Tauri v2 + Svelte 5) — Phase 2 session review UI",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

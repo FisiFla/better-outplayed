@@ -1,6 +1,6 @@
 //! Where the desktop shell reads its settings from, and where it keeps its files.
 //!
-//! # Why this is not `localplay_cli::config::Config`
+//! # Why this is not `replayed_cli::config::Config`
 //!
 //! The CLI owns the full configuration model and this module deliberately does not duplicate
 //! it:
@@ -10,7 +10,7 @@
 //!    captures nothing, so `[buffer]`, `[audio]`, `[hotkeys]` and `[events]` are none of its
 //!    business, and re-validating them here would let a capture-only mistake (say
 //!    `vendor = "software"`) refuse to open the review UI.
-//! 2. Depending on `localplay-cli` for its `Config` would pull the whole capture stack (`wgc`,
+//! 2. Depending on `replayed-cli` for its `Config` would pull the whole capture stack (`wgc`,
 //!    `wasapi`, the ffmpeg encoder child) into the GUI binary for a handful of fields.
 //!
 //! # The invariant that keeps the window usable
@@ -27,19 +27,19 @@
 //! perfectly while leaving the settings panel permanently blank and silent.
 //!
 //! What must not drift is the location the two binaries agree on, which is why [`app_data_dir`]
-//! repeats the CLI's rule verbatim: the CLI writes `localplay.db` there and the shell reads the
+//! repeats the CLI's rule verbatim: the CLI writes `replayed.db` there and the shell reads the
 //! same file. A test pins the parse of the real `config.example.toml` against these sections.
 //!
 //! Reading the whole file through the CLI's own type would let the engine's rules be borrowed
 //! rather than mirrored by hand; that is a bigger change than this module has needed.
 
 use crate::commands::{CommandError, ErrorCode};
-use localplay_events::process::{default_watch, GamesSection};
-use localplay_recorder::config::{
+use replayed_events::process::{default_watch, GamesSection};
+use replayed_recorder::config::{
     BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
 };
-use localplay_recorder::config_schema;
-use localplay_recorder::event_driver::EventsSection;
+use replayed_recorder::config_schema;
+use replayed_recorder::event_driver::EventsSection;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -294,7 +294,7 @@ impl RecordingConfig {
 /// with the documented default chord. The CLI's own `Config` requires both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundConfig {
-    /// `[hotkeys] clip`, verbatim. Parsed by `localplay_events::hotkey::Hotkey`, the CLI's parser,
+    /// `[hotkeys] clip`, verbatim. Parsed by `replayed_events::hotkey::Hotkey`, the CLI's parser,
     /// so one file means one chord to both front-ends.
     pub clip_hotkey: String,
     /// `[hotkeys] toggle_recording`: start/stop the recording. Off unless set.
@@ -474,7 +474,7 @@ impl EngineOptionsConfig {
 pub const FPS_MIN: u32 = 1;
 pub const FPS_MAX: u32 = 240;
 
-/// The GSI listener's port rule, the CLI's (`apps/localplay-cli/src/config.rs`).
+/// The GSI listener's port rule, the CLI's (`apps/replayed-cli/src/config.rs`).
 ///
 /// `0` turns the listener off; anything else is a real port, and the default sits above the
 /// ephemeral range so a temporarily bound listener elsewhere cannot shadow it. The desktop
@@ -703,7 +703,7 @@ fn validate_fps(fps: u32) -> Result<(), CommandError> {
 /// added a `16..=16384` bound the engine lacks, so `output_size = " 1920x1080"` recorded fine
 /// while `get_settings` failed and the panel never rendered.
 fn validate_output_size(size: &str) -> Result<(), CommandError> {
-    localplay_recorder::parse_output_size(size)
+    replayed_recorder::parse_output_size(size)
         .map(|_| ())
         .map_err(|err| {
             CommandError::new(
@@ -1366,7 +1366,42 @@ pub fn app_data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("localplay")
+    let dir = base.join("replayed");
+    migrate_legacy_data_dir(&base, &dir);
+    dir
+}
+
+/// Move the data directory over from the name the project had before the rename.
+///
+/// The product was renamed; the directory holding the index, the clips, the sessions and the
+/// settings was not, and a user who had been running the older build would have found an
+/// empty library. If the old directory is here and the new one is not, it is moved across in
+/// one rename, so the library and the settings survive.
+///
+/// If **both** are there, the old one is left alone: something is already using the new
+/// name, and merging two directories is not something to do to somebody's library without
+/// being asked. The move is a rename, not a copy, so a failure leaves the old directory
+/// exactly as it was — the user loses nothing, and the next start tries again.
+fn migrate_legacy_data_dir(base: &std::path::Path, dir: &std::path::Path) {
+    // The name before the rename, spelled out rather than derived: it must stay this
+    // literal forever, because it is the name of a directory that exists on disk.
+    const LEGACY: &str = "localplay";
+    let legacy = base.join(LEGACY);
+    if !legacy.is_dir() || dir.exists() {
+        return;
+    }
+    match std::fs::rename(&legacy, dir) {
+        Ok(()) => tracing::info!(
+            "the data directory was renamed from `{}` to `{}`",
+            legacy.display(),
+            dir.display()
+        ),
+        Err(err) => tracing::warn!(
+            "the old data directory at `{}` could not be moved to `{}`: {err}",
+            legacy.display(),
+            dir.display()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1543,9 +1578,9 @@ mod tests {
     }
 
     #[test]
-    fn the_app_data_directory_ends_in_localplay() {
+    fn the_app_data_directory_ends_in_replayed() {
         // Whatever the host provides, the two binaries must land in the same subdirectory.
-        assert_eq!(app_data_dir().file_name().unwrap(), "localplay");
+        assert_eq!(app_data_dir().file_name().unwrap(), "replayed");
     }
 
     // -- the [hotkeys] / [app] half -------------------------------------------------------
@@ -2318,7 +2353,7 @@ mod tests {
         assert!(validate_clips_dir("C:/clips").is_ok());
         assert!(validate_clips_dir("\\\\server\\share\\clips").is_ok());
 
-        for bad in ["clips", "localplay/clips", "C:clips"] {
+        for bad in ["clips", "replayed/clips", "C:clips"] {
             assert!(
                 validate_clips_dir(bad).is_err(),
                 "{bad:?} is relative and must be refused"
@@ -2368,7 +2403,7 @@ mod tests {
 
     #[test]
     fn output_size_follows_the_engines_own_parser() {
-        // Reused: `localplay_recorder::parse_output_size` trims each component and sets no bounds, so
+        // Reused: `replayed_recorder::parse_output_size` trims each component and sets no bounds, so
         // the panel accepts exactly what a start accepts. A private copy that did neither let
         // `output_size = " 1920x1080"` record fine while `get_settings` refused it.
         assert!(validate_output_size("").is_ok(), "empty is the native size");

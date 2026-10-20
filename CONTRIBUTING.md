@@ -2,7 +2,7 @@
 
 ## Build and test
 ```
-cargo test --workspace --features localplay-encoder/test-encoders   # needs ffmpeg on PATH
+cargo test --workspace --features replayed-encoder/test-encoders   # needs ffmpeg on PATH
 cd apps/desktop && npm ci && npm run check && npm test && npm run build
 cd apps/desktop/src-tauri && cargo test                              # separate workspace
 cargo clippy --workspace --all-targets -- -A clippy::unwrap_used -A clippy::chunks_exact_to_as_chunks -D warnings

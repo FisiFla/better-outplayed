@@ -1,13 +1,13 @@
 [package]
-name = "localplay-encoder"
+name = "replayed-encoder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-localplay-capture = { path = "../capture" }
-localplay-media = { path = "../media" }
+replayed-capture = { path = "../capture" }
+replayed-media = { path = "../media" }
 tracing.workspace = true
 
 # Media Foundation, for the hardware encoder MFT the Tier 2 zero-copy path hands GPU textures

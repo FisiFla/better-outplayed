@@ -6,25 +6,25 @@
 //! in bands, and the segment files still look healthy. The first real Windows run hit exactly
 //! this: on a 4K display at 150% scaling the capture item was 3840x2160 while the pipe was
 //! declared 2560x1440, because the size came from a DPI-virtualised `GetSystemMetrics`. The
-//! guard (`localplay_recorder::pump_once_counted` -> `guard_frame_size`) turns that silence
+//! guard (`replayed_recorder::pump_once_counted` -> `guard_frame_size`) turns that silence
 //! into an error naming both sizes; this test drives it through the real pump over the real
 //! ffmpeg encoder.
 //!
 //! Gating: like `post_roll.rs`, deliberately not `#![cfg(feature = "test-encoders")]`. It needs
-//! `EncodeConfig::for_tests_software`, which exists because `localplay-encoder` is a
-//! dev-dependency here with `test-encoders` on (`apps/localplay-cli/Cargo.toml`), while the
+//! `EncodeConfig::for_tests_software`, which exists because `replayed-encoder` is a
+//! dev-dependency here with `test-encoders` on (`apps/replayed-cli/Cargo.toml`), while the
 //! CLI's own feature stays opt-in so the shipping binary keeps no CPU-encoding fallback. A `cfg`
-//! gate would compile the test away under `--features localplay-encoder/test-encoders`.
+//! gate would compile the test away under `--features replayed-encoder/test-encoders`.
 //!
 //! Needs ffmpeg on `PATH` with a working libx264.
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::{pump_once, pump_once_counted, FramePacer};
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::{pump_once, pump_once_counted, FramePacer};
 
 /// What the encoder's rawvideo pipe is declared as (`-s 32x24`).
 const PIPE: (u32, u32) = (32, 24);

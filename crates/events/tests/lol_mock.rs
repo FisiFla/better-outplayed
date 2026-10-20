@@ -18,9 +18,9 @@
 // exemption does not reach it: the same rule, stated here.
 #![allow(clippy::unwrap_used)]
 
-use localplay_events::lol::{Endpoint, LolConfig, LolPoller, Response};
-use localplay_events::{EventKind, GameEvent};
 use native_tls::{Identity, TlsAcceptor, TlsConnector};
+use replayed_events::lol::{Endpoint, LolConfig, LolPoller, Response};
+use replayed_events::{EventKind, GameEvent};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -101,7 +101,7 @@ mod tls {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, name);
-        dn.push(DnType::OrganizationName, "localplay test fixture");
+        dn.push(DnType::OrganizationName, "replayed test fixture");
         params.distinguished_name = dn;
         params.serial_number = Some(SerialNumber::from(1u64));
         let key = Key::new();
@@ -119,7 +119,7 @@ mod tls {
     pub fn chain() -> &'static Chain {
         static CHAIN: std::sync::OnceLock<Chain> = std::sync::OnceLock::new();
         CHAIN.get_or_init(|| {
-            let (ca_params, ca_key, ca_cert) = ca("localplay test CA");
+            let (ca_params, ca_key, ca_cert) = ca("replayed test CA");
             let rsa = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("an RSA key");
             let public = RsaPublic(
                 rsa.to_public_key()
@@ -132,7 +132,7 @@ mod tls {
             let mut leaf_params = CertificateParams::default();
             leaf_params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
             let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "localplay test leaf");
+            dn.push(DnType::CommonName, "replayed test leaf");
             leaf_params.distinguished_name = dn;
             leaf_params.serial_number = Some(SerialNumber::from(2u64));
             let issuer = Issuer::from_params(&ca_params, &ca_key);
@@ -343,24 +343,23 @@ fn the_client_trusts_only_its_pinned_root() {
         "the generated CA must be untrusted by default, or this test proves nothing"
     );
 
-    // 2. localplay's client pinned to a different root (Riot's, as in production) refuses it too:
+    // 2. replayed's client pinned to a different root (Riot's, as in production) refuses it too:
     //    a squatter on port 2999 with some other certificate gets nothing.
-    let err = localplay_events::lol::LoopbackClient::for_endpoint(mock.endpoint())
+    let err = replayed_events::lol::LoopbackClient::for_endpoint(mock.endpoint())
         .expect("pinned to Riot's root")
         .get()
         .expect_err("a certificate Riot's CA did not sign must be refused");
     assert!(
-        matches!(err, localplay_events::lol::FetchError::Tls(..)),
+        matches!(err, replayed_events::lol::FetchError::Tls(..)),
         "{err}"
     );
     let other = tls::unrelated_root();
-    let err =
-        localplay_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
-            .expect("pinned to an unrelated root")
-            .get()
-            .expect_err("an unrelated root must be refused too");
+    let err = replayed_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
+        .expect("pinned to an unrelated root")
+        .get()
+        .expect_err("an unrelated root must be refused too");
     assert!(
-        matches!(err, localplay_events::lol::FetchError::Tls(..)),
+        matches!(err, replayed_events::lol::FetchError::Tls(..)),
         "{err}"
     );
 
@@ -416,7 +415,7 @@ fn the_live_client_is_only_ever_asked_for_a_get() {
         poller.poll_once();
     }
     // And the client on its own, which is the other way into the same endpoint.
-    let _ = localplay_events::lol::LoopbackClient::for_endpoint_with_root(
+    let _ = replayed_events::lol::LoopbackClient::for_endpoint_with_root(
         mock.endpoint(),
         &mock.root_pem,
     )
@@ -539,7 +538,7 @@ fn a_malformed_body_is_neither_an_event_nor_the_end_of_the_game() {
     );
     assert!(
         poller.poll_once().is_empty(),
-        "a body localplay cannot read is not an event"
+        "a body replayed cannot read is not an event"
     );
     assert!(
         poller.poll_once().is_empty(),
@@ -574,7 +573,7 @@ fn the_poller_only_ever_asks_for_loopback() {
     assert_eq!(poller.endpoint().addr(), mock.addr);
 
     // And a response type is what the client reports for a 404 rather than an error.
-    let client = localplay_events::lol::LoopbackClient::for_endpoint_with_root(
+    let client = replayed_events::lol::LoopbackClient::for_endpoint_with_root(
         mock.endpoint(),
         &mock.root_pem,
     )

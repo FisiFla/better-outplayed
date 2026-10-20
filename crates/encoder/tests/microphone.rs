@@ -11,12 +11,12 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubCapture, StubConfig};
-use localplay_capture::{AudioBuffer, AudioFormat, CaptureBackend};
-use localplay_encoder::{
+use replayed_capture::stub::{StubCapture, StubConfig};
+use replayed_capture::{AudioBuffer, AudioFormat, CaptureBackend};
+use replayed_encoder::{
     EncodeConfig, Encoder, FfmpegEncoder, MicAudioSpec, SampleFormat, VideoCodec,
 };
-use localplay_media::{FfmpegBinaries, MediaInfo};
+use replayed_media::{FfmpegBinaries, MediaInfo};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};

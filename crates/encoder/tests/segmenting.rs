@@ -1,16 +1,16 @@
 //! Drives the encoder with stub sources and asserts segments contain both a video and an audio stream.
 //!
-//! Fed in real time: the media timeline is the wall clock (see `localplay_encoder::ffmpeg`), so
+//! Fed in real time: the media timeline is the wall clock (see `replayed_encoder::ffmpeg`), so
 //! a burst of stubbed frames encodes as a few milliseconds of media.
 
 // An integration test is a crate of its own, so the crate root's `cfg_attr(test, ...)`
 // exemption does not reach it: the same rule, stated here.
 #![allow(clippy::unwrap_used)]
 
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::FfmpegBinaries;
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::FfmpegBinaries;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -73,7 +73,7 @@ fn produces_segments_with_both_a_video_and_an_audio_stream() {
         segments.len()
     );
 
-    let info = localplay_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
+    let info = replayed_media::MediaInfo::probe(&bin, &segments[0]).unwrap();
     assert!(info.video.is_some(), "segment must contain video");
     assert!(info.audio.is_some(), "segment must contain audio");
     // Guards the `segment_ms` unit: 1 instead of 1_000 yields 1ms segments, which still pass the

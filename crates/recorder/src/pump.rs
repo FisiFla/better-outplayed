@@ -5,8 +5,8 @@
 //! drive it with the synthetic stubs.
 
 use anyhow::{bail, Context, Result};
-use localplay_capture::{AudioBackend, CaptureBackend, Frame};
-use localplay_encoder::Encoder;
+use replayed_capture::{AudioBackend, CaptureBackend, Frame};
+use replayed_encoder::Encoder;
 use std::time::{Duration, Instant};
 
 /// Longest a single `next_frame` call waits for a frame to become due.
@@ -373,9 +373,9 @@ impl RateMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localplay_capture::stub::StubAudio;
-    use localplay_capture::{AudioFormat, PixelFormat};
-    use localplay_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
+    use replayed_capture::stub::StubAudio;
+    use replayed_capture::{AudioFormat, PixelFormat};
+    use replayed_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
 
     /// A capture backend that spends a known time in `next_frame`, so `counts.capture` has a floor to check.
     struct SlowCapture {
@@ -419,7 +419,7 @@ mod tests {
             dir.path().to_path_buf(),
             1_000,
         );
-        let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        let bin = replayed_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
         (
             FfmpegEncoder::spawn(&bin, &cfg).expect("spawn the encoder"),
             dir,

@@ -22,7 +22,7 @@ pub struct Request {
 
 /// Why a request was refused before it could be looked at. Each variant carries the status the
 /// connection is answered with: 405/404 for a wrong method or path (a client mistake), the
-/// rest refuse a body localplay will not read.
+/// rest refuse a body replayed will not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     /// Not a `POST`.

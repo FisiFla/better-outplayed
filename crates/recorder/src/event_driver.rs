@@ -12,12 +12,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use localplay_events::gsi::integration::{
-    game_path, integration_cfg_for, CS2_APP_ID, DOTA2_APP_ID,
-};
-use localplay_events::gsi::{self, GsiConfig, GsiGameBinding, GsiListener};
-use localplay_events::lol::{self, LolConfig, LolHandle};
-use localplay_events::{EventKind, GameEvent};
+use replayed_events::gsi::integration::{game_path, integration_cfg_for, CS2_APP_ID, DOTA2_APP_ID};
+use replayed_events::gsi::{self, GsiConfig, GsiGameBinding, GsiListener};
+use replayed_events::lol::{self, LolConfig, LolHandle};
+use replayed_events::{EventKind, GameEvent};
 use serde::Deserialize;
 
 use crate::{ClipReason, ClipWindow, RecordedClip, Recorder};
@@ -121,11 +119,11 @@ impl Policy {
     }
 
     /// The clip length for an event from `source`: the game's own, else the buffer's.
-    pub fn window_for(&self, source: localplay_events::Source) -> ClipWindow {
+    pub fn window_for(&self, source: replayed_events::Source) -> ClipWindow {
         match source {
-            localplay_events::Source::Lol => self.lol,
-            localplay_events::Source::Gsi => self.gsi,
-            localplay_events::Source::Manual => ClipWindow::default(),
+            replayed_events::Source::Lol => self.lol,
+            replayed_events::Source::Gsi => self.gsi,
+            replayed_events::Source::Manual => ClipWindow::default(),
         }
     }
 }
@@ -391,7 +389,7 @@ pub fn start_event_sources(app_dir: &Path, events: &EventsSection) -> EventSourc
 
 /// The name of the file both games read, and the one this crate writes into its own data
 /// directory for the user to install.
-pub const GSI_CFG_NAME: &str = "gamestate_integration_localplay.cfg";
+pub const GSI_CFG_NAME: &str = "gamestate_integration_replayed.cfg";
 
 /// The game id of Counter-Strike 2, as the bindings and the reports name it.
 pub const GSI_GAME_CS2: &str = "cs2";
@@ -461,7 +459,7 @@ fn start_gsi(
     app_dir: &Path,
     configured_port: u16,
     ephemeral: bool,
-    sink: localplay_events::EventSink,
+    sink: replayed_events::EventSink,
 ) -> Result<GsiHandle> {
     let games: Vec<GameSetup> = GSI_GAMES
         .iter()
@@ -557,7 +555,7 @@ fn per_game_token(app_dir: &Path, game: &str) -> Result<String> {
 }
 
 /// Do what a derived event asks for. The only decision, highlight versus marker, is the
-/// vocabulary's ([`localplay_events::EventKind::is_highlight`]).
+/// vocabulary's ([`replayed_events::EventKind::is_highlight`]).
 pub fn act_on_event(recorder: &Recorder, event: GameEvent) -> Result<Option<RecordedClip>> {
     act_on_event_in(recorder, event, ClipWindow::default())
 }
@@ -756,7 +754,7 @@ impl EventDriver {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
-            .name("localplay-events".into())
+            .name("replayed-events".into())
             .spawn(move || drive(&recorder, sources, &flag, &policy, &on_clip))
             .context("spawning the game-event thread")?;
         Ok(Self {
@@ -828,8 +826,8 @@ mod tests {
 
     fn kill() -> GameEvent {
         GameEvent::bare(
-            localplay_events::Source::Lol,
-            localplay_events::EventKind::Kill,
+            replayed_events::Source::Lol,
+            replayed_events::EventKind::Kill,
         )
     }
 
@@ -857,7 +855,7 @@ mod tests {
             ..EventsSection::default()
         };
         let policy = Policy::new(&events, 30).unwrap();
-        let objective = GameEvent::bare(localplay_events::Source::Lol, EventKind::Objective);
+        let objective = GameEvent::bare(replayed_events::Source::Lol, EventKind::Objective);
         assert!(!policy.clips(&objective), "muted");
         assert!(policy.clips(&kill()), "an unmuted highlight still clips");
         let bad = EventsSection {
@@ -876,7 +874,7 @@ mod tests {
         let policy = Policy::new(&all, 30).unwrap();
         for kind in EventKind::ALL.into_iter().filter(|k| k.is_objective()) {
             assert!(
-                !policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind)),
+                !policy.clips(&GameEvent::bare(replayed_events::Source::Lol, kind)),
                 "{kind}"
             );
         }
@@ -885,7 +883,7 @@ mod tests {
             ..EventsSection::default()
         };
         let policy = Policy::new(&some, 30).unwrap();
-        let clips = |kind| policy.clips(&GameEvent::bare(localplay_events::Source::Lol, kind));
+        let clips = |kind| policy.clips(&GameEvent::bare(replayed_events::Source::Lol, kind));
         assert!(!clips(EventKind::Turret));
         assert!(clips(EventKind::Dragon) && clips(EventKind::Baron) && clips(EventKind::Objective));
     }
@@ -898,18 +896,18 @@ mod tests {
         .unwrap();
         let policy = Policy::new(&events, 30).unwrap();
         assert_eq!(
-            policy.window_for(localplay_events::Source::Lol),
+            policy.window_for(replayed_events::Source::Lol),
             ClipWindow::new(25, 8)
         );
         assert_eq!(
-            policy.window_for(localplay_events::Source::Gsi),
+            policy.window_for(replayed_events::Source::Gsi),
             ClipWindow {
                 pre_seconds: Some(6),
                 post_seconds: None
             }
         );
         assert_eq!(
-            policy.window_for(localplay_events::Source::Manual),
+            policy.window_for(replayed_events::Source::Manual),
             ClipWindow::default()
         );
     }

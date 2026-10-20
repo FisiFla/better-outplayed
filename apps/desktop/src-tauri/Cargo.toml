@@ -1,10 +1,10 @@
 [package]
-name = "localplay-desktop"
+name = "replayed-desktop"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/FisiFla/better-outplayed"
-description = "localplay desktop shell — the Phase 2 session review UI (Tauri v2)"
+repository = "https://github.com/FisiFla/replayed"
+description = "replayed desktop shell — the Phase 2 session review UI (Tauri v2)"
 publish = false
 
 # Root of its own workspace: see the `exclude` note in ../../Cargo.toml for why this
@@ -14,7 +14,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 # Lists the audio endpoints for the settings pickers.
-localplay-capture = { path = "../../../crates/capture" }
+replayed-capture = { path = "../../../crates/capture" }
 serde = { version = "1", features = ["derive"] }
 # Parses the League/GSI event payloads for the match scoreboard; tests also assert the exact
 # JSON keys the TypeScript interfaces mirror.
@@ -34,17 +34,17 @@ tauri-plugin-dialog = "2"
 # One running instance owns the global hotkey, the tray and the capture session.
 tauri-plugin-single-instance = "2"
 # The shell reads the index, edits clips and probes them with these crates, and records through
-# the same engine the CLI drives (`localplay-recorder`), which owns capture, audio, the encoder
+# the same engine the CLI drives (`replayed-recorder`), which owns capture, audio, the encoder
 # and the ring.
-localplay-media = { path = "../../../crates/media" }
-localplay-store = { path = "../../../crates/store" }
-localplay-recorder = { path = "../../../crates/recorder" }
+replayed-media = { path = "../../../crates/media" }
+replayed-store = { path = "../../../crates/store" }
+replayed-recorder = { path = "../../../crates/recorder" }
 # The settings writer edits keys in place with their comments and formatting intact
 # (`toml_edit`), rather than re-serialising structs and destroying a hand-edited file.
 toml_edit = "0.25"
 # The global clip hotkey: the shell installs the same `RegisterHotKey` listener as the CLI, from
 # the same `[hotkeys] clip` key, so there is one hotkey implementation.
-localplay-events = { path = "../../../crates/events" }
+replayed-events = { path = "../../../crates/events" }
 tauri-plugin-notification = "2"
 drag = "2.1.1"
 fs4 = { version = "0.13", features = ["sync"] }
@@ -62,8 +62,8 @@ tempfile = "3"
 # which are test-only entry points in the crates below — see the notes in their manifests.
 # Dev-dependencies are not built for `cargo build`, so the shipping binary still has
 # neither.
-localplay-recorder = { path = "../../../crates/recorder", features = ["test-encoders"] }
-localplay-encoder = { path = "../../../crates/encoder", features = ["test-encoders"] }
+replayed-recorder = { path = "../../../crates/recorder", features = ["test-encoders"] }
+replayed-encoder = { path = "../../../crates/encoder", features = ["test-encoders"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

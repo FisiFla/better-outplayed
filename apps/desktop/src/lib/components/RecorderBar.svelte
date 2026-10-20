@@ -4,7 +4,7 @@
    * about this shell's *background* half that a user cannot otherwise discover: which chord
    * takes a clip (and whether it is really installed), and what closing the window does.
    *
-   * This window OWNS nothing of the recording: the engine is `localplay-recorder` — the
+   * This window OWNS nothing of the recording: the engine is `replayed-recorder` — the
    * same crate the CLI drives — and every number below comes from its status. What this
    * component decides is only what a person sees: three states (not recording, REC,
    * stopped with a reason), the counters while it runs, and two buttons.

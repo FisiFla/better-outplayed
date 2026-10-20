@@ -4,9 +4,9 @@ use super::clips::{
     free_output_path, index_new_clip, inherit_metadata, session_artifact_ok, validate_range,
 };
 use super::*;
-use localplay_media::edit::trim_lossless;
-use localplay_media::probe::MediaInfo;
-use localplay_store::Session;
+use replayed_media::edit::trim_lossless;
+use replayed_media::probe::MediaInfo;
+use replayed_store::Session;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -87,8 +87,8 @@ pub struct MatchDto {
     pub events: Vec<SessionEventDto>,
 }
 
-impl From<&localplay_store::matches::MatchSegment> for MatchDto {
-    fn from(m: &localplay_store::matches::MatchSegment) -> Self {
+impl From<&replayed_store::matches::MatchSegment> for MatchDto {
+    fn from(m: &replayed_store::matches::MatchSegment) -> Self {
         let parse = |p: &Option<String>| {
             p.as_deref()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
@@ -130,7 +130,7 @@ pub fn session_matches(deps: &Deps<'_>, session_id: i64) -> Result<Vec<MatchDto>
         .store
         .events_for_session(session_id)
         .map_err(|e| CommandError::store("reading the session timeline", e))?;
-    let segments = localplay_store::matches::split_matches(&events, session.duration_ms);
+    let segments = replayed_store::matches::split_matches(&events, session.duration_ms);
     Ok(segments.iter().map(MatchDto::from).collect())
 }
 
@@ -514,7 +514,7 @@ mod tests {
         );
 
         f.store
-            .insert_event(&localplay_store::NewEvent {
+            .insert_event(&replayed_store::NewEvent {
                 session_id: Some(session_id),
                 kind: "kill".to_string(),
                 at_ms: 1_500,
@@ -564,7 +564,7 @@ mod tests {
         let (session_id, _) = f.add_finished_session(4, 1_000);
         for (kind, at_ms) in [("kill", 1_200u64), ("death", 4_000)] {
             f.store
-                .insert_event(&localplay_store::NewEvent {
+                .insert_event(&replayed_store::NewEvent {
                     session_id: Some(session_id),
                     kind: kind.to_string(),
                     at_ms,
@@ -587,7 +587,7 @@ mod tests {
 
     fn add_event(f: &Fixture, session_id: i64, kind: &str, at_ms: u64, payload: Option<&str>) {
         f.store
-            .insert_event(&localplay_store::NewEvent {
+            .insert_event(&replayed_store::NewEvent {
                 session_id: Some(session_id),
                 kind: kind.to_string(),
                 at_ms,
@@ -731,7 +731,7 @@ mod tests {
         // Its scratch directory is being written into, so the file a range would be measured against
         // is not the file that would be read.
         let f = Fixture::new();
-        let (id, _) = f.add_running_session(localplay_store::SESSION_MODE_SESSION);
+        let (id, _) = f.add_running_session(replayed_store::SESSION_MODE_SESSION);
 
         let err = extract_clip(&f.deps(), id, 0, 500).expect_err("a running session has no file");
         assert_eq!(err.code, ErrorCode::SessionStillRecording);
@@ -751,7 +751,7 @@ mod tests {
         // Buffer mode keeps a rolling ring rather than one session file, so there is nothing for a
         // range to be measured against. The message says which mode it was.
         let f = Fixture::new();
-        let (id, dir) = f.add_running_session(localplay_store::SESSION_MODE_BUFFER);
+        let (id, dir) = f.add_running_session(replayed_store::SESSION_MODE_BUFFER);
         f.store
             .end_session(id, WALL_START_MS + 1_000, None, 0, 0)
             .unwrap();
@@ -856,7 +856,7 @@ mod tests {
             .store
             .start_session(
                 None,
-                localplay_store::SESSION_MODE_SESSION,
+                replayed_store::SESSION_MODE_SESSION,
                 WALL_START_MS,
                 &scratch.to_string_lossy(),
                 0,

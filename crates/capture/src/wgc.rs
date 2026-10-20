@@ -104,7 +104,7 @@ pub struct WgcCapture {
     /// Whether the caller asked for textures rather than pixels. Held here too so the answer survives
     /// `stop`/`start` and can be given before `start`, when an encoder decides whether it can take one.
     want_textures: bool,
-    /// Time spent inside `poll_frame` (the copy), accumulated. See [`localplay_capture::FrameTimings`].
+    /// Time spent inside `poll_frame` (the copy), accumulated. See [`replayed_capture::FrameTimings`].
     copying: Duration,
     /// Time inside `next_frame` that was not inside `poll_frame`: the polling loop's sleeps.
     waiting: Duration,

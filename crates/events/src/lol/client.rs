@@ -1,4 +1,4 @@
-//! The one place in localplay that relaxes any part of TLS verification.
+//! The one place in replayed that relaxes any part of TLS verification.
 //!
 //! Riot's Live Client Data API is HTTPS on `127.0.0.1:2999`, with a certificate issued by
 //! Riot's "LoL Game Engineering Certificate Authority" that carries no name matching an IP
@@ -69,7 +69,7 @@ pub enum FetchError {
     /// The peer answered, but not with HTTP this reader understands.
     #[error("the Live Client answered something malformed: {0}")]
     Protocol(String),
-    /// The peer answered with a status localplay does not expect from this endpoint.
+    /// The peer answered with a status replayed does not expect from this endpoint.
     #[error("the Live Client answered HTTP {0}")]
     UnexpectedStatus(u16),
 }
@@ -169,7 +169,7 @@ impl LoopbackClient {
         // (see `endpoint::is_valid_path`).
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
-             User-Agent: localplay/0.1\r\nConnection: close\r\n\r\n",
+             User-Agent: replayed/0.1\r\nConnection: close\r\n\r\n",
             self.endpoint.path()
         );
         tls.write_all(request.as_bytes())

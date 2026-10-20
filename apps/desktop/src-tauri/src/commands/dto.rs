@@ -1,6 +1,6 @@
 //! The data transfer objects the frontend reads (clips, sessions, storage).
 
-use localplay_store::{Clip, Session, SessionEvent};
+use replayed_store::{Clip, Session, SessionEvent};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------------------
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct ClipDto {
     pub id: i64,
     pub path: String,
-    /// Media-time position of the clip's first frame (see `localplay_store::Clip`). Not
+    /// Media-time position of the clip's first frame (see `replayed_store::Clip`). Not
     /// comparable across captures; the list is ordered by `created_at_ms` instead.
     pub started_at_ms: u64,
     pub duration_ms: u64,
@@ -65,7 +65,7 @@ pub struct SessionDto {
     /// The game the watcher matched. `None` for a session nobody detected, which is the
     /// ordinary case for a manual start.
     pub game: Option<String>,
-    /// `"buffer"` or `"session"` (see `localplay_store::SESSION_MODE_*`). A buffer session
+    /// `"buffer"` or `"session"` (see `replayed_store::SESSION_MODE_*`). A buffer session
     /// has no concatenated file: the row exists to group one run's clips and events.
     pub mode: String,
     /// Wall clock, ms since the Unix epoch. Not comparable with `offset_ms`, which is media time:

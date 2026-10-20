@@ -1,5 +1,5 @@
 [package]
-name = "localplay-cli"
+name = "replayed-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,19 +13,19 @@ toml.workspace = true
 # The recording engine, which the desktop shell drives too. The sub-crates below are named
 # here because this package's integration tests build fixtures out of them directly (the
 # stubs, a raw `FfmpegEncoder`, a memory ring).
-localplay-recorder = { path = "../../crates/recorder" }
-localplay-capture = { path = "../../crates/capture" }
-localplay-encoder = { path = "../../crates/encoder" }
-localplay-replay  = { path = "../../crates/replay" }
-localplay-media   = { path = "../../crates/media" }
-localplay-events  = { path = "../../crates/events" }
-localplay-store   = { path = "../../crates/store" }
+replayed-recorder = { path = "../../crates/recorder" }
+replayed-capture = { path = "../../crates/capture" }
+replayed-encoder = { path = "../../crates/encoder" }
+replayed-replay  = { path = "../../crates/replay" }
+replayed-media   = { path = "../../crates/media" }
+replayed-events  = { path = "../../crates/events" }
+replayed-store   = { path = "../../crates/store" }
 
 # Enables the hidden `--dev-software-encoder` flag for pipeline smoke tests on a
 # host with no GPU encoder. Never enabled in a release build. Forwarded to the engine,
 # which is where the flag is acted on.
 [features]
-test-encoders = ["localplay-encoder/test-encoders", "localplay-recorder/test-encoders"]
+test-encoders = ["replayed-encoder/test-encoders", "replayed-recorder/test-encoders"]
 
 # The post-roll regression test (`tests/post_roll.rs`) needs a scratch directory and
 # a clips directory of its own.
@@ -35,11 +35,11 @@ tempfile.workspace = true
 # dependencies are not built for `cargo build`, so the binary still cannot fall back to
 # CPU encoding (that guard is this package's own `test-encoders` feature, which stays
 # opt-in). The test file is not `cfg`-gated, because the feature the suite enables on the
-# command line (`--features localplay-encoder/test-encoders`) is not this package's.
-localplay-encoder = { path = "../../crates/encoder", features = ["test-encoders"] }
+# command line (`--features replayed-encoder/test-encoders`) is not this package's.
+replayed-encoder = { path = "../../crates/encoder", features = ["test-encoders"] }
 # The same trick for the engine: a test build can reach its software-encoder path, while
 # `cargo build` cannot (see the crate's own manifest).
-localplay-recorder = { path = "../../crates/recorder", features = ["test-encoders"] }
+replayed-recorder = { path = "../../crates/recorder", features = ["test-encoders"] }
 
 [lints]
 workspace = true

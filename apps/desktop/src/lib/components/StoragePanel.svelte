@@ -4,7 +4,7 @@
    * (spec §8.1).
    *
    * It is READ-ONLY, and says so. The cleanup pass itself belongs to the recorder
-   * (`localplay-cli`), which runs it at startup and on a timer while it is capturing; this
+   * (`replayed-cli`), which runs it at startup and on a timer while it is capturing; this
    * window reports the verdict that `plan_cleanup` reaches and never deletes anything on
    * its own initiative. A panel that appeared to manage storage without being able to
    * would be worse than one that explains who does.

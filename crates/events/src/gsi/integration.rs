@@ -1,4 +1,4 @@
-//! The token, and the `gamestate_integration_localplay.cfg` the user installs.
+//! The token, and the `gamestate_integration_replayed.cfg` the user installs.
 //!
 //! The app generates the file and the user installs it; the app never writes into game
 //! installation directories. Everything here produces text (a token and a file's contents) and
@@ -13,7 +13,7 @@
 //! The token must be stable across runs or the user would re-install the `.cfg` at every start.
 //! The first run generates one into the application data directory ([`load_or_create_token`]);
 //! later runs read it. It is created `0600` where the platform has modes. On Windows it lives in
-//! `%LOCALAPPDATA%\\localplay` (per-user) with no ACL hardening, since the token only gates a
+//! `%LOCALAPPDATA%\\replayed` (per-user) with no ACL hardening, since the token only gates a
 //! listener unreachable from anything but this machine.
 //!
 //! # The port in the file, and the port the listener bound
@@ -24,7 +24,7 @@
 //! [`crate::gsi::GsiListener::port`], and not a configured one, because a port that was already
 //! taken, or an ephemeral one, are both ways for the game and the listener to disagree and the
 //! game would then post into the void. A fixed port is also squat-able: a local process that
-//! binds it before localplay starts receives the game's POSTs, and with them the token.
+//! binds it before replayed starts receives the game's POSTs, and with them the token.
 //!
 //! # What installing the file costs, and what it leaves behind
 //!
@@ -212,13 +212,13 @@ pub fn integration_cfg_for(port: u16, path: &str, token: &str, dota: bool) -> St
     let (game, install_path, data) = if dota {
         (
             "Dota 2",
-            "...\\dota 2 beta\\game\\dota\\cfg\\gamestate_integration\\gamestate_integration_localplay.cfg",
+            "...\\dota 2 beta\\game\\dota\\cfg\\gamestate_integration\\gamestate_integration_replayed.cfg",
             DOTA_BLOCKS,
         )
     } else {
         (
             "Counter-Strike 2 / CS:GO",
-            "...\\Counter-Strike Global Offensive\\game\\csgo\\cfg\\gamestate_integration_localplay.cfg",
+            "...\\Counter-Strike Global Offensive\\game\\csgo\\cfg\\gamestate_integration_replayed.cfg",
             CS2_BLOCKS,
         )
     };
@@ -238,13 +238,13 @@ fn cfg_text(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "// localplay — {game} Game State Integration (generated)\n"
+        "// replayed — {game} Game State Integration (generated)\n"
     ));
     out.push_str("// Install this file as:\n");
     out.push_str(&format!("//   {install_path}\n"));
-    out.push_str("// localplay listens on loopback only; nothing here leaves this machine.\n");
+    out.push_str("// replayed listens on loopback only; nothing here leaves this machine.\n");
     out.push('\n');
-    out.push_str("\"localplay\"\n{\n");
+    out.push_str("\"replayed\"\n{\n");
     out.push_str(&format!(
         "    \"uri\"       \"http://127.0.0.1:{port}{path}\"\n"
     ));
@@ -256,7 +256,7 @@ fn cfg_text(
     out.push_str("    \"throttle\"  \"0.1\"\n");
     out.push_str("    \"heartbeat\" \"10.0\"\n");
     out.push('\n');
-    out.push_str("    // Echoed back in the payload's \"auth\" block; localplay rejects any\n");
+    out.push_str("    // Echoed back in the payload's \"auth\" block; replayed rejects any\n");
     out.push_str("    // request whose token does not match the one it generated.\n");
     out.push_str("    \"auth\"\n    {\n");
     out.push_str(&format!("        \"token\"     \"{token}\"\n"));
@@ -346,7 +346,7 @@ mod tests {
             "it explains itself to the user:\n{text}"
         );
         assert!(
-            text.contains("\"localplay\"\n{"),
+            text.contains("\"replayed\"\n{"),
             "the block is named:\n{text}"
         );
         assert!(text.trim_end().ends_with('}'), "and closed:\n{text}");

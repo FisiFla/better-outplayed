@@ -407,7 +407,7 @@ mod tests {
     /// box structure would test the parser against an idea of ffmpeg's output, not its actual
     /// output.
     fn stream(seconds: u32) -> Vec<u8> {
-        let bin = localplay_media_ffmpeg();
+        let bin = replayed_media_ffmpeg();
         let out = crate::sidecar_command(&bin.ffmpeg)
             .args([
                 "-v",
@@ -444,7 +444,7 @@ mod tests {
         out.stdout
     }
 
-    fn localplay_media_ffmpeg() -> crate::FfmpegBinaries {
+    fn replayed_media_ffmpeg() -> crate::FfmpegBinaries {
         crate::FfmpegBinaries::discover(None).expect("ffmpeg on PATH")
     }
 

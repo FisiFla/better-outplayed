@@ -3,19 +3,19 @@
 //! The rate is declared in two places, the encoder child's `-framerate` and the
 //! [`crate::pump::FramePacer`] that decides how often a frame is taken off the capture backend.
 //! It is decided once from the configured value and what the encoder was measured to sustain, and
-//! `Recorder::start_with_measure` writes it into [`localplay_encoder::EncodeConfig::fps`] and builds
+//! `Recorder::start_with_measure` writes it into [`replayed_encoder::EncodeConfig::fps`] and builds
 //! the pacer from the same field, so the two cannot come from different inputs.
 //!
 //! This is a pacing decision, not the timeline guarantee: paying a readback for frames the encoder
 //! will drop is waste. The media timeline tracks real time independently, via
-//! `-fps_mode passthrough` in `localplay_encoder::ffmpeg::video_output_args`.
+//! `-fps_mode passthrough` in `replayed_encoder::ffmpeg::video_output_args`.
 //!
 //! * The effective rate is `min(configured, measured)`; the configured rate is never exceeded.
 //! * A measurement at or above the configured rate changes nothing.
 //! * `encode.adapt_fps = false` skips the measurement (~1.5s of startup) and declares the
 //!   configured rate regardless; the cost is dropped frames and the capture work spent on them.
 
-use localplay_encoder::ThroughputMeasurement;
+use replayed_encoder::ThroughputMeasurement;
 
 /// The rate this recording runs at.
 #[derive(Debug, Clone, Copy, PartialEq)]

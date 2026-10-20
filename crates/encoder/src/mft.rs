@@ -13,7 +13,7 @@
 use crate::ffmpeg::MFT_TIMEOUT;
 use crate::VideoCodec;
 use anyhow::{bail, Context, Result};
-use localplay_capture::GpuTexture;
+use replayed_capture::GpuTexture;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::HMODULE;
@@ -1301,7 +1301,7 @@ impl MftFeed {
         let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = std::sync::Arc::clone(&stopping);
         let handle = std::thread::Builder::new()
-            .name("localplay-mft".to_string())
+            .name("replayed-mft".to_string())
             .spawn(move || encode_loop(rx, out, counter, codec, bitrate_kbps, fps, stop))
             .expect("spawning the hardware encoder thread");
         Self {

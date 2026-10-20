@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-/// Name of the directory holding `ffmpeg`/`ffprobe`, in every layout localplay runs in.
+/// Name of the directory holding `ffmpeg`/`ffprobe`, in every layout replayed runs in.
 ///
 /// The same word in a checkout, a `cargo run` target directory and an installed application,
 /// because the bundler's resource mapping (`apps/desktop/src-tauri/tauri.conf.json`) is written
@@ -107,7 +107,7 @@ pub fn dev_sidecar_dir_from(exe_dir: &Path) -> Option<PathBuf> {
 ///
 /// The order is the contract. Everything an installer can produce outranks everything a
 /// developer's machine can, so an installed app is never served a stale copy from a checkout
-/// above it, and `PATH` comes last: localplay cannot vouch for an arbitrary system ffmpeg, as it
+/// above it, and `PATH` comes last: replayed cannot vouch for an arbitrary system ffmpeg, as it
 /// assumes an LGPL-only, hardware-encoder-only build (see the README, "A note on the `ffmpeg`
 /// build").
 fn search_candidates(exe_dir: &Path, path_dir: Option<PathBuf>) -> Vec<PathBuf> {
@@ -133,7 +133,7 @@ fn dedupe(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// A `Command` for one of the sidecars, with no console window on Windows.
 ///
-/// Load-bearing on Windows. A GUI process like `localplay.exe` allocates a console for every
+/// Load-bearing on Windows. A GUI process like `replayed.exe` allocates a console for every
 /// child it spawns unless the child gets `CREATE_NO_WINDOW`, so each ffmpeg, ffprobe or `reg`
 /// call flashed a terminal and the app makes a dozen while drawing a screen. The storm held the
 /// main thread, leaving the window unresizable and undraggable although the window config says
@@ -261,7 +261,7 @@ pub fn run_with_stdin(mut cmd: Command, input: Vec<u8>, timeout: Duration) -> Re
 /// Poll `child` until it exits, killing it and failing if `timeout` elapses first. Polling is
 /// what makes the timeout real: a wedged child would otherwise park the caller forever.
 ///
-/// Public for the encoder's startup throughput probe (`localplay_encoder::throughput`), which
+/// Public for the encoder's startup throughput probe (`replayed_encoder::throughput`), which
 /// feeds frames in a loop for a bounded window, owns its own writing, and needs a deadline that
 /// really ends and a child that is killed and reaped rather than leaked.
 pub fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Result<()> {
@@ -372,7 +372,7 @@ mod tests {
     /// `binaries/`: the executable in `<Foo>.app/Contents/MacOS`, the sidecars in
     /// `<Foo>.app/Contents/Resources/binaries`. Returns `(exe_dir, resource_dir)`.
     fn fake_installed_app(root: &Path) -> (PathBuf, PathBuf) {
-        let contents = root.join("localplay.app").join("Contents");
+        let contents = root.join("replayed.app").join("Contents");
         let exe_dir = contents.join("MacOS");
         std::fs::create_dir_all(&exe_dir).expect("creating Contents/MacOS");
         let resources = contents.join("Resources").join(SIDECAR_DIR_NAME);
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn dev_fallback_gives_up_without_a_checkout() {
         let tmp = TempDir::new().expect("temp dir");
-        let exe_dir = tmp.path().join("Program Files/localplay");
+        let exe_dir = tmp.path().join("Program Files/replayed");
         std::fs::create_dir_all(&exe_dir).expect("creating install dir");
         // No Cargo.toml on the way up: an installed layout must not acquire a fallback.
         assert_eq!(dev_sidecar_dir_from(&exe_dir), None);
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(found.ffmpeg, resources.join(exe("ffmpeg")));
         assert_eq!(found.ffprobe, resources.join(exe("ffprobe")));
         assert!(
-            found.ffmpeg.starts_with(tmp.path().join("localplay.app")),
+            found.ffmpeg.starts_with(tmp.path().join("replayed.app")),
             "the resolved binary must be inside the application bundle, was {}",
             found.ffmpeg.display()
         );
@@ -531,7 +531,7 @@ mod tests {
         // A false positive would put a directory that cannot exist on the search list and print it in
         // every "ffmpeg not found" message.
         let tmp = TempDir::new().expect("temp dir");
-        let install = tmp.path().join("Program Files/localplay");
+        let install = tmp.path().join("Program Files/replayed");
         std::fs::create_dir_all(&install).expect("creating the installation directory");
         assert!(resource_sidecar_dirs_from(&install).is_empty());
 
@@ -548,22 +548,22 @@ mod tests {
     /// resolves the executable's own `Contents/MacOS` through the production code path:
     ///
     /// ```text
-    /// LOCALPLAY_APP_BUNDLE=apps/desktop/src-tauri/target/release/bundle/macos/localplay.app \
-    ///   cargo test -p localplay-media --lib a_real_app_bundle_beats_path
+    /// REPLAYED_APP_BUNDLE=apps/desktop/src-tauri/target/release/bundle/macos/replayed.app \
+    ///   cargo test -p replayed-media --lib a_real_app_bundle_beats_path
     /// ```
     ///
     /// `which_dir` is real, so when it finds a system ffmpeg this also shows the bundle's copy wins
     /// over `PATH`.
     #[test]
     fn a_real_app_bundle_beats_path() {
-        let Ok(app) = std::env::var("LOCALPLAY_APP_BUNDLE") else {
+        let Ok(app) = std::env::var("REPLAYED_APP_BUNDLE") else {
             return;
         };
         let app = PathBuf::from(app);
         let exe_dir = app.join("Contents").join("MacOS");
         assert!(
             exe_dir.is_dir(),
-            "LOCALPLAY_APP_BUNDLE must point at a `.app` directory: {} has no Contents/MacOS",
+            "REPLAYED_APP_BUNDLE must point at a `.app` directory: {} has no Contents/MacOS",
             app.display()
         );
 

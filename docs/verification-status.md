@@ -1,6 +1,6 @@
 # Verification status
 
-**This document is a ledger of what has actually been proven about localplay, and how.**
+**This document is a ledger of what has actually been proven about replayed, and how.**
 It exists because a repository that only says what it *intends* to do will be believed,
 and this project has already shipped a feature that passed every macOS test and produced
 solid black video the first time it ran on real Windows hardware. (That defect has since
@@ -63,8 +63,8 @@ nothing. It cannot check the GUI, a real keypress, anything needing a real game,
 live clock divergence; §9 lists what stays manual and §10 records which parts of it the
 2026-09-24 session got to by hand instead.
 
-[issue #1]: https://github.com/FisiFla/better-outplayed/issues/1
-[issue #2]: https://github.com/FisiFla/better-outplayed/issues/2
+[issue #1]: https://github.com/FisiFla/replayed/issues/1
+[issue #2]: https://github.com/FisiFla/replayed/issues/2
 
 ---
 
@@ -145,7 +145,7 @@ Command used to check the source of every row: `gh issue view 1` / `gh issue vie
 
 When this repository was inspected there was no committed log carrying these numbers; the
 fresh values below come from **read-only analysis of the scratch ring and one clip still
-present on the Windows box** (`%LOCALAPPDATA%\localplay\scratch` and `clips`) using
+present on the Windows box** (`%LOCALAPPDATA%\replayed\scratch` and `clips`) using
 `ffprobe`/`ffmpeg` reads only — no capture, no display, no input. The run-level `Ctrl+F8`
 clip facts come from the earlier **interactive session's own output**, which was never
 committed; that provenance is weaker than a committed log and is labelled as such.
@@ -258,7 +258,7 @@ recorder test's 10 fps. Three consequences, all recorded rather than smoothed ov
 
 **Splicing and playback survive that — checked, not assumed.** `-reset_timestamps 1` still
 gives every segment `start_time = 0`; the segmenter still cuts ~1 s segments (13 segments and
-13 s of media in the after-4K arm); `localplay_media::edit::concat_lossless` — the exact
+13 s of media in the after-4K arm); `replayed_media::edit::concat_lossless` — the exact
 function `ClipSplicer` calls — still produces a clip that probes with **both** streams and
 whose every coded frame decodes (117 frames in the 4K clip, 46/46 in the regression test).
 One caveat: a frame that lands just across a segment boundary makes the concat demuxer's
@@ -313,7 +313,7 @@ Source checked with `git log --oneline` and by reading each module's own doc com
 | **Ring buffer, segment ledger and cap eviction** (`crates/replay`) | Verified on Windows hardware | segments written; criterion 2 passed (issue #1), and the retained ring now records the cap (**15 MB**) and oldest-first eviction (§1) |
 | **Clip splicing** (`crates/replay`, `crates/media`) — lossless `-c copy` remux | Verified on Windows hardware | the 13,091 ms clip; criteria 4 and 5 passed (issues #1, #2) |
 | **The media-time trigger** (`55f1541`) | Verified on Windows hardware | fixed and confirmed on the Windows test machine (issue #2: "Verified on hardware") |
-| **The self-test trigger** — the same media-time trigger, reached without synthesising input (`2399332`) | Verified on the dev host (the trigger), not on Windows | `apps/localplay-cli/tests/self_test_clip.rs::the_self_test_trigger_writes_a_clip_through_the_hotkey_path` drives the whole command in-process over real ffmpeg: it waited for the ring to hold the configured window, called `Recorder::clip_now()` once, and wrote a real clip (8,053 ms for an 8,000 ms window, `encoder=libx264`). What still needs Windows is not the trigger but the keypress that reaches the *same* call |
+| **The self-test trigger** — the same media-time trigger, reached without synthesising input (`2399332`) | Verified on the dev host (the trigger), not on Windows | `apps/replayed-cli/tests/self_test_clip.rs::the_self_test_trigger_writes_a_clip_through_the_hotkey_path` drives the whole command in-process over real ffmpeg: it waited for the ring to hold the configured window, called `Recorder::clip_now()` once, and wrote a real clip (8,053 ms for an 8,000 ms window, `encoder=libx264`). What still needs Windows is not the trigger but the keypress that reaches the *same* call |
 
 ### Tests that cover the non-Windows half of this path
 
@@ -322,7 +322,7 @@ executes a Windows API.
 
 | Claim | Level | Test |
 |---|---|---|
-| The pacer discards surplus frames **without** reading them back | Verified on the dev host | `apps/localplay-cli/tests/discard_readback.rs::a_source_faster_than_the_pacer_is_discarded_without_being_read_back` |
+| The pacer discards surplus frames **without** reading them back | Verified on the dev host | `apps/replayed-cli/tests/discard_readback.rs::a_source_faster_than_the_pacer_is_discarded_without_being_read_back` |
 | A frame the source offers while the pacer is not due is discarded, not materialised | Verified on the dev host | `discard_readback.rs` (first test) |
 | The stub backend's discard path counts separately from its readbacks | Verified on the dev host | `crates/capture/src/stub.rs` unit tests |
 | Pipe size is reconciled with the backend's native size | Verified on the dev host | `b94be7b` message: "a macOS run logs `-s=1280x720 (capture native)`"; cross-checked for `x86_64-pc-windows-msvc` |
@@ -333,12 +333,12 @@ executes a Windows API.
 
 | Subsystem | Level | Evidence |
 |---|---|---|
-| `localplay-media` (`ffprobe` → `MediaInfo`, lossless remux/trim) | Verified on the dev host | `crates/media/tests/lossless.rs`, `crates/media/src/probe.rs` (real ffmpeg) |
-| `localplay-store` (SQLite schema, clip/session/event index) | Verified on the dev host | `crates/store/src/lib.rs` tests, real SQLite |
+| `replayed-media` (`ffprobe` → `MediaInfo`, lossless remux/trim) | Verified on the dev host | `crates/media/tests/lossless.rs`, `crates/media/src/probe.rs` (real ffmpeg) |
+| `replayed-store` (SQLite schema, clip/session/event index) | Verified on the dev host | `crates/store/src/lib.rs` tests, real SQLite |
 | **Storage cleanup policy + executor** delete-before-unlink (`48b5e5a`) | Verified on the dev host | `crates/store/src/cleanup.rs::the_size_rule_evicts_oldest_first_until_under_the_cap`, `crates/store/tests/cleanup_ordering.rs` |
 | Evicting a clip detaches its events instead of failing the foreign key | Verified on the dev host | `crates/store/src/lib.rs::deleting_a_clip_releases_its_events_instead_of_failing` |
-| `localplay-recorder` — the recording engine shared by CLI and GUI (`71a360c`) | Verified on the dev host | `crates/recorder/src/tests.rs::a_clip_records_why_it_was_taken` (real recording, real ffmpeg, real SQLite) |
-| `localplay-cli` drives the engine (`969bce9`) | Verified on the dev host | CLI integration tests in `apps/localplay-cli/tests/` |
+| `replayed-recorder` — the recording engine shared by CLI and GUI (`71a360c`) | Verified on the dev host | `crates/recorder/src/tests.rs::a_clip_records_why_it_was_taken` (real recording, real ffmpeg, real SQLite) |
+| `replayed-cli` drives the engine (`969bce9`) | Verified on the dev host | CLI integration tests in `apps/replayed-cli/tests/` |
 | Desktop IPC command layer + session-review window (`33d7ff7`, `c1decfb`) | Verified on the dev host | desktop-shell Rust tests (run in CI, `apps/desktop/src-tauri`) |
 | Desktop **recording wiring** — Start/Stop/Save clip over the engine (`912a026`, `f66e52e`) | Verified on the dev host (headless) | frontend `vitest` (`apps/desktop/src/lib/recording.test.ts` etc.), shell Rust tests, and headless render screenshots (`793439b`). **No GUI window is opened.** |
 | Desktop **background half** — the tray menu and its state-dependent labels, the tooltip and icon state, the menu-action → shell-call mapping, the close-to-hide rule, the `[app]` defaults and the autostart decision table | Verified on the dev host | `apps/desktop/src-tauri/src/background.rs` unit tests (pure functions over plain data), `config.rs` tests for the new `[hotkeys]`/`[app]` reader, `apps/desktop/src/lib/recording.test.ts` for the two display rules, and the headless screenshot state `11-hotkey-not-installed`. **The tray, the window hide and the keypress themselves are not covered by any of this** — see §9. |
@@ -387,22 +387,22 @@ The first commit after the session is `dd921b3` (2026-09-23 18:00).
 | GSI accept-loop blocking-mode fix | `bd59fce` | Verified on the dev host (CI) |
 | Self-test clip trigger (`--self-test-clip-after`) — the clip path without synthetic input | `2399332` | **Verified on Windows hardware** (2026-09-24, §10): the shipping CLI ran it in a real desktop session and took a clip — `self-test: the ring holds 7000ms of media; taking the clip` → a 7083ms file, indexed. Also verified on the dev host |
 | Desktop background half: tray, global clip hotkey, hide-on-close, `[app] start_with_system` | `46c0116`, `08f6770`, `5ec095d` | Verified on the dev host (headless: pure logic + a real recording driven through the trigger path). **Never observed on any machine**: no tray icon drawn, no window closed, no key pressed, no Run-key write executed |
-| A hotkey registration failure is returned rather than swallowed (`crates/events`) | `46c0116` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`localplay-cli` tests still pass, the listener is a no-op off Windows) |
+| A hotkey registration failure is returned rather than swallowed (`crates/events`) | `46c0116` | Type-checked for `x86_64-pc-windows-msvc` (`cargo check --target`); the CLI's half is verified on the dev host (`replayed-cli` tests still pass, the listener is a no-op off Windows) |
 | `cargo xtask verify` — the one-command acceptance harness + its report | `dda459b` | Verified on the dev host, where it runs and reports honestly: its clip/trigger/report/parsers/criterion-7 paths all executed, against the stub capture and the software encoder. **It has since run on Windows twice** — 2026-10-15 (§21) and 2026-10-16 (§23) — with two checks still *not performed* |
 | The pipeline **paces capture to a rate it can actually keep**: a startup throughput probe (`encode.adapt_fps`, default on) measures the encoder at the real capture resolution, and `min(configured, measured)` is given to both the pacer and the encoder child — one number, read back out of the encoder's own `-framerate`. **This is a pacing aid and a diagnostic, not the timeline guarantee** (see the two rows below, and §1) | `ae5b7c5`, `1028a0f` | Verified on the dev host: the decision's arithmetic, the new config key, the probe's bounds (a real libx264 probe, a dead encoder, a wedged child), and the pacer/encoder agreement are all covered by tests, and the startup lines below came from real CLI runs. **The probe's accuracy at 4K on an NVIDIA GPU is unverified**: only libx264 (software, content-sensitive) was measurable here, its numbers do not transfer to NVENC (hardware, content-blind), and the probe measures the encode path only — on this host it reported 62 fps where the pipeline achieved 8 |
 | The **media timeline is the frames' arrival timestamps**, not a declared grid: `-fps_mode passthrough` on the video output, so a machine that cannot keep up drops frames (held in the picture) instead of resampling the clock onto `1/R` — the fix for issue #2 | this change | Verified on the dev host end to end: a 4K pipeline that cannot keep up went from **0.660×** to **0.987×** media per wall second against a 0.999× control (table in §1), and the encoder stopped inventing frames (39 delivered → 1631 coded before; 97 → 97 after). A new regression test (`crates/encoder/tests/timeline.rs::a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock`) declares 4× the rate this machine measures and asserts the ratio stays in 0.85–1.15 with no invented frames; with the option removed it fails with `7243ms of video for 3.000694916s of wall clock (2.414x)` and 37972 coded frames for 984 submitted. **Partially verified on Windows** (2026-09-24, §10): the timeline suite ran on the Windows test machine against the *system* ffmpeg 9.0.2 and the starved-pipeline test **passed** there, so `-fps_mode passthrough` behaves as intended on Windows too. What this does **not** cover is the pinned sidecar (`binaries/ffmpeg.exe`), which is still evidenced only by the option's own strings inside the binary; and one sibling assertion in that file — the audio stream's length against the video's — **failed on Windows**, and it turned out to be a real loss of audio rather than a test artefact: the encoder's own queue was too short to ride out a momentary stall in ffmpeg and discarded 760 ms of a 3 s feed (§10.4). |
-| A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`localplay_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
+| A **VFR segment still splices, probes and plays**: `-reset_timestamps 1` keeps every segment at `start_time = 0`, the segmenter still cuts ~1 s segments, and the product's own lossless concat (`replayed_media::edit::concat_lossless`) produces a clip with both streams and every coded frame decodable | this change | Verified on the dev host: `crates/encoder/tests/timeline.rs::the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play` splices starved-pipeline segments and decodes 46 of 46 frames; the recorder's end-to-end clip test and the 4K CLI run both probe with two streams (117/117 frames decoded). The cost is measured and bounded in §1: a clip can be one frame interval per segment short of nominal, and a boundary frame can step the concatenated timeline back by ≤ ~50 ms |
 
-The two startup shapes that change produced, from real `localplay-cli buffer` runs on the
+The two startup shapes that change produced, from real `replayed-cli buffer` runs on the
 dev host (stub capture, `--dev-software-encoder`, so the encoder is libx264 at the stub's
 1280x720 — **these numbers are this host's and say nothing about the Windows test machine's**):
 
 ```text
 # encode.fps = 30, measured far above it: nothing is reduced
-INFO localplay_recorder: encode rate: 326.8fps sustainable at 1280x720 with libx264 (491 frames over 1.5s); encode.fps = 30 is within that, so capture runs at the configured 30fps
+INFO replayed_recorder: encode rate: 326.8fps sustainable at 1280x720 with libx264 (491 frames over 1.5s); encode.fps = 30 is within that, so capture runs at the configured 30fps
 
 # encode.fps = 120 against a 4K output: reduced to the measured rate
-WARN localplay_recorder: encode.fps = 120 is not achievable at 1280x720 on this machine: 61.9fps sustainable at 1280x720 frames scaled to a 3840x2160 output with libx264 (95 frames over 1.5s). Capturing at 61fps instead — the same rate the encoder child is told — so that the capture is not paying a readback and a copy for frames the encoder will throw away. The media timeline does not depend on this rate: frames carry their arrival timestamps, so a clip covers the seconds it was captured over either way. The configured rate was not reached at this resolution: lower encode.output_size (e.g. "1920x1080") or encode.fps to a rate this machine holds, or set encode.adapt_fps = false to declare 120fps anyway and accept the frames that will be dropped and held in the picture.
+WARN replayed_recorder: encode.fps = 120 is not achievable at 1280x720 on this machine: 61.9fps sustainable at 1280x720 frames scaled to a 3840x2160 output with libx264 (95 frames over 1.5s). Capturing at 61fps instead — the same rate the encoder child is told — so that the capture is not paying a readback and a copy for frames the encoder will throw away. The media timeline does not depend on this rate: frames carry their arrival timestamps, so a clip covers the seconds it was captured over either way. The configured rate was not reached at this resolution: lower encode.output_size (e.g. "1920x1080") or encode.fps to a rate this machine holds, or set encode.adapt_fps = false to declare 120fps anyway and accept the frames that will be dropped and held in the picture.
 ```
 
 ---
@@ -426,8 +426,8 @@ the CLI and the desktop shell cannot be cross-checked for MSVC from macOS at all
 
 What a green run proves:
 
-- the whole Rust **workspace test suite** (with `localplay-encoder/test-encoders`) —
-  `cargo test --workspace --features localplay-encoder/test-encoders`, **516 passed, 0 failed,
+- the whole Rust **workspace test suite** (with `replayed-encoder/test-encoders`) —
+  `cargo test --workspace --features replayed-encoder/test-encoders`, **516 passed, 0 failed,
   1 ignored** in that run (the count was 375 at the pass this section was written for, and it
   has grown with every phase since);
 - **`cargo check` for `x86_64-pc-windows-msvc`** of the cross-checkable crates
@@ -446,7 +446,7 @@ What a green run does **not** prove — quoted from the workflow's own header:
   desktop, so it executes the *tests*, not the capture path.)
 - **No GUI window.** "No window is opened, the screen is never captured and no input is
   synthesised."
-- **`localplay-store`, `localplay-recorder`, `localplay-cli` and the desktop shell are not
+- **`replayed-store`, `replayed-recorder`, `replayed-cli` and the desktop shell are not
   cross-checked for Windows from the macOS host**, because rusqlite's bundled SQLite C
   source cannot be built for MSVC from macOS. They are host-verified *there*, and the
   macOS job cannot carry that check — which is not the same as unverifiable: the
@@ -578,7 +578,7 @@ $ gh run view 35904179918 --log-failed
   leaving it to be discovered in the file. One combination is refused rather than recorded —
   `enabled = false` with a microphone — by the recorder before anything is opened, and again by
   `FfmpegEncoder::spawn` as the backstop: a container's audio tracks are named by position, so
-  `localplay_media::edit::audio_titles` would call a one-track recording of a voice
+  `replayed_media::edit::audio_titles` would call a one-track recording of a voice
   `Game Audio`. The two keys beside it are fail-closed as before: `source` and `codec` each have
   one implemented value (`"loopback"`, `"aac"`) and anything else is refused by
   `Config::validate`, which names what *is* implemented rather than recording something else.
@@ -603,7 +603,7 @@ input (the trigger is always an in-process call).
 | Item | Level | Evidence / what it would take |
 |---|---|---|
 | The chord is parsed once and normalised for display (`Ctrl+F8`) | Verified on the dev host | `crates/events/src/hotkey.rs` tests: parse, display round trip, a chord with no main key rejected |
-| A `RegisterHotKey` failure is returned to the caller, naming the chord, instead of being swallowed | Type-checked only | `cargo check -p localplay-events --target x86_64-pc-windows-msvc`. Registering a chord needs a Windows message queue, so no test has ever produced either outcome on a real machine |
+| A `RegisterHotKey` failure is returned to the caller, naming the chord, instead of being swallowed | Type-checked only | `cargo check -p replayed-events --target x86_64-pc-windows-msvc`. Registering a chord needs a Windows message queue, so no test has ever produced either outcome on a real machine |
 | The GUI installs the hotkey from `[hotkeys] clip` and a press takes a clip through `RecorderHost::clip_now` — the same call the button and the CLI make | Verified on the dev host | `background::install_hotkey` (the suite exercises the "no global hotkey off Windows" branch) and `commands/recorder.rs::one_hotkey_press_writes_exactly_one_clip_through_the_recorder`, which drives a **real** recording end to end and asserts exactly one clip file, one index row and one clip in the engine's counter |
 | **The keypress itself** — that pressing the chord reaches that listener on a real machine | **Unverified** | Needs Windows and a keyboard. `RegisterHotKey` + `GetMessageW` is the CLI's own path (and the CLI's hotkey was exercised interactively in the 2026-09-23 session), but the desktop app's wiring of it has never run |
 | The tray's state: icon choice, tooltip, and the labels that follow the setting | Verified on the dev host (as data) | `background.rs` tests over `TrayView` / `MenuAction`; the three icons are decoded by a test (`the_tray_icons_are_decodable_pngs_of_one_size`) |
@@ -660,14 +660,14 @@ observation; the Phase 1 runbook
 
 1. **`cargo xtask probe`** — confirms which hardware encoders this machine can actually open.
    Cheap, no capture. Confirms the encoder half of the path.
-2. **`cargo run --release -p localplay-cli -- buffer`** on the 4K display for ~40 s, then
+2. **`cargo run --release -p replayed-cli -- buffer`** on the 4K display for ~40 s, then
    read the debug line. Look for: **`skipped=` non-zero** (the readback skip, `dd921b3`)
    and **`dropped=` falling to zero** with **`fps=` reaching the configured rate** — this is
    the *only* thing that can neither be tested nor type-checked for the readback skip. Also
    re-measures **criteria 1 and 6** (issue #1).
 3. **Take one clip and `ffprobe` it** — re-confirms criteria 3/4/5/8 on the current
    build. Use the self-test trigger rather than a scripted keypress:
-   `cargo run --release -p localplay-cli -- buffer --self-test-clip-after 45` (it calls the
+   `cargo run --release -p replayed-cli -- buffer --self-test-clip-after 45` (it calls the
    hotkey's own `clip_now()`; no synthetic input), then press `Ctrl+F8` once by hand, when
    you are at the keyboard, to confirm the global hotkey itself fires. (The black-frame
    defect is already resolved — see §2 — so this is a regression check, not the dispute it
@@ -714,7 +714,7 @@ observation; the Phase 1 runbook
     Explorer, or its folder when the file does not exist), and quit — quitting while
     recording must flush the encoder (the clip written before the quit must be complete).
 13. **Set `[app] start_with_system = true`, restart the app, and check `reg query
-    HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v localplay`.** Then set it back
+    HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v replayed`.** Then set it back
     to `false`, restart, and check the value is gone and nothing else in the Run key was
     touched. Nothing has ever written that value.
 
@@ -729,19 +729,19 @@ no `git`), then `cargo test`. The toolchain is cargo/rustc 1.98.1 and the *syste
 
 ### 10.1 What ran, and what it proved
 
-`cargo test --workspace --features localplay-encoder/test-encoders --no-fail-fast`, in a remote-shell
+`cargo test --workspace --features replayed-encoder/test-encoders --no-fail-fast`, in a remote-shell
 session (session 0, no desktop):
 
 | Crate | Result |
 |---|---|
-| `localplay-capture` | 27 passed |
-| `localplay-encoder` | 22 + 3 + 2 passed; **1 failed** (§10.4) |
-| `localplay-events` | 151 + 8 + 10 + 11 + 4 passed, plus doc-tests |
-| `localplay-media` | 34 + 2 passed; **1 failed** (§10.3), now fixed |
-| `localplay-recorder` | 58 passed |
-| `localplay-replay` | 22 + 1 passed |
-| `localplay-store` | 59 + 5 + 12 passed |
-| `localplay-cli` | 18 + 1 + 2 + 2 + 3 passed; the capture test refused (§10.2) |
+| `replayed-capture` | 27 passed |
+| `replayed-encoder` | 22 + 3 + 2 passed; **1 failed** (§10.4) |
+| `replayed-events` | 151 + 8 + 10 + 11 + 4 passed, plus doc-tests |
+| `replayed-media` | 34 + 2 passed; **1 failed** (§10.3), now fixed |
+| `replayed-recorder` | 58 passed |
+| `replayed-replay` | 22 + 1 passed |
+| `replayed-store` | 59 + 5 + 12 passed |
+| `replayed-cli` | 18 + 1 + 2 + 2 + 3 passed; the capture test refused (§10.2) |
 | `xtask` | 44 passed, 1 ignored |
 
 Two things this settles that no amount of type-checking could:
@@ -785,7 +785,7 @@ Two caveats, stated rather than glossed:
   nothing to say which was the game and which the microphone. **Fixed**: the cause was that a
   `-c copy` through the concat demuxer does not carry per-stream metadata, measured with and
   without `-map_metadata 0`, so the concat now re-applies the names it knows
-  (`localplay_media::edit::audio_titles`, which the encoder also reads them from). The
+  (`replayed_media::edit::audio_titles`, which the encoder also reads them from). The
   regression test is `crates/media/tests/lossless.rs::concat_keeps_the_audio_track_names_the_encoder_wrote`,
   and removing the fix makes it fail with `[None, None]`.
 * **The pipeline could not hold 30fps at 4K** and said so itself:
@@ -895,7 +895,7 @@ supply:
 
 ### 10.6 One consequence worth knowing
 
-`localplay-cli` **exits** when the clip hotkey cannot be registered — deliberate, and the
+`replayed-cli` **exits** when the clip hotkey cannot be registered — deliberate, and the
 comment explains why (a buffer run whose chord does nothing is not worth starting). The
 2026-09-24 session showed what that means in practice: **the CLI cannot run at all from a remote shell,
 as a service, or on a headless box**, and neither can `--mode session`, which records
@@ -906,7 +906,7 @@ rather than in a bug report later.
 ### 10.7 The encoder's tests had not built on Windows for three weeks
 
 Found on 2026-10-15, trying to run the whole crate after the §10.4 fix: **`cargo test -p
-localplay-encoder` did not compile for `x86_64-pc-windows-msvc` at all.** Three errors, in two
+replayed-encoder` did not compile for `x86_64-pc-windows-msvc` at all.** Three errors, in two
 test modules:
 
 | site | what it was | introduced by |
@@ -919,8 +919,8 @@ file (`--test timeline`), which builds only that target; and this repository's o
 is a `cargo check` of the *libraries*, which never compiles `#[cfg(test)]` code:
 
 ```
-cargo check -p localplay-capture -p localplay-encoder -p localplay-events \
-            -p localplay-replay -p localplay-media -p xtask --target x86_64-pc-windows-msvc
+cargo check -p replayed-capture -p replayed-encoder -p replayed-events \
+            -p replayed-replay -p replayed-media -p xtask --target x86_64-pc-windows-msvc
 ```
 
 So the platform the product ships on could not run the crate's tests, and had not been able to
@@ -937,11 +937,11 @@ that added the shutdown test had also stranded the dead-writer test's doc commen
 test, so the doc went back to the function it describes.
 
 **And the gate now looks at the tests.** The CI cross-check step gained `--tests` and
-`--features localplay-encoder/test-encoders` (the feature the workspace suite uses: without it
+`--features replayed-encoder/test-encoders` (the feature the workspace suite uses: without it
 `EncodeConfig::for_tests_software` does not exist and `crates/encoder/tests/stream_output.rs`
 cannot be checked either). Verified locally against `x86_64-pc-windows-msvc`: the whole
 cross-check list now compiles with its tests, and the encoder's library-only check still reports
-only its pre-existing unused-import warning. `localplay-media` and `localplay-events` already
+only its pre-existing unused-import warning. `replayed-media` and `replayed-events` already
 gated their own unix-only test code properly, so the encoder was the whole of it.
 
 On the Windows test machine the whole crate is green and has run there for the first time since 2026-09-25:
@@ -1073,7 +1073,7 @@ only.
 
 | Target | Result |
 |---|---|
-| `localplay-recorder --lib` | **60 passed, 0 failed** — reproduced **4 consecutive times** |
+| `replayed-recorder --lib` | **60 passed, 0 failed** — reproduced **4 consecutive times** |
 | `buffering_writes_nothing_to_disk_and_only_a_saved_clip_does` | **ok** — constraint 1, on Windows |
 | `a_recorder_records_produces_a_clip_and_stops_cleanly` (buffer mode, RAM ring) | **ok** |
 | `a_clip_records_why_it_was_taken` | **ok** |
@@ -1085,9 +1085,9 @@ revision to a second directory and running the same three targets:
 
 | Target | at `0ec7142` | at the RAM commit |
 |---|---|---|
-| `localplay-cli --test self_test_clip` | **FAILED** | FAILED — pre-existing (this is §10.6's hotkey defect) |
-| `localplay-encoder --test timeline` | **FAILED** | FAILED — pre-existing |
-| `localplay-recorder --lib` | ok. 58 passed | 1 failure in the workspace-wide run, **4/4 clean** in its own suite |
+| `replayed-cli --test self_test_clip` | **FAILED** | FAILED — pre-existing (this is §10.6's hotkey defect) |
+| `replayed-encoder --test timeline` | **FAILED** | FAILED — pre-existing |
+| `replayed-recorder --lib` | ok. 58 passed | 1 failure in the workspace-wide run, **4/4 clean** in its own suite |
 
 The one recorder failure was `a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_pass`,
 asserting the status had dropped its game after the session ended. It is **not** a regression from
@@ -1137,8 +1137,8 @@ and **three of those were tests whose subject was not the ring at all**:
 
 | What named it | What was actually being tested | What happened |
 |---|---|---|
-| `apps/localplay-cli/tests/post_roll.rs` | the post-roll wait — the §10 bug where the wait starved ffmpeg | **retargeted** at the in-memory ring. Still three tests, now over the shipping path |
-| `apps/localplay-cli/tests/clip_index.rs` | the index — splice, index, evict | **retargeted**. The ring was only its clip producer |
+| `apps/replayed-cli/tests/post_roll.rs` | the post-roll wait — the §10 bug where the wait starved ffmpeg | **retargeted** at the in-memory ring. Still three tests, now over the shipping path |
+| `apps/replayed-cli/tests/clip_index.rs` | the index — splice, index, evict | **retargeted**. The ring was only its clip producer |
 | `crates/replay/tests/end_to_end_clip.rs` | the file ring, end to end | **deleted** with its subject |
 | `crates/replay/src/buffer.rs` | the ring and its ledger numbering | **deleted**; `BufferConfig` and `BufferStats` stay, both still used by the recorder |
 
@@ -1177,7 +1177,7 @@ with the fix in place" and that no number from the Windows test machine had been
 
 `schtasks /create … /it` so the CLI ran in **session 1** (`Logon Mode: Interactive only`, with
 `explorer` running), from the **release** build of the current tree, against
-`%LOCALAPPDATA%\localplay\config.toml` — a copy of the shipped `config.example.toml`, so the fps,
+`%LOCALAPPDATA%\replayed\config.toml` — a copy of the shipped `config.example.toml`, so the fps,
 output size and window are what a fresh install would use. `RUST_LOG=debug`, 180 s of capture, and
 the CLI's own `--self-test-clip-after 180` to end it. A running League client or game aborts the run
 before it starts: this captures the screen, which is not done while a protected game is up. Measured
@@ -1461,7 +1461,7 @@ than discovered later:
 
   | | `zero_copy = false` (readback) | `zero_copy = true` (hybrid) |
   |---|---|---|
-  | `localplay-cli` CPU | 119.37% of one core | **4.18%** |
+  | `replayed-cli` CPU | 119.37% of one core | **4.18%** |
   | its `ffmpeg` child | 156.10% | 4.07% |
   | both processes | **275.47%** | **8.25%** |
   | CLI peak RSS | 363 MB | 327 MB |
@@ -1473,7 +1473,7 @@ than discovered later:
   The readback path spent ~2.75 cores of CPU to write 86 MB; the hybrid spent ~0.08 cores to write
   181 MB, over windows of the same length (43.0 s and 44.5 s of steady state). **That is worse for the
   shipping path than §13's 88.9% alone suggested, and the difference is the instrument**: §13 and
-  `xtask verify` read the `localplay-cli` process, and at 4K/60 with the loopback track live the
+  `xtask verify` read the `replayed-cli` process, and at 4K/60 with the loopback track live the
   copy out of VRAM costs the CLI more than a core *and* hands ~1.5 cores of encode to a child that
   number does not contain. The hybrid is the only path whose encoder runs inside the process being
   measured (the MFT is in-process; the readback path encodes in the `ffmpeg` child), so a CLI-only
@@ -1573,7 +1573,7 @@ recording has no such input" is one absence rule for both instead of two.
 
 One combination is refused rather than recorded: `enabled = false` together with
 `[mic] enabled = true`. A container's audio tracks are named by position and
-`localplay_media::edit::audio_titles` calls the first one `Game Audio`, so a one-track
+`replayed_media::edit::audio_titles` calls the first one `Game Audio`, so a one-track
 recording of a voice would be labelled as the game's own audio — a file that says one thing and
 holds another, which is the class of defect this ledger exists to catch. It is refused in
 `Recorder::start_with_options` before anything is opened, and again in `FfmpegEncoder::spawn`
@@ -1700,7 +1700,7 @@ intermittent failure of the same kind, and it is recorded rather than re-run awa
 
 **What is known.** The runs either side of it on `main` are green (`b6d0a1d`, 4m7s; `f4dbf10`,
 4m57s). Locally the test passes five times in a row, and a full
-`cargo test --workspace --features localplay-encoder/test-encoders` passes with 35 `test result:
+`cargo test --workspace --features replayed-encoder/test-encoders` passes with 35 `test result:
 ok` lines and `EXIT=0`. So it is neither caused by that commit (text only) nor deterministic.
 
 **What is not.** The mechanism. `ring_of_stub_capture(6)` builds its ring from a **real-time**
@@ -1731,10 +1731,10 @@ and everything it says about a *real* capture path — was **compiled and never 
 2026-10-15, on the Windows test machine, in Session 1, against the released CLI at the tip:
 
 ```
-xtask.exe verify --seconds 60 --report … --cli target\release\localplay-cli.exe
+xtask.exe verify --seconds 60 --report … --cli target\release\replayed-cli.exe
 ```
 
-The harness wrote its own `RUN_CONFIG` into `%LOCALAPPDATA%\localplay\config.toml` (the user's
+The harness wrote its own `RUN_CONFIG` into `%LOCALAPPDATA%\replayed\config.toml` (the user's
 file was backed up and restored around the run), captured the primary monitor at 3840x2160/30fps
 through Windows Graphics Capture, encoded with `h264_nvenc` and wrote its report. **The sampler
 ran for the whole run, on Windows, for the first time**: samples every 2 s from t = 2.0 s to
@@ -1760,7 +1760,7 @@ a real startup failure naming `h264_amf`.
 | row | what it saw | reading |
 |---|---|---|
 | 12 `dropped` | `dropped=1 dropped_audio=0` of 1955 frames | one frame refused at the capture→encoder handover over 65 s at 30fps — §18's handover finding in miniature, and on a run that is otherwise clean. |
-| 16 `eviction` | "no seg-*.mp4 under `…\target/verify/work\appdata\localplay\scratch`", while the status line reported `segments=10` | the check wants the lowest *surviving* segment number to be greater than 0; it found no segment files at all. The run's own `segments=10` says the segments existed — but in **RAM**, not on disk: buffer mode writes nothing while it buffers (§12), so the scratch directory is empty by design and the row can never pass there. It was made *not performed* with that reason (§23), and has since been rewritten to read the ring's `evicted=` counter instead of looking for files on disk (§25). |
+| 16 `eviction` | "no seg-*.mp4 under `…\target/verify/work\appdata\replayed\scratch`", while the status line reported `segments=10` | the check wants the lowest *surviving* segment number to be greater than 0; it found no segment files at all. The run's own `segments=10` says the segments existed — but in **RAM**, not on disk: buffer mode writes nothing while it buffers (§12), so the scratch directory is empty by design and the row can never pass there. It was made *not performed* with that reason (§23), and has since been rewritten to read the ring's `evicted=` counter instead of looking for files on disk (§25). |
 | 23 `clip_duration` | 9020 ms against 8000 ms ± 500, "off by 1020ms" | the clip's own video is 9002 ms and its audio 9003 ms (row 27), so the file is ~1 s longer than the 5 s pre + 3 s post window asks for. §16 established that a container's duration is not the window and moved the *desktop* clip test onto the video stream; this harness row still bounds the duration, so it is measuring what §16 says not to measure — and the ~1 s itself is worth understanding separately, because §13 measured only ~190 ms of padding on the stub path. |
 
 **One row was not performed**: 18 `silence_detector` — the warning it looks for fires only on a
@@ -1911,7 +1911,7 @@ this sweep.
 | change | issue | what it fixes |
 |---|---|---|
 | `Prepared::begin` returns the index connection on every failure path | #29 | one transient start failure no longer bricks games mode for the process lifetime |
-| the clip splice moved off the pump thread onto `localplay-splice` | #30 | a clip no longer punches a frozen-picture hole into the recording it was cut from |
+| the clip splice moved off the pump thread onto `replayed-splice` | #30 | a clip no longer punches a frozen-picture hole into the recording it was cut from |
 | event markers carry their **occurrence** time, not their handling time | #31 | a kill chapter is no longer up to `coalesce.max` (18 s) late |
 | `started_at_ms` comes from the **resolved** window | #31 | chapter offsets are no longer off by up to one segment |
 | the post-roll budget is `post_ms + 2*segment_ms + margin` | #32 | clips no longer time out when `segment_time >= 6` |

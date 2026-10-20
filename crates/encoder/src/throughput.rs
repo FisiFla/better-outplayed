@@ -8,7 +8,7 @@
 //! (a held frame in the picture) while the clock stays honest.
 //!
 //! What this number answers is how fast this machine encodes at the resolution and with the
-//! encoder that will be used. Pacing capture to it (`localplay_recorder::FpsDecision`) stops the
+//! encoder that will be used. Pacing capture to it (`replayed_recorder::FpsDecision`) stops the
 //! pipeline paying for captures (on Windows a 33 MB GPU-to-CPU readback each) that the encoder
 //! would throw away, and tells a user that `encode.fps = 30` is not reachable at 4K here.
 //!
@@ -44,7 +44,7 @@
 use crate::ffmpeg::{video_input_args, video_output_args};
 use crate::EncodeConfig;
 use anyhow::{bail, Context, Result};
-use localplay_media::{ffmpeg_reason, wait_with_deadline, FfmpegBinaries};
+use replayed_media::{ffmpeg_reason, wait_with_deadline, FfmpegBinaries};
 use std::io::Write;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -121,7 +121,7 @@ fn measure_with_drain(
         budget.as_secs_f64()
     );
 
-    let mut cmd = localplay_media::sidecar_command(&bin.ffmpeg);
+    let mut cmd = replayed_media::sidecar_command(&bin.ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(video_input_args(cfg))
         .args(video_output_args(cfg))

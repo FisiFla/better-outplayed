@@ -11,11 +11,11 @@
 //! # What these commands do not do
 //!
 //! No command here captures the screen, enumerates windows or synthesises input, and none
-//! re-encodes: `trim_clip` is [`localplay_media::edit::trim_lossless`], a stream copy
+//! re-encodes: `trim_clip` is [`replayed_media::edit::trim_lossless`], a stream copy
 //! (`-c copy`), and the UI says so.
 
-use localplay_media::FfmpegBinaries;
-use localplay_store::Store;
+use replayed_media::FfmpegBinaries;
+use replayed_store::Store;
 use std::path::{Path, PathBuf};
 
 mod clips;
@@ -60,7 +60,7 @@ impl AppPaths {
         Self {
             clips_dir,
             thumbnails_dir: app_data_dir.join("thumbnails"),
-            db_path: app_data_dir.join("localplay.db"),
+            db_path: app_data_dir.join("replayed.db"),
         }
     }
 

@@ -50,8 +50,8 @@ impl fmt::Display for SchemaError {
             ),
             SchemaError::TooNew { found, supported } => write!(
                 f,
-                "the config file uses schema version {found}, but this version of localplay \
-                 only understands up to {supported}; update localplay (the file was left \
+                "the config file uses schema version {found}, but this version of replayed \
+                 only understands up to {supported}; update replayed (the file was left \
                  untouched)"
             ),
         }
@@ -183,7 +183,7 @@ mod tests {
                 supported: CURRENT_SCHEMA_VERSION
             }
         );
-        assert!(err.to_string().contains("update localplay"));
+        assert!(err.to_string().contains("update replayed"));
         assert!(matches!(
             check("schema_version = 999999999999\n"),
             Err(ParseError::Schema(SchemaError::TooNew { .. }))

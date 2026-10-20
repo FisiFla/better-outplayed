@@ -372,7 +372,7 @@ pub fn smoke_test_encoder(bin: &FfmpegBinaries, encoder: &str) -> Result<(), Str
 /// become a wall of text in a log or table.
 ///
 /// Public because it is the only actionable diagnosis of a failing ffmpeg child, and the
-/// encoder's probes (`localplay_encoder::probe`, `localplay_encoder::throughput`) must report
+/// encoder's probes (`replayed_encoder::probe`, `replayed_encoder::throughput`) must report
 /// the same words rather than a paraphrase.
 pub fn ffmpeg_reason(stderr: &str) -> String {
     let lines: Vec<&str> = stderr

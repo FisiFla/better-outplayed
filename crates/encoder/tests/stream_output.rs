@@ -14,10 +14,10 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::{edit, FfmpegBinaries, FragmentSplitter, MediaInfo};
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::{edit, FfmpegBinaries, FragmentSplitter, MediaInfo};
 use std::io::Read;
 use std::time::{Duration, Instant};
 
@@ -186,7 +186,7 @@ fn the_fragments_remux_into_a_playable_clip_with_both_streams() {
     let stream_path = dir.path().join("assembled.mp4");
     std::fs::write(&stream_path, &assembled).expect("writing the assembled stream");
 
-    // The clip path: `-c copy`, no re-encoding (`localplay_media::edit`'s remux).
+    // The clip path: `-c copy`, no re-encoding (`replayed_media::edit`'s remux).
     let clip_path = dir.path().join("clip.mp4");
     edit::remux_lossless(&bin, &stream_path, &clip_path).expect("the clip must remux");
 

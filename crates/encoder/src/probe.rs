@@ -2,7 +2,7 @@
 
 use crate::{Vendor, VideoCodec};
 use anyhow::{bail, Context, Result};
-use localplay_media::{smoke_test_encoder, FfmpegBinaries};
+use replayed_media::{smoke_test_encoder, FfmpegBinaries};
 use std::sync::{Mutex, OnceLock};
 
 /// Vendors tried, in order, for `vendor = "auto"`.
@@ -76,7 +76,7 @@ fn select_usable(
          it: that list names every encoder ffmpeg was built with, including ones whose \
          vendor runtime is not installed. Install the GPU vendor runtime (NVIDIA driver / \
          Intel graphics driver / AMD Adrenalin), or set encode.vendor to a vendor this \
-         machine has. localplay will not fall back to CPU encoding because it would cost \
+         machine has. replayed will not fall back to CPU encoding because it would cost \
          game performance.",
         outcome.join("; ")
     )
@@ -85,7 +85,7 @@ fn select_usable(
 /// Encoder names ffmpeg advertises. `-encoders` lines look like:
 /// ` V....D h264_nvenc  NVIDIA NVENC H.264 encoder (codec h264)`.
 fn advertised_encoders(bin: &FfmpegBinaries) -> Result<Vec<String>> {
-    let out = localplay_media::sidecar_command(&bin.ffmpeg)
+    let out = replayed_media::sidecar_command(&bin.ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
         .with_context(|| format!("running {}", bin.ffmpeg.display()))?;

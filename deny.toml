@@ -21,7 +21,7 @@ allow = [
 # vendored SQLite, and pinning one version of it is a rusqlite decision, not ours.
 multiple-versions = "warn"
 # A wildcard requirement is a version nobody reviewed. It stays allowed because
-# cargo-deny cannot tell a wildcard from a workspace inheritance (`localplay-media.workspace
+# cargo-deny cannot tell a wildcard from a workspace inheritance (`replayed-media.workspace
 # = true` is not a wildcard, but it reads as one), and denying it would fail the audit on
 # the project's own manifests.
 wildcards = "allow"

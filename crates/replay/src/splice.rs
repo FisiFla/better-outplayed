@@ -2,14 +2,14 @@
 
 use crate::window::SegmentWindow;
 use anyhow::{bail, Result};
-use localplay_media::{edit, FfmpegBinaries};
+use replayed_media::{edit, FfmpegBinaries};
 use std::path::{Path, PathBuf};
 
 /// The concat-list path escaping, re-exported for existing importers. It lives in
-/// `localplay_media::edit` beside the concat invocation whose list it renders; the splicer and
+/// `replayed_media::edit` beside the concat invocation whose list it renders; the splicer and
 /// the recorder's session finalise both build lists, and two copies of the Windows escaping are
 /// two places to get it wrong.
-pub use localplay_media::edit::concat_list_path;
+pub use replayed_media::edit::concat_list_path;
 
 #[derive(Debug, Clone)]
 pub struct ClipMetadata {
@@ -30,7 +30,7 @@ impl ClipSplicer {
     /// The layout check and size-derived budget are shared with the recorder's session finalise,
     /// being the same operation. Without them this path called `concat_lossless` with no `-map` and
     /// silently dropped the microphone track from any clip cut from a session recorded with one,
-    /// with exit status 0 (see `localplay_media::edit::concat_lossless`).
+    /// with exit status 0 (see `replayed_media::edit::concat_lossless`).
     pub fn splice(
         bin: &FfmpegBinaries,
         window: &SegmentWindow,
@@ -55,7 +55,7 @@ impl ClipSplicer {
         let _ = std::fs::remove_file(&list);
         concat?;
 
-        let info = localplay_media::MediaInfo::probe(bin, out)?;
+        let info = replayed_media::MediaInfo::probe(bin, out)?;
         log_drift(out, &info);
 
         Ok(ClipMetadata {
@@ -105,9 +105,9 @@ impl ClipSplicer {
         encoder: &str,
         audio_tracks: usize,
     ) -> Result<ClipMetadata> {
-        localplay_media::edit::remux_stream_lossless(bin, bytes, out, audio_tracks)?;
+        replayed_media::edit::remux_stream_lossless(bin, bytes, out, audio_tracks)?;
 
-        let info = localplay_media::MediaInfo::probe(bin, out)?;
+        let info = replayed_media::MediaInfo::probe(bin, out)?;
         log_drift(out, &info);
 
         Ok(ClipMetadata {
@@ -125,7 +125,7 @@ impl ClipSplicer {
 /// The offset is within the produced clip (audio against video stream timelines of the muxed
 /// file), not the QPC-clock divergence between the live capture sources, which would need
 /// instrumenting the capture path.
-fn log_drift(out: &Path, info: &localplay_media::MediaInfo) {
+fn log_drift(out: &Path, info: &replayed_media::MediaInfo) {
     let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
     match info.av_drift() {
         Some(d) => tracing::info!(

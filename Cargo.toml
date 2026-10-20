@@ -8,7 +8,7 @@ members = [
     "crates/media",
     "crates/events",
     "crates/store",
-    "apps/localplay-cli",
+    "apps/replayed-cli",
     "xtask",
 ]
 # The Phase 2 desktop shell is a workspace of its own, and deliberately not a member:
@@ -23,7 +23,7 @@ exclude = ["apps/desktop/src-tauri"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/FisiFla/better-outplayed"
+repository = "https://github.com/FisiFla/replayed"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -43,12 +43,12 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # The test leaf must be RSA: macOS Security.framework (native-tls `Identity::from_pkcs8`)
 # cannot import an EC PKCS#8 key.
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
-localplay-capture = { path = "crates/capture" }
-localplay-encoder = { path = "crates/encoder" }
-localplay-replay  = { path = "crates/replay" }
-localplay-media   = { path = "crates/media" }
-localplay-events  = { path = "crates/events" }
-localplay-store   = { path = "crates/store" }
+replayed-capture = { path = "crates/capture" }
+replayed-encoder = { path = "crates/encoder" }
+replayed-replay  = { path = "crates/replay" }
+replayed-media   = { path = "crates/media" }
+replayed-events  = { path = "crates/events" }
+replayed-store   = { path = "crates/store" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

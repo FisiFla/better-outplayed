@@ -1,6 +1,6 @@
 //! The in-memory replay ring and the thread that feeds it.
 //!
-//! `localplay_replay::MemoryRingBuffer` holds the footage (it takes bytes, so its rules are testable
+//! `replayed_replay::MemoryRingBuffer` holds the footage (it takes bytes, so its rules are testable
 //! without a pipe); this owns the reader thread on the encoder's output pipe and the lock that
 //! lets the pump query the span while the reader adds to it.
 //!
@@ -19,8 +19,8 @@
 //! lock would block the reader, fill the pipe, stall ffmpeg's stdin and the recording still running.
 
 use anyhow::{bail, Context, Result};
-use localplay_media::FfmpegBinaries;
-use localplay_replay::{MemoryRingBuffer, MemoryStats};
+use replayed_media::FfmpegBinaries;
+use replayed_replay::{MemoryRingBuffer, MemoryStats};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ChildStdout;
@@ -91,7 +91,7 @@ fn start_sink(path: &Path, capacity: usize) -> Result<(SinkFeed, JoinHandle<()>,
     let failure = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&failure);
     let writer = std::thread::Builder::new()
-        .name("localplay-session-writer".into())
+        .name("replayed-session-writer".into())
         .spawn(move || {
             while let Ok(chunk) = rx.recv() {
                 if let Err(err) = file.write_all(&chunk) {
@@ -185,7 +185,7 @@ impl MemoryRing {
         let ring = Arc::clone(&shared);
         let slot = Arc::clone(&failure);
         let reader = std::thread::Builder::new()
-            .name("localplay-ram-ring".into())
+            .name("replayed-ram-ring".into())
             .spawn(move || {
                 // A panic would otherwise kill this thread silently and show up only as short clips later; catch, name and record it.
                 let hook = Arc::clone(&slot);
@@ -291,7 +291,7 @@ impl MemoryRing {
         &self,
         trigger_ms: u64,
         stem: &str,
-    ) -> Result<localplay_replay::splice::ClipMetadata> {
+    ) -> Result<replayed_replay::splice::ClipMetadata> {
         self.trigger_window(trigger_ms, stem, self.pre_ms, self.post_ms)
     }
 
@@ -311,7 +311,7 @@ impl MemoryRing {
         stem: &str,
         pre_ms: u64,
         post_ms: u64,
-    ) -> Result<localplay_replay::splice::ClipMetadata> {
+    ) -> Result<replayed_replay::splice::ClipMetadata> {
         let out = self.clips_dir.join(format!("{stem}.mp4"));
         let source = self.clip_source(trigger_ms, pre_ms, post_ms)?;
         source.splice(&self.bin, &out, &self.encoder)

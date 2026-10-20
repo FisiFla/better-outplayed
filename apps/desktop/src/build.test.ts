@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
  * bundled typefaces must actually be emitted.
  */
 describe('production build', () => {
-  const outDir = mkdtempSync(join(tmpdir(), 'localplay-build-'));
+  const outDir = mkdtempSync(join(tmpdir(), 'replayed-build-'));
   let assets: string[] = [];
 
   beforeAll(async () => {

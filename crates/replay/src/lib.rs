@@ -1,4 +1,4 @@
-//! localplay replay buffer: the in-memory ring, segment ledger, window resolution, clip splicing.
+//! replayed replay buffer: the in-memory ring, segment ledger, window resolution, clip splicing.
 //!
 //! [`MemoryRingBuffer`] keeps footage as fragments in RAM, so a buffer merely waiting for
 //! something worth clipping writes nothing to disk, and a clip is spliced straight out of

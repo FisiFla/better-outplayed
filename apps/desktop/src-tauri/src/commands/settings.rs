@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::config::{EngineOptionsConfig, SettingEdit};
-use localplay_recorder::RecorderOptions;
+use replayed_recorder::RecorderOptions;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -697,30 +697,30 @@ mod tests {
         // What `lib.rs` hands to the runtime asset-protocol scope: playback is scoped to the clips
         // directory, with the thumbnails cache served alongside. Nothing else in the filesystem is
         // reachable from the webview.
-        let dir = PathBuf::from("/app-data/localplay");
+        let dir = PathBuf::from("/app-data/replayed");
         let paths = AppPaths::resolve(&dir, "");
         assert_eq!(
             paths.asset_roots(),
             [
-                Path::new("/app-data/localplay/clips"),
-                Path::new("/app-data/localplay/thumbnails")
+                Path::new("/app-data/replayed/clips"),
+                Path::new("/app-data/replayed/thumbnails")
             ]
         );
         assert_eq!(
             paths.db_path,
-            dir.join("localplay.db"),
+            dir.join("replayed.db"),
             "the same index file the CLI uses"
         );
 
         // A configured clips directory is honoured, and is still the first asset root.
-        let custom = AppPaths::resolve(&dir, "/mnt/games/localplay-clips");
+        let custom = AppPaths::resolve(&dir, "/mnt/games/replayed-clips");
         assert_eq!(
             custom.clips_dir,
-            PathBuf::from("/mnt/games/localplay-clips")
+            PathBuf::from("/mnt/games/replayed-clips")
         );
         assert_eq!(
             custom.asset_roots()[0],
-            Path::new("/mnt/games/localplay-clips")
+            Path::new("/mnt/games/replayed-clips")
         );
     }
 }

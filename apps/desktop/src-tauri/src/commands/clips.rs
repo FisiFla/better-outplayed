@@ -1,10 +1,10 @@
 //! Clip commands: list, metadata, trim, thumbnail, delete, and the path helpers they share.
 
 use super::*;
-use localplay_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
-use localplay_media::probe::MediaInfo;
-use localplay_store::cleanup::{plan_cleanup, CleanupPolicy};
-use localplay_store::{Clip, NewClip, Store};
+use replayed_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
+use replayed_media::probe::MediaInfo;
+use replayed_store::cleanup::{plan_cleanup, CleanupPolicy};
+use replayed_store::{Clip, NewClip, Store};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------------------
@@ -146,7 +146,7 @@ pub fn set_favourite(deps: &Deps<'_>, id: i64, favourite: bool) -> Result<ClipDt
 }
 
 /// Rename a clip: set its display title (blank clears it back to the file name). The file on
-/// disk is deliberately not renamed — see `localplay_store::V5_CLIP_COLUMNS`.
+/// disk is deliberately not renamed — see `replayed_store::V5_CLIP_COLUMNS`.
 pub fn set_clip_title(deps: &Deps<'_>, id: i64, title: &str) -> Result<ClipDto, CommandError> {
     let updated = deps.store.set_clip_title(id, title).map_err(|e| {
         CommandError::new(
@@ -229,7 +229,7 @@ pub(super) fn inherit_metadata(
 /// Cut `[start_ms, end_ms)` out of clip `id` into a new file next to the original, and index the
 /// result.
 ///
-/// The cut is [`localplay_media::edit::trim_lossless`], a stream copy; nothing here may
+/// The cut is [`replayed_media::edit::trim_lossless`], a stream copy; nothing here may
 /// re-encode an export. What a stream copy can cut is bounded by the stream itself (cuts snap to
 /// keyframes) rather than by the requested millisecond, so the returned clip reports the probed
 /// duration of the file actually written, not the requested span. The UI shows the two side by
@@ -717,7 +717,7 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::commands::test_support::*;
-    use localplay_media::binaries::run_with_timeout;
+    use replayed_media::binaries::run_with_timeout;
     use std::time::Duration;
 
     // -- list_clips ----------------------------------------------------------------------
@@ -1057,7 +1057,7 @@ mod tests {
 
         // Negative control: the same span, re-encoded, is a different byte stream.
         let re_encoded = f.paths.clips_dir.join("re-encoded.mp4");
-        let mut cmd = localplay_media::sidecar_command(&f.bins.ffmpeg);
+        let mut cmd = replayed_media::sidecar_command(&f.bins.ffmpeg);
         cmd.args(["-v", "error", "-y", "-ss", "1.500", "-i"])
             .arg(&src)
             .args(["-t", "1.500", "-c:v", "mpeg4", "-q:v", "5", "-g", "10"])

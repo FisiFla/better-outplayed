@@ -1,8 +1,8 @@
-# better-outplayed
+# replayed
 
 > **100% local, zero-cloud game clipping and replay buffer for Windows.**
 
-better-outplayed is an open-source alternative to [Outplayed](https://overwolf.com) and
+replayed is an open-source alternative to [Outplayed](https://overwolf.com) and
 [Ascent](https://tryascent.gg) that runs entirely on your machine. No account, no
 telemetry, no cloud upload, no Overwolf runtime. Just a native desktop app that keeps
 the last 30 seconds of your gameplay in a ring buffer — 35 with the shipped default's
@@ -10,13 +10,13 @@ the last 30 seconds of your gameplay in a ring buffer — 35 with the shipped de
 `buffer.max_pre_seconds` — and writes a lossless clip to disk the instant you press a
 hotkey or your game reports an event.
 
-> **Naming.** The repository and the *product* are `better-outplayed`: the Start Menu
-> shortcut, the install directory (`%LOCALAPPDATA%\better-outplayed`), the window title,
-> the tray and the log file (`better-outplayed.log`). The *executable* and the *data* still
-> carry the original `localplay` name — `localplay.exe`, `%LOCALAPPDATA%\localplay`, the
-> database (`localplay.db`), the GSI config name (`gamestate_integration_localplay.cfg`),
-> the Run-key value name and the crates (`localplay-cli`, `localplay-encoder`) — so every
-> `localplay` below is current.
+> **Naming.** The repository and the *product* are `replayed`: the Start Menu
+> shortcut, the install directory (`%LOCALAPPDATA%\replayed`), the window title,
+> the tray and the log file (`replayed.log`). The *executable* and the *data* still
+> carry the original `replayed` name — `replayed.exe`, `%LOCALAPPDATA%\replayed`, the
+> database (`replayed.db`), the GSI config name (`gamestate_integration_replayed.cfg`),
+> the Run-key value name and the crates (`replayed-cli`, `replayed-encoder`) — so every
+> `replayed` below is current.
 
 ![The library: a grid of clip cards](docs/screenshots/library.png)
 
@@ -95,7 +95,7 @@ for League the match **scoreboard** — every player's name, champion, team, kil
 assists and an `is_local` flag. It is a record of the match, not a clip of it. The GSI token
 and the footage are never in either place.
 
-**Where it lives.** All of it is under one per-user folder (`%LOCALAPPDATA%\localplay`: the
+**Where it lives.** All of it is under one per-user folder (`%LOCALAPPDATA%\replayed`: the
 config, the database, the logs, the thumbnails and, unless you chose another folder in
 Settings, the clips). Deleting a clip or session in the app deletes its files; uninstalling does
 not delete your clips.
@@ -117,7 +117,7 @@ one file into the game's own `cfg` folder, only when you press it.
 
 ```
                       ┌──────────────────────────────────────────────┐
-                      │  localplay.exe  (Tauri v2 shell)             │
+                      │  replayed.exe  (Tauri v2 shell)             │
                       │  ┌────────────────────────────────────────┐  │
    global hotkey ────▶│  │  frontend (Vite + webview)             │  │
    Ctrl+F8            │  │  dark-mode timeline / scrubber / trim  │  │
@@ -169,14 +169,14 @@ encode, no quality loss. The consequence is honest and intentional: cuts snap to
 nearest keyframe. Clip export works around this by forcing a keyframe on the buffer
 boundary; arbitrary scrubbing trims accept keyframe granularity.
 
-**Background operation (the desktop app).** `localplay.exe` is a tray application: the
+**Background operation (the desktop app).** `replayed.exe` is a tray application: the
 window is a review pane you open when you want it, and *closing* it hides it, because a
 clipper that exits when its window closes ends the recording every time its user tidies the
 screen. The clip hotkey (`[hotkeys] clip`, `Ctrl+F8` by default) is registered with
 `RegisterHotKey` at startup and is what takes a clip while the window is hidden; the tray
 icon and its tooltip carry the recording state, and the tray menu shows/hides the window,
 starts and stops recording, saves a clip now, opens `config.toml` and quits. A chord that
-cannot be registered — another application already owns it, or another better-outplayed does, since
+cannot be registered — another application already owns it, or another replayed does, since
 the CLI and the desktop app cannot both hold one chord — is reported in the window, in the
 tooltip and in the log, and the window keeps working without it. `[app] start_with_system`
 (default `false`) is the Windows Run-key entry.
@@ -218,7 +218,7 @@ tooltip and in the log, and the window keeps working without it. `[app] start_wi
 ## Repository layout
 
 ```
-better-outplayed/
+replayed/
 ├── .github/workflows/          # CI: tests + cross-check + frontend (macOS), the workspace
 │                               #   test suite (Windows), supply chain + packaging (Ubuntu/Windows)
 ├── Cargo.toml                  # workspace manifest
@@ -232,7 +232,7 @@ better-outplayed/
 │   ├── events/                 # LoL Live Client, CS2/Dota2 GSI
 │   └── store/                  # SQLite schema + clip/session/event index, cleanup policy
 ├── apps/
-│   ├── localplay-cli/          # headless binary: a hotkey driver over `recorder`
+│   ├── replayed-cli/          # headless binary: a hotkey driver over `recorder`
 │   └── desktop/
 │       ├── src-tauri/          # Tauri v2 app + IPC command layer over store/recorder
 │       └── src/                # Svelte frontend (nav rail, library, clip page, sessions,
@@ -272,7 +272,7 @@ the config file:
 - **CS2 / Dota 2** — a `127.0.0.1`-bound HTTP listener for Valve's Game State Integration.
   It requires a generated token (which the game echoes back inside the payload's `auth`
   object), rejects anything that does not carry it, and generates the
-  `gamestate_integration_localplay.cfg`. In the desktop app, **Settings > Game integrations**
+  `gamestate_integration_replayed.cfg`. In the desktop app, **Settings > Game integrations**
   has an Install button that finds the game in your Steam libraries and writes that file into
   its `cfg` folder (after checking the destination stays inside the game's install folder);
   otherwise copy the generated file there yourself.
@@ -362,7 +362,7 @@ stays manual.
 - [x] **Phase 0** — repo, tooling, design spec
 - [x] **Phase 1** — capture + loopback audio + hardware encode + ring buffer + hotkey trigger (PoC).
       **Ran on real Windows hardware** and produced correct clips. The 4K shortfall found on
-      2026-09-23 ([issue #1](https://github.com/FisiFla/better-outplayed/issues/1), closed) is
+      2026-09-23 ([issue #1](https://github.com/FisiFla/replayed/issues/1), closed) is
       fixed by the zero-copy path, where captured textures go straight to the hardware encoder:
       59.6 of 60 fps with no dropped frames and 3.1–4.0% of one core
       ([`docs/verification-status.md`](docs/verification-status.md) §13–§15).
@@ -423,7 +423,7 @@ subset of the Lucide icons (ISC); their licence texts are in
 
 ### A note on the `ffmpeg` build
 
-better-outplayed only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
+replayed only ever uses **hardware** encoders (`nvenc`/`qsv`/`amf`) and stream copy,
 so it never requires `libx264`. That means an **LGPL** `ffmpeg` build is sufficient,
 and shipping it does not pull the GPL `libx264`/`libx265` obligations into this
 project.

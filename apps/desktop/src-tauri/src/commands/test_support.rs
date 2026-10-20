@@ -1,8 +1,8 @@
 //! Shared fixtures for the per-module test suites (a real store, real ffmpeg output).
 
 use super::*;
-use localplay_media::binaries::run_with_timeout;
-use localplay_store::NewClip;
+use replayed_media::binaries::run_with_timeout;
+use replayed_store::NewClip;
 use std::time::Duration;
 
 /// The wall clock the session fixtures start at: deliberately enormous, so a timeline offset
@@ -136,7 +136,7 @@ impl Fixture {
             .store
             .start_session(
                 Some("Dota 2"),
-                localplay_store::SESSION_MODE_SESSION,
+                replayed_store::SESSION_MODE_SESSION,
                 WALL_START_MS,
                 &scratch_dir.to_string_lossy(),
                 media_epoch_ms,
@@ -177,7 +177,7 @@ impl Fixture {
 /// Encode `seconds` of `testsrc2` into `path` with ffmpeg, as a clip would be. `-g 10` at 10 fps
 /// puts a keyframe every second, so a stream-copy cut has keyframe structure to work with.
 pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32) {
-    let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
+    let mut cmd = replayed_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("testsrc2=size=320x180:rate=10:duration={seconds}"))
         .args([
@@ -204,7 +204,7 @@ pub(crate) fn stream_md5(
     seek_ms: u64,
     dur_ms: Option<u64>,
 ) -> String {
-    let mut cmd = localplay_media::sidecar_command(&bins.ffmpeg);
+    let mut cmd = replayed_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])
         .arg(format!("{:.3}", seek_ms as f64 / 1000.0))
         .arg("-i")

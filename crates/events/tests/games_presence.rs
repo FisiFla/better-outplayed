@@ -21,7 +21,7 @@
 // exemption does not reach it: the same rule, stated here.
 #![allow(clippy::unwrap_used)]
 
-use localplay_events::process::{
+use replayed_events::process::{
     default_watch, GamePresence, GameWatcher, GamesSection, Presence, ProcessWatcher, Signal,
     WatchedGame,
 };
@@ -199,7 +199,7 @@ fn the_watcher_thread_reports_a_start_and_releases_the_sink_when_stopped() {
     let watcher = GameWatcher::with_detector(Box::new(detector), &watch, Duration::from_millis(5));
     let (sink, changes) = channel();
 
-    let handle = localplay_events::process::spawn(watcher, sink).expect("a watcher thread");
+    let handle = replayed_events::process::spawn(watcher, sink).expect("a watcher thread");
     let change = changes
         .recv_timeout(Duration::from_secs(5))
         .expect("the start arrives");

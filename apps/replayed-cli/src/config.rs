@@ -1,12 +1,12 @@
 //! Root configuration: TOML in the app data directory, never environment variables.
 //!
 //! The `[buffer]`, `[encode]` and `[storage]` sections are the recorder's own types
-//! (`localplay_recorder::config`), shared with the desktop shell. What stays here is what a
+//! (`replayed_recorder::config`), shared with the desktop shell. What stays here is what a
 //! headless front-end owns: the hotkey and the game-event sources.
 
 use anyhow::{bail, Context, Result};
-use localplay_events::process::GamesSection;
-use localplay_recorder::config::{
+use replayed_events::process::GamesSection;
+use replayed_recorder::config::{
     BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
 };
 use serde::Deserialize;
@@ -44,7 +44,7 @@ pub struct Config {
 ///
 /// One combination is refused, by the recorder rather than here: `enabled = false` with a
 /// microphone (`[mic] enabled = true`). Audio tracks are named by position
-/// (`localplay_media::edit::audio_titles` calls the first `Game Audio`), so a one-track
+/// (`replayed_media::edit::audio_titles` calls the first `Game Audio`), so a one-track
 /// recording of a voice would be labelled as the game audio.
 #[derive(Debug, Deserialize)]
 pub struct AudioSection {
@@ -65,12 +65,12 @@ pub struct HotkeySection {
     pub bookmark: Option<String>,
 }
 
-pub use localplay_recorder::event_driver::EventsSection;
+pub use replayed_recorder::event_driver::EventsSection;
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
         let cfg: Self =
-            localplay_recorder::config_schema::parse(text).context("parsing config TOML")?;
+            replayed_recorder::config_schema::parse(text).context("parsing config TOML")?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -86,7 +86,7 @@ impl Config {
         match self.encode.vendor.as_str() {
             "auto" | "nvenc" | "qsv" | "amf" => {}
             "software" => bail!(
-                "vendor = \"software\" is not supported: localplay requires a GPU hardware \
+                "vendor = \"software\" is not supported: replayed requires a GPU hardware \
                  encoder (nvenc, qsv or amf) so that capturing does not cost game performance"
             ),
             other => bail!("unknown encode.vendor: {other}"),
@@ -116,7 +116,7 @@ impl Config {
             );
         }
         // The pipeline records aac over the system loopback and nothing else (ffmpeg input 1 is a
-        // loopback PCM stream, the audio codec fixed to aac in `localplay_encoder::ffmpeg`). A config
+        // loopback PCM stream, the audio codec fixed to aac in `replayed_encoder::ffmpeg`). A config
         // asking for anything else would be recorded as aac-over-loopback while claiming otherwise, so
         // it is refused, naming what is implemented.
         if self.audio.codec != "aac" {
@@ -177,7 +177,7 @@ mod tests {
         // watched, which is the safety posture.
         assert_eq!(
             cfg.recorder.mode,
-            localplay_recorder::RecordingMode::ReplayBuffer
+            replayed_recorder::RecordingMode::ReplayBuffer
         );
         assert!(
             !cfg.mic.enabled,
@@ -232,7 +232,7 @@ gsi_port = 45671
         let cfg = Config::from_toml(text).expect("a pre-Phase-5 file must keep parsing");
         assert_eq!(
             cfg.recorder.mode,
-            localplay_recorder::RecordingMode::ReplayBuffer
+            replayed_recorder::RecordingMode::ReplayBuffer
         );
         assert!(!cfg.mic.enabled, "no [mic] means no microphone");
         assert!(
@@ -241,12 +241,12 @@ gsi_port = 45671
         );
         assert_eq!(
             cfg.games.watch,
-            localplay_events::process::default_watch(),
+            replayed_events::process::default_watch(),
             "with the default watch list, unused while auto_record is off"
         );
         assert_eq!(
             cfg.storage.sessions,
-            localplay_recorder::config::SessionStorageRules::default(),
+            replayed_recorder::config::SessionStorageRules::default(),
             "and the session rules are the documented default"
         );
     }
@@ -260,7 +260,7 @@ gsi_port = 45671
         let cfg = Config::from_toml(&text).expect("the session mode parses");
         assert_eq!(
             cfg.recorder.mode,
-            localplay_recorder::RecordingMode::FullSession
+            replayed_recorder::RecordingMode::FullSession
         );
     }
 
@@ -391,9 +391,9 @@ gsi_port = 45671
         // The CLI does not re-declare `[buffer]`, `[encode]` or `[storage]`: the desktop shell parses
         // the same sections into the same types, so one config file means one thing to both.
         let cfg = Config::from_toml(include_str!("../../../config.example.toml")).unwrap();
-        let buffer: localplay_recorder::BufferSection = cfg.buffer;
-        let encode: localplay_recorder::EncodeSection = cfg.encode;
-        let storage: localplay_recorder::StorageSection = cfg.storage;
+        let buffer: replayed_recorder::BufferSection = cfg.buffer;
+        let encode: replayed_recorder::EncodeSection = cfg.encode;
+        let storage: replayed_recorder::StorageSection = cfg.storage;
         assert_eq!(buffer.segment_time, 1);
         assert_eq!(encode.codec, "h264");
         assert_eq!(storage.max_age_days, 7);

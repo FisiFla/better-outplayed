@@ -7,13 +7,13 @@
 //! it because the hotkey cannot fire on the macOS development host.
 //!
 //! The hotkey still needs Windows. What is tested here is the wait it drives, in isolation:
-//! `localplay_recorder::pump_until_span_on` over stub capture sources, a real ffmpeg encoder and
+//! `replayed_recorder::pump_until_span_on` over stub capture sources, a real ffmpeg encoder and
 //! the in-memory ring the replay buffer ships with. A fragment carries its own length, so that
 //! ring's span is exact instead of lagging a segment behind.
 //!
 //! Gating: deliberately not `#![cfg(feature = "test-encoders")]`. The suite enables that
 //! feature on the encoder package, not this one, so a `cfg` gate here would run an empty test
-//! binary and silently drop the regression test (`running 0 tests`). `localplay-encoder` is
+//! binary and silently drop the regression test (`running 0 tests`). `replayed-encoder` is
 //! instead a dev-dependency of this package with `test-encoders` on (`Cargo.toml`), which makes
 //! `EncodeConfig::for_tests_software` exist in every test build and no shipping one.
 //!
@@ -21,13 +21,13 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::{FfmpegBinaries, MediaInfo};
-use localplay_recorder::memory_ring::{MemoryRing, RingSetup};
-use localplay_recorder::{pump_once, pump_until_span_on, FramePacer, PumpCounts};
-use localplay_replay::MemoryStats;
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, EncodeOutput, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::{FfmpegBinaries, MediaInfo};
+use replayed_recorder::memory_ring::{MemoryRing, RingSetup};
+use replayed_recorder::{pump_once, pump_until_span_on, FramePacer, PumpCounts};
+use replayed_replay::MemoryStats;
 use std::time::{Duration, Instant};
 
 const WIDTH: u32 = 64;
@@ -39,7 +39,7 @@ const POST_MS: u64 = 2_000;
 /// Timeline handed to the encoder up front, so the buffer has content to extend.
 ///
 /// Wall-clock time: the encoder's media timeline is the wall clock (see the module comment in
-/// `localplay_encoder::ffmpeg`), so the fixture feeds its stubs in real time, through the same
+/// `replayed_encoder::ffmpeg`), so the fixture feeds its stubs in real time, through the same
 /// `pump_once` the CLI uses. The same frames in a burst would produce almost no footage.
 const PRE_FED: Duration = Duration::from_secs(3);
 
@@ -116,7 +116,7 @@ impl Fixture {
         let mut pacer = FramePacer::new(FPS);
         let feed_until = Instant::now() + PRE_FED;
         while Instant::now() < feed_until {
-            localplay_recorder::pump_once(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
+            replayed_recorder::pump_once(&mut pacer, &mut capture, Some(&mut audio), &mut encoder)
                 .expect("feeding the fixture's stubs");
         }
 

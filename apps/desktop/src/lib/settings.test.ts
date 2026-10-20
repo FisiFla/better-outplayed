@@ -12,7 +12,7 @@ import type { SettingsDto, UpdateSettingsOutcome } from './types';
 function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
   return {
     clips_dir: '',
-    clips_dir_resolved: 'C:\\Users\\player\\localplay\\clips',
+    clips_dir_resolved: 'C:\\Users\\player\\replayed\\clips',
     fps: 60,
     output_size: '',
     mic_enabled: false,
@@ -27,7 +27,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     watch_titles: ['League of Legends'],
     defaulted: [],
     config_exists: true,
-    config_path: 'C:\\Users\\player\\localplay\\config.toml',
+    config_path: 'C:\\Users\\player\\replayed\\config.toml',
     ...overrides,
   };
 }

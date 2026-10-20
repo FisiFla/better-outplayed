@@ -503,127 +503,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "localplay-capture"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
- "windows",
- "windows-core",
-]
-
-[[package]]
-name = "localplay-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-encoder",
- "localplay-events",
- "localplay-media",
- "localplay-recorder",
- "localplay-replay",
- "localplay-store",
- "serde",
- "tempfile",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "localplay-encoder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-media",
- "tempfile",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "localplay-events"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "getrandom 0.4.3",
- "native-tls",
- "p256",
- "rand_core",
- "rcgen",
- "rsa",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "thiserror",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "localplay-media"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "localplay-recorder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-encoder",
- "localplay-events",
- "localplay-media",
- "localplay-replay",
- "localplay-store",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "localplay-replay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "localplay-capture",
- "localplay-encoder",
- "localplay-media",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "localplay-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rusqlite",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,6 +840,127 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "replayed-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "replayed-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-encoder",
+ "replayed-events",
+ "replayed-media",
+ "replayed-recorder",
+ "replayed-replay",
+ "replayed-store",
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "replayed-encoder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-media",
+ "tempfile",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "replayed-events"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.4.3",
+ "native-tls",
+ "p256",
+ "rand_core",
+ "rcgen",
+ "rsa",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "replayed-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "replayed-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-encoder",
+ "replayed-events",
+ "replayed-media",
+ "replayed-replay",
+ "replayed-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "replayed-replay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "replayed-capture",
+ "replayed-encoder",
+ "replayed-media",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "replayed-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "rfc6979"
@@ -1638,7 +1638,7 @@ dependencies = [
  "anyhow",
  "flate2",
  "libc",
- "localplay-media",
+ "replayed-media",
  "serde",
  "sha2 0.11.1",
  "tempfile",

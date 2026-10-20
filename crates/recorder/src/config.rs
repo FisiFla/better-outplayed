@@ -61,8 +61,8 @@ impl RecordingMode {
     /// The `sessions.mode` value this mode opens its row with; the store owns the vocabulary.
     pub fn store_mode(self) -> &'static str {
         match self {
-            RecordingMode::ReplayBuffer => localplay_store::SESSION_MODE_BUFFER,
-            RecordingMode::FullSession => localplay_store::SESSION_MODE_SESSION,
+            RecordingMode::ReplayBuffer => replayed_store::SESSION_MODE_BUFFER,
+            RecordingMode::FullSession => replayed_store::SESSION_MODE_SESSION,
         }
     }
 
@@ -131,7 +131,7 @@ pub struct BufferSection {
     pub scratch_dir: String,
     /// Bytes of RAM the in-memory replay ring may occupy. Default 256 MiB.
     ///
-    /// Unclipped footage lives in RAM (see `localplay_replay::MemoryRingBuffer`), so this keeps the OS
+    /// Unclipped footage lives in RAM (see `replayed_replay::MemoryRingBuffer`), so this keeps the OS
     /// from killing the application. It is a fraction of a typical machine because the encoder and
     /// capture backends need room too. Defaulted so an older `config.toml` still parses.
     #[serde(default = "default_ram_cap_bytes")]
@@ -190,7 +190,7 @@ fn default_ram_cap_bytes() -> u64 {
 /// `[capture]`: what is recorded, a monitor or one window.
 ///
 /// Both keys are optional and default to the primary monitor. Choosing is the capture crate's
-/// ([`localplay_capture::target`]); only Windows Graphics Capture honours it.
+/// ([`replayed_capture::target`]); only Windows Graphics Capture honours it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(default)]
 pub struct CaptureSection {
@@ -201,7 +201,7 @@ pub struct CaptureSection {
     pub window: String,
     /// `"app"`: only the running watched game (the whole output while none runs); `"system"`:
     /// everything the default output plays.
-    pub game_audio: localplay_capture::GameAudioSource,
+    pub game_audio: replayed_capture::GameAudioSource,
     /// The output endpoint id whose audio is recorded when the whole output is captured (`"system"`,
     /// or `"app"` with no game running). Empty is the Windows default output. A game's own process
     /// audio follows the game whatever device it plays on, so this does not apply to it.
@@ -209,8 +209,8 @@ pub struct CaptureSection {
 }
 
 impl CaptureSection {
-    pub fn target(&self) -> localplay_capture::target::CaptureTarget {
-        localplay_capture::target::CaptureTarget::from_config(self.monitor, &self.window)
+    pub fn target(&self) -> replayed_capture::target::CaptureTarget {
+        replayed_capture::target::CaptureTarget::from_config(self.monitor, &self.window)
     }
 }
 
@@ -247,7 +247,7 @@ pub struct EncodeSection {
     /// A pacing decision, not the timeline guarantee: on Windows every captured frame costs a
     /// GPU-to-CPU readback (33 MB at 4K) whether or not it is encoded, so a rate the machine cannot
     /// hold is wasted work and a choppier picture. The media timeline tracks real time regardless,
-    /// because frames carry their arrival timestamps (`localplay_encoder::ffmpeg`). With
+    /// because frames carry their arrival timestamps (`replayed_encoder::ffmpeg`). With
     /// `adapt_fps = false` the unencodable frames are still dropped (the picture holds them) and the
     /// status line's drop counter says how many.
     ///
@@ -411,11 +411,11 @@ output_size = \"\"
         }
         assert_eq!(
             RecordingMode::FullSession.store_mode(),
-            localplay_store::SESSION_MODE_SESSION
+            replayed_store::SESSION_MODE_SESSION
         );
         assert_eq!(
             RecordingMode::ReplayBuffer.store_mode(),
-            localplay_store::SESSION_MODE_BUFFER
+            replayed_store::SESSION_MODE_BUFFER
         );
     }
 

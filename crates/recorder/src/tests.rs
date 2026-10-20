@@ -6,7 +6,7 @@
 //! Needs ffmpeg on `PATH` with a working libx264.
 
 use super::*;
-use localplay_events::EventKind;
+use replayed_events::EventKind;
 
 /// The stub geometry: small and slow, so four seconds of real-time capture encodes quickly.
 const WIDTH: u32 = 64;
@@ -18,16 +18,16 @@ const POST_SECONDS: u64 = 1;
 
 /// The application data directory the end-to-end recordings write into.
 ///
-/// A temp directory by default; setting `LOCALPLAY_TEST_CLIPS_DIR` keeps the recording there so
+/// A temp directory by default; setting `REPLAYED_TEST_CLIPS_DIR` keeps the recording there so
 /// the clip can be ffprobed by hand:
 ///
 /// ```text
-/// LOCALPLAY_TEST_CLIPS_DIR=$PWD/target/recorder-e2e \
-///   cargo test -p localplay-recorder -- --nocapture a_recorder_records
+/// REPLAYED_TEST_CLIPS_DIR=$PWD/target/recorder-e2e \
+///   cargo test -p replayed-recorder -- --nocapture a_recorder_records
 /// ffprobe target/recorder-e2e/clips/clip-*.mp4
 /// ```
 fn application_data_dir(what: &str) -> (Option<tempfile::TempDir>, PathBuf) {
-    match std::env::var_os("LOCALPLAY_TEST_CLIPS_DIR") {
+    match std::env::var_os("REPLAYED_TEST_CLIPS_DIR") {
         // One subdirectory per test: the tests run in parallel and each recorder owns its scratch directory.
         Some(dir) => (None, PathBuf::from(dir).join(what)),
         None => {
@@ -207,7 +207,7 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     // so the clip covers the request to within one segment.
     //
     // It can be shorter than the request by one frame interval per segment: with `-fps_mode
-    // passthrough` (`localplay_encoder::ffmpeg`) a segment ends at the last frame that arrived
+    // passthrough` (`replayed_encoder::ffmpeg`) a segment ends at the last frame that arrived
     // (~940ms of media per 1000ms segment at 10fps).
     let requested_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
     let frame_ms = 1000 / u64::from(FPS);
@@ -226,7 +226,7 @@ fn a_recorder_records_produces_a_clip_and_stops_cleanly() {
     );
 
     // Both streams, read back by ffprobe.
-    let info = localplay_media::probe::MediaInfo::probe(&bin, &clip.metadata.path)
+    let info = replayed_media::probe::MediaInfo::probe(&bin, &clip.metadata.path)
         .expect("the clip must be a readable media file");
     let video = info.video.as_ref().expect("the clip must carry video");
     let audio = info.audio.as_ref().expect("the clip must carry audio");
@@ -315,7 +315,7 @@ fn a_clip_records_why_it_was_taken() {
 
     // 2. An event: the derived reason a driver hands over, through the same call.
     let kill = GameEvent::new(
-        localplay_events::Source::Lol,
+        replayed_events::Source::Lol,
         EventKind::Kill,
         serde_json::json!({ "source": "lol", "event": "ChampionKill", "killer": "Ahri" }),
     );
@@ -326,7 +326,7 @@ fn a_clip_records_why_it_was_taken() {
     // 3. A marker: no clip, just the row.
     let marker_id = recorder
         .note_event(GameEvent::bare(
-            localplay_events::Source::Gsi,
+            replayed_events::Source::Gsi,
             EventKind::RoundStart,
         ))
         .expect("the marker is recorded");
@@ -421,7 +421,7 @@ fn a_clip_records_why_it_was_taken() {
     );
 
     // The event's clip is a real clip: the reason changes what is recorded about it, not the media path.
-    let info = localplay_media::probe::MediaInfo::probe(
+    let info = replayed_media::probe::MediaInfo::probe(
         &recorder_bin(&app_data_dir),
         &evented.metadata.path,
     )
@@ -729,8 +729,8 @@ fn a_recorder_reports_itself_as_not_running_before_it_is_started() {
 // ---------------------------------------------------------------------------------------
 
 use crate::session::layout_test_segments;
-use localplay_events::process::{PresenceChange, WatchedGame};
-use localplay_store::SESSION_MODE_SESSION;
+use replayed_events::process::{PresenceChange, WatchedGame};
+use replayed_store::SESSION_MODE_SESSION;
 
 /// The options these tests build, so each states only what it changes.
 fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
@@ -794,7 +794,7 @@ fn sessions_on_disk(app_data_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// Wait for the session store to hold exactly one finished session, and return its row.
 ///
 /// The engine writes the row from its own connection, so the read is a poll.
-fn wait_for_finished_session(bin: &FfmpegBinaries, db: &Path) -> localplay_store::Session {
+fn wait_for_finished_session(bin: &FfmpegBinaries, db: &Path) -> replayed_store::Session {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let store = open_clip_index(db).expect("the index opens");
@@ -892,7 +892,7 @@ fn a_full_session_records_into_its_own_directory_and_keeps_every_segment() {
         row.size_bytes > 4 * 1_024,
         "the session file is bigger than the cap: {row:?}"
     );
-    let info = localplay_media::probe::MediaInfo::probe(&bin, &final_path).expect("probing it");
+    let info = replayed_media::probe::MediaInfo::probe(&bin, &final_path).expect("probing it");
     assert!(
         info.duration_ms >= 4_000,
         "the session file covers the whole session: {}ms",
@@ -1090,11 +1090,11 @@ fn the_microphone_is_off_by_default_and_leaves_the_encoder_invocation_unchanged(
     let cfg = stub_config(&app_data_dir);
 
     // With the microphone off the encoder configuration has `mic_audio: None`, whose argument list
-    // `localplay-encoder` pins byte for byte.
+    // `replayed-encoder` pins byte for byte.
     let encode_cfg = build_encode_config(
         &cfg,
         &cfg.scratch_dir(),
-        localplay_encoder::VideoCodec::H264,
+        replayed_encoder::VideoCodec::H264,
         None,
         (WIDTH, HEIGHT),
     )
@@ -1621,7 +1621,7 @@ fn a_burst_event_is_marked_at_the_moment_it_happened() {
     // end of that wait — three seconds later.
     let arrived_at = recorder.media_now_ms();
     let (_tx, rx) = mpsc::channel::<GameEvent>();
-    let kill = GameEvent::bare(localplay_events::Source::Lol, EventKind::Kill);
+    let kill = GameEvent::bare(replayed_events::Source::Lol, EventKind::Kill);
     let policy = Policy {
         coalesce: Coalesce {
             quiet: BURST_WAIT,
@@ -1749,7 +1749,7 @@ fn a_replay_buffer_can_also_save_the_whole_session_off_the_same_encode() {
     );
     assert!(session.is_file(), "{session:?} exists");
     assert_eq!(stream_counts(&session, &bin), (1, 1));
-    let info = localplay_media::probe::MediaInfo::probe(&bin, &session).expect("probing it");
+    let info = replayed_media::probe::MediaInfo::probe(&bin, &session).expect("probing it");
     assert!(
         info.duration_ms >= wanted_ms,
         "the session file covers the whole recording, not the buffer's window: {}ms",
@@ -2007,7 +2007,7 @@ fn an_unset_zero_copy_survives_a_host_that_cannot_run_it() {
     match build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (64, 48)) {
         Ok(encode) => assert_eq!(
             encode.video,
-            localplay_encoder::VideoInput::RawPixels,
+            replayed_encoder::VideoInput::RawPixels,
             "with no hardware encoder the unset key resolves to the ordinary path"
         ),
         Err(err) => panic!("an unset zero_copy must not refuse to start: {err:#}"),
@@ -2041,7 +2041,7 @@ fn an_explicit_zero_copy_is_refused_off_windows() {
         &cfg,
         dir.path(),
         VideoCodec::H264,
-        Some(localplay_encoder::Vendor::Nvenc),
+        Some(replayed_encoder::Vendor::Nvenc),
         (64, 48),
     )
     .expect_err("an explicit zero_copy off Windows must refuse");
@@ -2074,7 +2074,7 @@ fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default()
         .expect("an unset value");
     assert_eq!(
         encode.audio_bitrate_kbps,
-        localplay_encoder::DEFAULT_AUDIO_BITRATE_KBPS,
+        replayed_encoder::DEFAULT_AUDIO_BITRATE_KBPS,
         "an unset value must be the pipeline's default"
     );
     assert_eq!(
@@ -2113,7 +2113,7 @@ fn the_configured_audio_opt_out_reaches_the_encoder_and_unset_records_audio() {
 
 /// A microphone with the game audio off is refused rather than recorded.
 ///
-/// Audio tracks are named by position and `localplay_media::edit::audio_titles` calls the first
+/// Audio tracks are named by position and `replayed_media::edit::audio_titles` calls the first
 /// `Game Audio`, so a one-track voice recording would be mislabelled. The refusal happens
 /// before anything is opened, so no capture or encoder child is needed.
 #[test]

@@ -1,7 +1,7 @@
-//! The localplay CLI: the headless front-end over the recording engine.
+//! The replayed CLI: the headless front-end over the recording engine.
 //!
 //! A driver and nothing else. The pipeline (capture, audio, encode, segment ring, clip) lives in
-//! `localplay-recorder`, which the desktop shell drives too; this crate only:
+//! `replayed-recorder`, which the desktop shell drives too; this crate only:
 //!
 //! 1. parses the config file (the CLI owns `[hotkeys]` and `[events]`; the recorder's
 //!    `[buffer]`/`[encode]`/`[storage]` sections are shared types),
@@ -14,11 +14,11 @@
 //!
 //! `[events] lol_poll_enabled` starts the League Live Client poller; `[events] gsi_port`
 //! (non-zero) starts the CS2 / Dota 2 GSI listener. Both are loopback-only by construction (see
-//! `localplay-events` and its static guard test) and report over one channel, which this loop
+//! `replayed-events` and its static guard test) and report over one channel, which this loop
 //! drains. A source that fails to start is reported and skipped: a machine with no League
 //! install must still record on the hotkey.
 //!
-//! The loop's only policy: a highlight ([`localplay_events::EventKind::is_highlight`]: a kill, a
+//! The loop's only policy: a highlight ([`replayed_events::EventKind::is_highlight`]: a kill, a
 //! bomb, the end of a game) takes a clip through the hotkey's own trigger, and a marker (a game
 //! or round boundary) is recorded in the `events` table without one. Neither is a second trigger
 //! mechanism: the clip is always [`Recorder::clip_now_with`].
@@ -49,14 +49,14 @@ pub mod config;
 use anyhow::{bail, Context, Result};
 use config::Config;
 #[cfg(feature = "test-encoders")]
-use localplay_capture::stub::StubConfig;
-use localplay_events::hotkey;
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::event_driver::{act_on_burst, start_event_sources, EventSources, Policy};
+use replayed_capture::stub::StubConfig;
+use replayed_events::hotkey;
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::event_driver::{act_on_burst, start_event_sources, EventSources, Policy};
 #[cfg(feature = "test-encoders")]
-use localplay_recorder::STUB_CAPTURE_SIZE;
-use localplay_recorder::{Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources};
-use std::path::PathBuf;
+use replayed_recorder::STUB_CAPTURE_SIZE;
+use replayed_recorder::{Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -75,10 +75,10 @@ const HOTKEY_POLL: Duration = Duration::from_millis(10);
 pub fn help() -> String {
     let mut text = String::from(
         "\
-localplay — Phase 1 headless replay buffer
+replayed — Phase 1 headless replay buffer
 
 usage:
-  localplay-cli buffer [OPTIONS]
+  replayed-cli buffer [OPTIONS]
 
 options:
   --mode <buffer|session>
@@ -111,9 +111,9 @@ options:
         backend — can be driven end to end on a development host.
 
 configuration:
-  %LOCALAPPDATA%\\localplay\\config.toml on Windows (the directory
+  %LOCALAPPDATA%\\replayed\\config.toml on Windows (the directory
   $LOCALAPPDATA points at may be redirected for a scratch run); the example
-  file is `config.example.toml`. localplay never reads configuration from
+  file is `config.example.toml`. replayed never reads configuration from
   environment variables.
 ",
     );
@@ -269,14 +269,14 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     let encode_fps = encode.fps;
 
     let bin = FfmpegBinaries::discover(None)?;
-    let hotkey = localplay_events::hotkey::Hotkey::parse(&hotkeys.clip)?;
+    let hotkey = replayed_events::hotkey::Hotkey::parse(&hotkeys.clip)?;
     // The event sources need the application data directory too (GSI token, generated cfg file),
     // and the recorder takes it by value below.
     let data_dir = app_dir.clone();
 
     // `--dev-software-encoder` exists only with the test-encoders feature; it selects libx264,
     // needs no GPU vendor, and is never reachable from the config file. The engine applies the
-    // gate (see `localplay_recorder::resolve_encoder`).
+    // gate (see `replayed_recorder::resolve_encoder`).
     let dev_software = opts.dev_software_encoder;
     let stub_sources = opts.stub_sources;
 
@@ -293,7 +293,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
             // `source` are refused in `Config::validate`, each having one implemented value.
             audio_bitrate_kbps: Some(audio.bitrate_kbps),
             audio_enabled: Some(audio.enabled),
-            // WGC + WASAPI on Windows, synthetic stubs elsewhere (`localplay_capture::platform` decides,
+            // WGC + WASAPI on Windows, synthetic stubs elsewhere (`replayed_capture::platform` decides,
             // and on Windows refuses to fall back to a stub). `--dev-stub-sources` selects the synthetic
             // pair explicitly, microphone included (which has no non-Windows backend), with the same gate
             // as `--dev-software-encoder`.
@@ -313,7 +313,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // game. This line is the CLI's own (the hotkey is what only it knows). The chord printed is the
     // parsed one, so `ctrl+f8` reads back as `Ctrl+F8` as in the desktop shell. The rate is the one
     // the pipeline runs at; when below the configured `encode.fps` the engine has already logged
-    // why (see `log_rate_decision` in `localplay-recorder`).
+    // why (see `log_rate_decision` in `replayed-recorder`).
     let status = recorder.status();
     if status.watching_games {
         tracing::info!(
@@ -482,13 +482,45 @@ fn app_data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("localplay")
+    let dir = base.join("replayed");
+    migrate_legacy_data_dir(&base, &dir);
+    dir
+}
+
+/// Move the data directory over from the name the project had before the rename.
+///
+/// The same rule the desktop shell uses, and for the same reason: the product was renamed and
+/// the directory holding the index, the clips and the settings was not, so a user running the
+/// older build would have found an empty library. If the old directory is here and the new one
+/// is not, it is moved across in one rename. If both are there the old one is left alone —
+/// merging two directories is not something to do to somebody's library without being asked.
+/// The move is a rename, not a copy, so a failure leaves the old directory exactly as it was.
+fn migrate_legacy_data_dir(base: &Path, dir: &Path) {
+    // The name before the rename, spelled out rather than derived: it must stay this
+    // literal forever, because it is the name of a directory that exists on disk.
+    const LEGACY: &str = "localplay";
+    let legacy = base.join(LEGACY);
+    if !legacy.is_dir() || dir.exists() {
+        return;
+    }
+    match std::fs::rename(&legacy, dir) {
+        Ok(()) => tracing::info!(
+            "the data directory was renamed from `{}` to `{}`",
+            legacy.display(),
+            dir.display()
+        ),
+        Err(err) => tracing::warn!(
+            "the old data directory at `{}` could not be moved to `{}`: {err}",
+            legacy.display(),
+            dir.display()
+        ),
+    }
 }
 
 /// The capture, audio and microphone sources this run uses.
 ///
 /// `Sources::Platform` is the shipping choice: WGC + WASAPI on Windows, the synthetic pair
-/// elsewhere (`localplay_capture::platform` refuses to substitute a stub on Windows).
+/// elsewhere (`replayed_capture::platform` refuses to substitute a stub on Windows).
 ///
 /// `--dev-stub-sources` selects the synthetic sources explicitly, microphone included; the
 /// microphone has no non-Windows backend, so this is the only way to drive that path on a

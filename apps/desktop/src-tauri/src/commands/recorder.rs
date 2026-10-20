@@ -5,10 +5,10 @@ use super::*;
 use crate::config::{EngineOptionsConfig, RecordingConfig};
 use crate::health::InstalledGsi;
 #[cfg(test)]
-use localplay_capture::stub::StubConfig;
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::event_driver::{EventDriver, Policy};
-use localplay_recorder::{
+use replayed_capture::stub::StubConfig;
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::event_driver::{EventDriver, Policy};
+use replayed_recorder::{
     GsiBinding, RecordedClip, Recorder, RecorderConfig, RecorderStatus, Sources,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 // Recording
 // ---------------------------------------------------------------------------------------
 //
-// The engine is `localplay-recorder`, the one the CLI drives. Here: one slot that holds the
+// The engine is `replayed-recorder`, the one the CLI drives. Here: one slot that holds the
 // recording this window started, and the plain functions the `#[tauri::command]` wrappers
 // delegate to.
 //
@@ -130,7 +130,7 @@ pub struct RecordedClipDto {
 /// The engine is an `Arc<Recorder>` so a command can take a handle and drop the slot lock before
 /// doing slow work (see `clip_now` above). `Mutex` because commands run on several threads.
 pub struct RecorderHost {
-    /// The directory `scratch/`, `clips/` and `localplay.db` resolve against, and where
+    /// The directory `scratch/`, `clips/` and `replayed.db` resolve against, and where
     /// `config.toml` is read from when a recording starts.
     app_data_dir: PathBuf,
     /// ffmpeg, or `None` when it could not be found at startup, in which case recording is
@@ -246,7 +246,7 @@ impl RecorderHost {
 
     /// How each game-event source came out of the running recording's startup; empty when
     /// no recording (and so no driver) is up.
-    pub fn event_reports(&self) -> Vec<localplay_recorder::event_driver::SourceReport> {
+    pub fn event_reports(&self) -> Vec<replayed_recorder::event_driver::SourceReport> {
         self.events
             .lock()
             .ok()
@@ -444,7 +444,7 @@ impl RecorderHost {
     /// is a real recording: a real encoder child, a real ring, a real splice and a real index row.
     /// [`Sources::Platform`] is a live Windows Graphics Capture session on Windows, which no test
     /// may open; [`Sources::Stub`] is the same engine over synthetic frames and is unreachable from
-    /// a configuration file (see `localplay_recorder::Sources`). Gated on `cfg(test)`, so a shipped
+    /// a configuration file (see `replayed_recorder::Sources`). Gated on `cfg(test)`, so a shipped
     /// binary has no such entry point; the CLI's equivalent is `--dev-software-encoder`.
     #[cfg(test)]
     pub fn start_for_test_with_stub_sources(
@@ -528,9 +528,9 @@ impl RecorderHost {
             )
         })?;
         recorder
-            .note_event(localplay_events::GameEvent::bare(
-                localplay_events::Source::Manual,
-                localplay_events::EventKind::Bookmark,
+            .note_event(replayed_events::GameEvent::bare(
+                replayed_events::Source::Manual,
+                replayed_events::EventKind::Bookmark,
             ))
             .map(|_| ())
             .map_err(|err| {
@@ -551,7 +551,7 @@ impl RecorderHost {
 mod tests {
     use super::*;
     use crate::commands::test_support::*;
-    use localplay_media::probe::MediaInfo;
+    use replayed_media::probe::MediaInfo;
     use std::time::{Duration, Instant};
 
     // -- recording -----------------------------------------------------------------------
@@ -985,7 +985,7 @@ mod tests {
         let status = RecorderStatus {
             watching_games: true,
             game: Some("Dota 2".to_string()),
-            mode: localplay_recorder::RecordingMode::FullSession,
+            mode: replayed_recorder::RecordingMode::FullSession,
             mic: true,
             ..RecorderStatus::stopped()
         };

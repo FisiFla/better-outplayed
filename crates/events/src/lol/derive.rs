@@ -4,7 +4,7 @@
 //! is a unit test. [`crate::lol::poller`] puts it on a network.
 //!
 //! The Live Client serves the whole event log so far, and a game is usually well under way
-//! before localplay starts. Replaying that history would be a storm of clips of footage nobody
+//! before replayed starts. Replaying that history would be a storm of clips of footage nobody
 //! asked for, hence the attach policy:
 //!
 //! | transition | what is emitted |

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to better-outplayed. Format follows
+All notable changes to replayed. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No release has been tagged yet, so
 everything is under *Unreleased*; the dated headings below are when the work landed, not
 versions. For what has and has not been *verified* on real hardware, read
@@ -46,7 +46,7 @@ versions. For what has and has not been *verified* on real hardware, read
   free disk space where clips are stored, how each game-event source started, and the last
   warnings and errors from the log.
 - **Game integration installer** in Settings: finds Counter-Strike 2 and Dota 2 in the Steam
-  libraries and writes `gamestate_integration_localplay.cfg` into the game's `cfg` folder when
+  libraries and writes `gamestate_integration_replayed.cfg` into the game's `cfg` folder when
   you press Install. The webview only names the game; the destination is checked to stay
   inside the game's install folder (symlinks and `..` refused).
 - **Privacy section** in the README: what is recorded, that it stays local, and that there is
@@ -186,7 +186,7 @@ versions. For what has and has not been *verified* on real hardware, read
 ## 2026-09-25 - zero-copy capture
 - Hybrid GPU video path removes the CPU readback (CPU per 4K capture from ~50% of a core to
   ~3%); the hardware encoder runs on its own thread.
-- Project renamed to better-outplayed.
+- Project renamed to replayed.
 
 ## 2026-09-24 - first Windows runs
 - Whole workspace built and tested on Windows; first real capture, clip and hardware encode.

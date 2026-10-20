@@ -877,7 +877,7 @@ pub fn spawn(watcher: GameWatcher, sink: PresenceSink) -> Result<WatchHandle> {
     );
 
     let thread = std::thread::Builder::new()
-        .name("localplay-games".to_string())
+        .name("replayed-games".to_string())
         .spawn(move || {
             while !flag.load(Ordering::SeqCst) {
                 let started = Instant::now();
@@ -1007,7 +1007,7 @@ impl GamesSection {
     ///
     /// ```no_run
     /// # fn main() -> anyhow::Result<()> {
-    /// use localplay_events::process::{default_watch, GamesSection};
+    /// use replayed_events::process::{default_watch, GamesSection};
     /// use std::sync::mpsc::channel;
     ///
     /// let section = GamesSection::default(); // auto_record = false: nothing is watched

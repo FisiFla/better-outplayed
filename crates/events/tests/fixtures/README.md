@@ -54,6 +54,6 @@ To regenerate:
 
 ```sh
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
-    -subj "/CN=127.0.0.1/O=localplay test fixture" -addext "subjectAltName=IP:127.0.0.1"
+    -subj "/CN=127.0.0.1/O=replayed test fixture" -addext "subjectAltName=IP:127.0.0.1"
 openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-pkcs8.pem && rm key.pem
 ```

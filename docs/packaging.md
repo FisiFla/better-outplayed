@@ -1,4 +1,4 @@
-# Packaging better-outplayed
+# Packaging replayed
 
 **Status: packagable, not shippable.** Two things were true before this document existed, and
 neither is true now: `bundle.active` was `false`, so `tauri build` produced no artifact anyone
@@ -23,9 +23,9 @@ This document is written the same way as
 
 | Target | Config | Artifact | Built in this repository? |
 |---|---|---|---|
-| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `better-outplayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
-| macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `better-outplayed.app` | **Yes**, on this development host (§4) |
-| macOS | (not enabled) `.dmg` | `better-outplayed_0.1.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
+| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `replayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
+| macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `replayed.app` | **Yes**, on this development host (§4) |
+| macOS | (not enabled) `.dmg` | `replayed_0.1.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
 | Linux | — | — | No target: the capture path is Windows-only (spec §2) |
 
 Common metadata, from `apps/desktop/src-tauri/tauri.conf.json`, all of it consistent with the
@@ -33,14 +33,14 @@ rest of the repository rather than invented here:
 
 | Field | Value | Where it comes from |
 |---|---|---|
-| `productName` | `better-outplayed` | the product's own name, and what the installer shows; §3.3 records when it changed and why the install directory follows it |
-| `mainBinaryName` | `localplay` | without it the installed executable would be `localplay-desktop`, the Cargo package name |
+| `productName` | `replayed` | the product's own name, and what the installer shows; §3.3 records when it changed and why the install directory follows it |
+| `mainBinaryName` | `replayed` | without it the installed executable would be `replayed-desktop`, the Cargo package name |
 | `version` | `0.1.0` | `[workspace.package] version` in the root `Cargo.toml`, and `package.json` |
-| `identifier` | `io.github.fisifla.better-outplayed` | reverse-DNS of the project's owner (`github.com/FisiFla`, the maintainer's address in the git history). Fixed now on purpose: it is the Windows uninstall key and the macOS bundle id |
+| `identifier` | `io.github.fisifla.replayed` | reverse-DNS of the project's owner (`github.com/FisiFla`, the maintainer's address in the git history). Fixed now on purpose: it is the Windows uninstall key and the macOS bundle id |
 | `publisher` | `FisiFla` | the copyright holder in `LICENSE-MIT` and the GitHub account that owns the repository |
 | `copyright` | `Copyright (c) 2026 FisiFla` | verbatim from `LICENSE-MIT` |
 | `category` | `Video` | the app records and cuts video; maps to `public.app-category.video` on macOS |
-| `homepage` | `https://github.com/FisiFla/better-outplayed` | `repository` in the root `Cargo.toml` |
+| `homepage` | `https://github.com/FisiFla/replayed` | `repository` in the root `Cargo.toml` |
 | `shortDescription` | *Local, zero-cloud game clipping and replay buffer for Windows* | the README's tagline |
 | `longDescription` | the README's first paragraph, plus the Windows/encoder requirement | README + spec §2 |
 | `licenseFile` | `../LICENSE.txt` | a short file that states the **dual** licence (MIT **OR** Apache-2.0) and points at both texts and at the third-party notices, so the installer shows a licence page that is not wrong. It was unset for a long time because naming a single licence file would have misstated the dual licence; the file states the dual licence instead |
@@ -78,8 +78,8 @@ templates):
 
 | Platform | Resource directory | Sidecars therefore at | Installer mechanism |
 |---|---|---|---|
-| Windows (`nsis`, `msi`) | the directory holding the executable | `%LOCALAPPDATA%\better-outplayed\binaries\ffmpeg.exe` (per-user) or `C:\Program Files\better-outplayed\binaries\ffmpeg.exe` (all-users) | the NSIS template does `SetOutPath $INSTDIR` and then `File /a "/oname=<destination>"` for every resource |
-| macOS (`.app`) | `<Foo>.app/Contents/Resources` | `better-outplayed.app/Contents/Resources/binaries/ffmpeg` | `bundle_project` copies resources into `Contents/Resources` and the main binary into `Contents/MacOS` |
+| Windows (`nsis`, `msi`) | the directory holding the executable | `%LOCALAPPDATA%\replayed\binaries\ffmpeg.exe` (per-user) or `C:\Program Files\replayed\binaries\ffmpeg.exe` (all-users) | the NSIS template does `SetOutPath $INSTDIR` and then `File /a "/oname=<destination>"` for every resource |
+| macOS (`.app`) | `<Foo>.app/Contents/Resources` | `replayed.app/Contents/Resources/binaries/ffmpeg` | `bundle_project` copies resources into `Contents/Resources` and the main binary into `Contents/MacOS` |
 
 ### 2.3 How the app finds them (`crates/media/src/binaries.rs`)
 
@@ -95,7 +95,7 @@ binaries:
 4. **a checkout's `binaries/`**, found by walking up from the executable to the first directory
    with a `Cargo.toml` — the *development-only* fallback that a `cargo run` executable needs,
    since it lives in `target/<profile>/`;
-5. **`PATH`**, last, because a system ffmpeg is the one source localplay cannot vouch for (the
+5. **`PATH`**, last, because a system ffmpeg is the one source replayed cannot vouch for (the
    LGPL-only, hardware-encoder-only assumptions of spec §2 do not hold for an arbitrary build).
 
 Everything an installer can produce outranks everything a developer's machine can produce, and
@@ -161,8 +161,8 @@ produced from macOS**, because the installer cannot be built here — §3.5 reco
 that was built on the Windows test machine, and it is named as above):
 
 ```text
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\better-outplayed_0.1.0_x64-setup.exe
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\better-outplayed_0.1.0_x64_en-US.msi   # only with --bundles msi
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\replayed_0.1.0_x64-setup.exe
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\replayed_0.1.0_x64_en-US.msi   # only with --bundles msi
 ```
 
 **This is a compile-and-bundle step and nothing else. It does not launch the application.**
@@ -179,7 +179,7 @@ Read from Tauri v2's NSIS template (`crates/tauri-bundler/src/bundle/windows/nsi
 not from a run:
 
 - installs the executable and every resource to `$INSTDIR`, per-user by default:
-  `%LOCALAPPDATA%\better-outplayed` (all-users, `C:\Program Files\better-outplayed`, is
+  `%LOCALAPPDATA%\replayed` (all-users, `C:\Program Files\replayed`, is
   available in the UI
   and needs elevation). `tauri.windows.conf.json` pins `installMode: currentUser` explicitly so
   this is a decision rather than an inherited default;
@@ -188,7 +188,7 @@ not from a run:
   plus `uninstall.exe`;
 - **checks and installs the WebView2 runtime if it is missing**, which by default means
   downloading Microsoft's bootstrapper — see §5.4;
-- refuses to install while localplay is running, and reuses the existing installation record
+- refuses to install while replayed is running, and reuses the existing installation record
   when it is run over an existing one (a non-NSIS install of the same product is detected and
   the user is asked to remove it first).
 
@@ -200,7 +200,7 @@ not from a run:
   protocol is an internal Tauri scheme);
 - it installs no service, scheduled task or run-at-startup entry (Tauri's elevated update task
   is not enabled — there is no updater to drive it);
-- it does not check for a GPU or a hardware encoder. localplay fails loudly at *runtime* when
+- it does not check for a GPU or a hardware encoder. replayed fails loudly at *runtime* when
   the machine cannot encode (spec §3.2), which is deliberate;
 - it has no licence page (§1).
 
@@ -209,24 +209,24 @@ not from a run:
 Both *were* read out of the NSIS template; §3.5 records what they actually did when the installer was first built and run on 2026-09-26.
 
 1. ~~**The install directory is also the application's data directory.**~~ *Decided and set
-   2026-09-26:* the installer gets its own directory. `productName` is now `better-outplayed`
-   while `mainBinaryName` stays `localplay`, and Tauri derives the per-user install path from
+   2026-09-26:* the installer gets its own directory. `productName` is now `replayed`
+   while `mainBinaryName` stays `replayed`, and Tauri derives the per-user install path from
    the former and the installed binary's name from the latter — so an install lands in
-   `%LOCALAPPDATA%\better-outplayed` with the exe still called `localplay.exe`, while the
-   app's data stays at `%LOCALAPPDATA%\localplay` exactly where it was and **no migration is
+   `%LOCALAPPDATA%\replayed` with the exe still called `replayed.exe`, while the
+   app's data stays at `%LOCALAPPDATA%\replayed` exactly where it was and **no migration is
    needed**. The alternative — moving the data into a subdirectory — would have been a
    recorder/store change plus a migration for the existing install, for the same result.
-2. **The uninstaller's "delete app data" checkbox does not delete localplay's data.** It
+2. **The uninstaller's "delete app data" checkbox does not delete replayed's data.** It
    removes `%APPDATA%\<identifier>` and `%LOCALAPPDATA%\<identifier>` — Tauri's directories,
    which this app does not use. The checkbox is therefore misleading in the *safe* direction:
    clips and the index survive an uninstall. A release should either point it at
-   `%LOCALAPPDATA%\localplay` through an NSIS hook, or drop the checkbox and say plainly that
+   `%LOCALAPPDATA%\replayed` through an NSIS hook, or drop the checkbox and say plainly that
    recordings are never deleted by the uninstaller.
 
 ### 3.4 Checking an installer without installing it
 
 On the Windows test machine, the installer's contents can be listed without running either it or the
-app (`7z l better-outplayed_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
+app (`7z l replayed_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
 first-pass check that `binaries\ffmpeg.exe` is inside. `npm run sidecars:check` already prints
 what was embedded at build time, and that *is* verified here (§4.2).
 
@@ -241,21 +241,21 @@ is a real, persistent one, so the install was real and left installed at the end
   installed — `node-v22.12.0-win-x64` extracted into the working directory, `PATH` and npm's cache
   set per run — so nothing was added to the system. Then `cargo xtask sidecars fetch --target
   x86_64-pc-windows-msvc` verified and extracted both sidecars, `npm ci` installed the frontend,
-  and the bundle produced **`better-outplayed_0.1.0_x64-setup.exe`, 262.6 MB**. That size is the
+  and the bundle produced **`replayed_0.1.0_x64-setup.exe`, 262.6 MB**. That size is the
   ~201 MiB of sidecars plus the embedded WebView2 that §5.4's `offlineInstaller` decision buys, and
   it is the first Windows installer this project has ever produced.
 * **The installer.** Silent, per-user, **no UAC prompt**, 21 seconds. It landed in
-  `%LOCALAPPDATA%\better-outplayed` — the separate directory §3.3 decided on — holding
-  `localplay.exe` (13989 KB), `uninstall.exe` (77 KB) and `binaries\{ffmpeg,ffprobe}.exe`
+  `%LOCALAPPDATA%\replayed` — the separate directory §3.3 decided on — holding
+  `replayed.exe` (13989 KB), `uninstall.exe` (77 KB) and `binaries\{ffmpeg,ffprobe}.exe`
   (100.5 MB and 100.3 MB). So `productName` really does move the install directory while
   `mainBinaryName` keeps the executable's name, and the §2 resource mapping really does put the
   sidecars where discovery looks for them.
 * **The application.** Launched through `schtasks /it`, because it is a tray application and needs
   a real session: 37.5 MB working set, still running at 30 seconds. Killed afterwards.
 * **The uninstall.** Silent. The installation directory was gone afterwards, and the Start Menu
-  shortcut (`better-outplayed.lnk`) with it.
+  shortcut (`replayed.lnk`) with it.
 * **The user's data.** Untouched by all of it. `clips\`, `thumbnails\`, `scratch\`, `config.toml`
-  and a 28 KB `localplay.db` all survived the uninstall, and the one recording in `clips\` was
+  and a 28 KB `replayed.db` all survived the uninstall, and the one recording in `clips\` was
   still there. §3.2 called the "delete app data" checkbox misleading *in the safe direction*; it is,
   and now it is measured rather than reasoned.
 * **Reinstall** after the silent uninstall reproduced all of the above with the data still intact.
@@ -275,7 +275,7 @@ inspected on the machine the work is done on.
 cargo xtask sidecars fetch --target x86_64-pc-windows-msvc   # optional here
 cd apps/desktop
 npm ci
-npm run tauri -- build            # -> src-tauri/target/release/bundle/macos/better-outplayed.app
+npm run tauri -- build            # -> src-tauri/target/release/bundle/macos/replayed.app
 ```
 
 ### 4.1 What was built here
@@ -284,22 +284,22 @@ The command above, on this host (exit status 0), with the host pair staged by ha
 
 ```console
 $ cd apps/desktop && CARGO_HOME="$PWD/../../target/cargo-home" npm run tauri -- build
-       Built application at: .../apps/desktop/src-tauri/target/release/localplay
+       Built application at: .../apps/desktop/src-tauri/target/release/replayed
      Running beforeBundleCommand `npm run sidecars:check`
 
-> localplay-desktop@0.1.0 sidecars:check
+> replayed-desktop@0.1.0 sidecars:check
 > node scripts/require-sidecars.mjs
 
-bundling sidecars from .../localplay/binaries: ffmpeg (0.0 MiB), ffprobe (0.0 MiB)
-    Bundling localplay.app (.../bundle/macos/localplay.app)
+bundling sidecars from .../replayed/binaries: ffmpeg (0.0 MiB), ffprobe (0.0 MiB)
+    Bundling replayed.app (.../bundle/macos/replayed.app)
     Finished 1 bundle at:
-        .../apps/desktop/src-tauri/target/release/bundle/macos/localplay.app
+        .../apps/desktop/src-tauri/target/release/bundle/macos/replayed.app
 ```
 
-Artifact: **`apps/desktop/src-tauri/target/release/bundle/macos/localplay.app`**, ad-hoc signed
-only (§4.4). The bundle is named after `productName`, and that was still `localplay` when
-this build ran: the product was renamed to `better-outplayed` on 2026-09-26 (§3.3), so a
-build from the current tree produces `better-outplayed.app`. Its size is decided entirely by what sits in `binaries/` when it is built:
+Artifact: **`apps/desktop/src-tauri/target/release/bundle/macos/replayed.app`**, ad-hoc signed
+only (§4.4). The bundle is named after `productName`, and that was still `replayed` when
+this build ran: the product was renamed to `replayed` on 2026-09-26 (§3.3), so a
+build from the current tree produces `replayed.app`. Its size is decided entirely by what sits in `binaries/` when it is built:
 
 | `binaries/` held | `.app` size | Of which sidecars |
 |---|---|---|
@@ -314,13 +314,13 @@ ballast in an installer, so a real Windows build must not be staged with a macOS
 The listing below is from the first, smaller build:
 
 ```console
-$ find localplay.app -type f -exec ls -l {} \; | awk '{print $5, $9}'
-1135    localplay.app/Contents/Info.plist
-13244960 localplay.app/Contents/MacOS/localplay
-0       localplay.app/Contents/Resources/binaries/.gitkeep
-242     localplay.app/Contents/Resources/binaries/ffmpeg
-243     localplay.app/Contents/Resources/binaries/ffprobe
-117998  localplay.app/Contents/Resources/icon.icns
+$ find replayed.app -type f -exec ls -l {} \; | awk '{print $5, $9}'
+1135    replayed.app/Contents/Info.plist
+13244960 replayed.app/Contents/MacOS/replayed
+0       replayed.app/Contents/Resources/binaries/.gitkeep
+242     replayed.app/Contents/Resources/binaries/ffmpeg
+243     replayed.app/Contents/Resources/binaries/ffprobe
+117998  replayed.app/Contents/Resources/icon.icns
 ```
 
 `Contents/Resources/binaries/{ffmpeg,ffprobe}` is exactly where `discover` looks once the
@@ -328,7 +328,7 @@ executable is at `Contents/MacOS/`, and the executable bit survived the copy —
 real macOS ffmpeg is ever bundled. (The zero-byte `.gitkeep` is copied along with them: it
 exists so that `tauri-build` can resolve the directory in a fresh clone, §2.4, and discovery
 ignores it.) `Info.plist` carries the metadata from §1
-(`CFBundleIdentifier=io.github.fisifla.better-outplayed`, `CFBundleShortVersionString=0.1.0`,
+(`CFBundleIdentifier=io.github.fisifla.replayed`, `CFBundleShortVersionString=0.1.0`,
 `LSApplicationCategoryType=public.app-category.video`, `NSHumanReadableCopyright=Copyright (c)
 2026 FisiFla`).
 
@@ -337,7 +337,7 @@ ignores it.) `Info.plist` carries the metadata from §1
 They are **placeholders**: two shell scripts (a few hundred bytes) that print
 `placeholder ffmpeg: not a real ffmpeg` and exit non-zero. There is no pinned macOS ffmpeg to
 put there (`xtask/sidecars.toml` pins a Windows archive, and a Homebrew ffmpeg is GPL, which
-localplay does not ship against), and `npm run sidecars:check` says so in the build log —
+replayed does not ship against), and `npm run sidecars:check` says so in the build log —
 `ffmpeg (0.0 MiB)`. So the listing above proves **placement**, and nothing about shipping a
 working binary. The Windows build embeds the real, checksum-verified pair, because that is the
 platform the pipeline exists for.
@@ -356,7 +356,7 @@ Without them the build stops before writing anything, which is the point of the 
 ```console
 $ npm run sidecars:check
 error: the installer would be built without ffmpeg and ffprobe.
-  looked in: .../localplay/binaries
+  looked in: .../replayed/binaries
   needs:     ffmpeg, ffprobe  (host platform: darwin)
   ...
 $ echo $?
@@ -372,7 +372,7 @@ as designed — loudly — and it is how this note came to be written.
 The lookup itself is tested against real bytes: `crates/media`'s
 `installed_app_finds_the_sidecars_in_its_own_bundle_resources` builds the same tree and asserts
 discovery returns the resource copy, and — with a bundle that actually exists —
-`LOCALPLAY_APP_BUNDLE=…/localplay.app cargo test -p localplay-media --lib
+`REPLAYED_APP_BUNDLE=…/replayed.app cargo test -p replayed-media --lib
 a_real_app_bundle_beats_path` resolves the *real* `.app`'s `Contents/MacOS` through the
 production code path and asserts it lands on `Contents/Resources/binaries/ffmpeg`, ahead of the
 real ffmpeg on this host's `PATH`.
@@ -384,30 +384,30 @@ one: Tauri's bundler runs its `bundle_dmg.sh`, which shells out to `hdiutil`, an
 is not permitted to create disk images.
 
 ```console
-$ ./bundle_dmg.sh --volname localplay ... localplay_0.1.0_aarch64.dmg localplay.app
+$ ./bundle_dmg.sh --volname replayed ... replayed_0.1.0_aarch64.dmg replayed.app
 Creating disk image...
-could not access /Volumes/localplay - Operation not permitted
+could not access /Volumes/replayed - Operation not permitted
 hdiutil: create failed - Operation not permitted
 failed to bundle project: error running bundle_dmg.sh
 ```
 
 `tauri.macos.conf.json` therefore lists `["app"]`, so the default macOS build succeeds. On a
 host where `hdiutil` is permitted, `npm run tauri -- build --bundles app,dmg` should produce
-`target/release/bundle/dmg/better-outplayed_0.1.0_aarch64.dmg`; that is **unverified**.
+`target/release/bundle/dmg/replayed_0.1.0_aarch64.dmg`; that is **unverified**.
 (The attempt above was made on 2026-09-23, before the product was renamed; the volume name
 and the artifact name both follow `productName`.)
 
 ### 4.4 The macOS bundle is not distributable
 
 ```console
-$ codesign -dv --verbose=4 localplay.app
-Identifier=localplay_desktop-f15df2dfe1af8f63
+$ codesign -dv --verbose=4 replayed.app
+Identifier=replayed_desktop-f15df2dfe1af8f63
 CodeDirectory ... flags=0x20002(adhoc,linker-signed)
 Signature=adhoc
 Info.plist=not bound
 
-$ spctl -a -vv localplay.app
-localplay.app: code has no resources but signature indicates they must be present
+$ spctl -a -vv replayed.app
+replayed.app: code has no resources but signature indicates they must be present
 ```
 
 The Mach-O binary carries the ad-hoc signature the linker applies, but the bundle was never
@@ -486,7 +486,7 @@ npm run tauri -- icon src-tauri/icons/app-icon.png
   A test in `apps/desktop/src-tauri/src/lib.rs` fails if any listed file is missing, because a
   wrong path there breaks the bundle build.
 - The mobile outputs the generator also writes (`android/`, `ios/`) were **not** committed:
-  localplay has no mobile target.
+  replayed has no mobile target.
 
 **Real artwork is a product decision, not a task.** Whatever replaces `app-icon.png` should be a
 square, transparent-cornered PNG of at least 1024×1024 with a dark-friendly silhouette, and a
@@ -497,7 +497,7 @@ depends on.
 
 ## 7. What the build and the tests do not touch
 
-localplay's development host is also a gaming machine, running kernel-level anti-cheat, and its
+replayed's development host is also a gaming machine, running kernel-level anti-cheat, and its
 owner may be mid-game. So, stated explicitly:
 
 - **Building an installer is a compile-and-bundle step.** It runs `cargo build`, the Vite

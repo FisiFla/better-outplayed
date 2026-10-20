@@ -3,7 +3,7 @@
  *
  * Same reasoning as `time.test.ts` and `clips.test.ts`: this window cannot be opened by the
  * test suite, so the display rules are pinned here. The values below are the shapes
- * `localplay-recorder` really publishes — including the two that are easy to render
+ * `replayed-recorder` really publishes — including the two that are easy to render
  * dishonestly: a rate that has not been measured yet (0.0 on a healthy recorder) and a clip
  * that was written but not indexed (no row at all).
  */
@@ -149,7 +149,7 @@ describe("the frame accounting", () => {
 describe("the notice for a clip that was just taken", () => {
   const clip: RecordedClip = {
     id: 3,
-    path: "C:\\Users\\player\\AppData\\Local\\localplay\\clips\\clip-1790184357.mp4",
+    path: "C:\\Users\\player\\AppData\\Local\\replayed\\clips\\clip-1790184357.mp4",
     duration_ms: 12_021,
     size_bytes: 26_624,
     codec: "h264_nvenc",
@@ -194,7 +194,7 @@ describe("the hotkey line", () => {
 
   it("is an alert — with the reason — when nothing is listening", () => {
     // The failure this whole feature exists to make visible: the chord is held by another
-    // application (or another localplay), so pressing it does nothing. The line has to name
+    // application (or another replayed), so pressing it does nothing. The line has to name
     // the chord *and* the reason, and it has to look like a problem.
     const reason =
       "the chord Ctrl+F8 could not be registered (RegisterHotKey failed: the hot key is " +
@@ -225,10 +225,10 @@ describe("the hotkey line", () => {
 describe("the config line", () => {
   const app = (overrides: Partial<AppStatus> = {}): AppStatus => ({
     hotkey: { chord: "Ctrl+F8", installed: true, error: null },
-    config_path: "C:\\Users\\player\\AppData\\Local\\localplay\\config.toml",
+    config_path: "C:\\Users\\player\\AppData\\Local\\replayed\\config.toml",
     config_exists: true,
     close_hint:
-      "Closing this window hides localplay in the tray; recording keeps running.",
+      "Closing this window hides replayed in the tray; recording keeps running.",
     ...overrides,
   });
 
@@ -239,7 +239,7 @@ describe("the config line", () => {
     const text = describeConfig(app({ config_exists: false }));
 
     expect(text).toContain(
-      "No config.toml at C:\\Users\\player\\AppData\\Local\\localplay\\config.toml",
+      "No config.toml at C:\\Users\\player\\AppData\\Local\\replayed\\config.toml",
     );
     expect(text).toContain("config.example.toml are");
   });

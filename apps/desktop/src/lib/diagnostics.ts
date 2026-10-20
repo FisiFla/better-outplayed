@@ -4,7 +4,7 @@
  * A shipped window has no console anyone can read. The app starts from the Start Menu, a
  * JavaScript error or a failed `invoke` disappears into a devtools panel nobody opens, and the
  * only report that reaches a maintainer is a screenshot. The backend already writes to
- * `%LOCALAPPDATA%\localplay\logs\better-outplayed.log`; this puts the frontend's failures on the
+ * `%LOCALAPPDATA%\replayed\logs\replayed.log`; this puts the frontend's failures on the
  * same stream, so one file answers what went wrong.
  *
  * Best effort by construction: `invoke` can be the very thing that is failing, so nothing here

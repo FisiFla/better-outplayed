@@ -1,6 +1,6 @@
 # Anti-cheat policy
 
-better-outplayed must be safe to run next to kernel anti-cheat (Vanguard, EAC, BattlEye, VAC).
+replayed must be safe to run next to kernel anti-cheat (Vanguard, EAC, BattlEye, VAC).
 It therefore uses **only** the capture paths OBS-style recorders use:
 
 - Windows Graphics Capture (video) and WASAPI loopback / microphone (audio),

@@ -1,6 +1,6 @@
 //! Sidecar acquisition: `xtask sidecars record` and `xtask sidecars fetch`.
 //!
-//! localplay ships no ffmpeg in the repository: the binaries are sidecars, downloaded at build
+//! replayed ships no ffmpeg in the repository: the binaries are sidecars, downloaded at build
 //! time and pinned by SHA-256 in `xtask/sidecars.toml`. The two halves of the pin are separate
 //! commands:
 //!
@@ -889,7 +889,7 @@ fn is_ffmpeg_family(file_name: &str) -> bool {
 fn first_line_of_version(bin: &Path) -> Result<String> {
     let mut cmd = Command::new(bin);
     cmd.arg("-version");
-    let out = localplay_media::binaries::run_with_timeout(cmd, Duration::from_secs(15))
+    let out = replayed_media::binaries::run_with_timeout(cmd, Duration::from_secs(15))
         .with_context(|| format!("running `{} -version`", bin.display()))?;
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()

@@ -22,18 +22,18 @@
 //!
 //! Gating: deliberately not `#![cfg(feature = "test-encoders")]`, which is enabled on the
 //! encoder package, so a `cfg` gate here would run an empty test binary. It needs
-//! `EncodeConfig::for_tests_software`, which exists because `localplay-encoder` is a
-//! dev-dependency here with that feature on (`apps/localplay-cli/Cargo.toml`).
+//! `EncodeConfig::for_tests_software`, which exists because `replayed-encoder` is a
+//! dev-dependency here with that feature on (`apps/replayed-cli/Cargo.toml`).
 //!
 //! Needs ffmpeg on `PATH` with a working libx264.
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend};
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::{pump_once_counted, FramePacer, PumpCounts};
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::{pump_once_counted, FramePacer, PumpCounts};
 use std::time::{Duration, Instant};
 
 /// What the synthetic source offers: four times the pacer's target. A source rate-matched to

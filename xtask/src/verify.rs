@@ -43,7 +43,7 @@
 
 use crate::probe::{self, ProbeReport};
 use anyhow::{bail, Context, Result};
-use localplay_media::{FfmpegBinaries, MediaInfo};
+use replayed_media::{FfmpegBinaries, MediaInfo};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -170,7 +170,7 @@ fn usage() -> String {
 usage:
   xtask verify [OPTIONS]
 
-Runs the Phase 1 acceptance checks against the localplay CLI and writes one Markdown
+Runs the Phase 1 acceptance checks against the replayed CLI and writes one Markdown
 report. It starts the buffer with a bounded configuration (stated in the report), drives
 the clip through the CLI's `--self-test-clip-after` trigger — which sends no keyboard or
 mouse input — probes the clip it produced, and exits non-zero if any check failed.
@@ -179,8 +179,8 @@ options:
   --seconds <N>        how much media to buffer before the self-test clip (default 45)
   --report <PATH>      where the report goes (default target/verify/report.md)
   --work-dir <PATH>    where the run's data directory goes (default target/verify/work)
-  --cli <PATH>         an already-built localplay-cli to test (skips the release build)
-  --no-build           do not build; use target/release/localplay-cli as it is
+  --cli <PATH>         an already-built replayed-cli to test (skips the release build)
+  --no-build           do not build; use target/release/replayed-cli as it is
   --dev-software-encoder
                        build and run with libx264 instead of a hardware encoder, for a
                        host with no GPU encoder (a development host). Checks that need
@@ -769,16 +769,16 @@ impl Session {
                 "build",
                 "the CLI under test exists",
                 "prerequisite",
-                "an executable localplay-cli",
+                "an executable replayed-cli",
                 cli.display().to_string(),
             );
             return Ok(());
         }
 
-        let target = self.repo.join("target/release").join(exe("localplay-cli"));
-        let mut command = "cargo build --release -p localplay-cli".to_string();
+        let target = self.repo.join("target/release").join(exe("replayed-cli"));
+        let mut command = "cargo build --release -p replayed-cli".to_string();
         if self.opts.dev_software {
-            command.push_str(" --features localplay-cli/test-encoders");
+            command.push_str(" --features replayed-cli/test-encoders");
         }
         if self.opts.no_build {
             let exists = target.is_file();
@@ -804,9 +804,9 @@ impl Session {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let mut cmd = Command::new(&cargo);
         cmd.current_dir(&self.repo)
-            .args(["build", "--release", "-p", "localplay-cli"]);
+            .args(["build", "--release", "-p", "replayed-cli"]);
         if self.opts.dev_software {
-            cmd.args(["--features", "localplay-cli/test-encoders"]);
+            cmd.args(["--features", "replayed-cli/test-encoders"]);
         }
         let out = cmd
             .output()
@@ -828,17 +828,17 @@ impl Session {
                 "build",
                 "the CLI under test builds and exists",
                 "prerequisite",
-                "a release localplay-cli",
+                "a release replayed-cli",
                 format!("exit status {}", out.status),
                 format!("`{command}` failed; see the Build section"),
             );
-            bail!("building localplay-cli failed");
+            bail!("building replayed-cli failed");
         }
         self.pass(
             "build",
             "the CLI under test builds and exists",
             "prerequisite",
-            "a release localplay-cli",
+            "a release replayed-cli",
             target.display().to_string(),
         );
         self.cli = Some(target);
@@ -905,7 +905,7 @@ impl Session {
     /// Start the buffer with the bounded configuration and drive the self-test clip.
     fn buffer_run(&mut self) -> Result<()> {
         let app_data = self.opts.work_dir.join("appdata");
-        let config_dir = app_data.join("localplay");
+        let config_dir = app_data.join("replayed");
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("creating {}", config_dir.display()))?;
         std::fs::write(config_dir.join("config.toml"), RUN_CONFIG.to_toml("auto"))
@@ -925,7 +925,7 @@ impl Session {
         let context_note = format!(
             "configuration (written by the harness, not the machine's own config):\n\n```toml\n{}\n```\n\n\
              command: `{}`\n\nRUST_LOG=debug; the application data directory was redirected to \
-             `{}` so the run could not touch the real `%LOCALAPPDATA%\\localplay` (and so the \
+             `{}` so the run could not touch the real `%LOCALAPPDATA%\\replayed` (and so the \
              RAM and eviction numbers below belong to this run alone).",
             RUN_CONFIG.to_toml("auto"),
             run.command,
@@ -1596,8 +1596,8 @@ impl Session {
             "cpu",
             "steady-state CPU under 5% of one core",
             "criterion 6",
-            "CPU < 5% of ONE core (ΔCPU / Δwall over the window, for the localplay-cli process \
-             itself — the same process the runbook's `Get-Process localplay-cli` recipe reads, \
+            "CPU < 5% of ONE core (ΔCPU / Δwall over the window, for the replayed-cli process \
+             itself — the same process the runbook's `Get-Process replayed-cli` recipe reads, \
              so the ffmpeg encoder child's own CPU is not counted; Task Manager's per-process \
              column is normalised across cores and would read 5/N%)",
             format!("{cpu_percent:.2}% of one core over {window_desc}"),
@@ -1634,7 +1634,7 @@ impl Session {
             .app_data
             .take()
             .context("no application data directory")?;
-        let clips_dir = app_data.join("localplay").join("clips");
+        let clips_dir = app_data.join("replayed").join("clips");
 
         let Some(clip) = newest_clip(&clips_dir)? else {
             self.fail(
@@ -2095,7 +2095,7 @@ impl Session {
         };
 
         let app_data = self.opts.work_dir.join("appdata-bad-vendor");
-        let config_dir = app_data.join("localplay");
+        let config_dir = app_data.join("replayed");
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("creating {}", config_dir.display()))?;
         std::fs::write(config_dir.join("config.toml"), RUN_CONFIG.to_toml(vendor))
@@ -2272,7 +2272,7 @@ impl Session {
         let verdict = verdict(tally);
 
         let mut md = String::new();
-        md.push_str("# localplay verification report\n\n");
+        md.push_str("# replayed verification report\n\n");
         md.push_str(&format!(
             "- **Generated**: {} UTC\n- **By**: `cargo xtask verify` (see `xtask/src/verify.rs`)\n\
              - **Verdict**: **{verdict}** — {passed} passed, {failed} failed, {not_performed} not performed\n\
@@ -3047,7 +3047,7 @@ mod tests {
 
     #[test]
     fn the_status_line_is_parsed_field_by_field() {
-        let line = "2026-09-23T19:20:27.157909Z DEBUG localplay_recorder: frames=1814 \
+        let line = "2026-09-23T19:20:27.157909Z DEBUG replayed_recorder: frames=1814 \
                     segments=57 bytes=37795772 span=57000ms evicted=3 dropped=1183 \
                     dropped_audio=12 skipped=2048 fps=24.1/24 configured=30";
         let status = parse_status(line).expect("the engine's own line must parse");
@@ -3092,7 +3092,7 @@ mod tests {
     #[test]
     fn the_trigger_and_wrote_lines_parse_into_their_numbers() {
         let trigger = parse_trigger(
-            "2026-09-23T19:21:00.000000Z  INFO localplay_recorder: hotkey pressed: \
+            "2026-09-23T19:21:00.000000Z  INFO replayed_recorder: hotkey pressed: \
              media=44000ms wall=44123ms (drift 123ms); waiting for post-roll",
         )
         .expect("the hotkey's own line");
@@ -3102,8 +3102,8 @@ mod tests {
         );
 
         let wrote = parse_wrote(
-            "2026-09-23T19:21:03.000000Z  INFO localplay_recorder: wrote \
-             /tmp/appdata/localplay/clips/clip-1758650463.mp4 (13091ms, 8529609 bytes, \
+            "2026-09-23T19:21:03.000000Z  INFO replayed_recorder: wrote \
+             /tmp/appdata/replayed/clips/clip-1758650463.mp4 (13091ms, 8529609 bytes, \
              encoder=h264_nvenc)",
         )
         .expect("the recorder's own line");
@@ -3118,7 +3118,7 @@ mod tests {
 
     #[test]
     fn the_wasapi_line_carries_the_conversion_pair() {
-        let line = "2026-09-23T19:20:00.000000Z  INFO localplay_capture::wasapi: \
+        let line = "2026-09-23T19:20:00.000000Z  INFO replayed_capture::wasapi: \
                     native_sample_rate=44100 native_channels=2 native_sample_format=F32 \
                     requested_sample_rate=48000 requested_channels=2 \
                     requested_sample_format=\"s16\" converting=true WASAPI loopback capture \
@@ -3134,7 +3134,7 @@ mod tests {
     #[test]
     fn the_splice_drift_line_parses_with_a_negative_delta() {
         let (video, audio, drift) = parse_drift_line(
-            "2026-09-23T19:21:04.000000Z  INFO localplay_replay::splice: clip clip-1758650463: \
+            "2026-09-23T19:21:04.000000Z  INFO replayed_replay::splice: clip clip-1758650463: \
              video 13091ms audio 13104ms drift -13ms",
         )
         .expect("the splice's own line");

@@ -1,7 +1,7 @@
-//! localplay CLI: the headless replay-buffer front-end.
+//! replayed CLI: the headless replay-buffer front-end.
 //!
 //! Thin by design: logging setup, subcommand dispatch, nothing else. The pipeline lives in
-//! `localplay-recorder`, and `localplay_cli` is the driver library around it, so integration
+//! `replayed-recorder`, and `replayed_cli` is the driver library around it, so integration
 //! tests can reach it (notably `tests/post_roll.rs`, since the hotkey is Windows-only) and
 //! drive `--self-test-clip-after` in-process.
 //!
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     // Before the tracing subscriber: `--help` is not a run and should print nothing else.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        print!("{}", localplay_cli::help());
+        print!("{}", replayed_cli::help());
         return Ok(());
     }
 
@@ -29,8 +29,8 @@ fn main() -> Result<()> {
         .init();
 
     match args.first().map(String::as_str) {
-        Some("buffer") => localplay_cli::run_buffer(),
-        Some(other) => bail!("unknown subcommand: {other}\n\n{}", localplay_cli::help()),
-        None => bail!("{}", localplay_cli::help()),
+        Some("buffer") => replayed_cli::run_buffer(),
+        Some(other) => bail!("unknown subcommand: {other}\n\n{}", replayed_cli::help()),
+        None => bail!("{}", replayed_cli::help()),
     }
 }

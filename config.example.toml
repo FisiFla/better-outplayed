@@ -1,14 +1,14 @@
 # ============================================================
-# localplay — example configuration
+# replayed — example configuration
 # ============================================================
 # Copy to the application data directory and edit:
-#   %LOCALAPPDATA%\localplay\config.toml
+#   %LOCALAPPDATA%\replayed\config.toml
 #
-# localplay never reads configuration from environment variables.
+# replayed never reads configuration from environment variables.
 
 # The version of this file's layout. Written by the app; leave it alone. A file without it
 # is read as version 1. A file declaring a version newer than the app understands is refused
-# rather than half-read — update localplay instead.
+# rather than half-read — update replayed instead.
 schema_version = 1
 
 [recorder]
@@ -52,7 +52,7 @@ max_post_seconds = 0
 # therefore the granularity of lossless trimming (cuts snap to <= this value).
 # Lower = more precise cuts, higher = larger files.
 segment_time = 1
-# Empty = %LOCALAPPDATA%\localplay\scratch
+# Empty = %LOCALAPPDATA%\replayed\scratch
 scratch_dir = ""
 # How much memory a replay buffer may use for the footage it has not been asked to keep,
 # in bytes. Default: 256 MiB.
@@ -85,7 +85,7 @@ output_device = ""
 [encode]
 # auto | nvenc | qsv | amf
 # "auto" probes the GPU and picks the first available hardware encoder.
-# If none is available localplay exits with an error rather than falling back
+# If none is available replayed exits with an error rather than falling back
 # to CPU encoding.
 vendor = "auto"
 # h264 | hevc
@@ -112,7 +112,7 @@ fps = 60
 # screen. What this setting buys you is the capture work not spent on frames the
 # encoder will drop, and a warning at startup instead of a surprise in the clip.
 #
-# With this on, localplay spends ~1.5 s at startup encoding frames at the real
+# With this on, replayed spends ~1.5 s at startup encoding frames at the real
 # capture resolution with the selected encoder, and both the pacer and the
 # encoder child are then told the rate it measured. Startup logs what it
 # measured and, if that is below `fps`, warns you which rate is in use and why.
@@ -182,7 +182,7 @@ codec = "aac"
 bitrate_kbps = 192
 
 [storage]
-# Empty = %LOCALAPPDATA%\localplay\clips
+# Empty = %LOCALAPPDATA%\replayed\clips
 clips_dir = ""
 # Default: 50 GiB. Favourited clips are exempt from this cap.
 max_total_bytes = 53687091200
@@ -202,7 +202,7 @@ max_age_days = 7
 # Defaults: 200 GiB and 7 days. A 4K session is roughly 9 GB an hour at the example
 # bitrate, so raise the cap if you record long sessions at 4K.
 [storage.sessions]
-# Empty = %LOCALAPPDATA%\localplay\sessions
+# Empty = %LOCALAPPDATA%\replayed\sessions
 sessions_dir = ""
 max_total_bytes = 214748364800
 max_age_days = 7
@@ -232,7 +232,7 @@ enabled = false
 device = ""
 
 # --- Game presence, and recording that follows it (Phase 5) ---------------------
-# When `auto_record = true`, localplay watches for the titles below and records one
+# When `auto_record = true`, replayed watches for the titles below and records one
 # session per game: recording starts when the game starts and stops (and is
 # finalised, and the storage policy is applied) when it stops.
 #
@@ -271,13 +271,13 @@ clip = "Ctrl+F8"
 # config structs do not deny unknown fields.
 
 [app]
-# Start better-outplayed with Windows (the desktop app; the CLI is never autostarted).
+# Start replayed with Windows (the desktop app; the CLI is never autostarted).
 #
 # `true`  = the app owns a value under
 #           HKCU\Software\Microsoft\Windows\CurrentVersion\Run — the per-user Run key — so
 #           the tray icon and the clip hotkey are there again after a reboot.
 # `false` = that value is removed, if this app put it there. Nothing else in the Run key is
-#           ever touched: the value name is localplay's own.
+#           ever touched: the value name is replayed's own.
 #
 # The file is the only switch **for this key**: the settings panel edits the clips
 # directory, the capture rate, the resolution, the microphone and auto-record, and
@@ -307,11 +307,11 @@ lol_poll_enabled = true
 #
 # The listener requires a token, which arrives inside the game's POST body (in the payload's
 # "auth" object — that is how Valve's "auth" block works; GSI sends no Authorization
-# header). localplay generates one per game on first use into
+# header). replayed generates one per game on first use into
 # <app data dir>/gsi-token-cs2.txt and <app data dir>/gsi-token-dota2.txt, and writes
 # the file you have to install to:
-#   <app data dir>/gsi/cs2/gamestate_integration_localplay.cfg
-#   <app data dir>/gsi/dota2/gamestate_integration_localplay.cfg
+#   <app data dir>/gsi/cs2/gamestate_integration_replayed.cfg
+#   <app data dir>/gsi/dota2/gamestate_integration_replayed.cfg
 # Copy the one for the game you play into its cfg directory:
 #   .../Counter-Strike Global Offensive/game/csgo/cfg/
 #   .../dota 2 beta/game/dota/cfg/gamestate_integration/

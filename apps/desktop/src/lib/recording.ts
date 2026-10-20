@@ -5,7 +5,7 @@
  * window cannot be opened by this project's test suite, so the display rules are pinned by
  * tests rather than eyeballed.
  *
- * The numbers come from `localplay-recorder`, the engine the CLI also drives, so what is
+ * The numbers come from `replayed-recorder`, the engine the CLI also drives, so what is
  * described here is a real capture (or the honest absence of one). Nothing in this file
  * invents a value the engine does not publish: a rate that has not been measured yet says
  * so, rather than printing `0.0fps` next to a running recorder.
@@ -54,7 +54,7 @@ export function recordingLabel(status: RecordingStatus | null): string {
  * machine that cannot hold the configured rate would look like a permanent shortfall rather
  * than the decision the engine actually made.
  *
- * `localplay-recorder` measures the achieved rate over a one-second window and reports 0.0
+ * `replayed-recorder` measures the achieved rate over a one-second window and reports 0.0
  * until the first window closes, deliberately (a rate over 200ms is noise). So a running
  * recorder whose rate has not been measured yet says "measuring…", and an idle one shows a
  * dash: `0.0 / 30 fps` on a healthy recorder would read as a failure that is not there.
@@ -74,7 +74,7 @@ export function formatRate(status: RecordingStatus | null): string {
  * Positive means the media timeline is *behind* real time — the measured 0.81x case on 4K
  * hardware, where a clip's configured `pre_seconds` of media covers more real seconds than
  * configured. It is reported rather than hidden because it is the reason the trigger is
- * taken from media time (see `localplay-recorder`'s trigger path).
+ * taken from media time (see `replayed-recorder`'s trigger path).
  */
 export function formatDrift(status: RecordingStatus | null): string {
   if (status === null || !status.running) return '—';
@@ -139,7 +139,7 @@ export function describeRecordedClip(clip: RecordedClip): string {
  * `problem` is the difference between a line of orientation and an alert: an *installed*
  * hotkey is a sentence telling the user what to press; one that is not installed is a
  * failure they have to act on — the chord is held by another application or by another
- * localplay, or this build has no global hotkey at all. The reason is the shell's own
+ * replayed, or this build has no global hotkey at all. The reason is the shell's own
  * sentence (it names the chord and the likely owner), not something invented here.
  */
 export function describeHotkey(

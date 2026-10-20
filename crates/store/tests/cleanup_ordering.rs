@@ -10,8 +10,8 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
-use localplay_store::{NewClip, Store};
+use replayed_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
+use replayed_store::{NewClip, Store};
 use std::path::PathBuf;
 
 /// A clips directory plus the database that indexes it, in a temp dir that outlives the test body.
@@ -27,7 +27,7 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("a temp dir");
         let clips_dir = dir.path().join("clips");
         std::fs::create_dir_all(&clips_dir).expect("create the clips dir");
-        let db_path = dir.path().join("localplay.db");
+        let db_path = dir.path().join("replayed.db");
         let store = Store::open(&db_path).expect("open the clip index");
         store.migrate().expect("migrate the clip index");
         Self {
@@ -91,7 +91,7 @@ impl Fixture {
     }
 
     /// Plan against the store's own rows, as the application does.
-    fn plan(&self, policy: &CleanupPolicy) -> localplay_store::cleanup::CleanupPlan {
+    fn plan(&self, policy: &CleanupPolicy) -> replayed_store::cleanup::CleanupPlan {
         plan_cleanup(&self.store.list_clips().expect("list"), policy, now_ms())
     }
 }

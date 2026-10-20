@@ -34,7 +34,7 @@ describe('the marker vocabulary', () => {
   });
 
   it('shows an unknown tag neutrally rather than hiding it', () => {
-    // The whole point: `localplay-store` passes `events.kind` through verbatim and knows no
+    // The whole point: `replayed-store` passes `events.kind` through verbatim and knows no
     // vocabulary. A tag this build has never heard of is a marker that exists, and an
     // unrecognised integration must not silently lose its timeline.
     expect(markerColor('bomb_planted_v2')).toBe(NEUTRAL_MARKER_COLOR);

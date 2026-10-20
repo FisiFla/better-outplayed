@@ -4,7 +4,7 @@
 // exemption does not reach it: the same rule, stated here.
 #![allow(clippy::unwrap_used)]
 
-use localplay_media::{edit, probe::MediaInfo, FfmpegBinaries};
+use replayed_media::{edit, probe::MediaInfo, FfmpegBinaries};
 use std::process::Command;
 
 fn ffmpeg() -> FfmpegBinaries {

@@ -1,5 +1,5 @@
 [package]
-name = "localplay-media"
+name = "replayed-media"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

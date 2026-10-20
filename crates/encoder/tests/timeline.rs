@@ -9,7 +9,7 @@
 //! The fix has two halves: the capture loop is paced to `encode.fps` (`FramePacer`), and the
 //! video input is timestamped from arrival (`-use_wallclock_as_timestamps 1`), which only works
 //! because the frame-rate conversion is off (`-fps_mode passthrough`, see
-//! `localplay_encoder::ffmpeg::video_output_args`): with ffmpeg's default conversion arrival
+//! `replayed_encoder::ffmpeg::video_output_args`): with ffmpeg's default conversion arrival
 //! timestamps are resampled onto a rigid 1/R grid, so the rate the encoder can emit becomes the
 //! media clock. The first test therefore proves little on its own, and says so.
 //!
@@ -51,10 +51,10 @@
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
-use localplay_capture::stub::{StubAudio, StubCapture, StubConfig};
-use localplay_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame, PixelFormat};
-use localplay_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
-use localplay_media::{FfmpegBinaries, MediaInfo};
+use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
+use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame, PixelFormat};
+use replayed_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
+use replayed_media::{FfmpegBinaries, MediaInfo};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -336,9 +336,8 @@ fn a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock() {
 
     // 1. What this machine sustains here, with the shipping probe and argument list
     //    (`video_input_args` + `video_output_args`, the functions the recorder's child is spawned from).
-    let measured =
-        localplay_encoder::throughput::measure_sustainable_fps(&bin, &cfg, STARVED_PROBE)
-            .expect("the probe must produce a number at this geometry");
+    let measured = replayed_encoder::throughput::measure_sustainable_fps(&bin, &cfg, STARVED_PROBE)
+        .expect("the probe must produce a number at this geometry");
     let declared = ((measured.fps * 4.0).round() as u32).max(8);
 
     // 2. Declare four times it. Nothing is faked: `measured` came from the same encoder, geometry and kind of frames.
@@ -447,8 +446,8 @@ fn a_starved_pipeline_still_keeps_the_media_timeline_on_the_wall_clock() {
 /// With the frame-rate conversion off, a segment holds the frames that arrived while it was open
 /// (VFR, `avg_frame_rate` whatever the machine managed). A clipper that cannot concatenate those
 /// is worse than a slightly-off clock, so this splices them with the product's lossless
-/// concatenation ([`localplay_media::edit::concat_lossless`], which
-/// `localplay_replay::splice::ClipSplicer::splice` calls) and requires the clip to be readable,
+/// concatenation ([`replayed_media::edit::concat_lossless`], which
+/// `replayed_replay::splice::ClipSplicer::splice` calls) and requires the clip to be readable,
 /// carry both streams, and be playable (every frame decoded, not just probed).
 #[test]
 fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
@@ -506,12 +505,12 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
     for seg in &segments {
         text.push_str(&format!(
             "file '{}'\n",
-            localplay_replay_concat_path(&std::fs::canonicalize(seg).expect("canonical path"))
+            replayed_replay_concat_path(&std::fs::canonicalize(seg).expect("canonical path"))
         ));
     }
     std::fs::write(&list, text).expect("write the concat list");
     let clip = dir.path().join("clip.mp4");
-    localplay_media::edit::concat_lossless(&bin, &list, &clip)
+    replayed_media::edit::concat_lossless(&bin, &list, &clip)
         .expect("the segments must concatenate losslessly");
 
     let info = MediaInfo::probe(&bin, &clip).expect("the clip must be a readable media file");
@@ -624,9 +623,9 @@ fn the_vfr_segments_a_starved_pipeline_writes_still_splice_and_play() {
 
 /// The concat list's path spelling, as the clip path writes it.
 ///
-/// `localplay_replay::splice::concat_list_path` is the real one, but the encoder crate must not
+/// `replayed_replay::splice::concat_list_path` is the real one, but the encoder crate must not
 /// depend on the replay engine, and on Unix it reduces to the path as written.
-fn localplay_replay_concat_path(path: &Path) -> String {
+fn replayed_replay_concat_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', r"'\''")
 }
 

@@ -118,7 +118,7 @@ if ($selfSession -eq 0) {
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$taskName = "localplay-verify-$stamp"
+$taskName = "replayed-verify-$stamp"
 $workerArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Worker " +
               "-Repo `"$Repo`" -Report `"$Report`" -Seconds $Seconds"
 if ($DevSoftwareEncoder) {

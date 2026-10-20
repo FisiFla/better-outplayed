@@ -1,4 +1,4 @@
-# better-outplayed — desktop shell (Phase 2)
+# replayed — desktop shell (Phase 2)
 
 The review window: a navigation rail over five views — the **library** (clip cards, search
 and filters), **sessions** (markers and per-match segments on a timeline), **storage**, a
@@ -82,8 +82,8 @@ with **no Tauri runtime and no window**.
 | `set_favourite(id, favourite)` | `Store::set_favourite` | Rejects an id with no row rather than reporting a no-op as success. |
 | `set_clip_title(id, title)`, `set_clip_tags(id, tags)` | `Store` | The schema-v5 library fields. |
 | `copy_clip_to_clipboard(id)`, `reveal_clip(id)`, `drag_clip_out(id)` | the clip's path | Copy, reveal in Explorer, and drag the file out of the window. |
-| `trim_clip(id, start_ms, end_ms)` | `localplay_media::edit::trim_lossless` | A **stream copy** (`-c copy`), never a re-encode. Writes `<name>.trim-<start>-<end>.<ext>` beside the original, probes the result and indexes it. |
-| `thumbnail(id, at_ms)` | `localplay_media::edit::thumbnail` | One JPEG in the thumbnails cache, reused on the next request. |
+| `trim_clip(id, start_ms, end_ms)` | `replayed_media::edit::trim_lossless` | A **stream copy** (`-c copy`), never a re-encode. Writes `<name>.trim-<start>-<end>.<ext>` beside the original, probes the result and indexes it. |
+| `thumbnail(id, at_ms)` | `replayed_media::edit::thumbnail` | One JPEG in the thumbnails cache, reused on the next request. |
 | `delete_clip(id)` | `Store::delete_clip_returning_path` | Row first, then the file (spec §8.2). Reports an orphan rather than hiding a failed unlink. |
 | `list_sessions()`, `session_detail(id)`, `session_events(id)`, `session_matches(id)` | `Store` | The sessions view: the list, the detail, the markers and the per-match segments. |
 | `extract_clip(...)`, `extract_match(...)` | the media crate | Cut a clip out of a finished session, or out of one match in it. |
@@ -105,12 +105,12 @@ before ffmpeg is ever spawned.
 ## Where the files live
 
 The shell resolves the application data directory by the **same rule as the CLI**
-(`%LOCALAPPDATA%\localplay` on Windows) — deliberately, because the two processes have to
+(`%LOCALAPPDATA%\replayed` on Windows) — deliberately, because the two processes have to
 agree on which index and which clips directory they are working with:
 
 | path | what |
 |---|---|
-| `<app data>/localplay.db` | the clip index (spec §5.5), written by the recorder, read here |
+| `<app data>/replayed.db` | the clip index (spec §5.5), written by the recorder, read here |
 | `<app data>/clips/` | clips; a trim's new file lands beside its parent |
 | `<app data>/thumbnails/` | the thumbnail cache, created on first use |
 | `<app data>/config.toml` | read by the recorder and by the settings panel, and **written** by the panel: `[storage]`, `[encode]`, `[mic]`, `[games]`, `[capture]` and `[recorder]`. Values fall back per key to `config.example.toml`, and the panel says which ones did. |
@@ -119,7 +119,7 @@ agree on which index and which clips directory they are working with:
 
 Clips play through Tauri's asset protocol, not through a command and not through a file
 server. `tauri.conf.json` enables it and scopes it statically to
-`$LOCALDATA/localplay/{clips,thumbnails}/**`; `lib.rs` additionally scopes the directories
+`$LOCALDATA/replayed/{clips,thumbnails}/**`; `lib.rs` additionally scopes the directories
 the process actually resolved at startup, which is what makes a configured
 `storage.clips_dir` outside the application data directory playable at all. Range requests
 come from the protocol handler, which is what lets the `<video>` element's own scrubbing
@@ -152,7 +152,7 @@ error-page screenshot, on a contrast ratio below WCAG AA, and on any console, pa
 error it cannot explain.
 
 The mock reaches the window through the test-only seam in `src/main.ts`: the page must be
-loaded with `?test-clip-source=1` *and* have set `globalThis.__localplayClipSource`, so a
+loaded with `?test-clip-source=1` *and* have set `globalThis.__replayedClipSource`, so a
 shipped window — loaded from `tauri://localhost/` — cannot be armed at all. Headless
 Chromium is downloaded into `target/desktop-shots/browsers/` on first use
 (`npm run shots:browser` does just that step). Media for the fixtures is generated with the
@@ -175,7 +175,7 @@ window at all**, and that is the half this directory's `background.rs` owns:
 |---|---|---|
 | Close the window → hide it (never quit, never end a recording); quit only from the tray | `background::close_action` | Yes, in `background.rs` — the rule is a function so a test can pin it |
 | `Ctrl+F8` takes a clip, through `RecorderHost::clip_now` (the same call the Save clip button makes) | `background::install_hotkey` + `on_hotkey_press` | Yes: one press → exactly one clip, driven against a real recording (`commands/recorder.rs`) |
-| A chord that cannot be registered is reported, not swallowed | `background::install_hotkey`, and `localplay_events::hotkey` returning the `RegisterHotKey` error | Yes (the parse and Windows-only branches); the registration itself needs Windows |
+| A chord that cannot be registered is reported, not swallowed | `background::install_hotkey`, and `replayed_events::hotkey` returning the `RegisterHotKey` error | Yes (the parse and Windows-only branches); the registration itself needs Windows |
 | The tray icon, tooltip and dynamic menu labels | `TrayView::{tray_state, tooltip, rendering}` and `MenuAction::{label, enabled}` | Yes, as pure values |
 | Menu item → the calls it makes (including stop-before-quit) | `background::dispatch`, over the `Shell` trait | Yes, against a recording fake |
 | `[app] start_with_system` → a Run-key entry | `background::sync_autostart`, `reg_argv`, `registered_path` | The decision table and the `reg.exe` argv: yes. The registry write: **no — Windows only** |
@@ -212,7 +212,7 @@ files reach the webview through the asset protocol instead.
   `frame-ancestors 'none'`; `connect-src` is limited to `ipc:`/`http://ipc.localhost`.
 - **The installer has been built and run, but is not shippable.** Bundling is configured —
   `bundle.active` is `true`, `bundle.resources` embeds the ffmpeg sidecars where
-  `localplay-media` looks for them — and the Windows installer was **built, installed, run,
+  `replayed-media` looks for them — and the Windows installer was **built, installed, run,
   uninstalled and reinstalled** on the Windows test machine on 2026-09-26
   ([`../../docs/packaging.md`](../../docs/packaging.md) §3.5). The artifacts are still
   unsigned, the icon is a placeholder and there is no updater. Read

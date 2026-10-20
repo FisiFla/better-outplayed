@@ -3,7 +3,7 @@
 //! [`listen`] returns `Err` naming the chord when it cannot be registered, never failing
 //! silently: a hotkey that does not exist and says nothing is the worst outcome here. The
 //! usual cause is another process owning the combination, including a second copy of
-//! localplay, because `RegisterHotKey` is system-wide. The CLI and the desktop app on the same
+//! replayed, because `RegisterHotKey` is system-wide. The CLI and the desktop app on the same
 //! `config.toml` cannot both hold it; the loser is told, so neither clips twice.
 //!
 //! Off Windows [`listen`] returns a channel that never yields and [`supported`] answers
@@ -125,7 +125,7 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
     let presses = listen_all(vec![hk])?;
     let (tx, rx) = channel();
     std::thread::Builder::new()
-        .name("localplay-hotkey-fwd".into())
+        .name("replayed-hotkey-fwd".into())
         .spawn(move || {
             while presses.recv().is_ok() {
                 if tx.send(()).is_err() {
@@ -161,7 +161,7 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
     // channel from the presses, because one is a handshake and the other a stream.
     let (report_tx, report_rx) = channel::<std::result::Result<(), String>>();
     std::thread::Builder::new()
-        .name("localplay-hotkey".into())
+        .name("replayed-hotkey".into())
         .spawn(move || {
             // SAFETY: called on a dedicated thread that owns the message queue.
             unsafe {
@@ -182,7 +182,7 @@ pub fn listen_all(hks: Vec<Hotkey>) -> Result<Receiver<usize>> {
                         }
                         let _ = report_tx.send(Err(format!(
                             "the chord {hk} could not be registered (RegisterHotKey failed: \
-                             {err}). Another application — or another localplay (the CLI and \
+                             {err}). Another application — or another replayed (the CLI and \
                              this app cannot both hold one chord) — already owns it. Nothing \
                              will happen when {hk} is pressed. Close the other application, \
                              or set a different chord under [hotkeys] in config.toml and \

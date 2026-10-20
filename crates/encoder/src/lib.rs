@@ -4,7 +4,7 @@
 // Scoped to the test build of this crate, so it cannot hide either in shipped code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
 
-use localplay_capture::{AudioBuffer, Frame};
+use replayed_capture::{AudioBuffer, Frame};
 use std::path::PathBuf;
 
 pub mod ffmpeg;
@@ -61,10 +61,10 @@ pub enum Vendor {
 ///
 /// A type rather than a bare string: the audio timeline is derived from the byte count, so a
 /// format the pipeline does not produce yields a silently wrong timeline. Every capture backend
-/// publishes signed 16-bit little-endian PCM (`localplay_capture::AudioFormat::default`).
+/// publishes signed 16-bit little-endian PCM (`replayed_capture::AudioFormat::default`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
-    /// Signed 16-bit little-endian, what `localplay-capture` delivers.
+    /// Signed 16-bit little-endian, what `replayed-capture` delivers.
     S16Le,
 }
 
@@ -93,7 +93,7 @@ pub struct MicAudioSpec {
 }
 
 impl Default for MicAudioSpec {
-    /// What every capture backend publishes: 48kHz stereo s16le (`localplay_capture::AudioFormat::default`).
+    /// What every capture backend publishes: 48kHz stereo s16le (`replayed_capture::AudioFormat::default`).
     fn default() -> Self {
         Self {
             sample_rate: 48_000,
@@ -145,7 +145,7 @@ pub struct EncodeConfig {
     /// A configured microphone that cannot be brought up fails the start; it never degrades to a
     /// recording that claims two tracks and carries one.
     ///
-    /// It cannot stand alone: `localplay_media::edit::audio_titles` names a one-track container
+    /// It cannot stand alone: `replayed_media::edit::audio_titles` names a one-track container
     /// `Game Audio`, so `game_audio = false` with a microphone is refused at spawn.
     pub mic_audio: Option<MicAudioSpec>,
     /// `None` means the real hardware encoder, the only shipping configuration.
@@ -204,7 +204,7 @@ pub enum EncodeOutput {
     /// Fragmented MP4 on the child's stdout (`pipe:1`): one `moof`+`mdat` fragment per forced
     /// keyframe, and no file written at all.
     ///
-    /// The caller keeps the stream in memory (`localplay_replay`'s `MemoryRingBuffer`), so an idle
+    /// The caller keeps the stream in memory (`replayed_replay`'s `MemoryRingBuffer`), so an idle
     /// replay buffer touches the disk only when a clip is saved. How it works:
     ///
     /// * `empty_moov+frag_keyframe+default_base_moof` gives a small `ftyp`+`moov` header (1249 bytes

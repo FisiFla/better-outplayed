@@ -6,7 +6,7 @@
 //! written to disk until a clip is saved.
 //!
 //! It is fed by [`crate::MemoryRingBuffer::push`] with whatever bytes the reader thread just got
-//! from ffmpeg's fragmented-MP4 output (box parsing is `localplay_media::fragments`). Taking
+//! from ffmpeg's fragmented-MP4 output (box parsing is `replayed_media::fragments`). Taking
 //! bytes rather than a stream lets every rule here be tested without a pipe, child or file.
 //!
 //! Two rules borrowed from the file ledger:
@@ -19,7 +19,7 @@
 //!   slightly over budget beats unable to clip (as `SegmentLedger::evict_to_cap` decides).
 
 use anyhow::Result;
-use localplay_media::FragmentSplitter;
+use replayed_media::FragmentSplitter;
 use std::collections::VecDeque;
 
 /// One fragment of the ring: a `moof`+`mdat` pair, and where it sits on the timeline.
@@ -318,8 +318,8 @@ mod tests {
     /// agreeing with what ffmpeg emits (fragment boundaries, `tfdt` spacing, `moof`+`mdat`
     /// pairing), which a hand-built byte string would not test.
     fn stream(seconds: u32) -> Vec<u8> {
-        let bin = localplay_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
-        let out = localplay_media::sidecar_command(&bin.ffmpeg)
+        let bin = replayed_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+        let out = replayed_media::sidecar_command(&bin.ffmpeg)
             .args([
                 "-v",
                 "error",

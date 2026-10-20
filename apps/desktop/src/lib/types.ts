@@ -331,7 +331,7 @@ export interface RecordedClip {
  *
  * `installed: false` is the interesting case: the chord is still named (it is what the user
  * was told to press) and `error` says why nothing is listening — the chord is taken by
- * another application or another localplay, or this build has no global hotkey at all.
+ * another application or another replayed, or this build has no global hotkey at all.
  */
 export interface HotkeyStatus {
   /** The configured chord, normalised by the Rust side's `Hotkey` display (`Ctrl+F8`). */

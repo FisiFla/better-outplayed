@@ -18,8 +18,8 @@
 // exemption does not reach it: the same rule, stated here.
 #![allow(clippy::unwrap_used)]
 
-use localplay_events::gsi::{self, GsiConfig, GsiListener};
-use localplay_events::{EventKind, GameEvent};
+use replayed_events::gsi::{self, GsiConfig, GsiListener};
+use replayed_events::{EventKind, GameEvent};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{channel, Receiver};

@@ -5,7 +5,7 @@
 //! vendor that must fail).
 
 use anyhow::{Context, Result};
-use localplay_media::FfmpegBinaries;
+use replayed_media::FfmpegBinaries;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -125,7 +125,7 @@ pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
         let state = if !text.lines().any(|l| l.contains(name)) {
             State::NotAdvertised
         } else {
-            match localplay_media::smoke_test_encoder(bin, name) {
+            match replayed_media::smoke_test_encoder(bin, name) {
                 Ok(()) => State::Works,
                 Err(reason) => State::Fails(reason),
             }

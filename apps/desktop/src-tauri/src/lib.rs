@@ -29,9 +29,9 @@ use commands::{
     StorageConfigView, StorageStats, ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
-use localplay_media::FfmpegBinaries;
-use localplay_recorder::GsiBinding;
-use localplay_store::Store;
+use replayed_media::FfmpegBinaries;
+use replayed_recorder::GsiBinding;
+use replayed_store::Store;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,7 +67,7 @@ pub struct AppState {
     app_data_dir: PathBuf,
     warnings: Vec<String>,
     /// The recording this window started, if any: the engine the CLI also drives
-    /// (`localplay-recorder`). A host rather than a bare handle because a start must resolve the
+    /// (`replayed-recorder`). A host rather than a bare handle because a start must resolve the
     /// application data directory and the ffmpeg sidecar binaries, both already here.
     recorder: RecorderHost,
     /// What installing the clip hotkey concluded: the chord, whether a listener is
@@ -421,7 +421,7 @@ fn copy_clip_to_clipboard(state: State<'_, AppState>, id: i64) -> Result<(), Com
 fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
     let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
     let (program, args) = background::reveal_command(&path, background::FileManager::current());
-    localplay_media::sidecar_command(&program)
+    replayed_media::sidecar_command(&program)
         .args(&args)
         .spawn()
         .map(drop)
@@ -735,8 +735,8 @@ fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, Com
 /// ours to change. Async because the join waits for that thread: a synchronous command would
 /// wait on the UI thread for it.
 #[tauri::command(async, rename_all = "snake_case")]
-fn list_audio_devices() -> Result<localplay_capture::audio_devices::AudioDevices, CommandError> {
-    std::thread::spawn(localplay_capture::audio_devices::list_audio_devices)
+fn list_audio_devices() -> Result<replayed_capture::audio_devices::AudioDevices, CommandError> {
+    std::thread::spawn(replayed_capture::audio_devices::list_audio_devices)
         .join()
         .map_err(|_| CommandError::new(ErrorCode::Recording, "listing audio devices panicked"))?
         .map_err(|e| CommandError::new(ErrorCode::Recording, format!("{e:#}")))
@@ -1006,7 +1006,7 @@ pub fn run() {
             // The index could not be opened. There is no window to show that in and no way to
             // repair it from, so the process ends; the reason is in the log.
             tracing::error!("{err}");
-            eprintln!("localplay: {err}");
+            eprintln!("replayed: {err}");
             std::process::exit(1);
         }
     };
@@ -1161,7 +1161,7 @@ pub fn run() {
             log_from_frontend
         ])
         .run(tauri::generate_context!())
-        .expect("error while running the localplay desktop shell");
+        .expect("error while running the replayed desktop shell");
 }
 
 /// Record an error the frontend hit, on the same stream as the backend's own.
@@ -1184,13 +1184,13 @@ fn log_from_frontend(level: String, message: String, detail: Option<String>) {
     let detail = flatten_for_log(detail);
     match level.as_str() {
         "error" => {
-            tracing::error!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::error!(target: "replayed_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
         "warn" => {
-            tracing::warn!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::warn!(target: "replayed_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
         _ => {
-            tracing::info!(target: "localplay_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
+            tracing::info!(target: "replayed_desktop::frontend", "[webview] {message}{}{detail}", if detail.is_empty() { "" } else { " — " })
         }
     }
 }
@@ -1250,7 +1250,7 @@ fn wire_background(
         let wiring = Arc::clone(&wiring);
         let hotkey = hotkey.clone();
         std::thread::Builder::new()
-            .name("localplay-tray".into())
+            .name("replayed-tray".into())
             .spawn(move || loop {
                 std::thread::sleep(TRAY_POLL);
                 wiring.refresh(&shell, &hotkey);
@@ -1264,7 +1264,7 @@ fn wire_background(
         let wiring = Arc::clone(&wiring);
         let hotkey = hotkey.clone();
         std::thread::Builder::new()
-            .name("localplay-hotkey-press".into())
+            .name("replayed-hotkey-press".into())
             .spawn(move || {
                 // `recv` blocks until a press or the channel closes (the listener thread ending, at exit).
                 while let Ok(action) = presses.recv() {
@@ -1314,7 +1314,7 @@ fn wire_background(
                         tracing::warn!("the window was closed but could not be hidden: {err}");
                     } else {
                         tracing::info!(
-                            "the window is hidden: recording continues, and localplay stays in \
+                            "the window is hidden: recording continues, and replayed stays in \
                              the tray. Quit from the tray menu (there is no other way out)."
                         );
                     }
@@ -1419,7 +1419,7 @@ impl Shell for AppShell {
             .ok_or_else(|| "the application state is not available yet".to_string())?;
         let path = state.config_path();
         let (program, args) = background::reveal_command(&path, background::FileManager::current());
-        localplay_media::sidecar_command(&program)
+        replayed_media::sidecar_command(&program)
             .args(&args)
             .spawn()
             .map_err(|err| format!("could not run {program}: {err}"))?;
@@ -1483,7 +1483,7 @@ struct TrayWiring {
 impl TrayWiring {
     fn install(shell: &AppShell, hotkey: &HotkeyStatus, icons: TrayIcons) -> tauri::Result<Self> {
         let view = TrayView {
-            status: &RecordingStatusDto::from(localplay_recorder::RecorderStatus::stopped()),
+            status: &RecordingStatusDto::from(replayed_recorder::RecorderStatus::stopped()),
             hotkey,
             window_visible: true,
             config_exists: shell.config_exists(),
@@ -1504,7 +1504,7 @@ impl TrayWiring {
         }
         let menu = builder.build()?;
 
-        let tray = TrayIconBuilder::with_id("localplay")
+        let tray = TrayIconBuilder::with_id("replayed")
             .icon(icons.for_state(view.tray_state()))
             .tooltip(view.tooltip())
             .menu(&menu)
@@ -1627,7 +1627,7 @@ fn init_tracing() -> PathBuf {
     // It sits beside the data (the directory of clips and the index) so one path answers "where are
     // the logs" on every platform. `RUST_LOG` still overrides the level.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,localplay_desktop=debug".into());
+        .unwrap_or_else(|_| "info,replayed_desktop=debug".into());
 
     let log_dir = crate::config::app_data_dir().join("logs");
     // Only when that path is real: `app_data_dir` falls back to `.` when neither LOCALAPPDATA nor
@@ -1640,14 +1640,14 @@ fn init_tracing() -> PathBuf {
             // 5 MB x (1 live + 3 rotated): a background app must not grow its log forever.
             const MAX_BYTES: u64 = 5 * 1024 * 1024;
             const KEEP: usize = 3;
-            let shared = log_dir.join("better-outplayed.log");
+            let shared = log_dir.join("replayed.log");
             // One process writes the shared file: the lock keeps a second launch out of it, so the
             // two cannot interleave their lines and the rotation cannot rename a file the other
             // process holds open (which fails on Windows). The loser writes a file of its own.
             match log_file::RotatingFile::open_locked(shared.clone(), MAX_BYTES, KEEP) {
                 Ok((file, true)) => Some((file, shared)),
                 Ok((_file, false)) => {
-                    let own = log_dir.join(format!("better-outplayed-{}.log", std::process::id()));
+                    let own = log_dir.join(format!("replayed-{}.log", std::process::id()));
                     tracing::warn!(
                         "another process is writing {}; this one writes {}",
                         shared.display(),
@@ -1687,7 +1687,7 @@ fn init_tracing() -> PathBuf {
             let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
             // The file the health page names even though nothing could be written to it: the
             // path is where the log *would* be, which is the answer a user needs.
-            log_dir.join("better-outplayed.log")
+            log_dir.join("replayed.log")
         }
     }
 }
@@ -1703,7 +1703,7 @@ mod tests {
     /// The log file a test's shell claims: the name the health page would show. Nothing writes
     /// to it, and the path does not have to exist.
     fn log_path() -> PathBuf {
-        PathBuf::from("better-outplayed.log")
+        PathBuf::from("replayed.log")
     }
 
     /// The directory holding this crate's manifest (`apps/desktop/src-tauri`), from which
@@ -1766,7 +1766,7 @@ mod tests {
     #[test]
     fn the_state_names_the_config_file_this_process_reads() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert_eq!(state.config_path(), app_dir.join("config.toml"));
@@ -1805,7 +1805,7 @@ mod tests {
             .iter()
             .find(|(_, destination)| {
                 destination.as_str().is_some_and(|destination| {
-                    destination.trim_end_matches('/') == localplay_media::binaries::SIDECAR_DIR_NAME
+                    destination.trim_end_matches('/') == replayed_media::binaries::SIDECAR_DIR_NAME
                 })
             })
             .expect("the sidecar directory is mapped");
@@ -1813,7 +1813,7 @@ mod tests {
 
         assert_eq!(
             destination.trim_end_matches('/'),
-            localplay_media::binaries::SIDECAR_DIR_NAME,
+            replayed_media::binaries::SIDECAR_DIR_NAME,
             "the bundler must write the sidecars into the directory `FfmpegBinaries::discover` \
              reads: `binaries/` under the resource directory"
         );
@@ -1840,15 +1840,15 @@ mod tests {
 
         // These two differ on purpose: Tauri derives the per-user install directory from `productName`
         // and the installed binary's name from `mainBinaryName`, so the mismatch keeps the installation
-        // out of %LOCALAPPDATA%\localplay, the directory holding the user's clips and index. Changing
+        // out of %LOCALAPPDATA%\replayed, the directory holding the user's clips and index. Changing
         // either alone moves something the other should not.
         assert_eq!(
-            config["productName"], "better-outplayed",
+            config["productName"], "replayed",
             "the install directory's name, and the bundle's"
         );
         assert_eq!(
-            config["mainBinaryName"], "localplay",
-            "the installed exe is localplay, as the crates and the CLI are"
+            config["mainBinaryName"], "replayed",
+            "the installed exe is replayed, as the crates and the CLI are"
         );
         assert_eq!(
             config["version"], "0.1.0",
@@ -1919,12 +1919,12 @@ mod tests {
     #[test]
     fn opening_the_shell_creates_the_index_and_the_clips_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
 
         let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert!(
-            app_dir.join("localplay.db").is_file(),
+            app_dir.join("replayed.db").is_file(),
             "the index is created"
         );
         assert!(
@@ -1944,7 +1944,7 @@ mod tests {
     #[test]
     fn reopening_the_shell_reuses_the_index_instead_of_recreating_it() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
 
         let first = AppState::open(&app_dir, storage(), log_path()).unwrap();
         // The listing only names files that are there, so the row needs its file: an empty stand-in,
@@ -1953,7 +1953,7 @@ mod tests {
         let id = {
             let store = first.store.lock().unwrap();
             store
-                .insert_clip(&localplay_store::NewClip {
+                .insert_clip(&replayed_store::NewClip {
                     path: app_dir.join("clips").join("kept.mp4"),
                     started_at_ms: 0,
                     duration_ms: 1_000,
@@ -1973,7 +1973,7 @@ mod tests {
     #[test]
     fn the_asset_roots_are_the_clips_directory_and_the_thumbnail_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert_eq!(
@@ -1985,7 +1985,7 @@ mod tests {
     #[test]
     fn a_configured_clips_directory_is_used_and_added_to_the_asset_scope() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         let elsewhere = dir.path().join("on-another-drive").join("clips");
         let configured = StorageConfig {
             clips_dir: elsewhere.to_string_lossy().into_owned(),
@@ -2002,7 +2002,7 @@ mod tests {
         );
         assert_eq!(
             state.paths.lock().unwrap().db_path,
-            app_dir.join("localplay.db"),
+            app_dir.join("replayed.db"),
             "the index stays put"
         );
     }
@@ -2012,7 +2012,7 @@ mod tests {
         // The shell reads `[storage]` and nothing else (see `config.rs`), so a file with a capture
         // setting the CLI would reject still opens the review UI.
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
             app_dir.join("config.toml"),
@@ -2039,7 +2039,7 @@ mod tests {
     #[test]
     fn a_config_missing_a_storage_key_still_opens_the_shell_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         std::fs::create_dir_all(&app_dir).unwrap();
         // `max_age_days` is missing: a key the desktop's reader falls back on, a section the CLI
         // would refuse.
@@ -2067,7 +2067,7 @@ mod tests {
     #[test]
     fn a_config_that_is_not_toml_still_opens_the_shell_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "[storage\nclips_dir = ").unwrap();
 
@@ -2091,7 +2091,7 @@ mod tests {
     #[test]
     fn the_state_is_built_before_the_hotkey_is_installed() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
 
         assert!(
@@ -2132,7 +2132,7 @@ mod tests {
     #[test]
     fn only_an_approved_clips_directory_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let app_dir = dir.path().join("localplay");
+        let app_dir = dir.path().join("replayed");
         let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
         state.approve_clips_root(&app_dir);
 

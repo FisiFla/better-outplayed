@@ -1,6 +1,6 @@
 # Third-party notices
 
-better-outplayed is a Rust workspace with a Svelte frontend and it ships no third-party
+replayed is a Rust workspace with a Svelte frontend and it ships no third-party
 code of its own. Everything below is either compiled into the application, loaded by the
 window out of `dist/`, or installed beside the application as a sidecar — and this file
 says what each of those is, and under which licence.
@@ -12,7 +12,7 @@ The two halves travel differently, so they are listed separately:
 - **[Bundled binaries and libraries](#bundled-binaries-and-libraries)** are compiled into
   the application, or installed next to it.
 
-The application's *own* licence is not in this file. better-outplayed is MIT **OR**
+The application's *own* licence is not in this file. replayed is MIT **OR**
 Apache-2.0, at your option, and that is stated in `LICENSE.txt` — which the installer
 shows on its licence page, and which is installed next to this one.
 
@@ -301,7 +301,7 @@ alongside them. For this build that is:
 
 ### The Tauri runtime and its plugins — Apache-2.0 OR MIT
 
-The window is a Tauri v2 application: its Rust side is compiled into `localplay.exe`, and
+The window is a Tauri v2 application: its Rust side is compiled into `replayed.exe`, and
 the webview it drives is the platform's own (WebView2 on Windows) — no browser engine is
 shipped.
 
@@ -340,7 +340,7 @@ that builds the application and is not part of it.)
 
 ### The Rust crates compiled into the application
 
-284 third-party crates are compiled into `localplay.exe` for the Windows target. Each
+284 third-party crates are compiled into `replayed.exe` for the Windows target. Each
 licence is named below exactly as the crate declares it. The full text of each licence is
 in that licence's own upstream project — `LICENSE-MIT` and `LICENSE-APACHE` in this
 repository for the two that cover most of the list, and the upstream project for the

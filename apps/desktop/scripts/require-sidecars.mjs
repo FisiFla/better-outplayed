@@ -52,7 +52,7 @@ if (missing.length > 0) {
       `  looked in: ${sourceDir}`,
       `  needs:     ${required.join(', ')}  (host platform: ${process.platform})`,
       '',
-      'The bundled sidecars are what lets an installed localplay run on a machine that has',
+      'The bundled sidecars are what lets an installed replayed run on a machine that has',
       'no system ffmpeg, so bundling without them would ship an app that cannot clip.',
       '',
       'Fix it by fetching the pinned sidecar binaries:',
