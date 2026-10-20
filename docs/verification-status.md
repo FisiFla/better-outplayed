@@ -2098,3 +2098,28 @@ release notes now say exactly that, with the exception named and its trust ancho
 described. The old wording was stronger than the code; this is the correction, and it is
 recorded here rather than quietly edited.
 
+
+### A residual: the archive is unpacked with a crate that has three open advisories
+
+`tauri-plugin-updater` unpacks the downloaded installer with `zip`'s `ZipArchive::extract`
+— the exact API behind **RUSTSEC-2026-0367**, **RUSTSEC-2026-0368** and
+**RUSTSEC-2026-0369** (privileged Unix bits preserved from the archive, symlinks that may
+point outside the destination, and permissions applied through them). The locked version
+is `zip 4.6.1`; the 4.x line ends there, the plugin's requirement pins the 4.x line, and
+OSV reports all three as `NO-FIX`. There is nothing to bump to.
+
+What the advisories need is an archive the attacker controls. The plugin does not offer
+one: `Update::install` calls `self.verify(bytes)?` — the minisign check against the pinned
+public key, with `require_signed_version` on — **before** `install_inner`, which is the
+only thing that reaches the extraction, and `Update::download_and_install` is `download`
+(which verifies) followed by `install_inner`. The plugin's own comment on that function
+says it: *"`download` already verified the bytes"*. The bytes that reach
+`ZipArchive::extract` have therefore been verified against a key whose private half is a
+release-pipeline secret that has never shipped.
+
+The residual is the shape of the bug rather than its reach. The symlink escape and the
+permission bits would matter if the signature check were bypassed, or if the application
+ran with more privilege than the user who installed it. It runs with less: a per-user
+Windows installer, where SUID and SGID do not exist, unpacking into a temporary directory
+the user owns. The three advisories are therefore ignored in `deny.toml`, with the reason
+written down there in full, rather than left to pass silently.

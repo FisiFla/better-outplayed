@@ -6,6 +6,36 @@ ignore = [
   # Marvin timing attack in `rsa`: only used (dev-dependency) to mint a throwaway RSA test leaf
   # for the LoL mock TLS server; no network-facing RSA operation in shipped code, no fix available.
   "RUSTSEC-2023-0071",
+  # ZIP extraction advisories in `zip 4.6.1`, reached only through `tauri-plugin-updater`.
+  #
+  # `zip` arrives with the updater plugin, which unpacks the downloaded installer with
+  # `ZipArchive::extract` — exactly the API these three advisories describe. What the
+  # advisories need is an attacker-controlled archive, and the plugin never extracts one:
+  #
+  #   * `Update::install` calls `self.verify(bytes)?` — the minisign check against the
+  #     pinned public key, with `require_signed_version` on — and only then calls
+  #     `install_inner`, which is what reaches the extraction.
+  #   * `Update::download_and_install` is `download` (which verifies) followed by
+  #     `install_inner`, and the plugin's own comment says so: "`download` already verified
+  #     the bytes".
+  #
+  # So the bytes that reach `ZipArchive::extract` have been verified against a key whose
+  # private half lives in the release pipeline's secrets and never ships. Producing bytes
+  # that pass that check means holding the private key.
+  #
+  # The residual is the shape of the bug rather than its reach: the symlink escape and the
+  # Unix permission bits would matter if the signature check were bypassed, or if the
+  # application ran privileged. It does not — it is a per-user installer on Windows, where
+  # SUID and SGID do not exist and the extracted archive is unpacked into a temporary
+  # directory the user owns.
+  #
+  # There is no fix to take. The 4.x line ends at 4.6.1, the plugin's requirement pins the
+  # 4.x line, and OSV reports all three as `NO-FIX`. Bumping is not possible; not shipping
+  # the updater would remove the only network path the project has, which is the opposite of
+  # what this decision is for.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
 ]
 
 [licenses]
