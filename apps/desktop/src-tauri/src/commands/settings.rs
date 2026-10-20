@@ -714,10 +714,7 @@ mod tests {
 
         // A configured clips directory is honoured, and is still the first asset root.
         let custom = AppPaths::resolve(&dir, "/mnt/games/replayed-clips");
-        assert_eq!(
-            custom.clips_dir,
-            PathBuf::from("/mnt/games/replayed-clips")
-        );
+        assert_eq!(custom.clips_dir, PathBuf::from("/mnt/games/replayed-clips"));
         assert_eq!(
             custom.asset_roots()[0],
             Path::new("/mnt/games/replayed-clips")
