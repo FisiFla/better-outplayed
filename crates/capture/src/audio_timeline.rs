@@ -15,6 +15,21 @@ use std::time::Duration;
 /// audio; 100ms is ten periods of headroom and still nothing a clip cut notices.
 pub(crate) const LIVE_LAG: Duration = Duration::from_millis(100);
 
+/// The most silence one gap may materialise.
+///
+/// A gap is padded with a contiguous run of zeroes, so it costs memory in proportion to its
+/// length: 11.9 hours of it is 8TB, and the allocator aborts the process on a request it cannot
+/// serve rather than fail it. A gap past this bound is not a gap the device left out - it is a
+/// stretch the recording cannot account for, such as a device position belonging to another
+/// clock or a session that was suspended - and it is dropped instead of filled.
+///
+/// One second is generous for what a gap really is. The silence fill advances a device period at
+/// a time, so the timeline stays within [`LIVE_LAG`] of the live edge and an ordinary outage is
+/// padded a few milliseconds per poll; only a single jump, one clock reading far from the last,
+/// reaches this bound. It is also small enough to fit in the encoder's audio queue, because a
+/// longer run of silence would push out the real audio that follows it.
+pub(crate) const MAX_FILL: Duration = Duration::from_secs(1);
+
 /// One packet as the source described it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PacketInfo {
@@ -54,6 +69,10 @@ pub(crate) struct AudioTimeline {
     /// Padded frame ranges not yet fully emitted, oldest first.
     fills: VecDeque<(u64, u64)>,
     scratch: Vec<u8>,
+    /// Packets whose timestamp the recording could not account for, and the stretches dropped for
+    /// the same reason. Counted so the anomaly can be reported once instead of per packet.
+    unusable_timestamps: u64,
+    dropped_stretches: u64,
 }
 
 impl AudioTimeline {
@@ -66,6 +85,8 @@ impl AudioTimeline {
             pending: Vec::new(),
             fills: VecDeque::new(),
             scratch: Vec::new(),
+            unusable_timestamps: 0,
+            dropped_stretches: 0,
         }
     }
 
@@ -77,15 +98,25 @@ impl AudioTimeline {
         u64::from(self.format.sample_rate / 100)
     }
 
+    /// The most silence one gap may materialise, in frames.
+    fn max_fill_frames(&self) -> u64 {
+        u64::from(self.format.sample_rate).saturating_mul(MAX_FILL.as_secs())
+    }
+
     /// The frame index `time` falls on, rounded; anything before the origin is frame 0.
     fn frame_at(&self, time: Duration) -> u64 {
         let nanos = time.saturating_sub(self.origin).as_nanos();
-        ((nanos * u128::from(self.format.sample_rate) + 500_000_000) / 1_000_000_000) as u64
+        let frames = (nanos * u128::from(self.format.sample_rate) + 500_000_000) / 1_000_000_000;
+        // Saturate rather than truncate: a time far outside the recording would otherwise wrap
+        // into an arbitrary frame index, and the timeline would pad that many frames of silence.
+        u64::try_from(frames).unwrap_or(u64::MAX)
     }
 
     fn time_of(&self, frame: u64) -> Duration {
         let nanos = u128::from(frame) * 1_000_000_000 / u128::from(self.format.sample_rate);
-        self.origin + Duration::from_nanos(nanos as u64)
+        self.origin.saturating_add(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
     }
 
     /// Pull and place up to `max` packets. Returns whether the source ran dry, the only state in
@@ -111,6 +142,11 @@ impl AudioTimeline {
     /// Put one packet where its timestamp says. Within one block of the running count it is just
     /// appended, so timestamp jitter never chops a steady stream; a discontinuity is placed exactly
     /// because the engine has said samples are missing.
+    ///
+    /// A timestamp the recording cannot account for - further away than [`MAX_FILL`] - is not
+    /// obeyed: the packet follows the previous one instead. Such a timestamp is not a gap the
+    /// device left silent, it is a reading from another clock, and padding it would ask for
+    /// gigabytes of zeroes.
     pub fn place(&mut self, info: PacketInfo, samples: &[u8]) {
         let bytes_per_frame = self.bytes_per_frame();
         let frames = (samples.len() / bytes_per_frame).min(info.frames) as u64;
@@ -122,49 +158,113 @@ impl AudioTimeline {
             } else {
                 self.block_frames()
             };
-            if at > self.placed + tolerance {
-                self.pad(at - self.placed);
-            } else if at + tolerance < self.placed {
-                // The stream already covers this stretch (padding that ran ahead of a late packet).
-                skip = (self.placed - at).min(frames);
+            if at > self.placed.saturating_add(tolerance) {
+                let gap = at - self.placed;
+                if gap <= self.max_fill_frames() {
+                    self.pad(gap);
+                } else {
+                    self.note_unusable_timestamp(gap);
+                }
+            } else if at.saturating_add(tolerance) < self.placed {
+                let late = self.placed - at;
+                if late <= self.max_fill_frames() {
+                    // The stream already covers this stretch (padding that ran ahead of a late packet).
+                    skip = late.min(frames);
+                } else {
+                    // Too late to be jitter, and too late to be a stretch this recording can
+                    // account for either. Dropping the packet would lose real audio over a
+                    // timestamp nobody can use, so the packet follows the previous one.
+                    self.note_unusable_timestamp(late);
+                }
             }
         }
-        let start = skip as usize * bytes_per_frame;
-        let end = frames as usize * bytes_per_frame;
+        let start = (skip as usize).saturating_mul(bytes_per_frame);
+        let end = (frames as usize).saturating_mul(bytes_per_frame);
         self.pending.extend_from_slice(&samples[start..end]);
-        self.placed += frames - skip;
+        self.placed = self.placed.saturating_add(frames - skip);
     }
 
     /// Pad with silence up to `LIVE_LAG` before `now`, so a stretch with no packets still advances
     /// the audio at the video's pace instead of arriving later as one burst.
+    ///
+    /// A live edge further ahead than [`MAX_FILL`] is a clock the recording cannot follow - the
+    /// session was suspended, or the clock was set - and the stretch is dropped rather than
+    /// filled. The timeline carries on at the live edge, which is where the device's next packet
+    /// lands.
     pub fn fill_to(&mut self, now: Duration) {
         let at = self.frame_at(now.saturating_sub(LIVE_LAG));
         if at > self.placed {
-            self.pad(at - self.placed);
+            let gap = at - self.placed;
+            if gap <= self.max_fill_frames() {
+                self.pad(gap);
+            } else {
+                self.drop_stretch(at);
+            }
         }
     }
 
+    /// Count a timestamp the recording cannot account for, and say so once.
+    ///
+    /// The audio is still captured, but the track is no longer aligned to the clock to the
+    /// millisecond, and the reason is a device timestamp that does not belong to this recording.
+    fn note_unusable_timestamp(&mut self, distance: u64) {
+        self.unusable_timestamps += 1;
+        if self.unusable_timestamps == 1 {
+            tracing::warn!(
+                distance_secs = distance as f64 / f64::from(self.format.sample_rate),
+                "an audio packet carried a timestamp the recording cannot account for, so the \
+                 timestamp is ignored: the audio carries on on the clock instead of the gap being \
+                 padded with silence"
+            );
+        }
+    }
+
+    /// Move the timeline to `frames`, the live edge, after a stretch it cannot account for.
+    ///
+    /// The buffered audio is kept: it is the last stretch before the clock jumped and it is still
+    /// worth having. What is dropped is the stretch itself, which is why the frame index moves
+    /// without the bytes moving with it.
+    fn drop_stretch(&mut self, frames: u64) {
+        self.dropped_stretches += 1;
+        if self.dropped_stretches == 1 {
+            tracing::warn!(
+                "the clock moved further ahead than the recording can account for, so the stretch \
+                 is dropped instead of being padded with silence: the audio track continues from \
+                 the live edge and is shorter than the video by the length of that stretch"
+            );
+        }
+        self.fills.clear();
+        self.placed = frames;
+        self.emitted = frames;
+    }
+
     fn pad(&mut self, frames: u64) {
+        // The last line of defence: a gap is never materialised beyond the bound, whatever a
+        // caller asks for, so no allocation can be sized by a timestamp alone.
+        let frames = frames.min(self.max_fill_frames());
         let start = self.placed;
-        let end = start + frames;
+        let end = start.saturating_add(frames);
         match self.fills.back_mut() {
             Some(last) if last.1 == start => last.1 = end,
             _ => self.fills.push_back((start, end)),
         }
-        let bytes = frames as usize * self.bytes_per_frame();
-        self.pending.resize(self.pending.len() + bytes, 0);
+        let bytes = usize::try_from(frames)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.bytes_per_frame());
+        let len = self.pending.len().saturating_add(bytes);
+        self.pending.resize(len, 0);
         self.placed = end;
     }
 
     /// The next whole 10ms block, stamped from its position on the timeline.
     pub fn next_block(&mut self) -> Option<Block> {
         let block_frames = self.block_frames();
-        let block_bytes = block_frames as usize * self.bytes_per_frame();
+        let block_bytes = (block_frames as usize).saturating_mul(self.bytes_per_frame());
         if self.pending.len() < block_bytes {
             return None;
         }
         let data: Vec<u8> = self.pending.drain(..block_bytes).collect();
-        let (start, end) = (self.emitted, self.emitted + block_frames);
+        let (start, end) = (self.emitted, self.emitted.saturating_add(block_frames));
         let filler = self
             .fills
             .iter()
@@ -186,11 +286,21 @@ impl AudioTimeline {
     }
 }
 
+/// The QPC (in ticks since boot) as the audio engine reports it: `10,000,000 * t / f`.
+///
+/// The engine computes this in 64-bit arithmetic, so this does too: the multiply wraps after
+/// 51.24 hours of machine uptime (2^64 / 10^7 ticks), and an anchor computed exactly in 128 bits
+/// would no longer be the same kind of number as the packet timestamps it is subtracted from.
+/// Computing both the same way is what keeps them on one scale.
+pub(crate) fn qpc_to_hns(counter: u64, frequency: u64) -> u64 {
+    counter.wrapping_mul(10_000_000) / frequency
+}
+
 /// A device QPC position (100ns units) on the shared clock, given one instant read on both:
 /// `anchor_hns` on the QPC and `anchor` on the shared clock. `None` before the shared clock began.
 pub(crate) fn qpc_to_shared(hns: u64, anchor_hns: u64, anchor: Duration) -> Option<Duration> {
     if hns >= anchor_hns {
-        Some(anchor + Duration::from_nanos((hns - anchor_hns).saturating_mul(100)))
+        Some(anchor.saturating_add(Duration::from_nanos((hns - anchor_hns).saturating_mul(100))))
     } else {
         anchor.checked_sub(Duration::from_nanos((anchor_hns - hns).saturating_mul(100)))
     }
@@ -264,6 +374,168 @@ mod tests {
             .iter()
             .flat_map(|b| b.buffer.data.chunks_exact(4).map(|f| f[0]))
             .collect()
+    }
+
+    /// The gap the 4K recording on a real Windows 11 machine died on: a device timestamp
+    /// 2^32 ten-millisecond blocks - 42,949,672.96 seconds, 497 days - ahead of the origin.
+    /// Padding it asked the allocator for 8,246,337,208,320 bytes and the process was aborted.
+    const ABORT_GAP: Duration = Duration::from_nanos((1u64 << 32) * 10_000_000);
+
+    /// The most silence the timeline may hold, in bytes.
+    fn max_fill_bytes() -> usize {
+        FORMAT.sample_rate as usize * MAX_FILL.as_secs() as usize * 4
+    }
+
+    #[test]
+    fn a_timestamp_the_recording_cannot_account_for_is_ignored() {
+        // The device says the packet belongs 497 days into the recording. No stretch of a
+        // recording can account for that, so the timestamp is not obeyed: the audio is kept and
+        // the gap is not padded with 8TB of zeroes.
+        let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        let (info, samples) = packet(Some(ORIGIN + ABORT_GAP), BLOCK, 7, false);
+        timeline.place(info, &samples);
+
+        assert!(
+            timeline.pending.len() <= max_fill_bytes() + BLOCK * 4,
+            "the gap was not materialised: {} bytes buffered",
+            timeline.pending.len()
+        );
+        assert_eq!(
+            timeline.placed, BLOCK as u64,
+            "the packet is on the timeline"
+        );
+        let block = timeline.next_block().expect("a block");
+        assert!(
+            block.buffer.data.iter().all(|&s| s == 7),
+            "the audio is kept, only the timestamp is ignored"
+        );
+    }
+
+    #[test]
+    fn the_silence_a_gap_may_hold_is_bounded() {
+        // A gap of an hour is still a gap, not a stretch to fill with an hour of zeroes.
+        let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        let (info, samples) = packet(Some(ORIGIN + Duration::from_secs(3600)), BLOCK, 7, false);
+        timeline.place(info, &samples);
+
+        assert!(
+            timeline.pending.len() <= max_fill_bytes() + BLOCK * 4,
+            "{} bytes buffered for a one hour gap",
+            timeline.pending.len()
+        );
+    }
+
+    #[test]
+    fn a_gap_within_the_bound_is_still_filled_with_silence() {
+        // A second is a gap a recording can account for, and it is padded as before.
+        let packets = vec![
+            packet(Some(ORIGIN), BLOCK, 1, false),
+            packet(Some(ORIGIN + MAX_FILL), BLOCK, 2, false),
+        ];
+        let (blocks, timeline) = run(packets);
+        let frames = frames(&blocks);
+        let silence = MAX_FILL.as_secs() as usize * 100 * BLOCK;
+
+        assert_eq!(frames.len(), silence + BLOCK);
+        assert!(
+            frames[BLOCK..silence].iter().all(|&s| s == 0),
+            "the gap is silence"
+        );
+        assert!(frames[silence..].iter().all(|&s| s == 2));
+        assert!(timeline.pending.is_empty());
+    }
+
+    #[test]
+    fn a_clock_that_jumped_ahead_does_not_materialise_the_gap() {
+        // The clock moved 497 days forward in one step: a suspended session, or a clock that was
+        // set. The stretch is dropped, and the timeline carries on at the live edge.
+        let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        timeline.fill_to(ORIGIN + ABORT_GAP);
+
+        assert!(
+            timeline.pending.len() <= max_fill_bytes(),
+            "{} bytes buffered for a clock that jumped",
+            timeline.pending.len()
+        );
+
+        // The next packet lands at the live edge and is captured.
+        let (info, samples) = packet(Some(ORIGIN + ABORT_GAP), BLOCK, 7, false);
+        timeline.place(info, &samples);
+        let mut blocks = Vec::new();
+        while let Some(block) = timeline.next_block() {
+            blocks.push(block);
+        }
+        assert!(
+            frames(&blocks).contains(&7),
+            "the audio after the jump is captured"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_too_late_to_be_jitter_keeps_the_audio() {
+        // The timeline is eleven seconds in, and the packet claims to belong before the
+        // recording started: too late to be jitter, and too far back for any stretch of this
+        // recording to account for. The audio is kept rather than dropped over a timestamp
+        // nobody can use.
+        let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        let (info, samples) = packet(Some(ORIGIN), 11 * 48_000, 1, false);
+        timeline.place(info, &samples);
+        let (info, samples) = packet(Some(Duration::ZERO), BLOCK, 2, false);
+        timeline.place(info, &samples);
+
+        let mut blocks = Vec::new();
+        while let Some(block) = timeline.next_block() {
+            blocks.push(block);
+        }
+        let frames = frames(&blocks);
+        assert!(
+            frames.contains(&2),
+            "the late packet's audio is kept, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_frame_index_beyond_the_recording_saturates_instead_of_wrapping() {
+        let timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        assert_eq!(
+            timeline.frame_at(Duration::MAX),
+            u64::MAX,
+            "a time beyond the recording saturates, it does not wrap into a frame index"
+        );
+    }
+
+    #[test]
+    fn the_qpc_anchor_is_the_value_the_audio_engine_computes() {
+        // The audio engine puts the QPC of every packet in its buffer as 10,000,000 * t / f,
+        // computed in 64-bit arithmetic, so the multiply wraps after 51.24 hours of machine
+        // uptime. The anchor has to be that same number, or the two are not on one scale and
+        // every packet timestamp comes out nonsense.
+        let frequency = 10_000_000u64; // the 10MHz QPC of a typical machine
+        for hours in [1, 60, 60 * 24 * 30] {
+            let counter = hours * 3600 * frequency;
+            let engine = counter.wrapping_mul(10_000_000) / frequency;
+            assert_eq!(
+                qpc_to_hns(counter, frequency),
+                engine,
+                "the anchor after {hours} hours of uptime is the engine's own number"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_timestamp_stays_on_the_shared_clock_after_the_engine_wraps() {
+        let frequency = 10_000_000u64;
+        let uptime = 60 * 3600 * frequency; // 60 hours of ticks: the engine's multiply has wrapped
+        let anchor_hns = qpc_to_hns(uptime, frequency);
+        // The packet's own timestamp, as the engine computes it.
+        let packet_hns = (uptime + frequency).wrapping_mul(10_000_000) / frequency;
+        let anchor = Duration::from_secs(10);
+
+        assert_eq!(
+            qpc_to_shared(packet_hns, anchor_hns, anchor),
+            Some(anchor + Duration::from_secs(1)),
+            "a packet one second after the anchor is one second later on the shared clock"
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@
 
 use crate::audio_recovery::{RecoveringSource, SourceGone};
 use crate::audio_target::{GameAudioOpener, LoopbackFactory};
-use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
+use crate::audio_timeline::{qpc_to_hns, qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
 use crate::platform::init_com;
 use crate::{
     clock_base, is_silent_block, AudioBackend, AudioBuffer, AudioFormat, ConvertedSilenceWatch,
@@ -660,6 +660,10 @@ fn start_stream(
 
 /// The QPC in 100ns units and the shared clock, read back to back. `Instant` is QPC-based on
 /// Windows, so the two then differ by a constant and one reading maps every packet timestamp.
+///
+/// The QPC is converted the way the audio engine converts the one it puts in every packet
+/// ([`qpc_to_hns`]), so the anchor and the packet timestamps stay on one scale even after the
+/// engine's 64-bit multiply has wrapped.
 pub(crate) fn qpc_anchor() -> Result<(u64, Duration)> {
     let mut frequency = 0i64;
     let mut counter = 0i64;
@@ -672,7 +676,7 @@ pub(crate) fn qpc_anchor() -> Result<(u64, Duration)> {
     if frequency <= 0 || counter < 0 {
         bail!("QueryPerformanceCounter returned frequency {frequency}, count {counter}");
     }
-    let hns = (counter as u128 * 10_000_000 / frequency as u128) as u64;
+    let hns = qpc_to_hns(counter as u64, frequency as u64);
     Ok((hns, anchor))
 }
 
