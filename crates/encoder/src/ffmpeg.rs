@@ -100,15 +100,6 @@ pub(crate) const MFT_TIMEOUT: Duration = Duration::from_secs(2);
 /// buffer, so this only bounds a pathological case (see `drain_stderr`).
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
-/// How long a failure report waits for ffmpeg's stderr **once the child has been reaped**.
-///
-/// The child's own stderr is complete the moment it is reaped, so the only thing that can still
-/// delay the text is a descendant that inherited the pipe and is holding it open — the
-/// pathological case the budget exists for. Waiting longer here is worth it: ffmpeg's own words
-/// are the one thing a user cannot get anywhere else, and a report that loses them is a report
-/// that says "it died" and nothing more.
-const STDERR_DRAIN_AFTER_REAP: Duration = Duration::from_secs(10);
-
 /// How long a writer failure waits for ffmpeg to become reapable so its exit status and stderr
 /// can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
 ///
@@ -1235,9 +1226,11 @@ impl FfmpegEncoder {
                 _ => return None,
             }
         };
-        // The child is reaped, so its stderr is complete: the only thing that can still delay the
-        // text is a descendant holding the pipe open, and the reason is worth waiting for.
-        let stderr = self.drain_stderr(STDERR_DRAIN_AFTER_REAP);
+        // The reader has been running since the child was spawned, so the text is already
+        // waiting for us in all but one case: a descendant that inherited the pipe and is
+        // holding it open, in which case the text will never arrive and the budget is what
+        // stops the report from waiting for it.
+        let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
         Some(format!(
             "ffmpeg exited with {status} using encoder '{}': {}",
             self.encoder_name,
