@@ -6,6 +6,8 @@
 //! Needs ffmpeg on `PATH` with a working libx264.
 
 use super::*;
+use crate::pump::frame_bytes;
+use replayed_capture::{Frame, PixelFormat};
 use replayed_events::EventKind;
 
 /// The stub geometry: small and slow, so four seconds of real-time capture encodes quickly.
@@ -2259,4 +2261,62 @@ fn a_short_and_a_long_clip_come_out_of_one_recording_at_their_own_lengths() {
         "and shorter than the default window: {}ms",
         short.metadata.duration_ms
     );
+}
+
+/// A frame is sized by its geometry, and a frame that is not the size its geometry says is
+/// refused.
+///
+/// The raw video pipe is a flat byte stream with no framing, so a frame that claims 3840x2160
+/// and carries 33,177,599 bytes is read as the start of the *next* frame's pixels: the damage
+/// appears seconds later as a desync pointing at nothing. The size is therefore computed in
+/// `usize` and saturating — a `u32` multiplication of three numbers this large wraps into a
+/// *small* number, and a small number is the dangerous one, because a buffer sized for a
+/// fraction of the frame compares equal to nothing and the frame is then read as if it were
+/// whole.
+#[test]
+fn a_frame_is_sized_by_its_geometry_and_a_short_frame_is_refused() {
+    // The 4K desktop this was reported on: 3840x2160 BGRA.
+    let (width, height) = (3840u32, 2160u32);
+    let bytes = frame_bytes(width, height);
+    assert_eq!(
+        bytes, 33_177_600,
+        "a 4K BGRA frame is 33.2MB and the size must be exact"
+    );
+    assert_eq!(
+        u64::from(width) * u64::from(height) * 4,
+        bytes as u64,
+        "the size is the geometry times four bytes a pixel"
+    );
+    assert!(
+        frame_bytes(u32::MAX, u32::MAX) > u32::MAX as usize,
+        "a geometry whose u32 product would wrap must saturate, not wrap into a small number \
+         that sizes a buffer for a fraction of the frame"
+    );
+
+    // A frame one byte short of the frame the pipe was declared for.
+    let short = Frame {
+        data: vec![0u8; bytes - 1],
+        pts: Duration::ZERO,
+        width,
+        height,
+        format: PixelFormat::Bgra8,
+        texture: None,
+    };
+    let err = guard_frame_size(&short, (width, height))
+        .expect_err("a frame that is not the size its geometry says must be refused");
+    assert!(
+        err.to_string().contains("33177600"),
+        "the refusal must name the size the frame should have had: {err}"
+    );
+
+    // And the frame that is the right size goes through, or the guard would refuse good footage.
+    let honest = Frame {
+        data: vec![0u8; bytes],
+        pts: Duration::ZERO,
+        width,
+        height,
+        format: PixelFormat::Bgra8,
+        texture: None,
+    };
+    guard_frame_size(&honest, (width, height)).expect("an honest frame is admitted");
 }

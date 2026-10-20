@@ -235,12 +235,44 @@ pub fn pump_once_counted_with_mic(
     Ok(counts)
 }
 
-/// Refuse a frame whose geometry disagrees with the rawvideo pipe's declared size.
+/// Bytes one BGRA pixel occupies: blue, green, red, alpha.
+const BYTES_PER_PIXEL: usize = 4;
+
+/// The bytes a frame of `width` × `height` BGRA pixels occupies.
+///
+/// Saturating, and in `usize`: the geometry is a pair of `u32`s from a capture backend, and a
+/// frame's size is three of them multiplied, which does not fit in a `u32` at the sizes a
+/// display can be — 3840x2160 is 33,177,600 bytes on its own, and a `u32` multiplication of
+/// three such numbers wraps.
+///
+/// A wrapped size is worse than a wrong one, because it is *small*: a buffer sized for a
+/// fraction of the frame, and the frame then read as if it were whole — diagonal banding and a
+/// stream desync — instead of the size being refused. Saturating rather than checked, because
+/// a size that cannot be represented is a frame no machine holds, and the caller compares this
+/// against a buffer that does exist.
+pub fn frame_bytes(width: u32, height: u32) -> usize {
+    (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(BYTES_PER_PIXEL)
+}
+
+/// Refuse a frame whose geometry disagrees with the rawvideo pipe's declared size, or whose
+/// pixels are not the size that geometry says.
 ///
 /// The pipe is a flat byte stream with no framing, so a wrong-sized frame is mis-read silently
 /// (diagonal banding, healthy-looking segments). Seen on a 4K desktop at 150% scaling, where the
 /// pipe was declared 2560x1440 (DPI-virtualised `GetSystemMetrics`) but frames were 3840x2160.
 /// A mismatch means `build_encode_config` and the backend disagree; stop loudly.
+///
+/// The geometry alone is not the whole contract: a frame that *claims* 3840x2160 and carries
+/// 33,177,599 bytes is one byte short of the frame the pipe was declared for, and ffmpeg reads
+/// the pipe as a byte stream — so the short frame is the start of the next frame's pixels. The
+/// size is computed by [`frame_bytes`], which cannot wrap, so the comparison is against the
+/// frame's real size and not against a wrapped one.
+///
+/// A frame with no pixels is not this check's business: on the zero-copy path the pixels are in
+/// VRAM and the frame carries a texture, so the byte count is the texture's and not the
+/// buffer's.
 pub fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
     if (frame.width, frame.height) != configured {
         bail!(
@@ -253,6 +285,21 @@ pub fn guard_frame_size(frame: &Frame, configured: (u32, u32)) -> Result<()> {
             configured.0,
             configured.1
         );
+    }
+    if frame.has_pixels() {
+        let expected = frame_bytes(frame.width, frame.height);
+        if frame.data.len() != expected {
+            bail!(
+                "capture produced a {}x{} frame carrying {} bytes, but a frame of that \
+                 size is {} bytes: ffmpeg reads the raw video pipe as a flat byte stream, \
+                 so a frame of any other length is mis-read (garbled bands, stream desync) \
+                 rather than reported",
+                frame.width,
+                frame.height,
+                frame.data.len(),
+                expected
+            );
+        }
     }
     Ok(())
 }
@@ -394,7 +441,7 @@ mod tests {
             std::thread::sleep(self.spend);
             let (width, height) = self.size;
             Ok(Some(Frame {
-                data: vec![0u8; (width * height * 4) as usize],
+                data: vec![0u8; frame_bytes(width, height)],
                 pts: Duration::ZERO,
                 width,
                 height,

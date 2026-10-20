@@ -135,7 +135,13 @@ pub struct BufferSection {
     /// Unclipped footage lives in RAM (see `replayed_replay::MemoryRingBuffer`), so this keeps the OS
     /// from killing the application. It is a fraction of a typical machine because the encoder and
     /// capture backends need room too. Defaulted so an older `config.toml` still parses.
-    #[serde(default = "default_ram_cap_bytes")]
+    ///
+    /// Clamped when it is parsed ([`MAX_RAM_CAP_BYTES`]): this is the only bound on the ring, and
+    /// a bound that a hand-edited file can raise past the machine's memory is not a bound.
+    #[serde(
+        default = "default_ram_cap_bytes",
+        deserialize_with = "clamp_ram_cap_bytes"
+    )]
     pub ram_cap_bytes: u64,
     /// The longest pre-roll a single clip may ask for, in seconds; `0` means `pre_seconds`. It sizes
     /// the ring so a long-clip hotkey can reach further back. Larger requests are clamped, not errors.
@@ -174,6 +180,15 @@ impl BufferSection {
 /// clamp is here so a hand-edited file cannot overflow the millisecond arithmetic downstream.
 pub const MAX_WINDOW_SECONDS: u64 = 86_400;
 
+/// The largest RAM budget the replay buffer may be given, in bytes.
+///
+/// The RAM cap is the only bound on the ring: the footage it holds is unclipped and in memory,
+/// so a cap that is not bounded is a cap that is not a cap. 64 GiB is far more than any
+/// machine's worth of footage — at 40 Mbit/s it is more than a day of recording — and far
+/// less than the machine has, so a ring that reaches the cap evicts rather than starving the
+/// operating system.
+pub const MAX_RAM_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// A window length from the configuration, clamped to [`MAX_WINDOW_SECONDS`].
 ///
 /// The clamp is arithmetic on a number that has already been parsed, and the point is to bound
@@ -181,6 +196,17 @@ pub const MAX_WINDOW_SECONDS: u64 = 86_400;
 fn clamp_seconds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let seconds = u64::deserialize(deserializer)?;
     Ok(seconds.min(MAX_WINDOW_SECONDS))
+}
+
+/// A RAM budget from the configuration, clamped to [`MAX_RAM_CAP_BYTES`].
+///
+/// Clamped when it is parsed, for the same reason the window lengths are: the number is a
+/// memory budget, and a hand-edited file must not be able to ask for more memory than exists.
+/// The arithmetic downstream is saturating, so the budget itself has to be a number that can be
+/// carried.
+fn clamp_ram_cap_bytes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let bytes = u64::deserialize(deserializer)?;
+    Ok(bytes.min(MAX_RAM_CAP_BYTES))
 }
 
 /// 256 MiB. See [`BufferSection::ram_cap_bytes`] for why it is not larger.
@@ -370,6 +396,31 @@ output_size = \"\"
             file.buffer.ram_cap_bytes,
             256 * 1024 * 1024,
             "an absent key must default, not fail and not be zero"
+        );
+    }
+
+    /// The RAM cap is the only bound on the ring, so a hand-edited file must not be able to ask
+    /// for more memory than the machine has: the budget is clamped when it is parsed.
+    #[test]
+    fn an_absurd_ram_cap_is_clamped_when_it_is_parsed() {
+        #[derive(Debug, Deserialize)]
+        struct File {
+            buffer: BufferSection,
+        }
+        let text = format!(
+            "{MINIMAL}\n[buffer]\npre_seconds = 30\npost_seconds = 5\nsegment_time = 1\n\
+             scratch_dir = \"\"\nram_cap_bytes = {huge}\n",
+            huge = u64::MAX
+        );
+        let file: File = toml::from_str(&text).expect("a file with an absurd RAM cap parses");
+        assert_eq!(
+            file.buffer.ram_cap_bytes, MAX_RAM_CAP_BYTES,
+            "the budget is clamped at parse time: a cap that is not bounded is not a cap"
+        );
+        // And the shipped budget is inside the bound, so the clamp never touches a real file.
+        assert!(
+            default_ram_cap_bytes() <= MAX_RAM_CAP_BYTES,
+            "the default must be inside the bound"
         );
     }
 
