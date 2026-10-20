@@ -517,8 +517,13 @@ $ gh run view 35904179918 --log-failed
   display it has little left to win — `skipped=204` against `frames=10525` (§13) — because the
   panel delivers ~60 fps, not the 144 Hz the issue assumed, so almost no frame is read back
   and then thrown away.
-- **Single-monitor capture only.** `crates/capture/src/wgc.rs` captures the primary monitor
-  (index 0) and rejects any other index; monitor selection is not wired to config.
+- **Single-monitor capture is what was ever measured.** Monitor selection *is* wired: `[capture]
+  monitor` is read by the recorder (`crates/recorder/src/config.rs`) and by the desktop shell
+  (`SettingEdit::CaptureMonitor`), the settings panel exposes it, and
+  `crates/capture/src/target.rs::pick_monitor` refuses an index that does not exist rather than
+  recording the wrong display. What has never been exercised is the path that selects a
+  non-primary monitor: every recorded run in §10–§23 captured index 0, so the multi-monitor
+  behaviour is unverified.
 - **No macOS/Linux capture backend.** `crates/capture/src/platform.rs` selects WGC/WASAPI
   on Windows and the synthetic `StubCapture` everywhere else. Off Windows the pipeline
   captures a generated image and *proves nothing* about real capture.

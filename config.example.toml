@@ -237,8 +237,10 @@ device = ""
 # finalised, and the storage policy is applied) when it stops.
 #
 # **Off by default, and that is the whole safety posture of the feature**: with it
-# off, nothing is polled, no process list is enumerated and no request is made — no
-# watcher thread exists at all. League of Legends is detected through Riot's own
+# off, no watcher thread exists at all — nothing is polled and no game is looked
+# for. (The game-audio path still enumerates the process list, once, to find the
+# watched game's process id for the per-application capture; that is a different
+# feature and it does not run a watcher.) League of Legends is detected through Riot's own
 # Live Client Data API (a read-only GET to 127.0.0.1:2999, which only answers during
 # a real match); every other title by comparing process names in a snapshot — the
 # same enumeration Task Manager does, with nothing opened, read or injected, and no
