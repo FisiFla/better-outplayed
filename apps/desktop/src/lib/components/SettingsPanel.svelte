@@ -19,6 +19,7 @@
   } from '../types';
   import { QUALITY_OPTIONS, captureUpdate, deviceOptions, monitorIndex } from '../settings';
   import EncoderPanel from './EncoderPanel.svelte';
+  import UpdaterPanel from './UpdaterPanel.svelte';
 
   interface Props {
     /** `null` until the first read answers; the panel is hidden meanwhile. */
@@ -156,6 +157,7 @@
     { id: 'settings-encoder', label: 'Encoder' },
     { id: 'settings-automatic', label: 'Automatic recording' },
     { id: 'settings-games', label: 'Game integrations' },
+    { id: 'settings-updates', label: 'Updates' },
   ];
   let activeSection = $state('settings-library');
 
@@ -412,6 +414,8 @@
         </div>
       {/each}
     </div>
+
+    <UpdaterPanel />
     </div>
     </div>
   {/if}

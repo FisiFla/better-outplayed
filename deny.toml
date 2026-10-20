@@ -32,8 +32,11 @@ wildcards = "allow"
 #
 # `reqwest` and `hyper` are deliberately *not* on this list: `tauri` itself depends on
 # `reqwest`, so denying them would fail the desktop shell's own audit for a crate the
-# project does not choose. The guard for the app's own egress stays where it can see it —
-# in the source tree.
+# project does not choose — and the updater plugin depends on it too, because it is the one
+# thing in this tree that talks to the internet, and only when the user asks it to. The
+# guard for the app's own egress stays where it can see it — in the source tree, where the
+# dependency check reads the resolved graphs and allows exactly one of them to hold a
+# client.
 deny = [
   "attohttpc", "isahc", "surf", "ureq",
 ]

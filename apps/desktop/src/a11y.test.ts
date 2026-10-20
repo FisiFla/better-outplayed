@@ -19,6 +19,16 @@ import type {
 vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (p: string) => `asset://${p}`,
   invoke: () => Promise.resolve(undefined),
+  // The updater plugin is imported by the settings panel, and it extends `Resource` and
+  // builds a `Channel` at module level. The mock has to carry both, or the import throws
+  // before a single test in this file runs.
+  Resource: class {
+    rid = 0;
+    async close() {}
+  },
+  Channel: class {
+    onmessage: ((message: unknown) => void) | null = null;
+  },
 }));
 
 const clip: ClipDto = {

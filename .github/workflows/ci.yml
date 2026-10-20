@@ -473,8 +473,13 @@ jobs:
         run: npm ci
 
       - name: Bundle the application
+        # `--no-sign`: `bundle.createUpdaterArtifacts` is on, so the bundler archives the
+        # macOS app as an updater artifact and wants to sign it with the release key — a
+        # secret this job must not have (a pull request from a fork has no secrets at all).
+        # This bundle is checked, never shipped, so an unsigned updater artifact is exactly
+        # right here; the release workflow signs the real one.
         working-directory: apps/desktop
-        run: npm run tauri -- build --bundles app
+        run: npm run tauri -- build --bundles app --no-sign
 
       - name: Check the bundle carries the pinned sidecar
         # The bundle must carry the *pinned* ffmpeg, not merely a file called "ffmpeg":
@@ -581,8 +586,14 @@ jobs:
         # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
         # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
         # tauri.windows.conf.json.
+        #
+        # `--no-sign`: `bundle.createUpdaterArtifacts` is on, so this build also produces
+        # the updater's artifact and wants to sign it with the release key — a secret this
+        # job must not have, since it runs on pull requests from forks. The installer this
+        # job produces is checked and never published, so an unsigned updater artifact is
+        # exactly right here; the release workflow signs the real one.
         working-directory: apps/desktop
-        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
+        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc --no-sign
 
       - name: Check the installer exists and carries the sidecars
         # Lists the NSIS archive with 7-Zip (preinstalled on the runner); does not run it.

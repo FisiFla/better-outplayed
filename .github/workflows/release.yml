@@ -24,10 +24,30 @@
 # ---------------------------------------------------------------------------
 #   - `replayed_<version>_x64-setup.exe` — the NSIS installer;
 #   - `SHA256SUMS` — the installer's SHA-256 in `sha256sum -c` format, so the download can
-#     be checked before it is run. The same hash is printed in the release body.
+#     be checked before it is run. The same hash is printed in the release body;
+#   - `replayed_<version>_x64-setup.nsis.zip` — the *updater's* artifact: the installer,
+#     zipped. This is what the installed application downloads;
+#   - `replayed_<version>_x64-setup.nsis.zip.sig` — the minisign signature of that zip,
+#     made with the release key whose public half is pinned in `tauri.conf.json`;
+#   - `latest.json` — the update manifest. It names the zip and its signature, and it is
+#     published under the stable name `releases/latest/download/latest.json`, which is the
+#     one URL the application asks (see `plugins.updater.endpoints`).
 #
-# Both are uploaded as a workflow artefact as well, *before* the release step, so a failed
-# release still leaves the built installer on the Actions page instead of nowhere.
+# All of them are uploaded as a workflow artefact as well, *before* the release step, so a
+# failed release still leaves the built installer on the Actions page instead of nowhere.
+#
+# ---------------------------------------------------------------------------
+# THE SIGNING KEY
+# ---------------------------------------------------------------------------
+# The release needs two repository secrets, and the build fails without them:
+#
+#   - `TAURI_SIGNING_PRIVATE_KEY` — the private minisign key, base64, exactly as
+#     `tauri signer generate` wrote it. It never enters the repository;
+#   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — its password.
+#
+# The public half of the same key pair is `plugins.updater.pubkey` in `tauri.conf.json`, and
+# the CLI refuses to sign with a key that does not match it — so a wrong secret fails the
+# release here, and not on a user's machine.
 #
 # ---------------------------------------------------------------------------
 # PERMISSIONS
@@ -174,11 +194,35 @@ jobs:
         working-directory: apps/desktop
         run: npm run build
 
+      - name: Check the signing key is configured
+        # The updater's artifact is signed during the build, and the CLI cannot sign
+        # without the private key. This step says so in words, instead of leaving the
+        # build to fail with a base64 error.
+        shell: pwsh
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) {
+            throw ("this release needs the updater's signing key: set the repository secret " +
+              "TAURI_SIGNING_PRIVATE_KEY (the base64 private minisign key) and " +
+              "TAURI_SIGNING_PRIVATE_KEY_PASSWORD. The public half of that key pair is the " +
+              "one pinned in plugins.updater.pubkey in tauri.conf.json.")
+          }
+          Write-Host "the signing key is configured"
+
       - name: Build the NSIS installer
         # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
         # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
         # tauri.windows.conf.json.
+        #
+        # `bundle.createUpdaterArtifacts` is on, so this build also produces the updater's
+        # own artifact — the installer, zipped — and signs it with the key below. The
+        # signature is checked against `plugins.updater.pubkey`, so a key that does not
+        # match the pinned one fails here.
         working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
 
       - name: Check the installer exists and carries the sidecars
@@ -289,8 +333,11 @@ jobs:
 
           - **Local only, no telemetry.** replayed records on this machine and writes clips
             to your disk. There is no account, no sign-in, no telemetry, no crash reporting,
-            no analytics and no cloud upload; the only network traffic it creates is to
-            your own machine, over loopback.
+            no analytics and no cloud upload. The network traffic it creates is to your own
+            machine, over loopback, with **one exception**: the update check you ask for in
+            Settings → Updates. That asks this project's own GitHub release page once, and
+            what it downloads is checked against the signing key this build was made with
+            before anything is installed.
           - **It carries its own ffmpeg.** The installer embeds the pinned `ffmpeg` and
             `ffprobe` pair, so no system ffmpeg is needed and nothing is installed
             system-wide. They are **LGPL v3 or later** (BtbN's `win64-lgpl` build, without
@@ -328,6 +375,95 @@ jobs:
           $body | Set-Content -Path "release/RELEASE_NOTES.md" -Encoding utf8NoBOM
           Write-Host $body
 
+      - name: Stage the updater artifact and write the update manifest
+        # The manifest the installed application reads, and the one thing in this project
+        # that the updater depends on.
+        #
+        # Its shape is the one `tauri-plugin-updater` parses:
+        #
+        #   {
+        #     "version": "0.2.0",
+        #     "notes": "…what changed…",
+        #     "pub_date": "2026-10-20T10:00:00.000Z",
+        #     "platforms": {
+        #       "windows-x86_64-nsis": { "signature": "…", "url": "…" },
+        #       "windows-x86_64":      { "signature": "…", "url": "…" }
+        #     }
+        #   }
+        #
+        # The two platform keys are the same artifact under the two names the updater looks
+        # for: it tries `{os}-{arch}-{bundle type}` first — `windows-x86_64-nsis`, which is
+        # what the bundler writes into a released binary — and falls back to `{os}-{arch}`
+        # for a build that has no bundle type recorded, such as a development build.
+        #
+        # The signature is the content of the `.sig` file the CLI wrote next to the zip: the
+        # minisign signature of that exact zip, made with the release key. The application
+        # checks the bytes it downloads against it and the public key pinned in
+        # `tauri.conf.json`; a manifest that names a different artifact, or an artifact that
+        # was swapped, fails that check and nothing is installed.
+        id: updater
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.assets.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          # The updater's artifact is the installer, zipped: `bundle.createUpdaterArtifacts`
+          # in tauri.conf.json makes `tauri build` write it beside the installer.
+          $artifact = Get-ChildItem -Path $dir -Filter '*.nsis.zip' | Select-Object -First 1
+          if (-not $artifact) { throw "no updater artifact was produced in $dir" }
+          $signature = Get-ChildItem -Path $dir -Filter '*.nsis.zip.sig' | Select-Object -First 1
+          if (-not $signature) {
+            throw ("the updater artifact was not signed: there is no .sig beside it in $dir. " +
+              "The release needs TAURI_SIGNING_PRIVATE_KEY.")
+          }
+          Write-Host "updater artifact: $($artifact.Name)"
+          Write-Host "signature:        $($signature.Name)"
+
+          Copy-Item $artifact.FullName -Destination "release/$($artifact.Name)"
+          Copy-Item $signature.FullName -Destination "release/$($signature.Name)"
+
+          # The signature, as the manifest carries it: the base64 blob, without a newline.
+          $sig = (Get-Content $signature.FullName -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($sig)) { throw "the signature file is empty" }
+
+          # Where the artifact is published. GitHub serves a release asset from this path.
+          $url = "https://github.com/$env:REPO/releases/download/$env:TAG/$($artifact.Name)"
+
+          # The notes: this version's section of the changelog, which is what the update
+          # panel shows. A release with no changelog section is not a failed release, but it
+          # is worth saying out loud.
+          $changelog = Get-Content "CHANGELOG.md" -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($env:VERSION))\][^\n]*\n(.*?)(?=^## \[|\z)"
+          $found = [regex]::Match($changelog, $pattern)
+          if ($found.Success) {
+            $notes = $found.Groups[1].Value.Trim()
+          } else {
+            $notes = ""
+            Write-Host "WARNING: CHANGELOG.md has no section for $env:VERSION"
+          }
+
+          $platform = [ordered]@{
+            signature = $sig
+            url = $url
+          }
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            notes = $notes
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z"
+            platforms = [ordered]@{
+              "windows-x86_64-nsis" = $platform
+              "windows-x86_64" = $platform
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path "release/latest.json" -Encoding utf8NoBOM
+          Write-Host "release/latest.json:"
+          Get-Content "release/latest.json" -Raw | Write-Host
+
+          "artifact=$($artifact.Name)" >> $env:GITHUB_OUTPUT
+          "signature=$($signature.Name)" >> $env:GITHUB_OUTPUT
+
       - name: Upload the release assets
         # Before the release step, and unconditionally: a release that fails to publish
         # still leaves the built installer here, on the Actions page, to be fetched by hand.
@@ -348,6 +484,8 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           VERSION: ${{ steps.assets.outputs.version }}
           INSTALLER: ${{ steps.installer.outputs.name }}
+          UPDATER_ARTIFACT: ${{ steps.updater.outputs.artifact }}
+          UPDATER_SIGNATURE: ${{ steps.updater.outputs.signature }}
         run: |
           # `gh release view` is expected to fail when there is no release for the tag
           # yet, so a failing native command must not stop the script: the exit code is
@@ -356,7 +494,17 @@ jobs:
           if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
             throw "the GitHub CLI is not on this runner"
           }
-          $assets = @("release/$env:INSTALLER", "release/SHA256SUMS")
+          # The updater's own assets go up with the rest: the application downloads the zip
+          # and checks it against the signature, and `latest.json` is the manifest that
+          # names both. `latest.json` is what the stable
+          # `releases/latest/download/latest.json` path serves.
+          $assets = @(
+            "release/$env:INSTALLER",
+            "release/SHA256SUMS",
+            "release/$env:UPDATER_ARTIFACT",
+            "release/$env:UPDATER_SIGNATURE",
+            "release/latest.json"
+          )
           $title = "replayed $env:VERSION ($env:TAG)"
           $notes = "release/RELEASE_NOTES.md"
 

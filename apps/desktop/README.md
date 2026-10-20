@@ -231,16 +231,25 @@ listener, and nothing else).
 Run and passing:
 
 ```sh
-cd apps/desktop && npm test          # 251 vitest tests
+cd apps/desktop && npm test          # 292 vitest tests
 cd apps/desktop && npm run build     # vite production build
 cd apps/desktop && npm run check     # svelte-check: 0 errors, 0 warnings
-cd apps/desktop && npm run shots     # 20 screenshots, 227 checks, 0 failures
-cd apps/desktop/src-tauri && cargo test    # 212 tests, against a real store and real ffmpeg
+cd apps/desktop && npm run shots     # 21 screenshots, 234 checks, 0 failures
+cd apps/desktop/src-tauri && cargo test    # 258 tests, against a real store and real ffmpeg
 cd apps/desktop/src-tauri && cargo clippy  # no warnings in shipping code
 ```
 
-**Seen, headlessly:** the frontend rendered in Chromium at 1280x800, in seventeen states
-(twenty screenshots), with the
+**A local bundle build now needs the release key.** `bundle.createUpdaterArtifacts` is on, so
+`tauri build` wants the minisign private key that signs the updater artifact. Pass
+`--no-sign` to build without it — the build is then not updatable, which is fine for
+anything that is not a release:
+
+```sh
+cd apps/desktop && npm run tauri -- build --no-sign
+```
+
+**Seen, headlessly:** the frontend rendered in Chromium at 1280x800, in eighteen states
+(twenty-one screenshots), with the
 built bundle and a mocked `ClipSource` — the clip list, the detail view, the timeline, a
 drag of both trim handles (3240ms → 9331ms, from real pointer input), a scrub that moved both
 the playhead and the `<video>`, the trim notice, the recorder bar while it is recording

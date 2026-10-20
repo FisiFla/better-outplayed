@@ -16,8 +16,8 @@ anywhere else is not monitored.
 ## Scope and threat model
 
 replayed is a local application: no accounts, no telemetry, no crash reporting, no cloud
-upload, no auto-updater. It listens only on loopback and makes no outbound connections
-other than to loopback.
+upload. It listens only on loopback and makes no outbound connections other than to
+loopback — **with one exception, the update check, described below**.
 
 - the **game-state-integration (GSI) listener** — a token-gated HTTP listener on
   `127.0.0.1` (`crates/events/src/gsi.rs`; `bind` refuses any non-loopback address and the
@@ -32,15 +32,18 @@ other than to loopback.
 
 The tree's outbound sockets are exactly five files, and that list is pinned by a test:
 `crates/events/tests/no_egress.rs::only_the_loopback_modules_talk_to_a_socket_at_all`. The
-same file carries the rest of the zero-egress guard, and it is worth knowing how:
+updater's request is made inside the updater plugin, whose code is not this tree's; what
+this tree grants it, and how narrow that is, is described below. The
+same file carries the rest of the egress guard, and it is worth knowing how:
 
 - the capability check is a **denylist of names** with an explicit **per-file exemption
   list**, each exemption carrying its reason
   (`no_capability_to_reach_off_this_machine_is_used_outside_its_exemptions`), rather than
   an allowlist of constructors — an allowlist of constructors is only as good as the list;
 - there is a separate **dependency check**: no HTTP client may be a direct dependency of any
-  manifest (`no_http_client_is_a_dependency`), because the source-tree guard reads our code
-  and a dependency is a capability nobody wrote;
+  manifest, and no resolved dependency graph may hold one either, with a single exemption —
+  the desktop shell's, because the updater plugin is in it
+  (`no_http_client_is_a_dependency`);
 - every `TcpListener::bind` in the tree is pinned to loopback, and the address is *read off
   the source* rather than guessed from a file-level mention
   (`every_listener_is_bound_to_loopback`).
@@ -55,10 +58,73 @@ In scope:
 - the webview (strict CSP, no filesystem/shell/http capability granted),
 - the installer writing into a game's own folder, and the containment rule around it,
 - the log file, and what a second instance or the webview can put in it,
+- **the updater**: a tampered update manifest, a swapped update artifact, and what an
+  attacker who can serve the manifest gets to choose,
 - supply chain: pinned, checksummed ffmpeg sidecars; `cargo-deny`, `npm audit` and
   gitleaks in CI.
 
 Out of scope: an attacker who already runs code as the same user.
+
+---
+
+## The updater: the one thing that reaches another machine
+
+The application has exactly one outbound request, and the user starts it: **Settings →
+Updates → Check for updates**. There is no check at startup, no polling, no background
+task, no telemetry and no phone-home of any kind. If the button is never pressed, nothing
+is ever requested.
+
+**What is requested, and from where.** The endpoint is fixed in
+`apps/desktop/src-tauri/tauri.conf.json` (`plugins.updater.endpoints`) and is this
+project's own GitHub release page:
+
+```
+https://github.com/FisiFla/replayed/releases/latest/download/latest.json
+```
+
+The frontend cannot change it, and the webview cannot open a connection of its own: the
+content security policy's `connect-src` is `ipc: http://ipc.localhost`, and the request is
+made by the Rust side of the updater plugin, not by the window. The webview's only
+permissions for it are `updater:allow-check` and `updater:allow-download-and-install`
+(`apps/desktop/src-tauri/capabilities/default.json`).
+
+**The trust anchor is the pinned minisign public key.** `plugins.updater.pubkey` in
+`tauri.conf.json` holds the public half of the release key pair. It is compiled into the
+binary, so it cannot be changed at runtime by anything on the machine or by the manifest.
+Every artifact the updater downloads is checked against it **before it is installed**:
+
+- the artifact's bytes are verified against the signature the manifest names, using that
+  pinned key. A **tampered `latest.json`** — one that names a different artifact, or a
+  signature that is not the one for those bytes — fails the check and **nothing is
+  installed**;
+- a **swapped artifact** — a genuine file of a different release, or a modified installer —
+  fails the same check, because the signature covers the bytes;
+- `plugins.updater.requireSignedVersion` is on, so the signature must also carry the
+  version it was signed for. The manifest is not itself signed, so without this an
+  attacker who can serve it could pair a *new* version number with an *older* release's
+  URL and signature and force a downgrade onto a validly signed build. With it, the
+  signed version and the announced version have to agree.
+
+**The private key never ships.** It lives only in the release pipeline's secrets
+(`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and in the
+maintainer's own storage; it is not in this repository, not in the installer, and not in
+the application's data directory. The CLI refuses to sign with a key that does not match
+the pinned public key, so a release signed with the wrong key fails at the pipeline rather
+than on a user's machine.
+
+**What this does not protect against.** The updater inherits the platform's trust: the
+request is made with the platform's certificate roots, so whoever controls the DNS or the
+network path to `github.com` can serve *a* manifest — but not one whose artifact carries
+a signature from the pinned key. And the release pipeline itself is a trust anchor: whoever
+can publish a release under this repository's identity can ship an artifact the updater
+will accept. That is the same trust the GitHub Releases page already carries, and the
+pipeline is the only place the signing key is used.
+
+**What has not been verified.** The signature check path is unit-tested
+(`apps/desktop/src-tauri/tests/updater.rs`), but **no release has ever been signed with
+the release key and offered to an installed copy**: the end-to-end path is unverified, and
+`docs/verification-status.md` §27 records that.
+
 
 ---
 
@@ -168,7 +234,11 @@ treated as untrusted input, not as the application.
   `frame-ancestors`.
 - **No filesystem, shell or http capability**
   (`apps/desktop/src-tauri/capabilities/default.json`): `core:default`, the open-file
-  dialog and notifications, and nothing else.
+  dialog, notifications, and the updater's two commands — and nothing else. The updater
+  permissions are **not** an http capability: they let the *Rust side* make the one
+  request described above, to the one URL pinned in `tauri.conf.json`. The webview still
+  has no way to open a connection of its own — the CSP's `connect-src` is
+  `ipc: http://ipc.localhost` — and it cannot name a different endpoint.
 - **The asset protocol is the window's only read channel**, so its scope is the boundary.
   The static scope is the default layout
   (`$LOCALDATA/replayed/clips/**`, `$LOCALDATA/replayed/thumbnails/**`) and the runtime

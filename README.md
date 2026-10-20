@@ -134,11 +134,22 @@ Settings, the clips). Deleting a clip or session in the app deletes its files; u
 not delete your clips.
 
 **Local only.** There is no account, no sign-in, no telemetry, no crash reporting, no analytics
-and no upload. The only network traffic the app creates is to your own machine: it polls
+and no upload. The network traffic the app creates is to your own machine: it polls
 `127.0.0.1:2999` for League events and, if enabled, listens on `127.0.0.1` for CS2 / Dota 2.
 The listener binds loopback only and rejects any request without its generated token; a test
 in `crates/events` asserts that nothing else in that crate opens a socket to a non-loopback
-address. There is no auto-updater yet; a new version is something you download yourself.
+address.
+
+**One exception, and it is yours to press.** *Settings → Updates → Check for updates* asks
+whether there is a newer release. That is the only request this application makes to another
+machine: one HTTPS GET to this project's own GitHub release page
+(`https://github.com/FisiFla/replayed/releases/latest/download/latest.json`), and then, only
+if you press **Download and install**, one download of the installer from the same page.
+There is no check at startup, no polling, no background task and no telemetry — if you never
+press the button, nothing is ever requested. What it downloads is checked against the
+minisign public key this build was made with, and a file that does not match is refused
+before anything is installed; the private half of that key lives in the release pipeline's
+secrets and never ships.
 
 **Your input.** The app never sends keystrokes or mouse input and never writes to a game
 client's API. The Settings button that installs the Game State Integration file writes exactly
@@ -220,6 +231,10 @@ tooltip and in the log, and the window keeps working without it. `[app] start_wi
 - *CS2 / Dota 2* — a `127.0.0.1`-bound HTTP listener consuming Valve's Game State
   Integration POSTs via a user-installed config file.
 - *Everything else* — the global hotkey path, which needs no integration at all.
+
+The one request that leaves the machine is the update check you ask for in *Settings →
+Updates*, and it goes to this project's own GitHub release page — see the
+[Privacy](#privacy) section above.
 
 ---
 
@@ -420,8 +435,12 @@ stays manual.
       inspected, and the **Windows installer now builds, installs, uninstalls and reinstalls on
       real hardware** ([`docs/packaging.md`](docs/packaging.md) §3.5 — measured 2026-09-26, first
       time any of it was observed rather than inferred). What is still missing is **code signing
-      and notarisation**; the auto-updater is **deferred to a later phase** with GitHub Releases
-      as the intended mechanism, not missing from this one.
+      and notarisation**. The auto-updater **now exists** — a signed, user-initiated check
+      against this project's own GitHub Releases, with the artifact checked against a pinned
+      minisign key before it is installed — but it has **never been used end to end**: no
+      release has been signed with the release key and offered to an installed copy yet, so
+      what is missing there is the evidence, not the code
+      ([`docs/verification-status.md`](docs/verification-status.md) §27).
 
 > **Caveat on every `[x]` above.** The Windows-only surface has now run on Windows: on
 > 2026-09-24 the whole Rust workspace was built **and its test suite executed** on the Windows test machine,

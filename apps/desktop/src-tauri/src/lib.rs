@@ -1107,6 +1107,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // The "clip saved" toast and sound (see `RecorderHost::on_clip_saved`).
         .plugin(tauri_plugin_notification::init())
+        // The updater: the one plugin in this shell that reaches another machine, and it
+        // does so only when the user presses "Check for updates" in the settings panel.
+        // It is registered here, not started here — the plugin has no background work at
+        // all: the endpoint and the minisign public key come from `plugins.updater` in
+        // tauri.conf.json, and every artifact is verified against that key before it is
+        // installed.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             // The hotkey is installed here, and not before the builder: Tauri runs the plugins'
             // setup before the application's own, and the single-instance plugin's check is one

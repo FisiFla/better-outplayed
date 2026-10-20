@@ -11,6 +11,14 @@ It therefore uses **only** the capture paths OBS-style recorders use:
 It never injects, hooks, reads or writes another process's memory, synthesises input, or writes
 to a game client. `scripts/check-forbidden-apis.sh` enforces the API half of this in CI.
 
+**The one request it makes to another machine.** *Settings → Updates → Check for updates*
+asks this project's own GitHub release page whether there is a newer replayed. That is an
+ordinary HTTPS GET, and then a download of the installer from the same page; it touches no
+game, no game client and no process, it says nothing about the machine it runs on, and it
+happens only when the user presses the button. Nothing else in the application reaches the
+network. What it downloads is checked against the signing key this build was made with
+before it is installed.
+
 Tested anti-cheats: none systematically yet — tracked in the release checklist. This project is not
 affiliated with any game or anti-cheat vendor; use at your own risk.
 

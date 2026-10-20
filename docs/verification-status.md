@@ -2024,3 +2024,77 @@ both modes.
 - A fixed port is still squattable unless `gsi_ephemeral_port` is turned on. The default is
   unchanged at `45671`.
 - No Windows run of the harness has happened with any of this in place.
+
+## 27. The updater: the one thing that reaches another machine (2026-10-20)
+
+Until now this tree made **no network egress at all**, and said so in the README, in
+`SECURITY.md` and in the code (`crates/events/tests/no_egress.rs`). The updater is the one
+feature that changes that, so this section records what was built, what was checked, and
+what was **not**.
+
+### What it is
+
+- Tauri v2's official updater plugin: `tauri-plugin-updater` 2.14 (Rust) and
+  `@tauri-apps/plugin-updater` 2.14 (JS) — the same major version the other plugins in
+  this shell already use, pinned the same way (`"2"` in the manifest, `^2.14.0` in
+  `package.json`).
+- `bundle.createUpdaterArtifacts` is on, so a release produces the updater's own artifact
+  (the installer, zipped) and its minisign signature.
+- The endpoint is **one fixed URL**, in `plugins.updater.endpoints` in `tauri.conf.json`:
+  `https://github.com/FisiFla/replayed/releases/latest/download/latest.json`. GitHub
+  serves the newest release's asset at that stable path, which is why the release workflow
+  now publishes `latest.json` as an asset of every release.
+- The trust anchor is the **minisign public key pinned in `plugins.updater.pubkey`**, in
+  the same file. It is compiled into the binary. Every artifact is verified against it
+  before it is installed, and `plugins.updater.requireSignedVersion` additionally requires
+  the signature to carry the version it was signed for — so a tampered manifest cannot pair
+  a new version number with an older, validly signed release.
+- The **check is user-initiated only**. A "Check for updates" control in *Settings →
+  Updates*. No startup check, no polling, no background task, no telemetry.
+- The private key **never ships**: it is a release-pipeline secret
+  (`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and it is not in
+  this repository.
+
+### What is verified
+
+| claim | level | how |
+|---|---|---|
+| The pinned key is a key the plugin can parse, the endpoint is the one fixed HTTPS URL, the bundle produces updater artifacts, and the signed version is required | **Verified on the dev host** | `apps/desktop/src-tauri/tests/updater.rs` — six tests over `tauri.conf.json` and the minisign decode, one of which parses `plugins.updater` into the **plugin's own** `Config` type |
+| The signature check accepts a good artifact and refuses a tampered one, and refuses a signature made by another key | **Verified on the dev host** | the same file, driven against a **throwaway** key pair and a fixed test vector, with the same `minisign-verify` crate the plugin uses |
+| The pinned key is *not* the throwaway key the test vector was signed with | **Verified on the dev host** | the same file |
+| The application asks nothing until the user presses the button | **Verified on the dev host** | `apps/desktop/src/lib/updater.test.ts` ("asks nothing until it is asked") and `apps/desktop/src/lib/components/UpdaterPanel.test.ts` ("asks nothing when the panel opens", "asks once, when the button is pressed") |
+| The tree's dependency graph holds an HTTP client in exactly one place, and the source denylist is unchanged | **Verified on the dev host** | `crates/events/tests/no_egress.rs` — the dependency check now reads the resolved graphs as well as the manifests, with one exemption: the desktop shell's, for the updater |
+
+### What is **not** verified — and this is the important half
+
+- **No update has ever been performed, end to end.** The release workflow has never run
+  with the signing key configured, no `latest.json` has ever been published, and no
+  installed copy of replayed has ever been offered an update. The whole path — manifest
+  fetched, artifact downloaded, signature checked, installer run — is **unverified**.
+- **The release key has never signed a real release.** It was generated on 2026-10-20 and
+  used only on scratch files while the signing path was being set up; it has never signed
+  anything that was published, and it lives outside this repository. The key that signed
+  the committed test vector is a different one — a throwaway pair, made for the test and
+  never used for anything else.
+- **The manifest's shape is derived from the plugin's source, not observed.** The plugin's
+  `RemoteRelease` type and its target lookup (`{os}-{arch}-{bundle type}` first,
+  `{os}-{arch}` as the fallback) were read from `tauri-plugin-updater` 2.14, and
+  `latest.json` is written to that shape. Whether GitHub serves the asset where the
+  workflow expects it, and whether the plugin accepts the manifest, has not been tried.
+- **The updater has never run on Windows.** It is type-checked and unit-tested on the
+  development host (macOS), and the Windows path — the NSIS `/UPDATE` install, the
+  restart, the "restart to finish" state — is **unverified**.
+- **The guard was widened, not loosened.** The source-file denylist, the loopback bind
+  check and the certificate check are exactly as they were. The dependency check learned
+  about *resolved* graphs and gained one exemption; removing that exemption makes the
+  guard fail (it was checked by removing it and watching the test go red), and a client in
+  any other graph makes it fail too.
+
+### The claim that changed
+
+The application is no longer "zero egress, ever". It is **"no egress except one
+user-initiated update check"**, and the README, `SECURITY.md`, `docs/anti-cheat.md` and the
+release notes now say exactly that, with the exception named and its trust anchor
+described. The old wording was stronger than the code; this is the correction, and it is
+recorded here rather than quietly edited.
+

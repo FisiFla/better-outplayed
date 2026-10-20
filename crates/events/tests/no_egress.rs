@@ -1,11 +1,11 @@
-//! Zero egress, enforced by inspecting the source tree.
+//! Egress, enforced by inspecting the source tree.
 //!
 //! Static checks rather than runtime hopes:
 //!
 //! * no capability that could reach another machine, outside the files that are allowed to
 //!   have one and say why ([`no_capability_to_reach_off_this_machine_is_used_outside_its_exemptions`]);
-//! * no HTTP client in any manifest, so the capability cannot arrive as a dependency
-//!   ([`no_http_client_is_a_dependency`]);
+//! * no HTTP client in any manifest, and none in any dependency graph but the one that is
+//!   allowed to have it ([`no_http_client_is_a_dependency`]);
 //! * TLS certificate verification is relaxed in exactly one file, the one that pins the
 //!   loopback address ([`certificate_verification_is_pinned_and_only_the_hostname_check_is_relaxed`]);
 //! * every `TcpListener::bind` is pinned to loopback, and the *address* is read rather than
@@ -23,6 +23,24 @@
 //! lines removed first, otherwise this module's own prose ("never bind `0.0.0.0`") would
 //! satisfy the checks it asserts. Block comments are not stripped; the tree uses none, so one
 //! would show up as an offender rather than a silent pass.
+//!
+//! # The one exception
+//!
+//! The application is not "zero egress, ever". It is **no egress except one user-initiated
+//! update check**: the "Check for updates" button in the settings panel asks one fixed
+//! GitHub URL whether there is a newer release, and the artifact it is offered is verified
+//! against the minisign public key pinned in `apps/desktop/src-tauri/tauri.conf.json`
+//! before it is installed.
+//!
+//! That exception is narrow in three ways, and each of them is a check here:
+//!
+//! - the *source* denylist above is unchanged — no file in this tree gained a client, a
+//!   socket or a name resolution. The plugin's own code is not this project's code;
+//! - the *manifest* check still fails on any direct HTTP-client dependency, and the
+//!   *graph* check now fails on any resolved graph that contains one, with a single
+//!   exemption: the desktop shell's, and only because the updater plugin is in it;
+//! - the loopback bind check is untouched. The updater's requests leave the machine; they
+//!   are not listeners, and nothing was loosened to let them out.
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
@@ -115,6 +133,24 @@ const BANNED_DEPENDENCIES: &[&str] = &[
     "curl",
 ];
 
+/// The dependency graphs that may contain an HTTP client, and why.
+///
+/// **One entry, and it is the updater.** The desktop shell's graph holds `reqwest` because
+/// `tauri` depends on it (which is why `deny.toml` cannot ban it) and because
+/// `tauri-plugin-updater` does: the one thing in this tree that talks to the internet, and
+/// it does so only when the user presses "Check for updates", it asks one fixed GitHub URL,
+/// and every artifact it downloads is verified against the minisign public key pinned in
+/// `apps/desktop/src-tauri/tauri.conf.json` before it is installed.
+///
+/// Every other graph — the core crates, the CLI, xtask — must stay free of HTTP clients.
+/// The engine that records the screen does not talk to the internet, and a graph that
+/// grew a client would be a capability nobody chose on purpose.
+const GRAPH_EXEMPT: &[(&str, &str)] = &[(
+    "apps/desktop/src-tauri/Cargo.lock",
+    "the desktop shell, for the updater: the one thing here that talks to the internet, \
+     and only when the user asks it to",
+)];
+
 #[test]
 fn no_capability_to_reach_off_this_machine_is_used_outside_its_exemptions() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -184,6 +220,153 @@ fn no_http_client_is_a_dependency() {
         offenders.is_empty(),
         "an HTTP client is a direct dependency ({offenders:?}); the League module builds its \
          own client, and nothing else may"
+    );
+
+    // The *graph*, not just the manifests: a client can arrive without any manifest
+    // naming it, and the one that does arrive that way is the updater. This is the half
+    // that has to know about it, and it knows about exactly one graph.
+    let mut graphs = Vec::new();
+    for entry in walk_lock_files(&root) {
+        let rel = relative(&root, &entry);
+        let clients = http_clients_in_the_graph(&code_of(&entry));
+        if clients.is_empty() {
+            continue;
+        }
+        if exemption_in(GRAPH_EXEMPT, &rel).is_some() {
+            continue;
+        }
+        graphs.push(format!("{rel}: {clients:?}"));
+    }
+
+    assert!(
+        graphs.is_empty(),
+        "a dependency graph holds an HTTP client ({graphs:?}); the only graph allowed to \
+         hold one is the desktop shell's, because the updater plugin is in it — and the \
+         updater talks to the internet only when the user asks it to"
+    );
+}
+
+/// The HTTP clients a resolved dependency graph holds, and what pulled them in.
+///
+/// The packages a lock file names, and the packages each of them depends on: a client is
+/// "in the graph" when it is a package the graph resolved, not only when a manifest named
+/// it. The dependents are reported too, because "this graph holds a client" is a much
+/// less useful failure message than "this graph holds a client, and these are what
+/// brought it in".
+fn http_clients_in_the_graph(lock: &str) -> Vec<(String, Vec<String>)> {
+    let packages = locked_packages(lock);
+    let mut out = Vec::new();
+    for (name, _) in &packages {
+        if !BANNED_DEPENDENCIES.contains(&name.as_str()) {
+            continue;
+        }
+        let dependents: Vec<String> = packages
+            .iter()
+            .filter(|(_, dependencies)| {
+                dependencies
+                    .iter()
+                    .any(|dependency| dependency.as_str() == name.as_str())
+            })
+            .map(|(dependent, _)| dependent.clone())
+            .collect();
+        out.push((name.clone(), dependents));
+    }
+    out
+}
+
+/// The packages a lock file names, and the packages each of them depends on.
+///
+/// The shape of a `Cargo.lock` is a list of `[[package]]` blocks, each with a `name` and
+/// optionally a `dependencies` list whose entries are `"name"`, `"name version"` or
+/// `"name version (source)"`. Only the name is wanted here.
+fn locked_packages(lock: &str) -> Vec<(String, Vec<String>)> {
+    lock.split("[[package]]")
+        .skip(1)
+        .map(|block| {
+            let name = block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))
+                .map(|value| unquote(value.trim()).to_string())
+                .unwrap_or_default();
+            (name, locked_dependencies(block))
+        })
+        .collect()
+}
+
+/// The packages one `[[package]]` block depends on, by name.
+fn locked_dependencies(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in block.lines() {
+        let line = line.trim();
+        if line == "dependencies = []" {
+            continue;
+        }
+        if line == "dependencies = [" {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line == "]" {
+            inside = false;
+            continue;
+        }
+        let entry = line.trim().trim_end_matches(',').trim_matches('"');
+        if let Some(name) = entry.split_whitespace().next() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// A quoted value, without its quotes.
+fn unquote(value: &str) -> &str {
+    value.trim().trim_matches('"')
+}
+
+#[test]
+fn a_resolved_client_is_a_client_the_graph_has() {
+    // The rule the dependency check applies, on lock files made for the purpose. A client
+    // can arrive in a graph without any manifest naming it, so the check reads the graph;
+    // this is the shape it reads.
+    let with_client = "\
+[[package]]
+name = \"replayed-events\"
+version = \"0.2.0\"
+dependencies = [
+ \"reqwest 0.13.5 (registry+https://github.com/rust-lang/crates.io-index)\",
+]
+
+[[package]]
+name = \"reqwest\"
+version = \"0.13.5\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+";
+    assert_eq!(
+        http_clients_in_the_graph(with_client),
+        vec![("reqwest".to_string(), vec!["replayed-events".to_string()])],
+        "a graph that resolved a client has one, whatever the manifest said, and the \
+         package that brought it in is named"
+    );
+
+    let without_client = "\
+[[package]]
+name = \"replayed-events\"
+version = \"0.2.0\"
+dependencies = [
+ \"serde 1.0.0\",
+]
+
+[[package]]
+name = \"serde\"
+version = \"1.0.0\"
+dependencies = []
+";
+    assert!(
+        http_clients_in_the_graph(without_client).is_empty(),
+        "a graph with no client in it has none"
     );
 }
 
@@ -453,7 +636,12 @@ fn is_loopback_address(address: &str) -> bool {
 
 /// The reason a path may hold a capability, if it may.
 fn exemption(rel: &str) -> Option<&'static str> {
-    EXEMPT.iter().find_map(|(path, reason)| {
+    exemption_in(EXEMPT, rel)
+}
+
+/// The reason a path may be on a list, if it may.
+fn exemption_in(list: &[(&'static str, &'static str)], rel: &str) -> Option<&'static str> {
+    list.iter().find_map(|(path, reason)| {
         let matches =
             rel == *path || (rel.starts_with(path) && rel[path.len()..].starts_with(['/', '.']));
         matches.then_some(*reason)
@@ -551,14 +739,45 @@ fn relative(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// The file extensions the tree's source is written in.
+const EXTENSIONS: &[&str] = &[
+    "rs", "toml", "sh", "ps1", "bat", "cmd", "ts", "svelte", "mjs", "js", "yml", "yaml",
+];
+
+/// Whether a path is one of the tree's source files.
+fn is_source(path: &Path) -> bool {
+    path.extension().is_some_and(|x| {
+        EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(x.to_str().unwrap_or_default()))
+    })
+}
+
+/// Whether a path is one of the tree's lock files.
+fn is_lock_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "Cargo.lock")
+}
+
 /// The source files in the tree.
 ///
 /// The frontend's dependencies are not walked: they are not this project's code, and a
 /// dependency that can make a request is the manifest's business, not the source's.
 fn walk_source(dir: &Path) -> Vec<std::path::PathBuf> {
-    const EXTENSIONS: &[&str] = &[
-        "rs", "toml", "sh", "ps1", "bat", "cmd", "ts", "svelte", "mjs", "js", "yml", "yaml",
-    ];
+    walk_tree(dir, &is_source)
+}
+
+/// The lock files in the tree.
+///
+/// They are not walked by [`walk_source`]: a lock file is not source, and the capability
+/// denylist is about what this project's own code says, not what a resolved graph happens
+/// to contain. The dependency check reads these, because a client can arrive in the graph
+/// without any manifest naming it.
+fn walk_lock_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    walk_tree(dir, &is_lock_file)
+}
+
+/// The files in the tree a predicate accepts.
+fn walk_tree<F: Fn(&Path) -> bool>(dir: &Path, accept: &F) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -579,12 +798,8 @@ fn walk_source(dir: &Path) -> Vec<std::path::PathBuf> {
             continue;
         }
         if p.is_dir() {
-            out.extend(walk_source(&p));
-        } else if p.extension().is_some_and(|x| {
-            EXTENSIONS
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(x.to_str().unwrap_or_default()))
-        }) {
+            out.extend(walk_tree(&p, accept));
+        } else if accept(&p) {
             out.push(p);
         }
     }

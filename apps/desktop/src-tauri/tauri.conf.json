@@ -40,6 +40,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -68,6 +69,15 @@
     },
     "macOS": {
       "hardenedRuntime": true
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERDRjU4QzBGNjZGOTQwMDQKUldRRVFQbG1ENHoxM0hiTzBvcG1MVEhmVW1yOE1RVHl6ZXVFSS8zTFdEUExFM05jRm9DcGJ2NHQK",
+      "endpoints": [
+        "https://github.com/FisiFla/replayed/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
     }
   }
 }

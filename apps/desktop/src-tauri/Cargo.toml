@@ -50,6 +50,12 @@ toml_edit = "0.25"
 # the same `[hotkeys] clip` key, so there is one hotkey implementation.
 replayed-events = { path = "../../../crates/events" }
 tauri-plugin-notification = "2"
+# The in-app updater: the ONE thing in this application that talks to the internet, and
+# it does so only when the user presses "Check for updates" in the settings panel. The
+# plugin fetches one fixed GitHub URL (the release manifest, `plugins.updater.endpoints`
+# in tauri.conf.json) and verifies every artifact it downloads against the minisign
+# public key pinned in the same file, before it installs anything.
+tauri-plugin-updater = "2"
 drag = "2.1.1"
 fs4 = { version = "0.13", features = ["sync"] }
 
@@ -67,6 +73,15 @@ tauri-build = { version = "2", features = [] }
 [dev-dependencies]
 # The command tests use real temporary stores and real temporary files.
 tempfile = "3"
+# The minisign verification the updater plugin performs, as a direct dependency so the
+# test can drive it: the plugin's own copy of the check is not public API. The test
+# proves the *shape* of the check — a good artifact verifies, a tampered one does not —
+# with a throwaway key, and that the key pinned in tauri.conf.json is a well-formed
+# minisign public key and is not that throwaway one.
+minisign-verify = "0.3"
+# The encoding the pinned key and every signature are written in, decoded in the test the
+# same way the plugin decodes them.
+base64 = "0.22"
 # The integration test drives a **real** recording (a real encoder child, a real ring, a
 # real splice and a real index row) through the tray's and the hotkey's trigger path. It
 # needs the engine's synthetic capture source (so that no test opens a capture session on
