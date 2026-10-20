@@ -46,6 +46,28 @@ impl VideoCodec {
             VideoCodec::Hevc => "hevc",
         }
     }
+
+    /// The codec an ffmpeg encoder name belongs to.
+    ///
+    /// The name is the only place the codec is visible: the recorder publishes the encoder's
+    /// name (`h264_nvenc`), and a panel that has to say "H.264" cannot read it out of that.
+    pub fn of_encoder(encoder: &str) -> Option<Self> {
+        if encoder.starts_with("h264") {
+            Some(VideoCodec::H264)
+        } else if encoder.starts_with("hevc") {
+            Some(VideoCodec::Hevc)
+        } else {
+            None
+        }
+    }
+
+    /// The codec's own name, as the config file spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "h264",
+            VideoCodec::Hevc => "hevc",
+        }
+    }
 }
 
 /// GPU encoder vendors. There is deliberately no software variant: a silent CPU fallback is
@@ -56,6 +78,161 @@ pub enum Vendor {
     Qsv,
     Amf,
 }
+
+impl Vendor {
+    /// The name `encode.vendor` uses for this vendor.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Vendor::Nvenc => "nvenc",
+            Vendor::Qsv => "qsv",
+            Vendor::Amf => "amf",
+        }
+    }
+}
+
+/// The family an encoder name belongs to, and what it can be asked for.
+///
+/// The families spell the same settings differently: NVENC, QSV and AMF each have their own
+/// rate-control switch and their own preset names, so a table keyed by the family is the only
+/// way two places (the argument list and the settings panel) cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderFamily {
+    Nvenc,
+    Qsv,
+    Amf,
+    /// A software encoder (libx264/libx265). Only the test builds reach it; there is no shipping
+    /// CPU fallback.
+    Software,
+}
+
+impl EncoderFamily {
+    /// The family an ffmpeg encoder name belongs to.
+    ///
+    /// By suffix, which is how ffmpeg names them: `h264_nvenc`, `hevc_qsv`, `h264_amf`. Anything
+    /// else is software.
+    pub fn of(encoder: &str) -> Self {
+        if encoder.ends_with("_nvenc") {
+            EncoderFamily::Nvenc
+        } else if encoder.ends_with("_qsv") {
+            EncoderFamily::Qsv
+        } else if encoder.ends_with("_amf") {
+            EncoderFamily::Amf
+        } else {
+            EncoderFamily::Software
+        }
+    }
+
+    /// The family a vendor name belongs to, as `encode.vendor` spells it.
+    ///
+    /// The other direction of [`EncoderFamily::of`]: the config names a vendor, the encoder
+    /// names a family, and the settings panel has to know which presets the vendor takes.
+    pub fn of_vendor(vendor: &str) -> Option<Self> {
+        match vendor {
+            "nvenc" => Some(EncoderFamily::Nvenc),
+            "qsv" => Some(EncoderFamily::Qsv),
+            "amf" => Some(EncoderFamily::Amf),
+            _ => None,
+        }
+    }
+
+    /// The vendor this family is, or `None` for the software one.
+    pub fn vendor(self) -> Option<Vendor> {
+        match self {
+            EncoderFamily::Nvenc => Some(Vendor::Nvenc),
+            EncoderFamily::Qsv => Some(Vendor::Qsv),
+            EncoderFamily::Amf => Some(Vendor::Amf),
+            EncoderFamily::Software => None,
+        }
+    }
+
+    /// The presets this family accepts (ffmpeg's `-preset` values).
+    ///
+    /// The names are ffmpeg's, not ours: a preset that is not one of these is not passed on at
+    /// all (ffmpeg refuses an unknown value and the recording would not start), so this list is
+    /// also what the settings panel may offer.
+    pub fn presets(self) -> &'static [&'static str] {
+        match self {
+            // NVENC: p1 is the slowest and the best, p7 the fastest.
+            EncoderFamily::Nvenc => &["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+            EncoderFamily::Qsv => &[
+                "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow",
+            ],
+            EncoderFamily::Amf => &["speed", "balanced", "quality"],
+            EncoderFamily::Software => &[
+                "ultrafast",
+                "superfast",
+                "veryfast",
+                "faster",
+                "fast",
+                "medium",
+                "slow",
+                "slower",
+                "veryslow",
+            ],
+        }
+    }
+}
+
+/// The rate-control mode an encoder is asked for.
+///
+/// Three modes, because three is what the encoders this app drives really offer:
+///
+/// * [`RateControl::Cbr`]: a rate to hold. What every build before this existed did.
+/// * [`RateControl::Vbr`]: a rate to aim near, with the peak bounded.
+/// * [`RateControl::Quality`]: a constant quality (a quantiser value). **At the encoder's own
+///   value**: this build carries no QP setting, so the number is whatever the encoder defaults
+///   to, and the file's size follows the picture rather than the configured bitrate.
+///
+/// **Not every path can do every mode.** The ffmpeg-child path can do all three (the vendor's own
+/// constant-quality mode); the Media Foundation path reaches CBR and VBR through
+/// `CODECAPI_AVEncCommonRateControlMode`, and its constant-quality mode needs a QP value this
+/// app does not carry — see [`MFT_RATE_CONTROLS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateControl {
+    #[default]
+    Cbr,
+    Vbr,
+    Quality,
+}
+
+impl RateControl {
+    /// Every mode the ffmpeg-child path can be told to use, in the order a panel lists them.
+    pub const ALL: [RateControl; 3] = [RateControl::Cbr, RateControl::Vbr, RateControl::Quality];
+
+    /// The name in `config.toml` and in the settings panel.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateControl::Cbr => "cbr",
+            RateControl::Vbr => "vbr",
+            RateControl::Quality => "quality",
+        }
+    }
+
+    /// The mode a configuration asks for.
+    ///
+    /// The error names what is accepted, because a hand-edited file with `rate_control = "crf"`
+    /// must say what to write instead — and `crf` is a software-encoder mode this app has no
+    /// encoder for.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        match spec.trim().to_ascii_lowercase().as_str() {
+            "cbr" => Ok(RateControl::Cbr),
+            "vbr" => Ok(RateControl::Vbr),
+            "quality" => Ok(RateControl::Quality),
+            other => anyhow::bail!(
+                "unknown encode.rate_control {other:?}: expected \"cbr\" (a rate to hold), \
+                 \"vbr\" (a rate to aim near) or \"quality\" (a constant quality)"
+            ),
+        }
+    }
+}
+
+/// The rate-control modes the Media Foundation (zero-copy) path can be told to use.
+///
+/// The MFT's mode comes from `CODECAPI_AVEncCommonRateControlMode`, which has constant bitrate
+/// and the variable-bitrate family. Its constant-quality mode needs a QP value this app does not
+/// carry, so it is **not** in this list: the list is what the settings panel may offer, and it
+/// must not offer a mode the encoder cannot be told to use.
+pub const MFT_RATE_CONTROLS: [RateControl; 2] = [RateControl::Cbr, RateControl::Vbr];
 
 /// The PCM sample encoding an audio input is declared with (`-f <name>`).
 ///
@@ -154,6 +331,14 @@ pub struct EncodeConfig {
     pub output: EncodeOutput,
     /// Where the video comes from: this process's own pixels, or its own encoder. Defaults to [`VideoInput::RawPixels`].
     pub video: VideoInput,
+    /// The rate-control mode the encoder is asked for. Defaults to [`RateControl::Cbr`], which is
+    /// what every build before this setting existed did.
+    pub rate_control: RateControl,
+    /// The encoder's own preset (ffmpeg's `-preset`); empty means the encoder's own default.
+    ///
+    /// Only the ffmpeg-child path can use one: the Media Foundation path has no generic preset
+    /// (`ICodecAPI` has no such key), so a preset set there is dropped with a warning.
+    pub preset: String,
 }
 
 /// Where an encoder's output goes.
@@ -169,6 +354,16 @@ impl EncodeConfig {
     /// cannot disagree.
     pub fn accepts_textures(&self) -> bool {
         self.video == VideoInput::EncodedBitstream
+    }
+
+    /// Ask for a rate-control mode and an encoder preset.
+    ///
+    /// A builder rather than two more constructor arguments: the constructor already carries
+    /// eight, and these two are optional refinements of an otherwise complete configuration.
+    pub fn with_rate_control(mut self, mode: RateControl, preset: impl Into<String>) -> Self {
+        self.rate_control = mode;
+        self.preset = preset.into();
+        self
     }
 }
 
@@ -248,6 +443,10 @@ impl EncodeConfig {
             // Files on disk, which survive a crash. A caller wanting no disk churn sets `FragmentedStream`.
             output: EncodeOutput::Segmented,
             video: VideoInput::RawPixels,
+            // Constant bitrate, as every build before these two settings existed.
+            rate_control: RateControl::default(),
+            // The encoder's own default preset.
+            preset: String::new(),
         }
     }
 
@@ -280,6 +479,10 @@ impl EncodeConfig {
             software_encoder: None,
             output: EncodeOutput::Segmented,
             video: VideoInput::RawPixels,
+            // Constant bitrate, as every build before these two settings existed.
+            rate_control: RateControl::default(),
+            // The encoder's own default preset.
+            preset: String::new(),
         }
     }
 
@@ -386,5 +589,78 @@ pub trait Encoder: Send {
     /// outlives any borrow; a second caller's `None` is honest.
     fn take_output_stream(&mut self) -> Option<std::process::ChildStdout> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mode a configuration asks for, and what an unknown one says.
+    ///
+    /// The error has to name the accepted values: a hand-edited `rate_control = "crf"` must say
+    /// what to write instead, and "crf" is a software-encoder mode this app has no encoder for.
+    #[test]
+    fn the_rate_control_mode_parses_and_an_unknown_one_says_what_is_accepted() {
+        assert_eq!(RateControl::parse("cbr").unwrap(), RateControl::Cbr);
+        assert_eq!(RateControl::parse("vbr").unwrap(), RateControl::Vbr);
+        assert_eq!(RateControl::parse("quality").unwrap(), RateControl::Quality);
+        // The spelling is forgiving about case and space, like the rest of the config.
+        assert_eq!(RateControl::parse("  CBR ").unwrap(), RateControl::Cbr);
+
+        let err = RateControl::parse("crf").expect_err("crf is not a mode this build has");
+        let message = err.to_string();
+        assert!(
+            message.contains("crf"),
+            "the message names the value: {message}"
+        );
+        assert!(
+            message.contains("cbr") && message.contains("vbr") && message.contains("quality"),
+            "and the modes that are accepted: {message}"
+        );
+    }
+
+    /// The mode's name is what the config file and the panel use.
+    #[test]
+    fn the_modes_keep_their_names() {
+        assert_eq!(RateControl::Cbr.as_str(), "cbr");
+        assert_eq!(RateControl::Vbr.as_str(), "vbr");
+        assert_eq!(RateControl::Quality.as_str(), "quality");
+        // And the default is the mode every build before this existed used.
+        assert_eq!(RateControl::default(), RateControl::Cbr);
+    }
+
+    /// The family an encoder name belongs to, and the vendor behind it.
+    ///
+    /// The three hardware families spell the same settings differently, so the tables that list
+    /// them have to be keyed by the family and not by the vendor string in the config.
+    #[test]
+    fn the_encoder_family_follows_the_name() {
+        assert_eq!(EncoderFamily::of("h264_nvenc"), EncoderFamily::Nvenc);
+        assert_eq!(EncoderFamily::of("hevc_nvenc"), EncoderFamily::Nvenc);
+        assert_eq!(EncoderFamily::of("h264_qsv"), EncoderFamily::Qsv);
+        assert_eq!(EncoderFamily::of("hevc_amf"), EncoderFamily::Amf);
+        assert_eq!(EncoderFamily::of("libx264"), EncoderFamily::Software);
+        assert_eq!(EncoderFamily::Nvenc.vendor(), Some(Vendor::Nvenc));
+        assert_eq!(EncoderFamily::Amf.vendor().map(Vendor::as_str), Some("amf"));
+        assert_eq!(EncoderFamily::Software.vendor(), None);
+    }
+
+    /// Every family has presets, and no two families share a name.
+    ///
+    /// A preset that belongs to another family is not passed on at all (ffmpeg refuses an
+    /// unknown `-preset` and the recording would not start), so the lists must not overlap.
+    #[test]
+    fn the_preset_lists_are_per_family_and_do_not_overlap() {
+        let nvenc = EncoderFamily::Nvenc.presets();
+        let qsv = EncoderFamily::Qsv.presets();
+        let amf = EncoderFamily::Amf.presets();
+        assert!(nvenc.contains(&"p4"));
+        assert!(qsv.contains(&"medium"));
+        assert!(amf.contains(&"balanced"));
+        for name in nvenc {
+            assert!(!qsv.contains(name), "{name} is in two families' lists");
+            assert!(!amf.contains(name), "{name} is in two families' lists");
+        }
     }
 }

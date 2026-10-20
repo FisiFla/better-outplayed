@@ -24,9 +24,9 @@ use background::{
     AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,
 };
 use commands::{
-    AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, ErrorCode,
-    RecordedClipDto, RecorderHost, RecordingStatusDto, SessionDto, SessionEventDto,
-    StorageConfigView, StorageStats, ThumbnailRef,
+    AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, DiagnosticsReport,
+    EncoderSettings, EncoderStatus, ErrorCode, RecordedClipDto, RecorderHost, RecordingStatusDto,
+    SessionDto, SessionEventDto, StorageConfigView, StorageStats, ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use replayed_media::FfmpegBinaries;
@@ -97,6 +97,14 @@ pub struct AppState {
     /// start rewrite it. Shared with the recorder host, which does the rewriting when the
     /// listener comes up.
     installed_gsi: Arc<Mutex<Vec<health::InstalledGsi>>>,
+    /// The encoder the last recording ran, remembered so the encoder panel can name it after
+    /// the recording has stopped.
+    ///
+    /// The engine publishes the encoder's name in its status (`h264_nvenc`), but only while
+    /// it is running: the status belongs to the recorder, and the recorder is gone once the
+    /// recording stopped. The panel asks "which encoder did the smoke test choose", and that
+    /// answer has to outlive the recording.
+    last_encoder: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -198,6 +206,7 @@ impl AppState {
             approved_roots: Mutex::new(Vec::new()),
             log_path,
             installed_gsi,
+            last_encoder: Mutex::new(None),
         })
     }
 
@@ -252,6 +261,26 @@ impl AppState {
     /// The log file this process writes.
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// The encoder the last recording ran: the live one while a recording is up, the remembered
+    /// one after it has stopped.
+    ///
+    /// The engine's status carries the name (`h264_nvenc`) only while the recorder exists, so
+    /// the live value is remembered on the way past. `None` before the first recording: the
+    /// vendor is chosen by the startup smoke test, and that has not run yet.
+    pub fn last_encoder(&self) -> Option<String> {
+        if let Some(name) = self.recorder.raw_status().encoder {
+            *self
+                .last_encoder
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = Some(name.clone());
+            return Some(name);
+        }
+        self.last_encoder
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     /// The default clips directory: the one under the application data directory.
@@ -670,6 +699,49 @@ fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError>
 #[tauri::command(rename_all = "snake_case")]
 fn gsi_targets() -> Vec<health::GsiTarget> {
     health::gsi_targets(&health::steam_libraries(&health::steam_roots()))
+}
+
+/// Assemble a diagnostics report, copy it to the clipboard, and hand it back.
+///
+/// The report carries the version, the platform, the effective configuration (with every
+/// credential redacted), the recent problems and the tail of the log. It is copied to the
+/// clipboard so a user can paste it into a bug report without attaching anything by hand, and
+/// returned so the panel can show what was copied.
+///
+/// Async because it waits for the clipboard: the call blocks until the child process is done,
+/// and the window must not stop answering while it does.
+#[tauri::command(async, rename_all = "snake_case")]
+fn copy_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsReport, CommandError> {
+    commands::copy_diagnostics(&state.app_data_dir, &state.config_path(), state.log_path())
+}
+
+/// The effective encoder settings, for the encoder panel.
+#[tauri::command(rename_all = "snake_case")]
+fn encoder_settings(state: State<'_, AppState>) -> Result<EncoderSettings, CommandError> {
+    commands::encoder_settings(&state.config_path())
+}
+
+/// Validate the encoder settings, write them, and report what was actually stored.
+///
+/// The settings are baked into the encoder when a recording starts, so a change takes effect on
+/// the next start — the panel says so; the backend does not restart anything.
+#[tauri::command(async, rename_all = "snake_case")]
+fn update_encoder_settings(
+    state: State<'_, AppState>,
+    settings: EncoderSettings,
+) -> Result<EncoderSettings, CommandError> {
+    commands::update_encoder_settings(&state.config_path(), &settings)
+}
+
+/// Which encoder was chosen, and what it can do.
+///
+/// The capabilities depend on the path the recording will take, not only on the vendor: the
+/// zero-copy Media Foundation path cannot scale and has no presets, and the ffmpeg-child path
+/// can. See `commands::encoder`.
+#[tauri::command(rename_all = "snake_case")]
+fn encoder_status(state: State<'_, AppState>) -> Result<EncoderStatus, CommandError> {
+    let last = state.last_encoder();
+    commands::encoder_status(&state.config_path(), last.as_deref())
 }
 
 /// Write the GSI cfg for one game into its detected install folder.
@@ -1158,6 +1230,10 @@ pub fn run() {
             health,
             gsi_targets,
             install_gsi_cfg,
+            copy_diagnostics,
+            encoder_settings,
+            update_encoder_settings,
+            encoder_status,
             log_from_frontend
         ])
         .run(tauri::generate_context!())
@@ -1851,7 +1927,7 @@ mod tests {
             "the installed exe is replayed, as the crates and the CLI are"
         );
         assert_eq!(
-            config["version"], "0.1.0",
+            config["version"], "0.2.0",
             "in step with the workspace version"
         );
 

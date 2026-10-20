@@ -67,7 +67,7 @@
 //! `submit_video`/`submit_audio` never block the caller. The payload's buffer is moved into the
 //! channel, not cloned (a 3840x2160 BGRA frame is 33.2MB).
 
-use crate::{EncodeConfig, EncodeOutput, Encoder, SampleFormat, VideoInput};
+use crate::{EncodeConfig, EncodeOutput, Encoder, RateControl, SampleFormat, VideoInput};
 use anyhow::{bail, Context, Result};
 use replayed_capture::{AudioBuffer, Frame};
 use replayed_media::FfmpegBinaries;
@@ -270,7 +270,13 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
     if cfg.codec == crate::VideoCodec::Hevc {
         args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
     }
-    args.extend(rate_control_args(cfg.encoder_name(), cfg.bitrate_kbps));
+    // The encoder's own preset, when one was asked for and this encoder has one.
+    args.extend(preset_args(cfg.encoder_name(), &cfg.preset));
+    args.extend(rate_control_args(
+        cfg.encoder_name(),
+        cfg.rate_control,
+        cfg.bitrate_kbps,
+    ));
     args.extend(["-g".to_string(), gop_frames(cfg).to_string()]);
     // Forced keyframes make segment boundaries cuttable.
     args.extend([
@@ -288,20 +294,89 @@ pub fn video_output_args(cfg: &EncodeConfig) -> Vec<String> {
 /// second of that rate. `-maxrate`/`-bufsize` are generic, so the software encoders the tests
 /// use take them too.
 ///
+/// The mode decides the switch and whether the rate is a target at all: a constant-quality mode
+/// has no bitrate target, so `-b:v`/`-maxrate`/`-bufsize` are left out rather than describing a
+/// number the encoder ignores.
+///
 /// Only the argument list is tested; whether a driver obeys it is a measurement on that hardware.
-pub fn rate_control_args(encoder: &str, bitrate_kbps: u32) -> Vec<String> {
+pub fn rate_control_args(encoder: &str, mode: RateControl, bitrate_kbps: u32) -> Vec<String> {
     let rate = format!("{bitrate_kbps}k");
-    let mut args = vec!["-b:v".to_string(), rate.clone()];
-    if encoder.ends_with("_nvenc") || encoder.ends_with("_amf") {
-        args.extend(["-rc".to_string(), "cbr".to_string()]);
+    let mut args = Vec::new();
+    if mode != RateControl::Quality {
+        args.extend(["-b:v".to_string(), rate.clone()]);
     }
-    args.extend([
-        "-maxrate".to_string(),
-        rate.clone(),
-        "-bufsize".to_string(),
-        rate,
-    ]);
+    args.extend(rate_control_mode_args(encoder, mode));
+    if mode != RateControl::Quality {
+        args.extend([
+            "-maxrate".to_string(),
+            rate.clone(),
+            "-bufsize".to_string(),
+            rate,
+        ]);
+    }
     args
+}
+
+/// The encoder's own rate-control switch, for the mode asked for.
+///
+/// **Per vendor, because the three families spell it differently.** The names are ffmpeg's:
+///
+/// | vendor | cbr | vbr | quality |
+/// |---|---|---|---|
+/// | nvenc | `-rc cbr` | `-rc vbr` | `-rc constqp` |
+/// | qsv   | (its own default already is CBR) | `-rc vbr` | `-rc icq` |
+/// | amf   | `-rc cbr` | `-rc vbr` | `-rc cqp` |
+///
+/// QSV gets **no** `-rc` for constant bitrate, which is exactly what every build before this
+/// setting existed sent: ffmpeg's QSV encoder infers constant bitrate from the bitrate
+/// arguments alone, and adding `-rc cbr` would change the argument list of every recording that
+/// did not ask for a mode.
+///
+/// The software encoders (the test builds) have no `-rc` at all: x264 and x265 take `-crf`
+/// instead, and their constant-quality value is ffmpeg's own default for each.
+fn rate_control_mode_args(encoder: &str, mode: RateControl) -> Vec<String> {
+    use crate::EncoderFamily;
+    let (flag, value) = match (EncoderFamily::of(encoder), mode) {
+        (EncoderFamily::Nvenc, RateControl::Cbr) => ("-rc", "cbr"),
+        (EncoderFamily::Nvenc, RateControl::Vbr) => ("-rc", "vbr"),
+        (EncoderFamily::Nvenc, RateControl::Quality) => ("-rc", "constqp"),
+        (EncoderFamily::Qsv, RateControl::Cbr) => return Vec::new(),
+        (EncoderFamily::Qsv, RateControl::Vbr) => ("-rc", "vbr"),
+        (EncoderFamily::Qsv, RateControl::Quality) => ("-rc", "icq"),
+        (EncoderFamily::Amf, RateControl::Cbr) => ("-rc", "cbr"),
+        (EncoderFamily::Amf, RateControl::Vbr) => ("-rc", "vbr"),
+        (EncoderFamily::Amf, RateControl::Quality) => ("-rc", "cqp"),
+        // x264's default CRF is 23 and x265's is 28; passing them says the same thing ffmpeg
+        // would have done, in a form a reader can see.
+        (EncoderFamily::Software, RateControl::Quality) => {
+            let crf = if encoder.contains("265") { "28" } else { "23" };
+            return vec!["-crf".to_string(), crf.to_string()];
+        }
+        (EncoderFamily::Software, _) => return Vec::new(),
+    };
+    vec![flag.to_string(), value.to_string()]
+}
+
+/// The arguments that ask for the encoder's own preset (`-preset`).
+///
+/// Empty when no preset was asked for, and empty when the preset is not one this encoder family
+/// accepts: ffmpeg refuses an unknown `-preset` value and the recording would not start at all,
+/// so a preset that does not apply is dropped with a warning instead. The families' lists are
+/// [`crate::EncoderFamily::presets`], which is also what the settings panel offers.
+pub fn preset_args(encoder: &str, preset: &str) -> Vec<String> {
+    if preset.is_empty() {
+        return Vec::new();
+    }
+    let family = crate::EncoderFamily::of(encoder);
+    if !family.presets().contains(&preset) {
+        tracing::warn!(
+            "the preset {preset:?} is not one the {family:?} encoder accepts, so it is using \
+             its own default: the presets it takes are {:?}",
+            family.presets()
+        );
+        return Vec::new();
+    }
+    vec!["-preset".to_string(), preset.to_string()]
 }
 
 /// The ffmpeg arguments that declare one raw-PCM loopback audio input: format, sample rate,
@@ -624,7 +699,15 @@ impl FfmpegEncoder {
         // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream).then(|| {
-            crate::mft::MftFeed::spawn(cfg.codec, cfg.bitrate_kbps, cfg.fps, video_tx.clone())
+            crate::mft::MftFeed::spawn(
+                crate::mft::MftEncoderParams {
+                    codec: cfg.codec,
+                    bitrate_kbps: cfg.bitrate_kbps,
+                    fps: cfg.fps,
+                    mode: cfg.rate_control,
+                },
+                video_tx.clone(),
+            )
         });
         let video_writer = std::thread::Builder::new()
             .name("ffmpeg-video-in".into())
@@ -1355,21 +1438,135 @@ mod tests {
                 .map(|i| args[i + 1].clone())
         };
         for enc in ["h264_nvenc", "hevc_amf", "h264_qsv", "libx264"] {
-            let args = rate_control_args(enc, 20_000);
+            let args = rate_control_args(enc, RateControl::Cbr, 20_000);
             assert_eq!(get(&args, "-b:v").as_deref(), Some("20000k"), "{enc}");
             assert_eq!(get(&args, "-maxrate").as_deref(), Some("20000k"), "{enc}");
             assert_eq!(get(&args, "-bufsize").as_deref(), Some("20000k"), "{enc}");
         }
         assert_eq!(
-            get(&rate_control_args("h264_nvenc", 1), "-rc").as_deref(),
+            get(&rate_control_args("h264_nvenc", RateControl::Cbr, 1), "-rc").as_deref(),
             Some("cbr")
         );
         assert_eq!(
-            get(&rate_control_args("hevc_amf", 1), "-rc").as_deref(),
+            get(&rate_control_args("hevc_amf", RateControl::Cbr, 1), "-rc").as_deref(),
             Some("cbr")
         );
-        assert_eq!(get(&rate_control_args("h264_qsv", 1), "-rc"), None);
-        assert_eq!(get(&rate_control_args("libx264", 1), "-rc"), None);
+        assert_eq!(
+            get(&rate_control_args("h264_qsv", RateControl::Cbr, 1), "-rc"),
+            None
+        );
+        assert_eq!(
+            get(&rate_control_args("libx264", RateControl::Cbr, 1), "-rc"),
+            None
+        );
+    }
+
+    /// The mode asked for is the mode the encoder is told, per vendor.
+    ///
+    /// The three families spell the same three modes differently, and a mode that reached the
+    /// wrong vendor's switch would be refused by ffmpeg — the recording would not start at all.
+    /// Constant bitrate is the exception that keeps the old argument list: QSV is left alone
+    /// because ffmpeg's QSV encoder already infers it.
+    #[test]
+    fn the_rate_control_mode_reaches_the_vendors_own_switch() {
+        let rc = |enc: &str, mode| {
+            let args = rate_control_args(enc, mode, 20_000);
+            args.iter()
+                .position(|a| a == "-rc")
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(rc("h264_nvenc", RateControl::Vbr).as_deref(), Some("vbr"));
+        assert_eq!(
+            rc("hevc_nvenc", RateControl::Quality).as_deref(),
+            Some("constqp")
+        );
+        assert_eq!(rc("h264_qsv", RateControl::Vbr).as_deref(), Some("vbr"));
+        assert_eq!(rc("hevc_qsv", RateControl::Quality).as_deref(), Some("icq"));
+        assert_eq!(rc("h264_amf", RateControl::Vbr).as_deref(), Some("vbr"));
+        assert_eq!(rc("hevc_amf", RateControl::Quality).as_deref(), Some("cqp"));
+        // Constant bitrate on QSV stays unsaid, as it has always been.
+        assert_eq!(rc("h264_qsv", RateControl::Cbr), None);
+    }
+
+    /// A constant-quality mode has no bitrate target, so the bitrate arguments are left out.
+    ///
+    /// Passing `-b:v` next to `-rc constqp` would describe a number the encoder ignores, and the
+    /// file's size would follow the picture rather than the setting — the user would see a
+    /// bitrate they configured and a file of a different size.
+    #[test]
+    fn a_constant_quality_mode_carries_no_bitrate_target() {
+        for enc in ["h264_nvenc", "h264_qsv", "h264_amf"] {
+            let args = rate_control_args(enc, RateControl::Quality, 20_000);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "-b:v" || a == "-maxrate" || a == "-bufsize"),
+                "a constant-quality mode has no bitrate target: {enc} -> {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "-rc"),
+                "but it does say which mode: {enc} -> {args:?}"
+            );
+        }
+    }
+
+    /// A preset is passed on only where the encoder has one.
+    ///
+    /// ffmpeg refuses an unknown `-preset` value, so a preset that does not apply to the
+    /// selected encoder must be dropped rather than passed: the recording would not start.
+    #[test]
+    fn a_preset_reaches_the_encoder_that_has_one_and_is_dropped_where_it_does_not() {
+        assert_eq!(
+            preset_args("h264_nvenc", "p4"),
+            vec!["-preset".to_string(), "p4".to_string()]
+        );
+        assert_eq!(
+            preset_args("h264_qsv", "medium"),
+            vec!["-preset".to_string(), "medium".to_string()]
+        );
+        assert_eq!(
+            preset_args("hevc_amf", "quality"),
+            vec!["-preset".to_string(), "quality".to_string()]
+        );
+        // No preset asked for: nothing is said.
+        assert!(preset_args("h264_nvenc", "").is_empty());
+        // A preset that belongs to another family: dropped, not passed on.
+        assert!(
+            preset_args("h264_qsv", "p4").is_empty(),
+            "a QSV encoder has no p4"
+        );
+        assert!(
+            preset_args("h264_nvenc", "balanced").is_empty(),
+            "an NVENC encoder has no balanced"
+        );
+    }
+
+    /// The preset and the rate control reach the child's argument list.
+    ///
+    /// Both are optional refinements, so the list they produce has to be the old one plus what
+    /// was asked for — and exactly the old one when nothing was.
+    #[test]
+    fn the_preset_and_the_mode_reach_the_childs_argument_list() {
+        let cfg = args_cfg(30, 1000);
+        assert!(
+            !video_output_args(&cfg).iter().any(|a| a == "-preset"),
+            "no preset asked for: none is said"
+        );
+
+        // A hardware encoder, so the vendor's own switch is the one that is spoken.
+        let mut cfg = args_cfg(30, 1000);
+        cfg.software_encoder = Some("h264_nvenc");
+        cfg.preset = "p4".to_string();
+        let args = video_output_args(&cfg);
+        let at = args.iter().position(|a| a == "-preset").expect("-preset");
+        assert_eq!(args[at + 1], "p4");
+
+        cfg = args_cfg(30, 1000);
+        cfg.software_encoder = Some("h264_nvenc");
+        cfg.rate_control = RateControl::Vbr;
+        let args = video_output_args(&cfg);
+        let at = args.iter().position(|a| a == "-rc").expect("-rc");
+        assert_eq!(args[at + 1], "vbr");
     }
 
     /// A configuration the argument builders can be exercised with; these tests are about the argument list only.

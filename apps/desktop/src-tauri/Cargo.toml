@@ -39,6 +39,10 @@ tauri-plugin-single-instance = "2"
 replayed-media = { path = "../../../crates/media" }
 replayed-store = { path = "../../../crates/store" }
 replayed-recorder = { path = "../../../crates/recorder" }
+# The encoder's own vocabulary: the rate-control modes and the per-vendor preset lists the
+# settings panel offers. One source, so the panel and the encoder cannot disagree about what a
+# vendor takes.
+replayed-encoder = { path = "../../../crates/encoder" }
 # The settings writer edits keys in place with their comments and formatting intact
 # (`toml_edit`), rather than re-serialising structs and destroying a hand-edited file.
 toml_edit = "0.25"
@@ -48,6 +52,14 @@ replayed-events = { path = "../../../crates/events" }
 tauri-plugin-notification = "2"
 drag = "2.1.1"
 fs4 = { version = "0.13", features = ["sync"] }
+
+# The Windows version for the diagnostics report. `RtlGetVersion` is the only call that does not
+# lie about it: `GetVersionEx` reports 6.2 to an application with no manifest.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -6,6 +6,7 @@
 //! Paths are `String` because an empty one means "the default under the application data
 //! directory", which [`crate::RecorderConfig`] applies when resolving them.
 
+use anyhow::Result;
 use serde::Deserialize;
 
 /// `[recorder]`: which recording this run is.
@@ -256,6 +257,51 @@ pub struct EncodeSection {
     pub adapt_fps: bool,
     /// `"1920x1080"`, or empty for the capture backend's native size.
     pub output_size: String,
+    /// The rate-control mode: `"cbr"`, `"vbr"` or `"quality"`. Default `"cbr"`.
+    ///
+    /// * `cbr`: a rate to hold. What every build before this key existed did.
+    /// * `vbr`: a rate to aim near, with the peak bounded.
+    /// * `quality`: a constant quality, at the encoder's own value — this build carries no QP
+    ///   setting, so the number is whatever the encoder defaults to and the file's size follows
+    ///   the picture rather than the configured bitrate.
+    ///
+    /// **Not every path can do every mode.** The Media Foundation path (the zero-copy one) can be
+    /// told constant bitrate and variable bitrate; its constant-quality mode needs a QP value
+    /// this app does not carry, so it is not offered there (see
+    /// [`replayed_encoder::MFT_RATE_CONTROLS`]).
+    ///
+    /// Defaulted, so a file written before this key existed keeps parsing and keeps recording the
+    /// way it did.
+    #[serde(default = "default_rate_control")]
+    pub rate_control: String,
+    /// The encoder's own preset (ffmpeg's `-preset`), or empty for the encoder's own default.
+    ///
+    /// The names are per vendor — NVENC takes `p1`…`p7`, QSV takes `veryfast`…`veryslow`, AMF
+    /// takes `speed`/`balanced`/`quality` — and the list is
+    /// [`replayed_encoder::EncoderFamily::presets`]. A preset that does not apply to the encoder
+    /// that was selected is dropped with a warning rather than passed on, because ffmpeg refuses
+    /// an unknown value and the recording would not start at all.
+    ///
+    /// Only the ffmpeg-child path can use one: the Media Foundation path has no generic preset.
+    #[serde(default)]
+    pub preset: String,
+}
+
+impl EncodeSection {
+    /// The rate-control mode the file asks for.
+    ///
+    /// The error names the accepted values, because a hand-edited `rate_control = "crf"` has to
+    /// say what to write instead: `crf` is a software-encoder mode, and this app has no software
+    /// encoder.
+    pub fn rate_control_mode(&self) -> Result<replayed_encoder::RateControl> {
+        replayed_encoder::RateControl::parse(&self.rate_control)
+    }
+}
+
+/// `encode.rate_control` when the file does not mention it: constant bitrate, which is what every
+/// build before this key existed did.
+fn default_rate_control() -> String {
+    replayed_encoder::RateControl::Cbr.as_str().to_string()
 }
 
 /// `encode.adapt_fps` when the file does not mention it: on, since skipping readbacks for frames
@@ -333,6 +379,48 @@ output_size = \"\"
         assert!(encode_section(MINIMAL).adapt_fps, "absent means on");
         let text = MINIMAL.replace("fps = 30", "fps = 30\nadapt_fps = false");
         assert!(!encode_section(&text).adapt_fps);
+    }
+
+    /// A file written before the rate-control and preset keys existed must still parse, and must
+    /// keep recording the way it did: constant bitrate, the encoder's own preset.
+    ///
+    /// The default is the *behaviour*, not a value: the argument list every existing recording
+    /// sends is unchanged (the encoder crate pins that byte for byte).
+    #[test]
+    fn a_config_without_the_rate_control_or_the_preset_parses_and_gets_the_old_behaviour() {
+        let section = encode_section(MINIMAL);
+        assert_eq!(
+            section.rate_control_mode().unwrap(),
+            replayed_encoder::RateControl::Cbr,
+            "absent means constant bitrate, as every build before the key did"
+        );
+        assert_eq!(section.preset, "", "absent means the encoder's own preset");
+    }
+
+    /// The mode the file asks for, and what an unknown one says.
+    #[test]
+    fn the_rate_control_mode_is_read_and_an_unknown_one_is_refused() {
+        let text = MINIMAL.replace("fps = 30", "fps = 30\nrate_control = \"vbr\"");
+        assert_eq!(
+            encode_section(&text).rate_control_mode().unwrap(),
+            replayed_encoder::RateControl::Vbr
+        );
+
+        let text = MINIMAL.replace("fps = 30", "fps = 30\nrate_control = \"crf\"");
+        let err = encode_section(&text)
+            .rate_control_mode()
+            .expect_err("crf is a software-encoder mode this app has no encoder for");
+        assert!(
+            err.to_string().contains("crf"),
+            "the message names the value: {err}"
+        );
+    }
+
+    /// The preset is carried as written; the encoder is what knows whether it applies.
+    #[test]
+    fn the_preset_is_carried_as_written() {
+        let text = MINIMAL.replace("fps = 30", "fps = 30\npreset = \"p4\"");
+        assert_eq!(encode_section(&text).preset, "p4");
     }
 
     /// A typo is a parse error rather than a silent default: `adapt_fps = "yes"` must not leave a user misled.

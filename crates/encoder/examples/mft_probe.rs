@@ -124,7 +124,15 @@ fn main() -> anyhow::Result<()> {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
         );
         match nv12.and_then(|texture| {
-            replayed_encoder::mft::MftEncoder::open_for_texture(&texture, codec, BITRATE_KBPS, FPS)
+            replayed_encoder::mft::MftEncoder::open_for_texture(
+                &texture,
+                replayed_encoder::mft::MftEncoderParams {
+                    codec,
+                    bitrate_kbps: BITRATE_KBPS,
+                    fps: FPS,
+                    mode: replayed_encoder::RateControl::Cbr,
+                },
+            )
         }) {
             Ok(encoder) => println!(
                 "an NV12 texture opens: {} taking {}",
@@ -152,10 +160,13 @@ fn main() -> anyhow::Result<()> {
         match replayed_encoder::mft::MftEncoder::open(
             &device,
             size,
-            codec,
             Some(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM),
-            BITRATE_KBPS,
-            FPS,
+            replayed_encoder::mft::MftEncoderParams {
+                codec,
+                bitrate_kbps: BITRATE_KBPS,
+                fps: FPS,
+                mode: replayed_encoder::RateControl::Cbr,
+            },
         ) {
             Ok(mut encoder) => {
                 println!(

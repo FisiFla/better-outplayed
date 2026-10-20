@@ -19,7 +19,9 @@ use replayed_store::Store;
 use std::path::{Path, PathBuf};
 
 mod clips;
+mod diagnostics;
 mod dto;
+mod encoder;
 mod error;
 mod recorder;
 mod sessions;
@@ -28,7 +30,9 @@ mod settings;
 mod test_support;
 
 pub use clips::*;
+pub use diagnostics::*;
 pub use dto::*;
+pub use encoder::*;
 pub use error::*;
 pub use recorder::*;
 pub use sessions::*;

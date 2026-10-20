@@ -33,7 +33,7 @@
 //! Reading the whole file through the CLI's own type would let the engine's rules be borrowed
 //! rather than mirrored by hand; that is a bigger change than this module has needed.
 
-use crate::commands::{CommandError, ErrorCode};
+use crate::commands::{CommandError, EncoderSettings, ErrorCode};
 use replayed_events::process::{default_watch, GamesSection};
 use replayed_recorder::config::{
     BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
@@ -239,6 +239,24 @@ pub struct RecordingConfig {
     pub storage: StorageSection,
     #[serde(default)]
     pub capture: CaptureSection,
+    /// The `[audio]` section: only the game-audio track's rate.
+    ///
+    /// The CLI owns the whole section (the track's codec and whether it exists at all), and the
+    /// shell has no switch for a video-only recording. The **bitrate** is read because the
+    /// encoder panel offers it: a rate the panel can change has to reach the encoder, and the
+    /// encoder's own default is 192 kbps when nothing is configured.
+    #[serde(default)]
+    pub audio: AudioSection,
+}
+
+/// The `[audio]` section, as far as the shell cares: the game-audio track's rate.
+///
+/// Absent means the encoder's own default, not zero: a track recorded at 0 kbps is not a track.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioSection {
+    /// The game-audio track's rate, in kilobits per second.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl RecordingConfig {
@@ -474,6 +492,20 @@ impl EngineOptionsConfig {
 pub const FPS_MIN: u32 = 1;
 pub const FPS_MAX: u32 = 240;
 
+/// The ceiling on `[encode] bitrate_kbps`: 250 Mbit/s.
+///
+/// The panel's own policy, not the engine's: nothing in the engine bounds the bitrate, and a
+/// number a user can type by accident is not a number to write into the file. 250 Mbit/s is far
+/// above any real recording (a 4K60 HEVC capture is a tenth of it) and far below the point where
+/// the value stops being a rate and starts being a typo.
+pub const MAX_BITRATE_KBPS: u32 = 250_000;
+
+/// The ceiling on `[audio] bitrate_kbps`: 512 kbit/s.
+///
+/// AAC tops out well below that; the ceiling is here to catch a mistyped number, not to describe
+/// a limit the codec has.
+pub const MAX_AUDIO_BITRATE_KBPS: u32 = 512;
+
 /// The GSI listener's port rule, the CLI's (`apps/replayed-cli/src/config.rs`).
 ///
 /// `0` turns the listener off; anything else is a real port, and the default sits above the
@@ -520,6 +552,26 @@ pub enum SettingEdit {
     CaptureMonitor(usize),
     /// `[capture] window`. Empty captures the monitor.
     CaptureWindow(String),
+    /// `[encode] vendor`: `"auto"`, `"nvenc"`, `"qsv"` or `"amf"`.
+    EncodeVendor(String),
+    /// `[encode] codec`: `"h264"` or `"hevc"`.
+    EncodeCodec(String),
+    /// `[encode] bitrate_kbps`, in kilobits per second.
+    EncodeBitrate(u32),
+    /// `[encode] adapt_fps`: measure what the machine can sustain and record at the lower of
+    /// that and `fps`.
+    EncodeAdaptFps(bool),
+    /// `[encode] zero_copy`: hand the captured texture to the hardware encoder.
+    ///
+    /// `None` **removes** the key, which is what "let the recorder decide" means: an absent key
+    /// is the hardware path when the machine has one.
+    EncodeZeroCopy(Option<bool>),
+    /// `[encode] rate_control`: `"cbr"`, `"vbr"` or `"quality"`.
+    EncodeRateControl(String),
+    /// `[encode] preset`: the encoder's own preset, or empty for its default.
+    EncodePreset(String),
+    /// `[audio] bitrate_kbps`: the game-audio track's rate.
+    AudioBitrate(u32),
 }
 
 /// The quality presets the panel offers, as `[encode] bitrate_kbps`.
@@ -559,6 +611,14 @@ impl SettingEdit {
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
             SettingEdit::CaptureWindow(_) => "capture.window",
+            SettingEdit::EncodeVendor(_) => "encode.vendor",
+            SettingEdit::EncodeCodec(_) => "encode.codec",
+            SettingEdit::EncodeBitrate(_) => "encode.bitrate_kbps",
+            SettingEdit::EncodeAdaptFps(_) => "encode.adapt_fps",
+            SettingEdit::EncodeZeroCopy(_) => "encode.zero_copy",
+            SettingEdit::EncodeRateControl(_) => "encode.rate_control",
+            SettingEdit::EncodePreset(_) => "encode.preset",
+            SettingEdit::AudioBitrate(_) => "audio.bitrate_kbps",
         }
     }
 }
@@ -610,11 +670,20 @@ fn mistyped(key: &'static str) -> CommandError {
             what = match key {
                 "storage.clips_dir"
                 | "encode.output_size"
+                | "encode.vendor"
+                | "encode.codec"
+                | "encode.rate_control"
+                | "encode.preset"
                 | "capture.window"
                 | "mic.device"
                 | "capture.output_device" => "string",
-                "encode.fps" | "encode.bitrate_kbps" | "capture.monitor" => "integer",
-                "mic.enabled" | "games.auto_record" | "recorder.save_session" => "true/false value",
+                "encode.fps" | "encode.bitrate_kbps" | "audio.bitrate_kbps" | "capture.monitor" =>
+                    "integer",
+                "mic.enabled"
+                | "games.auto_record"
+                | "recorder.save_session"
+                | "encode.adapt_fps"
+                | "encode.zero_copy" => "true/false value",
                 "games.watch" => "list of [[games.watch]] tables",
                 _ => "value of the shape this key takes",
             },
@@ -825,7 +894,93 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
                 Ok(())
             }
         }
+        SettingEdit::EncodeVendor(vendor) => {
+            if ["auto", "nvenc", "qsv", "amf"].contains(&vendor.as_str()) {
+                Ok(())
+            } else {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "encode.vendor is {vendor:?}, but it must be \"auto\" (the first vendor \
+                         that can encode a frame), \"nvenc\", \"qsv\" or \"amf\""
+                    ),
+                ))
+            }
+        }
+        SettingEdit::EncodeCodec(codec) => {
+            if ["h264", "hevc"].contains(&codec.as_str()) {
+                Ok(())
+            } else {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!("encode.codec is {codec:?}, but it must be \"h264\" or \"hevc\""),
+                ))
+            }
+        }
+        SettingEdit::EncodeBitrate(kbps) => {
+            if *kbps == 0 || *kbps > MAX_BITRATE_KBPS {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "encode.bitrate_kbps is {kbps}, but the rate must be between 1 and \
+                         {MAX_BITRATE_KBPS} kbit/s"
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        SettingEdit::EncodeAdaptFps(_) | SettingEdit::EncodeZeroCopy(_) => Ok(()),
+        SettingEdit::EncodeRateControl(mode) => replayed_encoder::RateControl::parse(mode)
+            .map(|_| ())
+            .map_err(|err| {
+                CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!("encode.rate_control is not usable: {err:#}"),
+                )
+            }),
+        SettingEdit::EncodePreset(preset) => {
+            // The shape only: which presets exist depends on the encoder that will be selected,
+            // and that is not known until the smoke test has run (see `commands::encoder`).
+            if preset.is_empty() || known_presets().contains(&preset.as_str()) {
+                Ok(())
+            } else {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!("encode.preset is {preset:?}, which is not an encoder preset"),
+                ))
+            }
+        }
+        SettingEdit::AudioBitrate(kbps) => {
+            if *kbps == 0 || *kbps > MAX_AUDIO_BITRATE_KBPS {
+                Err(CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "audio.bitrate_kbps is {kbps}, but the rate must be between 1 and \
+                         {MAX_AUDIO_BITRATE_KBPS} kbit/s"
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
+}
+
+/// Every preset name any encoder family takes.
+///
+/// The union, because which family will be selected is not known until the smoke test has run
+/// (`encode.vendor = "auto"`). A preset that belongs to another family is dropped by the
+/// encoder with a warning, so this list only has to catch typos.
+fn known_presets() -> Vec<&'static str> {
+    [
+        replayed_encoder::EncoderFamily::Nvenc,
+        replayed_encoder::EncoderFamily::Qsv,
+        replayed_encoder::EncoderFamily::Amf,
+    ]
+    .into_iter()
+    .flat_map(|family| family.presets().iter().copied())
+    .collect()
 }
 
 /// Read the effective settings: the file's values where it sets them, the example's where it
@@ -1134,6 +1289,18 @@ pub(crate) fn write_settings_locked(
     migrate_to_current(&mut doc, &text)?;
 
     for edit in edits {
+        // "Let the recorder decide" is an absent key, so `zero_copy = None` removes it rather
+        // than writing a value: the two are not the same thing, and writing `false` would turn
+        // the hardware path off.
+        if let SettingEdit::EncodeZeroCopy(None) = edit {
+            if let Some(table) = doc
+                .get_mut("encode")
+                .and_then(|item| item.as_table_like_mut())
+            {
+                table.remove("zero_copy");
+            }
+            continue;
+        }
         let (table_key, value_key, section) = match edit {
             SettingEdit::ClipsDir(_) => ("storage", "clips_dir", "storage"),
             SettingEdit::Fps(_) => ("encode", "fps", "encode"),
@@ -1146,6 +1313,14 @@ pub(crate) fn write_settings_locked(
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
             SettingEdit::CaptureMonitor(_) => ("capture", "monitor", "capture"),
             SettingEdit::CaptureWindow(_) => ("capture", "window", "capture"),
+            SettingEdit::EncodeVendor(_) => ("encode", "vendor", "encode"),
+            SettingEdit::EncodeCodec(_) => ("encode", "codec", "encode"),
+            SettingEdit::EncodeBitrate(_) => ("encode", "bitrate_kbps", "encode"),
+            SettingEdit::EncodeAdaptFps(_) => ("encode", "adapt_fps", "encode"),
+            SettingEdit::EncodeZeroCopy(_) => ("encode", "zero_copy", "encode"),
+            SettingEdit::EncodeRateControl(_) => ("encode", "rate_control", "encode"),
+            SettingEdit::EncodePreset(_) => ("encode", "preset", "encode"),
+            SettingEdit::AudioBitrate(_) => ("audio", "bitrate_kbps", "audio"),
         };
         match doc.get(table_key) {
             None => {
@@ -1175,6 +1350,16 @@ pub(crate) fn write_settings_locked(
             }
             SettingEdit::CaptureMonitor(index) => toml_edit::value(*index as i64),
             SettingEdit::CaptureWindow(title) => toml_edit::value(title.clone()),
+            SettingEdit::EncodeVendor(vendor) => toml_edit::value(vendor.clone()),
+            SettingEdit::EncodeCodec(codec) => toml_edit::value(codec.clone()),
+            SettingEdit::EncodeBitrate(kbps) => toml_edit::value(*kbps as i64),
+            SettingEdit::EncodeAdaptFps(adapt) => toml_edit::value(*adapt),
+            SettingEdit::EncodeZeroCopy(Some(on)) => toml_edit::value(*on),
+            // The `None` case was handled above and never reaches here.
+            SettingEdit::EncodeZeroCopy(None) => continue,
+            SettingEdit::EncodeRateControl(mode) => toml_edit::value(mode.clone()),
+            SettingEdit::EncodePreset(preset) => toml_edit::value(preset.clone()),
+            SettingEdit::AudioBitrate(kbps) => toml_edit::value(*kbps as i64),
         };
         doc[table_key][value_key] = value;
     }
@@ -1215,6 +1400,182 @@ pub(crate) fn write_settings_locked(
             .join(", ")
     );
     Ok(())
+}
+
+/// The `[encode]` section and the game-audio bitrate, as the encoder panel sees them.
+///
+/// **The same rule the rest of this module follows:** the file's values where it sets them, the
+/// example's where it does not, and the engine's rules and nothing more. A mistyped key is an
+/// error naming it, and an `output_size` the engine's own parser refuses is an error too — but a
+/// value the recorder would accept is returned however odd it looks, because the panel renders
+/// only once this succeeds and is the one surface that can repair the file.
+pub fn read_encoder_settings(path: &Path) -> Result<EncoderSettings, CommandError> {
+    let config_exists = path.is_file();
+    let text = if config_exists {
+        std::fs::read_to_string(path).map_err(|err| {
+            CommandError::new(
+                ErrorCode::Io,
+                format!("could not read the config file {}: {err}", path.display()),
+            )
+        })?
+    } else {
+        EXAMPLE_CONFIG.to_string()
+    };
+    let doc: toml_edit::DocumentMut = text.parse().map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "the config file {} could not be parsed: {err}",
+                path.display()
+            ),
+        )
+    })?;
+    let example: toml_edit::DocumentMut = EXAMPLE_CONFIG.parse().map_err(|err| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!("config.example.toml could not be parsed: {err}"),
+        )
+    })?;
+
+    let vendor = string_key(&doc, &example, "encode", "vendor", "encode.vendor")?
+        .unwrap_or_else(|| "auto".to_string());
+    let codec = string_key(&doc, &example, "encode", "codec", "encode.codec")?
+        .unwrap_or_else(|| "h264".to_string());
+    let bitrate_kbps = int_key(
+        &doc,
+        &example,
+        "encode",
+        "bitrate_kbps",
+        "encode.bitrate_kbps",
+    )?
+    .unwrap_or(20_000);
+    let fps = int_key(&doc, &example, "encode", "fps", "encode.fps")?.unwrap_or(60);
+    let output_size = string_key(
+        &doc,
+        &example,
+        "encode",
+        "output_size",
+        "encode.output_size",
+    )?
+    .unwrap_or_default();
+    // The one key the engine validates itself, so the reader keeps refusing it: the panel must
+    // not show a value a start would reject.
+    if !output_size.trim().is_empty() {
+        validate_output_size(&output_size)?;
+    }
+    let adapt_fps =
+        bool_key(&doc, &example, "encode", "adapt_fps", "encode.adapt_fps")?.unwrap_or(true);
+    // Absent means "let the recorder decide", which is what an absent key says. There is no
+    // example value to fall back to: the example leaves the key out on purpose.
+    let zero_copy = get_bool(&doc, "encode", "zero_copy", "encode.zero_copy")?;
+    let rate_control = string_key(
+        &doc,
+        &example,
+        "encode",
+        "rate_control",
+        "encode.rate_control",
+    )?
+    .unwrap_or_else(|| replayed_encoder::RateControl::Cbr.as_str().to_string());
+    let preset =
+        string_key(&doc, &example, "encode", "preset", "encode.preset")?.unwrap_or_default();
+    let audio_bitrate_kbps = int_key(
+        &doc,
+        &example,
+        "audio",
+        "bitrate_kbps",
+        "audio.bitrate_kbps",
+    )?
+    .unwrap_or(replayed_encoder::DEFAULT_AUDIO_BITRATE_KBPS);
+
+    Ok(EncoderSettings {
+        vendor,
+        codec,
+        bitrate_kbps,
+        fps,
+        output_size,
+        adapt_fps,
+        zero_copy,
+        rate_control,
+        preset,
+        audio_bitrate_kbps,
+    })
+}
+
+/// One string key: the file's value, else the example's, else nothing.
+fn string_key(
+    doc: &toml_edit::DocumentMut,
+    example: &toml_edit::DocumentMut,
+    table_key: &str,
+    value_key: &'static str,
+    full_key: &'static str,
+) -> Result<Option<String>, CommandError> {
+    Ok(get_str(doc, table_key, value_key, full_key)?
+        .or(get_str(example, table_key, value_key, full_key)?))
+}
+
+/// One integer key: the file's value, else the example's, else nothing.
+fn int_key(
+    doc: &toml_edit::DocumentMut,
+    example: &toml_edit::DocumentMut,
+    table_key: &str,
+    value_key: &'static str,
+    full_key: &'static str,
+) -> Result<Option<u32>, CommandError> {
+    let raw = get_int(doc, table_key, value_key, full_key)?
+        .or(get_int(example, table_key, value_key, full_key)?);
+    match raw {
+        Some(raw) => Ok(Some(u32::try_from(raw).map_err(|_| mistyped(full_key))?)),
+        None => Ok(None),
+    }
+}
+
+/// One boolean key: the file's value, else the example's, else nothing.
+fn bool_key(
+    doc: &toml_edit::DocumentMut,
+    example: &toml_edit::DocumentMut,
+    table_key: &str,
+    value_key: &'static str,
+    full_key: &'static str,
+) -> Result<Option<bool>, CommandError> {
+    Ok(get_bool(doc, table_key, value_key, full_key)?
+        .or(get_bool(example, table_key, value_key, full_key)?))
+}
+
+/// Write the encoder panel's settings into the file.
+///
+/// Every key is written, in one write: the panel sends the whole configuration, so the file ends
+/// up saying exactly what the panel shows. The write is atomic and validated first, so a
+/// rejected setting leaves the file as it was.
+pub fn write_encoder_settings(path: &Path, settings: &EncoderSettings) -> Result<(), CommandError> {
+    write_settings(path, &encoder_edits(settings))
+}
+
+/// [`write_encoder_settings`], with [`settings_write_lock`] already held.
+///
+/// The caller holds the lock so that the write and the read back that follows it are one
+/// sequence: the panel is told what was stored, and that answer must come from the file the
+/// write produced.
+pub(crate) fn write_encoder_settings_locked(
+    path: &Path,
+    settings: &EncoderSettings,
+) -> Result<(), CommandError> {
+    write_settings_locked(path, &encoder_edits(settings))
+}
+
+/// The edits that carry the encoder panel's settings into the file.
+fn encoder_edits(settings: &EncoderSettings) -> Vec<SettingEdit> {
+    vec![
+        SettingEdit::EncodeVendor(settings.vendor.clone()),
+        SettingEdit::EncodeCodec(settings.codec.clone()),
+        SettingEdit::EncodeBitrate(settings.bitrate_kbps),
+        SettingEdit::Fps(settings.fps),
+        SettingEdit::OutputSize(settings.output_size.clone()),
+        SettingEdit::EncodeAdaptFps(settings.adapt_fps),
+        SettingEdit::EncodeZeroCopy(settings.zero_copy),
+        SettingEdit::EncodeRateControl(settings.rate_control.clone()),
+        SettingEdit::EncodePreset(settings.preset.clone()),
+        SettingEdit::AudioBitrate(settings.audio_bitrate_kbps),
+    ]
 }
 
 /// Bring the document to the layout version this build writes, and stamp it with that version.
@@ -2399,6 +2760,131 @@ mod tests {
         .unwrap();
         assert_eq!(on.toggle_recording_hotkey.as_deref(), Some("Ctrl+F9"));
         assert_eq!(on.bookmark_hotkey.as_deref(), Some("Ctrl+F10"));
+    }
+
+    // -- the encoder panel's read and write path -----------------------------------------
+
+    /// A file with an `[encode]` section and nothing else: the panel reads what is there and
+    /// the example's values for the rest.
+    #[test]
+    fn the_encoder_settings_come_from_the_file_and_the_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[encode]\nvendor = \"qsv\"\ncodec = \"hevc\"\nbitrate_kbps = 8000\n\
+             rate_control = \"vbr\"\npreset = \"medium\"\nzero_copy = true\n",
+        )
+        .unwrap();
+
+        let settings = read_encoder_settings(&path).unwrap();
+
+        assert_eq!(settings.vendor, "qsv");
+        assert_eq!(settings.codec, "hevc");
+        assert_eq!(settings.bitrate_kbps, 8_000);
+        assert_eq!(settings.rate_control, "vbr");
+        assert_eq!(settings.preset, "medium");
+        assert_eq!(settings.zero_copy, Some(true));
+        // Not in the file: the example's.
+        assert_eq!(settings.fps, 60);
+        assert_eq!(settings.audio_bitrate_kbps, 192);
+        assert!(settings.adapt_fps);
+    }
+
+    /// The panel's settings are written to the file and read back.
+    ///
+    /// The round trip is the point: what the panel shows after a write has to be what the file
+    /// says, not what the panel sent.
+    #[test]
+    fn the_encoder_settings_are_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[storage]\nclips_dir = \"\"\n").unwrap();
+
+        let wanted = EncoderSettings {
+            vendor: "amf".to_string(),
+            codec: "hevc".to_string(),
+            bitrate_kbps: 30_000,
+            fps: 30,
+            output_size: "1920x1080".to_string(),
+            adapt_fps: false,
+            zero_copy: Some(false),
+            rate_control: "quality".to_string(),
+            preset: "speed".to_string(),
+            audio_bitrate_kbps: 160,
+        };
+        write_encoder_settings(&path, &wanted).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("vendor = \"amf\""), "{text}");
+        assert!(text.contains("rate_control = \"quality\""), "{text}");
+        assert!(text.contains("preset = \"speed\""), "{text}");
+        assert!(text.contains("adapt_fps = false"), "{text}");
+        assert!(text.contains("bitrate_kbps = 160"), "{text}");
+        // The rest of the file survives.
+        assert!(text.contains("[storage]"), "{text}");
+
+        assert_eq!(read_encoder_settings(&path).unwrap(), wanted);
+    }
+
+    /// "Let the recorder decide" is an absent key, so writing it removes the key.
+    ///
+    /// Writing `false` instead would turn the hardware path **off**, which is the opposite of
+    /// what the panel asked for.
+    #[test]
+    fn an_unset_zero_copy_removes_the_key_rather_than_writing_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[encode]\nzero_copy = true\n").unwrap();
+
+        let mut wanted = read_encoder_settings(&path).unwrap();
+        assert_eq!(wanted.zero_copy, Some(true));
+        wanted.zero_copy = None;
+        write_encoder_settings(&path, &wanted).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("zero_copy"),
+            "the key is gone, not set to false: {text}"
+        );
+        assert_eq!(read_encoder_settings(&path).unwrap().zero_copy, None);
+    }
+
+    /// The game-audio rate reaches the recorder's own configuration.
+    ///
+    /// The encoder panel offers it, so it has to travel: a rate the panel can change that the
+    /// recorder ignores would be a lie.
+    #[test]
+    fn the_audio_bitrate_reaches_the_recorders_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[buffer]\npre_seconds = 30\npost_seconds = 5\nsegment_time = 1\nscratch_dir = \"\"\n\n\
+             [encode]\nvendor = \"auto\"\ncodec = \"h264\"\nbitrate_kbps = 20000\nfps = 60\n\
+             output_size = \"\"\n\n[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\n\
+             max_age_days = 1\n\n[audio]\nbitrate_kbps = 160\n",
+        )
+        .unwrap();
+
+        let recording = RecordingConfig::load(&path).unwrap();
+        assert_eq!(
+            recording.audio.bitrate_kbps,
+            Some(160),
+            "the configured rate is carried across"
+        );
+
+        // Absent: nothing is carried, and the encoder's own default applies.
+        std::fs::write(
+            &path,
+            "[buffer]\npre_seconds = 30\npost_seconds = 5\nsegment_time = 1\nscratch_dir = \"\"\n\n\
+             [encode]\nvendor = \"auto\"\ncodec = \"h264\"\nbitrate_kbps = 20000\nfps = 60\n\
+             output_size = \"\"\n\n[storage]\nclips_dir = \"\"\nmax_total_bytes = 1\n\
+             max_age_days = 1\n",
+        )
+        .unwrap();
+        let absent = RecordingConfig::load(&path).unwrap();
+        assert_eq!(absent.audio.bitrate_kbps, None);
     }
 
     #[test]

@@ -343,6 +343,40 @@ impl RecorderHost {
         self.start(&settings)
     }
 
+    /// The engine's configuration, built from the file's settings.
+    ///
+    /// A function of its own so the mapping can be checked without a start: what the file says
+    /// and what the engine is asked for have to agree, and a start is a long way to find out
+    /// that they do not.
+    fn engine_config(
+        &self,
+        settings: &RecordingConfig,
+        sources: Sources,
+        dev_software_encoder: bool,
+        bins: &FfmpegBinaries,
+    ) -> RecorderConfig {
+        RecorderConfig {
+            bin: bins.clone(),
+            app_data_dir: self.app_data_dir.clone(),
+            buffer: settings.buffer.clone(),
+            encode: settings.encode.clone(),
+            storage: settings.storage.clone(),
+            capture: settings.capture.clone(),
+            // The `[audio]` bitrate is carried across (the CLI's own value, and the encoder
+            // panel's): it reaches ffmpeg's `-b:a`, so the file records what the file says.
+            // `enabled` is not read: the shell has no switch for a video-only recording, and
+            // absent means the game audio is recorded. Setting either here would be a second
+            // source of truth for what the file owns.
+            audio_bitrate_kbps: settings.audio.bitrate_kbps,
+            audio_enabled: None,
+            // WGC + WASAPI on Windows, synthetic stubs elsewhere. This shell has no switch for it and must
+            // not: the engine refuses to substitute a stub on Windows, so no path here captures nothing
+            // while looking like a recording.
+            sources,
+            dev_software_encoder,
+        }
+    }
+
     /// The body of a start. `sources` and `dev_software_encoder` are the engine's own choices,
     /// passed through unchanged: shipping code takes [`Self::start`], which is exactly
     /// [`Sources::Platform`] with the software encoder off.
@@ -371,25 +405,7 @@ impl RecorderHost {
             ));
         }
 
-        let cfg = RecorderConfig {
-            bin: bins.clone(),
-            app_data_dir: self.app_data_dir.clone(),
-            buffer: settings.buffer.clone(),
-            encode: settings.encode.clone(),
-            storage: settings.storage.clone(),
-            capture: settings.capture.clone(),
-            // The shell does not parse `[audio]` (see `config.rs`), so it carries neither the bitrate (the
-            // encoder's own 192 kbps default applies) nor `enabled` (absent means game audio is recorded).
-            // Setting either here would be a second source of truth for what the file owns, and this shell
-            // has no switch for a video-only recording.
-            audio_bitrate_kbps: None,
-            audio_enabled: None,
-            // WGC + WASAPI on Windows, synthetic stubs elsewhere. This shell has no switch for it and must
-            // not: the engine refuses to substitute a stub on Windows, so no path here captures nothing
-            // while looking like a recording.
-            sources,
-            dev_software_encoder,
-        };
+        let cfg = self.engine_config(settings, sources, dev_software_encoder, bins);
 
         // The file's [mic] and [games], not defaults: a start that ignored them would record without
         // the configured microphone and watcher. Malformed sections refuse the start, like the capture
@@ -899,6 +915,31 @@ mod tests {
             "the message must say why there is no clip: {}",
             err.message
         );
+    }
+
+    /// The game-audio rate the file names reaches the engine's configuration.
+    ///
+    /// The encoder panel offers the rate, so it has to travel: a rate the panel can change and
+    /// the recorder ignores would be a lie in the panel.
+    #[test]
+    fn the_configured_audio_bitrate_reaches_the_engines_configuration() {
+        let f = Fixture::new();
+        let host = host(&f, true);
+        let mut settings = RecordingConfig::example().unwrap();
+        settings.audio.bitrate_kbps = Some(160);
+
+        let cfg = host.engine_config(&settings, Sources::Platform, false, &f.bins);
+
+        assert_eq!(
+            cfg.audio_bitrate_kbps,
+            Some(160),
+            "the configured rate must reach the engine"
+        );
+
+        // Absent: nothing is carried, and the engine's own default applies.
+        settings.audio.bitrate_kbps = None;
+        let cfg = host.engine_config(&settings, Sources::Platform, false, &f.bins);
+        assert_eq!(cfg.audio_bitrate_kbps, None);
     }
 
     #[test]

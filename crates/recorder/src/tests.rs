@@ -77,6 +77,10 @@ fn stub_config(app_data_dir: &Path) -> RecorderConfig {
             // The shipping default; at 64x48 libx264 is far above 10fps, so the probe cannot reduce the rate.
             adapt_fps: true,
             output_size: String::new(),
+            // Constant bitrate and the encoder's own preset: what a file that does not mention
+            // them records as.
+            rate_control: "cbr".to_string(),
+            preset: String::new(),
         },
         storage: StorageSection {
             clips_dir: String::new(),
@@ -2080,6 +2084,53 @@ fn the_configured_audio_bitrate_reaches_the_encoder_and_unset_gets_the_default()
     assert_eq!(
         encode.audio_bitrate_kbps, 192,
         "which is 192 kbps, not zero and not 128"
+    );
+}
+
+/// The rate-control mode and the preset reach the encoder's configuration.
+///
+/// The two are the last of the `[encode]` keys, and the ones a settings panel can write, so they
+/// have to travel: a panel that could set them and an encoder that ignored them would be a lie.
+#[test]
+fn the_configured_rate_control_and_preset_reach_the_encoder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+
+    cfg.encode.rate_control = "vbr".to_string();
+    cfg.encode.preset = "veryfast".to_string();
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("a vbr configuration");
+    assert_eq!(
+        encode.rate_control,
+        replayed_encoder::RateControl::Vbr,
+        "the configured mode must reach the encoder"
+    );
+    assert_eq!(encode.preset, "veryfast", "and so must the preset");
+
+    // And a file that does not mention them records as it always did.
+    cfg.encode.rate_control = "cbr".to_string();
+    cfg.encode.preset = String::new();
+    let encode = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect("the default configuration");
+    assert_eq!(encode.rate_control, replayed_encoder::RateControl::Cbr);
+    assert_eq!(encode.preset, "");
+}
+
+/// A mode that is not one of the three refuses the start, naming the key.
+///
+/// A recording at the encoder's own rate, while the file says something else, is the failure this
+/// is about: the file would claim a rate the recording does not have.
+#[test]
+fn an_unknown_rate_control_refuses_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = stub_config(dir.path());
+    cfg.encode.rate_control = "crf".to_string();
+
+    let err = build_encode_config(&cfg, dir.path(), VideoCodec::H264, None, (WIDTH, HEIGHT))
+        .expect_err("an unknown mode must not be recorded as something else");
+    assert!(
+        err.to_string().contains("crf"),
+        "the refusal names the value: {err:#}"
     );
 }
 

@@ -11,7 +11,7 @@
 //! which matters because the machine runs an anti-cheat.
 
 use crate::ffmpeg::MFT_TIMEOUT;
-use crate::VideoCodec;
+use crate::{RateControl, VideoCodec};
 use anyhow::{bail, Context, Result};
 use replayed_capture::GpuTexture;
 use std::time::{Duration, Instant};
@@ -29,26 +29,26 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
 };
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VLevel5_1, eAVEncH264VLevel5_2,
-    eAVEncH264VProfile_High, eAVEncH265VLevel4_1, eAVEncH265VLevel5, eAVEncH265VLevel5_1,
-    eAVEncH265VProfile_Main_420_10, eAVEncH265VProfile_Main_420_8, CODECAPI_AVEncCommonBufferSize,
-    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncVideoForceKeyFrame,
-    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIDeviceManager,
-    IMFMediaEventGenerator, IMFMediaType, IMFTransform, METransformHaveOutput,
-    METransformNeedInput, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType,
-    MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx,
-    MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_ARGB32,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES, MFVideoFormat_NV12,
-    MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2, MFVideoInterlace_Progressive,
-    MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_CATEGORY_VIDEO_PROCESSOR,
-    MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MF_EVENT_FLAG_NO_WAIT,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_LEVEL,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MF_VERSION,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncH264VLevel5_1, eAVEncH264VLevel5_2, eAVEncH264VProfile_High, eAVEncH265VLevel4_1,
+    eAVEncH265VLevel5, eAVEncH265VLevel5_1, eAVEncH265VProfile_Main_420_10,
+    eAVEncH265VProfile_Main_420_8, CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFTransform,
+    METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video, MFShutdown,
+    MFStartup, MFTEnumEx, MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute,
+    MFVideoFormat_ARGB32, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES,
+    MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
+    MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
+    MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 
 /// What an encoder asked for, when its events were drained.
@@ -541,9 +541,17 @@ fn set_codec_api_value(api: &ICodecAPI, key: &windows::core::GUID, value: u32, w
 /// average to aim near, roughly VBR, or a rate to hold). The mode is set first, then the rate,
 /// the order an encoder expects.
 ///
+/// **The mode is what the user asked for, within what this surface can express.**
+/// `CODECAPI_AVEncCommonRateControlMode` has constant bitrate (`CBR`) and the variable-bitrate
+/// family; the variable mode here is `PeakConstrainedVBR`, the one that pairs with the maximum
+/// bitrate and the buffer size this function also pins. The constant-quality mode the MFT also
+/// has needs a QP value this app does not carry, so it is not reachable from here: asking for it
+/// falls back to constant bitrate with a warning, rather than a recording that claims a
+/// quality it did not get.
+///
 /// An MFT with no `ICodecAPI` is not a failure (the recording is made at the encoder's default)
 /// but it is said out loud rather than inferred from a file's size.
-fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
+fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32, mode: RateControl) {
     let api: ICodecAPI = match transform.cast() {
         Ok(api) => api,
         Err(err) => {
@@ -554,11 +562,29 @@ fn pin_bitrate(transform: &IMFTransform, bitrate_kbps: u32) {
             return;
         }
     };
+    let (mft_mode, what) = match mode {
+        RateControl::Cbr => (eAVEncCommonRateControlMode_CBR, "rate control mode (CBR)"),
+        RateControl::Vbr => (
+            eAVEncCommonRateControlMode_PeakConstrainedVBR,
+            "rate control mode (peak-constrained VBR)",
+        ),
+        RateControl::Quality => {
+            // Not reachable from this surface: the MFT's constant-quality mode is
+            // `CODECAPI_AVEncCommonQuality`, a QP value this app does not carry. Say so, and
+            // rate-control as constant bitrate, which is what the MFT was already doing.
+            tracing::warn!(
+                "the Media Foundation path has no constant-quality mode without a QP value, so \
+                 the encoder is rate-controlled as constant bitrate; the constant-quality mode is \
+                 available on the ffmpeg child path (encode.zero_copy = false)"
+            );
+            (eAVEncCommonRateControlMode_CBR, "rate control mode (CBR)")
+        }
+    };
     set_codec_api_value(
         &api,
         &CODECAPI_AVEncCommonRateControlMode,
-        eAVEncCommonRateControlMode_CBR.0 as u32,
-        "rate control mode (CBR)",
+        mft_mode.0 as u32,
+        what,
     );
     set_codec_api_value(
         &api,
@@ -820,20 +846,18 @@ impl MftEncoder {
     /// `device` is the capture path's, deliberately: an MFT given a manager over a different device
     /// cannot be handed the captured texture at all.
     ///
-    /// `bitrate_kbps` is the rate the stream is made at; nothing else sets one, since ffmpeg copies
-    /// the stream. `fps` is the rate frames will be fed at, which the encoder budgets the bitrate by.
+    /// `params` is the codec, the rate and the mode the encoder is opened with (see
+    /// [`MftEncoderParams`]).
     pub fn open(
         device: &ID3D11Device,
         size: (u32, u32),
-        codec: VideoCodec,
         preferred: Option<DXGI_FORMAT>,
-        bitrate_kbps: u32,
-        fps: u32,
+        params: MftEncoderParams,
     ) -> Result<Self> {
         // SAFETY: `MFStartup` is refcounted and its pair is in `Drop`, so opening several encoders
         // in one process is a supported sequence.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("MFStartup")?;
-        match Self::open_started(device, size, codec, preferred, bitrate_kbps, fps) {
+        match Self::open_started(device, size, preferred, params) {
             Ok(encoder) => Ok(encoder),
             Err(err) => {
                 // SAFETY: balances the `MFStartup` above, which succeeded.
@@ -848,10 +872,8 @@ impl MftEncoder {
     fn open_started(
         device: &ID3D11Device,
         size: (u32, u32),
-        codec: VideoCodec,
         preferred: Option<DXGI_FORMAT>,
-        bitrate_kbps: u32,
-        fps: u32,
+        params: MftEncoderParams,
     ) -> Result<Self> {
         let manager = create_device_manager(device)?;
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -876,7 +898,10 @@ impl MftEncoder {
                 // SAFETY: COM-allocated by `MFTEnumEx`; the matching free.
                 unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
             }
-            bail!("no hardware encoder MFT on this machine will take {codec:?} at this size")
+            bail!(
+                "no hardware encoder MFT on this machine will take {:?} at this size",
+                params.codec
+            )
         }
         // SAFETY: `activates` points at `count` initialised entries written by the call above.
         let candidates = unsafe { std::slice::from_raw_parts(activates, count as usize) };
@@ -886,15 +911,7 @@ impl MftEncoder {
         for candidate in candidates.iter().flatten() {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            match configure_encoder(
-                candidate,
-                &manager,
-                size,
-                codec,
-                preferred,
-                bitrate_kbps,
-                fps,
-            ) {
+            match configure_encoder(candidate, &manager, size, preferred, params) {
                 Ok((transform, input_format)) => {
                     chosen = Some((transform, name, input_format));
                     break;
@@ -922,7 +939,7 @@ impl MftEncoder {
             events,
             device: device.clone(),
             size,
-            fps,
+            fps: params.fps,
             encoder_name,
             input_format,
         })
@@ -935,12 +952,7 @@ impl MftEncoder {
     /// disagreement leaves a texture the encoder silently cannot see. The geometry also comes from the
     /// texture: it is the size that will arrive, and `VideoInput::EncodedBitstream` refuses a scaled
     /// output at spawn.
-    pub fn open_for_texture(
-        texture: &ID3D11Texture2D,
-        codec: VideoCodec,
-        bitrate_kbps: u32,
-        fps: u32,
-    ) -> Result<Self> {
+    pub fn open_for_texture(texture: &ID3D11Texture2D, params: MftEncoderParams) -> Result<Self> {
         // SAFETY: `texture` is a live D3D11 texture and `GetDevice` is the documented way to ask
         // which device it belongs to. The device it returns is a new reference, held by the encoder.
         let device = unsafe { texture.GetDevice() }.context("ID3D11Texture2D::GetDevice")?;
@@ -950,10 +962,8 @@ impl MftEncoder {
         Self::open(
             &device,
             (desc.Width, desc.Height),
-            codec,
             Some(desc.Format),
-            bitrate_kbps,
-            fps,
+            params,
         )
     }
 
@@ -1184,6 +1194,24 @@ impl Drop for MftEncoder {
     }
 }
 
+/// What the hardware encoder is opened with: the codec, the rate and the mode.
+///
+/// One value rather than four arguments, because the encoder is opened from three places (the
+/// recording, the probe and the test) and a list of arguments is a list that can be given in the
+/// wrong order.
+#[derive(Debug, Clone, Copy)]
+pub struct MftEncoderParams {
+    /// The codec the encoder produces.
+    pub codec: VideoCodec,
+    /// The rate the stream is made at, in kbit/s. Nothing else sets one: ffmpeg copies the
+    /// stream, so this is the rate the clip really has.
+    pub bitrate_kbps: u32,
+    /// The rate frames are fed at, which the encoder budgets the bitrate by.
+    pub fps: u32,
+    /// The rate-control mode asked for (see [`pin_bitrate`] for what this surface can express).
+    pub mode: RateControl,
+}
+
 /// Configure one candidate: unlock it, give it the device, set its output type, then its input.
 ///
 /// The order matters; each step was learned from a refusal. An async MFT that is not unlocked
@@ -1193,27 +1221,31 @@ fn configure_encoder(
     activate: &IMFActivate,
     manager: &IMFDXGIDeviceManager,
     size: (u32, u32),
-    codec: VideoCodec,
     preferred: Option<DXGI_FORMAT>,
-    bitrate_kbps: u32,
-    fps: u32,
+    params: MftEncoderParams,
 ) -> Result<(IMFTransform, String)> {
     // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
     let transform: IMFTransform = unsafe { activate.ActivateObject() }
         .context("IMFActivate::ActivateObject(IMFTransform)")?;
 
     prepare_transform(activate, &transform, manager)?;
-    set_output_type(&transform, size, codec, bitrate_kbps, fps)?;
+    set_output_type(
+        &transform,
+        size,
+        params.codec,
+        params.bitrate_kbps,
+        params.fps,
+    )?;
     // The number is set here, not only described: the output type carries `MF_MT_AVG_BITRATE`, which
     // these encoders treat as a target rather than a limit (see `pin_bitrate`).
-    pin_bitrate(&transform, bitrate_kbps);
+    pin_bitrate(&transform, params.bitrate_kbps, params.mode);
 
     // Negotiated, not assumed: this MFT takes `ARGB32` at 640x480 and refuses it at 3840x2160 with
     // `MF_E_INVALIDMEDIATYPE`, so what it eats depends on size as well as format. Candidates are
     // tried in order, the direct one first (`ARGB32` means the texture goes straight in).
     let mut refusals = Vec::new();
     for (subtype, name) in candidate_inputs(preferred) {
-        let input = video_type(subtype, size, fps)?;
+        let input = video_type(subtype, size, params.fps)?;
         // SAFETY: setting the input type on a configured transform, with a media type that outlives
         // the call. A refusal here is expected for some formats at some sizes.
         match unsafe { transform.SetInputType(0, &input, 0) } {
@@ -1289,12 +1321,7 @@ pub struct MftFeed {
 impl MftFeed {
     /// Start the encoder's thread, whose output goes into `out`, the video queue the pump writes to,
     /// so depth accounting stays in one place.
-    pub fn spawn(
-        codec: VideoCodec,
-        bitrate_kbps: u32,
-        fps: u32,
-        out: std::sync::mpsc::SyncSender<Vec<u8>>,
-    ) -> Self {
+    pub fn spawn(params: MftEncoderParams, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&dropped);
@@ -1302,7 +1329,7 @@ impl MftFeed {
         let stop = std::sync::Arc::clone(&stopping);
         let handle = std::thread::Builder::new()
             .name("replayed-mft".to_string())
-            .spawn(move || encode_loop(rx, out, counter, codec, bitrate_kbps, fps, stop))
+            .spawn(move || encode_loop(rx, out, counter, params, stop))
             .expect("spawning the hardware encoder thread");
         Self {
             tx: Some(tx),
@@ -1398,15 +1425,13 @@ fn encode_loop(
     rx: std::sync::mpsc::Receiver<GpuTexture>,
     out: std::sync::mpsc::SyncSender<Vec<u8>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    codec: VideoCodec,
-    bitrate_kbps: u32,
-    fps: u32,
+    params: MftEncoderParams,
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Opened on the first texture, because the device and size come from it; opening here also keeps
     // the open off the capture path.
     let mut encoder: Option<MftEncoder> = None;
-    let fps = fps.max(1);
+    let fps = params.fps.max(1);
     // Frames handed to the encoder so far; media time and the keyframe cadence both count from it.
     let mut frames: u64 = 0;
     // Frames encoded and then not queued, counted rather than logged one by one: a stalled queue drops every frame behind it.
@@ -1414,7 +1439,7 @@ fn encode_loop(
 
     while let Ok(texture) = rx.recv() {
         if encoder.is_none() {
-            match MftEncoder::open_for_texture(texture.as_raw(), codec, bitrate_kbps, fps) {
+            match MftEncoder::open_for_texture(texture.as_raw(), params) {
                 Ok(mut opened) => {
                     if let Err(err) = opened.start() {
                         tracing::error!("could not start the hardware encoder: {err:#}");
@@ -2036,7 +2061,20 @@ pub fn can_encode_with_textures(
     let Ok(device) = create_capture_kind_device() else {
         return false;
     };
-    MftEncoder::open(&device, size, codec, None, bitrate_kbps, fps).is_ok()
+    MftEncoder::open(
+        &device,
+        size,
+        None,
+        MftEncoderParams {
+            codec,
+            bitrate_kbps,
+            fps,
+            // The probe asks whether the encoder will open at all, not how it will rate-control,
+            // so it uses the mode every build used: constant bitrate.
+            mode: RateControl::Cbr,
+        },
+    )
+    .is_ok()
 }
 
 /// Every hardware video encoder MFT this machine admits to, with no type filter at all: whether

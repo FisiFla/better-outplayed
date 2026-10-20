@@ -3179,6 +3179,12 @@ fn build_encode_config(
     // (`RecorderConfig::game_audio`): `false` declares no audio input and no loopback listener.
     encode_cfg.game_audio = cfg.game_audio();
 
+    // The rate-control mode and the encoder's own preset, from `[encode]`. The mode is parsed
+    // here, so a hand-edited value that is not one of the three is a startup failure naming the
+    // key rather than a recording at the encoder's own rate.
+    encode_cfg =
+        encode_cfg.with_rate_control(cfg.encode.rate_control_mode()?, cfg.encode.preset.clone());
+
     // The hybrid, when asked for and possible. Both refusals are configuration contradictions caught
     // here, because a recording that silently ran a different pipeline than configured is worse than
     // one that does not start.
