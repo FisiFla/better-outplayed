@@ -68,6 +68,9 @@
 //! * An event is stamped with the media time of the moment it *arrived*, not of the moment its
 //!   clip was cut: a burst is coalesced before the clip is made, and that wait can run for most
 //!   of the pre-roll.
+//! * A marker for the event that caused a clip stays inside that clip's pre-roll: the event
+//!   happened before the post-roll did. The clip's first frame can be a segment before the
+//!   requested start, so the trigger, measured from that frame, is where the pre-roll ends.
 //! * A clip is dated by the frame it really starts on — the resolved window's start, not the
 //!   requested one — because the index row and the chapter offsets are measured from that frame.
 //! * The pacer decides before the frame is materialised, and non-due frames are drained with
@@ -894,8 +897,12 @@ impl Recorder {
     }
 
     /// [`Recorder::clip_now_with`] with this clip's own [`ClipWindow`] (short/long hotkeys, per-game lengths).
+    ///
+    /// The request's own instant is taken here, at the call site, and handed to the engine with
+    /// the command: the engine reads its clock when it gets round to the command, which is later
+    /// than the moment the caller asked, and the two are not the same moment.
     pub fn clip_now_in(&self, reason: ClipReason, window: ClipWindow) -> Result<RecordedClip> {
-        self.clip_now_in_at(reason, window, None)
+        self.clip_now_in_at(reason, window, Some(self.media_now_ms()))
     }
 
     /// [`Recorder::clip_now_in`] with the moment the trigger happened, when the caller knows it.
@@ -905,6 +912,9 @@ impl Recorder {
     /// coalesced before the clip is cut, and the coalescing can run for most of the pre-roll:
     /// without this the marker points at the request instant, which is up to the whole
     /// coalescing window later than the moment it describes.
+    ///
+    /// `None` means "the engine's own trigger", for a caller with no earlier instant to give:
+    /// the media position the engine reads when it handles the command.
     pub fn clip_now_in_at(
         &self,
         reason: ClipReason,
@@ -2430,6 +2440,12 @@ impl Engine {
             Some(at_ms) => at_ms,
             None => self.ledger.origin_ms().saturating_add(trigger_ms),
         };
+        // The marker names the moment inside the clip that caused it, so it belongs to the
+        // clip's pre-roll: the event happened before the post-roll did. The window is cut at
+        // fragment boundaries, so the clip's first frame can be a segment before the requested
+        // start, and the trigger measured from that frame is where the pre-roll ends. A marker
+        // past it would name a moment the clip's pre-roll does not cover.
+        let at_ms = at_ms.min(started_at_ms.saturating_add(pre_ms));
 
         // The events in the clip's span, for its chapters. Read before the splice, so the
         // chapters are known when the file is written: a marker recorded while the splice ran
@@ -2551,8 +2567,9 @@ impl Engine {
         }
 
         // An event-triggered clip says why it exists, and so does a manual one (the user's own bookmark).
-        // `at` is the trigger instant (`pre_ms` into the clip), so the marker lands on the moment that
-        // caused it. A failed insert is reported, not fatal: the clip file is on disk either way.
+        // `at` is the trigger instant, at most `pre_ms` into the clip, so the marker lands on the
+        // moment that caused it and inside the pre-roll that leads to it. A failed insert is
+        // reported, not fatal: the clip file is on disk either way.
         let session_id = Some(self.session);
         let recorded = match pending.reason.event() {
             Some(event) => index_event(&self.store, event, pending.at_ms, id, session_id),

@@ -480,6 +480,135 @@ fn a_clip_records_why_it_was_taken() {
     );
 }
 
+/// The marker for the event that caused a clip stays inside that clip's pre-roll.
+///
+/// The clip's window is cut at whole fragments, so the clip's first frame can be a segment
+/// before the requested start, and the trigger, measured from that frame, is where the
+/// pre-roll ends. A marker stamped with the engine's own handling instant lands past that:
+/// it names a moment the clip's pre-roll does not cover, and it is as far past it as the
+/// fragment the window was cut short by.
+///
+/// The pre-roll here is deliberately not a whole number of segments. With a pre-roll of two
+/// one-second segments the requested start lands on a fragment boundary, the overshoot is
+/// nothing, and the defect hides behind an alignment that only the recording machine can
+/// arrange.
+#[test]
+fn an_event_triggered_clip_is_stamped_inside_its_pre_roll() {
+    const PRE_SECONDS: u64 = 3;
+    const SEGMENT_SECONDS: u64 = 2;
+
+    let (_tmp, app_data_dir) = application_data_dir("event-clip-pre-roll");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.pre_seconds = PRE_SECONDS;
+    cfg.buffer.segment_time = SEGMENT_SECONDS;
+    let db_path = cfg.db_path();
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "enough media for a clip",
+        |s| s.span_ms >= (PRE_SECONDS + POST_SECONDS) * 1000,
+    );
+
+    let kill = GameEvent::new(
+        replayed_events::Source::Lol,
+        EventKind::Kill,
+        serde_json::json!({ "source": "lol", "event": "ChampionKill", "killer": "Ahri" }),
+    );
+    let clip = recorder
+        .clip_now_with(ClipReason::GameEvent(kill))
+        .expect("the event trigger produces a clip");
+    recorder.stop().expect("stop must succeed");
+
+    let store = open_clip_index(&db_path).expect("reopen the clip index");
+    let events = store.list_events().expect("list the events");
+    let kill_row = events
+        .iter()
+        .find(|e| e.kind == "kill")
+        .expect("the kill's row");
+    // The clip's first frame, and the pre-roll measured from it: the marker has to sit at or
+    // before the end of that, because the event that caused the clip happened before the
+    // post-roll did.
+    let pre_roll_end = clip.started_at_ms + PRE_SECONDS * 1000;
+    assert!(
+        kill_row.at_ms <= pre_roll_end,
+        "the marker names the moment inside the clip that caused it, so it stays inside the \
+         pre-roll: {}ms, and the pre-roll ends at {pre_roll_end}ms (the clip starts at {}ms)",
+        kill_row.at_ms,
+        clip.started_at_ms
+    );
+}
+
+/// The event's `at` is the request's own instant, not the moment the engine got round to it.
+///
+/// The engine reads its clock when it handles the command, and a command that waits in the
+/// queue is handled later than it was asked for. The marker would then name a second of the
+/// recording the request never happened in, and the gap is as wide as the wait.
+///
+/// The kill's request is queued behind a clip with a long post-roll, so it waits in the queue
+/// while the media moves on, and the two instants are seconds apart.
+#[test]
+fn an_event_triggered_clip_is_stamped_with_the_request_instant() {
+    /// The post-roll of the clip the kill's request waits behind: five seconds of media, so
+    /// the engine is busy long enough for the queue to matter.
+    const BUSY_POST_SECONDS: u64 = 5;
+
+    let (_tmp, app_data_dir) = application_data_dir("event-clip-request-instant");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.max_post_seconds = BUSY_POST_SECONDS;
+    let db_path = cfg.db_path();
+
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "enough media for a clip",
+        |s| s.span_ms >= (PRE_SECONDS + POST_SECONDS) * 1000,
+    );
+
+    // The kill's request: taken while the engine is busy with the clip below, so it waits in
+    // the queue. The instant it carries is the one the caller asked at.
+    let recorder = std::sync::Arc::new(recorder);
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+    let recorder_for_thread = std::sync::Arc::clone(&recorder);
+    let kill_thread = std::thread::spawn(move || {
+        // Long enough for the engine to be well inside its post-roll wait, short enough that
+        // the wait is still running.
+        std::thread::sleep(Duration::from_millis(250));
+        let at = recorder_for_thread.media_now_ms();
+        asked_tx.send(at).expect("the instant travels");
+        recorder_for_thread
+            .clip_now_with(ClipReason::GameEvent(GameEvent::bare(
+                replayed_events::Source::Lol,
+                EventKind::Kill,
+            )))
+            .expect("the event trigger produces a clip")
+    });
+
+    // The clip that occupies the engine while the request waits.
+    recorder
+        .clip_now_in(ClipReason::Manual, ClipWindow::new(0, BUSY_POST_SECONDS))
+        .expect("the busy clip");
+    let clip = kill_thread.join().expect("the kill's thread");
+    recorder.stop().expect("stop must succeed");
+
+    let asked_at = asked_rx.recv().expect("the instant the request carried");
+    let store = open_clip_index(&db_path).expect("reopen the clip index");
+    let events = store.list_events().expect("list the events");
+    let kill_row = events
+        .iter()
+        .find(|e| e.kind == "kill")
+        .expect("the kill's row");
+    assert!(
+        kill_row.at_ms <= asked_at + SEGMENT_SECONDS * 1000,
+        "the marker names the moment the request was made ({asked_at}ms), not the moment the \
+         engine handled it: the row says {}ms, and the clip's own pre-roll ends at {}ms",
+        kill_row.at_ms,
+        clip.started_at_ms + PRE_SECONDS * 1000
+    );
+}
+
 /// Each chapter's `(start ms, title)`, read back with ffprobe.
 fn chapter_starts(path: &Path, bin: &FfmpegBinaries) -> Vec<(u64, String)> {
     let output = std::process::Command::new(&bin.ffprobe)
