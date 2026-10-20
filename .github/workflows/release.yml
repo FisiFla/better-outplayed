@@ -1,0 +1,380 @@
+# Release pipeline for replayed.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT DOES
+# ---------------------------------------------------------------------------
+# A tag becomes a published GitHub Release carrying the Windows NSIS installer.
+#
+#   - a `push` of a `v*` tag starts the pipeline and publishes that tag;
+#   - `workflow_dispatch` starts it by hand, which is how a release is re-cut: give the tag
+#     in the `tag` input, or dispatch the workflow on the tag itself.
+#
+# The build is the one CI already runs in its `package-windows` job, copied step for step
+# (see `.github/workflows/ci.yml`): the pinned and checksum-verified ffmpeg sidecar, the
+# frontend, and `tauri build` producing the NSIS installer. The installer is inspected
+# before it is published, exactly as CI inspects it.
+#
+# Nothing here is signed, because no code-signing certificate exists yet
+# (docs/packaging.md §5.1). That is not hidden: the release body says so, in the place a
+# user reads before running the installer, and it says what to do about the SmartScreen
+# warning the unsigned build produces.
+#
+# ---------------------------------------------------------------------------
+# THE ASSETS
+# ---------------------------------------------------------------------------
+#   - `replayed_<version>_x64-setup.exe` — the NSIS installer;
+#   - `SHA256SUMS` — the installer's SHA-256 in `sha256sum -c` format, so the download can
+#     be checked before it is run. The same hash is printed in the release body.
+#
+# Both are uploaded as a workflow artefact as well, *before* the release step, so a failed
+# release still leaves the built installer on the Actions page instead of nowhere.
+#
+# ---------------------------------------------------------------------------
+# PERMISSIONS
+# ---------------------------------------------------------------------------
+# `contents: write`, and nothing else: the workflow creates a release and writes nothing
+# else in the repository. The token is the automatic `GITHUB_TOKEN`, so this workflow runs
+# and publishes with no secret configured at all.
+#
+# ---------------------------------------------------------------------------
+# ACTION PINS
+# ---------------------------------------------------------------------------
+# Every action is pinned to a full commit SHA, with the human-readable version beside it,
+# for the reason `.github/workflows/ci.yml` sets out: a mutable tag is a moving target that
+# can be repointed at new code without any change in this file. The SHAs below are the ones
+# CI already uses, so the two workflows run the same code. Refresh one with:
+#
+#   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
+#
+# `dtolnay/rust-toolchain` is the awkward one, as in CI: `stable` is a *branch*, not a
+# version, and the action installs whatever `stable` is on the day the job runs. Pinning the
+# branch's head pins the action's own code; the Rust version it installs stays whatever the
+# channel says.
+#
+# The release itself is published with the GitHub CLI, which is preinstalled on the hosted
+# runner. That is deliberate: a third-party release action would be one more dependency to
+# hand a write token to, and `gh` is already on the image.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Re-cut a release by hand: either name the tag in the input, or dispatch the workflow
+  # on the tag itself. The tag must already exist — this workflow publishes a tag, it does
+  # not invent one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish, e.g. v0.1.0. Leave empty to use the tag the run was dispatched on.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# A release is never cancelled half-published: `cancel-in-progress` stays false, and the
+# group is keyed on the *tag* so a manual re-cut cannot race the tag's own run.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Windows release (NSIS installer)
+    runs-on: windows-latest
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          $tag = "$env:REQUESTED_TAG".Trim()
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$env:REF_NAME".Trim() }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw ("the release needs a version tag like v0.1.0, and got '$tag'. " +
+              "This run was dispatched on ref '$env:REF_NAME' (ref type: $env:REF_TYPE). " +
+              "Pick the tag in the Ref dropdown, or fill in the 'tag' input.")
+          }
+          Write-Host "releasing tag: $tag"
+          # The artefact name has to be a legal one; a tag may hold characters GitHub
+          # releases allow and artefact names do not.
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "slug=$($tag -replace '[^A-Za-z0-9._-]', '_')" >> $env:GITHUB_OUTPUT
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          # The whole history and every tag: the tag's own commit is checked below, and the
+          # release is attached to that commit.
+          fetch-depth: 0
+
+      - name: Resolve the commit the tag points at
+        id: commit
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # A native command that fails must not stop the script: the failures below are
+          # expected (a tag that is not there yet) and are reported by hand, with a
+          # message of our own.
+          $ErrorActionPreference = 'Continue'
+          # The tag must exist, and the checkout must be sitting on the commit it names —
+          # a release built from anything else would not be the release of that tag.
+          $tagCommit = git rev-parse "refs/tags/$env:TAG^{commit}" 2>$null
+          if ($LASTEXITCODE -ne 0) { throw "the tag '$env:TAG' does not exist in the repository" }
+          $tagCommit = $tagCommit.Trim()
+          $head = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $head) {
+            throw "the tag '$env:TAG' points at $tagCommit but the checkout is at $head"
+          }
+          Write-Host "tag $env:TAG -> $head"
+          "sha=$head" >> $env:GITHUB_OUTPUT
+
+      - name: Set up the Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+
+      - name: Cache the Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Two workspaces: the repo's own (target/) and the desktop shell's, which is a
+          # separate workspace rooted at apps/desktop/src-tauri.
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Fetch the ffmpeg sidecars
+        # Pinned and checksum-verified (sidecars.toml); bundling refuses to run without them.
+        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+
+      - name: Install the frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build the frontend
+        # `tauri build` runs this as its `beforeBuildCommand`, so this step is the same
+        # build twice over. It is here so that a missing `apps/desktop/dist` fails with a
+        # readable error instead of inside the Rust build, where the release build panics
+        # on a missing `tauri::generate_context!` input.
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Build the NSIS installer
+        # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
+        # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
+        # tauri.windows.conf.json.
+        working-directory: apps/desktop
+        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
+
+      - name: Check the installer exists and carries the sidecars
+        # The check CI runs, before anything is published: the NSIS archive is listed with
+        # 7-Zip (preinstalled on the runner); it is not run.
+        id: installer
+        shell: pwsh
+        run: |
+          $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $exe = Get-ChildItem -Path $dir -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $exe) { throw "no NSIS installer was produced in $dir" }
+          Write-Host "installer: $($exe.FullName) ($($exe.Length) bytes)"
+          $listing = & 7z l $exe.FullName | Out-String
+          foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'replayed.exe') {
+            if ($listing -notmatch [regex]::Escape($name)) {
+              Write-Host $listing
+              throw "the installer does not contain $name"
+            }
+          }
+          "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Stage the release assets
+        id: assets
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          INSTALLER: ${{ steps.installer.outputs.name }}
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          # The version the bundle was built from is the one in tauri.conf.json, and the
+          # tag has to agree with it: a `v0.2.0` release carrying a 0.1.0 installer is
+          # exactly the mistake a release pipeline exists to stop.
+          $version = (Get-Content "apps/desktop/src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $tagVersion = [regex]::Match($env:TAG, '^v(?<core>\d+\.\d+\.\d+)').Groups['core'].Value
+          if ($tagVersion -ne $version) {
+            throw ("the tag $env:TAG says version $tagVersion but the build is version " +
+              "$version. Bump the version in Cargo.toml, package.json and tauri.conf.json, " +
+              "or tag the version that was built.")
+          }
+          if ($env:INSTALLER -notmatch ('_' + [regex]::Escape($version) + '_')) {
+            throw "the installer $($env:INSTALLER) does not carry the version $version"
+          }
+          Write-Host "version: $version"
+
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item $env:INSTALLER_PATH -Destination "release/$env:INSTALLER"
+          Write-Host "staged: release/$env:INSTALLER"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Compute the installer's SHA-256
+        id: checksum
+        shell: pwsh
+        env:
+          INSTALLER: ${{ steps.installer.outputs.name }}
+        run: |
+          $path = "release/$env:INSTALLER"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+          # `sha256sum -c` format: the hash, two spaces, the file name. No byte-order
+          # mark, or the first hash would not parse.
+          "$hash  $env:INSTALLER" | Set-Content -Path "release/SHA256SUMS" -Encoding utf8NoBOM
+          # Read the file back and hash it again: a checksum of a file that changed under
+          # us is worse than no checksum at all.
+          $again = (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+          if ($again -ne $hash) { throw "the installer changed while it was being hashed" }
+          Write-Host "sha256: $hash"
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Write the release notes
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.assets.outputs.version }}
+          COMMIT: ${{ steps.commit.outputs.sha }}
+          INSTALLER: ${{ steps.installer.outputs.name }}
+          SHA256: ${{ steps.checksum.outputs.sha256 }}
+        run: |
+          # The body of the release, with the facts a user needs before running an
+          # unsigned installer. Nothing here is a promise the build cannot keep.
+          $body = @'
+          # replayed __VERSION__ (__TAG__)
+
+          The Windows installer, built from commit `__COMMIT__` and published as the tag
+          `__TAG__`.
+
+          **`__INSTALLER__`** — the NSIS installer. Per-user install, no UAC prompt, into
+          `%LOCALAPPDATA%\replayed`.
+
+          **SHA-256**
+
+          ```
+          __SHA256__  __INSTALLER__
+          ```
+
+          The same value is attached as `SHA256SUMS`. Check the download before you run it:
+
+          ```powershell
+          Get-FileHash -Algorithm SHA256 .\__INSTALLER__
+          ```
+
+          or, with both files in one directory:
+
+          ```sh
+          sha256sum -c SHA256SUMS
+          ```
+
+          ## What this build is
+
+          - **Local only, no telemetry.** replayed records on this machine and writes clips
+            to your disk. There is no account, no sign-in, no telemetry, no crash reporting,
+            no analytics and no cloud upload; the only network traffic it creates is to
+            your own machine, over loopback.
+          - **It carries its own ffmpeg.** The installer embeds the pinned `ffmpeg` and
+            `ffprobe` pair, so no system ffmpeg is needed and nothing is installed
+            system-wide. They are **LGPL v3 or later** (BtbN's `win64-lgpl` build, without
+            the GPL-only encoders), and the licence and the LGPL source offer are installed
+            beside them.
+          - **Supported systems: Windows 10 1903+ or Windows 11, x86_64**, with a hardware
+            encoder (NVIDIA NVENC, Intel QuickSync or AMD AMF). The installer embeds the
+            WebView2 runtime, so installing it needs no network access.
+
+          ## Windows SmartScreen will say "unknown publisher" — this build is not code-signed
+
+          **replayed is not code-signed yet.** No code-signing certificate has been bought,
+          so Windows SmartScreen cannot vouch for the publisher and hides the installer
+          behind a warning. The warning is about the missing signature, not about the file
+          being malicious — but it is also why checking the SHA-256 above is worth doing
+          before you run it.
+
+          To install:
+
+          1. Download `__INSTALLER__` and, if you want to, check its SHA-256 against the
+             value above.
+          2. Run it. Windows shows "Windows protected your PC".
+          3. Click **More info**.
+          4. Click **Run anyway**.
+
+          Every build will show that warning until the project has a code-signing
+          certificate; the open question is recorded in `docs/packaging.md` §5.1 in the
+          repository.
+          '@
+          $body = $body.Replace('__VERSION__', $env:VERSION)
+          $body = $body.Replace('__TAG__', $env:TAG)
+          $body = $body.Replace('__COMMIT__', $env:COMMIT)
+          $body = $body.Replace('__INSTALLER__', $env:INSTALLER)
+          $body = $body.Replace('__SHA256__', $env:SHA256)
+          $body | Set-Content -Path "release/RELEASE_NOTES.md" -Encoding utf8NoBOM
+          Write-Host $body
+
+      - name: Upload the release assets
+        # Before the release step, and unconditionally: a release that fails to publish
+        # still leaves the built installer here, on the Actions page, to be fetched by hand.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-${{ steps.tag.outputs.slug }}
+          path: release/
+          # The build may have failed before there was anything to upload; that is a
+          # failure of its own, already reported by the step that failed.
+          if-no-files-found: warn
+
+      - name: Publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.assets.outputs.version }}
+          INSTALLER: ${{ steps.installer.outputs.name }}
+        run: |
+          # `gh release view` is expected to fail when there is no release for the tag
+          # yet, so a failing native command must not stop the script: the exit code is
+          # read by hand below.
+          $ErrorActionPreference = 'Continue'
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw "the GitHub CLI is not on this runner"
+          }
+          $assets = @("release/$env:INSTALLER", "release/SHA256SUMS")
+          $title = "replayed $env:VERSION ($env:TAG)"
+          $notes = "release/RELEASE_NOTES.md"
+
+          # A re-cut replaces the assets and the notes of the release that is already
+          # there, rather than failing on it: that is what the manual trigger is for.
+          gh release view $env:TAG --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "the release $env:TAG already exists; replacing its assets and notes"
+            gh release upload $env:TAG @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            gh release edit $env:TAG --title $title --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+          }
+          else {
+            # `--verify-tag`: the tag must already exist in the remote repository, so a
+            # typo cannot publish a release under a tag nobody pushed. The release's
+            # target is that tag, whose commit is the one this job built.
+            gh release create $env:TAG @assets --title $title --notes-file $notes --verify-tag
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          gh release view $env:TAG --json url --jq .url
