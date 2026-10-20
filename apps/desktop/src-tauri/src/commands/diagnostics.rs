@@ -390,7 +390,6 @@ fn write_temp_file(text: &str) -> Result<PathBuf, CommandError> {
 /// 6.2 to an application with no manifest). Windows 11 is the version 10.0 with a build number
 /// of 22000 or more, which is how it is told apart.
 pub fn platform() -> String {
-    let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     #[cfg(windows)]
     {
@@ -398,7 +397,7 @@ pub fn platform() -> String {
     }
     #[cfg(not(windows))]
     {
-        let _ = os;
+        let os = std::env::consts::OS;
         format!("{os} {arch}")
     }
 }
