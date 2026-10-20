@@ -10,13 +10,17 @@ the last 30 seconds of your gameplay in a ring buffer — 35 with the shipped de
 `buffer.max_pre_seconds` — and writes a lossless clip to disk the instant you press a
 hotkey or your game reports an event.
 
-> **Naming.** The repository and the *product* are `replayed`: the Start Menu
-> shortcut, the install directory (`%LOCALAPPDATA%\replayed`), the window title,
-> the tray and the log file (`replayed.log`). The *executable* and the *data* still
-> carry the original `replayed` name — `replayed.exe`, `%LOCALAPPDATA%\replayed`, the
-> database (`replayed.db`), the GSI config name (`gamestate_integration_replayed.cfg`),
-> the Run-key value name and the crates (`replayed-cli`, `replayed-encoder`) — so every
-> `replayed` below is current.
+> **Naming.** Everything is `replayed` — the repository, the product, the Start
+> Menu shortcut, the install directory (`%LOCALAPPDATA%\replayed`), the window
+> title, the tray, the log file (`replayed.log`), the executable (`replayed.exe`),
+> the database (`replayed.db`), the GSI config name
+> (`gamestate_integration_replayed.cfg`), the Run-key value name and the crates
+> (`replayed-cli`, `replayed-encoder`). There is no second name left over from
+> the project's earlier spelling.
+>
+> An install from before the rename keeps its data where it was: the old
+> `%LOCALAPPDATA%\localplay` directory is moved over on first start, so the
+> clips, the index and the settings are not lost.
 
 ![The library: a grid of clip cards](docs/screenshots/library.png)
 
@@ -26,6 +30,35 @@ hotkey or your game reports an event.
 
 *Rendered headlessly in Chromium from fixture data (`npm run shots` in `apps/desktop`), not captured
 from the real window: WebView2, real-DPI sizing and Inter on Windows have not been seen.*
+
+---
+
+## Using replayed
+
+**This section is for people who want to clip their gameplay.** Everything below it is for
+reviewers and developers, and assumes you are reading the source.
+
+- **Install.** The installer is the NSIS package `replayed_<version>_x64-setup.exe`, published on
+  the project's [GitHub Releases](https://github.com/FisiFla/replayed/releases) page. **The build
+  is not code-signed**, so Windows SmartScreen shows it as coming from an *unknown publisher*:
+  choose **More info → Run anyway**.
+- **What you need.** Windows 10 1903+ or Windows 11, 64-bit, and a GPU with a hardware encoder
+  (NVIDIA, Intel or AMD). The capture path is Windows-only, and there is no software-encoder
+  fallback a user can reach.
+- **How you clip.** Start a recording from the tray icon or the window, then press **Ctrl+F8**.
+  The replay buffer keeps the last 30 seconds in memory, so the clip includes the seconds
+  *before* you pressed the key. A game event can cut a clip for you, on the games listed in
+  [the user guide](docs/USER-GUIDE.md#the-games-that-are-supported).
+- **Where things live.** Everything is under `%LOCALAPPDATA%\replayed` — the clips, the index,
+  the logs and the settings. There is no account, no telemetry and no upload.
+
+The full guide — the supported-games matrix, what is and is not recorded, uninstalling, and
+troubleshooting — is in **[docs/USER-GUIDE.md](docs/USER-GUIDE.md)**.
+
+> **Status.** replayed is pre-alpha. What has been verified on real Windows hardware, and what
+> has only been type-checked, is recorded item by item in
+> [`docs/verification-status.md`](docs/verification-status.md) — including the fact that the
+> game integrations have never run against a real game.
 
 ---
 
@@ -238,6 +271,7 @@ replayed/
 │       └── src/                # Svelte frontend (nav rail, library, clip page, sessions,
 │                                #   storage, health, settings)
 ├── docs/
+│   ├── USER-GUIDE.md           # for the people using the app: install, first run, troubleshooting
 │   ├── verification-status.md  # what is verified and how — READ IT FIRST
 │   ├── platform-traps.md       # OS behaviours (macOS/BSD vs Linux/Windows) that bite
 │   ├── packaging.md            # what `tauri build` produces, and what a release still needs
