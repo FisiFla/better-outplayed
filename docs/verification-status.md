@@ -2123,3 +2123,109 @@ ran with more privilege than the user who installed it. It runs with less: a per
 Windows installer, where SUID and SGID do not exist, unpacking into a temporary directory
 the user owns. The three advisories are therefore ignored in `deny.toml`, with the reason
 written down there in full, rather than left to pass silently.
+
+---
+
+## 28. On real Windows hardware, 2026-10-20
+
+The sweep until now had been verified on the development host (macOS) and on the CI runners.
+This section records what was measured on a **real Windows machine** with the game running, and
+what was found there. Two of the findings are defects the macOS-only verification could not
+see; both are tracked as issues (#74 and #75) and both are fixed by the commits this section
+names.
+
+### The machine and the build
+
+Windows 11, an RTX 3090, MSVC Build Tools 2022, the Windows SDK 26100, Rust 1.98.1 with the
+`x86_64-pc-windows-msvc` target, and Node 22.23.3 installed **portably** (a zip unpacked into
+the user's own directory — no system install, no PATH change).
+
+The pinned sidecar was fetched with the project's own tool, its SHA-256 verified, and
+**executed**: `ffmpeg version n9.0.2-17-g2a571b6068-20260930`. The frontend built. The NSIS
+installer was built from the rewritten history and came out at 292.74 MiB (with the two ~128 MiB
+sidecars inside it). It was installed **silently**, with the unsigned build and `--no-sign`
+deliberately chosen: the minisign private key has no business on a gaming machine.
+
+### The upgrade path — verified
+
+A user who had the pre-rename build installed with a real library — clips, a 15,102-byte
+`config.toml`, a GSI token, a 40,960-byte index — installed over it. The index arrived as
+`replayed.db` with the same size, the settings and the token with theirs, the three
+directories, the `.bak` with its own name kept, and the old directory was removed because it
+ended up empty. The old rule ("adopt the old data only if the new directory is absent") could
+never have fired on a real upgrade, because the installer creates that directory before the
+application has ever started; the fix decides by the **data in** the directory instead. See
+issue #73 and the commit that closed it.
+
+### The capture, with the game running
+
+The recording was aimed at the primary display, with **Rainbow Six Siege running under
+BattlEye** in the foreground. The application's own log is the record:
+
+```
+INFO replayed_capture::wgc: capturing display=Display 2 target=CaptureTarget { monitor: 0, window: None }
+INFO replayed_capture::wgc: WGC capture started width=3840 height=2160
+INFO replayed_encoder::mft: the encoder accepted rate control mode (CBR) = 0
+INFO replayed_encoder::mft: the encoder accepted mean bitrate (bit/s) = 40000000
+INFO replayed_recorder: zero-copy: captured textures go straight to the hardware encoder, and ffmpeg copies the h264 stream instead of encoding it (chosen by default, because a hardware encoder is present)
+INFO replayed_recorder: encode rate: 64.7fps sustainable at 3840x2160 with h264_nvenc (97 frames over 1.5s); encode.fps = 60 is within that, so capture runs at the configured 60fps
+INFO replayed_recorder: media clock: measured from the ring's own fragments; the ledger stands at 0ms of media, 2364ms of wall clock have passed since the recording began (one segment is 1000ms)
+INFO replayed_recorder: capture geometry 3840x2160 at 60fps (frame counter starts at 0)
+INFO replayed_capture::wasapi: WASAPI loopback capture started on the default render endpoint native_sample_rate=44100 ... requested_sample_rate=48000 ... converting=true
+INFO replayed_capture::audio_target: game audio: capturing everything the default output plays (endpoint loopback) per_app=false
+```
+
+So, on real hardware: the display capture ran at 3840x2160; the **hardware encoder** was
+selected and accepted a CBR rate and a 40 Mbps mean bitrate; the zero-copy path was taken, with
+ffmpeg copying the stream rather than encoding it; the encoder sustained **64.7 fps at 4K**,
+which is above the configured 60; the WASAPI loopback started on the default render endpoint
+and the **sample-rate conversion from 44.1 kHz to 48 kHz was active** — the territory of the
+`silence_detector` check that has never been performed, now at least observed to run; and the
+media clock reported the ledger standing at 0 ms of media while 2364 ms of wall clock had
+passed, which is the nominal-versus-measured difference the sweep documented.
+
+**No input was sent, no window was enumerated, and the game process was never opened.** The
+audio was the *endpoint* loopback, not the per-application one, so the game was never named to
+the audio subsystem. The game watcher was off for the run, so no process enumeration happened
+at all.
+
+### What this found
+
+1. **A 4K recording aborted the process** with `memory allocation of 8246337213460 bytes
+   failed` — an 8.25-terabyte allocation on a machine with 397 GB free. **Issue #74.**
+   The number is exact: with 5,140 bytes of real audio still buffered, the request was
+   `480 x 2^32` ten-millisecond blocks of silence — **2^32 blocks = 497.1 days** — because
+   `AudioTimeline::pad` sized a contiguous run of zeroes purely by a device timestamp it
+   never checked. The timestamp was absurd because of a second defect: the audio engine
+   computes its 100 ns clock value in **64-bit** arithmetic, so it wraps after **51.24
+   hours** of machine uptime at a 10 MHz QPC, while the project's anchor used exact `u128`
+   arithmetic. After that point the two are on different scales, every packet timestamp
+   fails to convert, and the timeline's own arithmetic eventually asks for the 497 days.
+   Both are fixed: the anchor now uses the engine's own wrapping formula, so the wrap
+   cancels; the silence one gap may materialise is bounded to a second; and a timestamp the
+   recording cannot account for is refused rather than obeyed. The recorder's frame sizing
+   is saturating, and `buffer.ram_cap_bytes` is clamped where it is parsed.
+2. **The event's timestamp was stamped when the engine handled the clip**, not when the
+   caller asked for it — a 100 ms error on a loaded machine, invisible on an idle one. The
+   sweep's own regression test caught it. **Issue #75.** Two things collide: the stamp was
+   taken at the engine's handling time, and the clip's start is the *resolved* window's
+   first fragment, which can begin up to one segment before the requested pre-roll. The
+   stamp is now taken at the call site, and a marker is capped at the clip's pre-roll's
+   end — the event that caused a clip happened before the post-roll did, so a marker past
+   that point names a moment the pre-roll does not cover.
+
+### What was NOT verified
+
+- **No clip was produced.** The process aborted before the self-test clip was taken, so the
+  end-to-end path — capture, splice, chapter, index row — has still not been seen on real
+  hardware. That is the one thing this section cannot claim.
+- The game's own audio was not captured: the run deliberately used the endpoint loopback, and
+  the per-application path was not exercised.
+- The game integrations (CS2's and Dota 2's GSI, League's live client) were **not** exercised
+  against a real game. R6 has no game-event integration, so no event reached the recorder.
+- **No person watched a clip and heard its audio.** The window was opened on the machine and
+  moved to the second display, but nobody has watched a recorded clip of a real game.
+- The capture was **one run**, not a soak. The 72-hour stability check the release checklist
+  asks for has not been done.
+- The `silence_detector` check has still not been *performed*; what is new is that the
+  conversion path was observed to run.
