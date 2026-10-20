@@ -100,9 +100,14 @@ pub(crate) const MFT_TIMEOUT: Duration = Duration::from_secs(2);
 /// buffer, so this only bounds a pathological case (see `drain_stderr`).
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
-/// Poll interval while a failure report waits out [`STDERR_DRAIN_BUDGET`]: the reader signals
-/// on a channel, so the reporting thread polls; 5ms is far below the report's timescale.
-const STDERR_DRAIN_POLL: Duration = Duration::from_millis(5);
+/// How long a failure report waits for ffmpeg's stderr **once the child has been reaped**.
+///
+/// The child's own stderr is complete the moment it is reaped, so the only thing that can still
+/// delay the text is a descendant that inherited the pipe and is holding it open — the
+/// pathological case the budget exists for. Waiting longer here is worth it: ffmpeg's own words
+/// are the one thing a user cannot get anywhere else, and a report that loses them is a report
+/// that says "it died" and nothing more.
+const STDERR_DRAIN_AFTER_REAP: Duration = Duration::from_secs(10);
 
 /// How long a writer failure waits for ffmpeg to become reapable so its exit status and stderr
 /// can be reported as the cause (see `FfmpegEncoder::ffmpeg_death`).
@@ -695,6 +700,11 @@ impl FfmpegEncoder {
         let output_stream = child.stdout.take();
         let video_in = child.stdin.take().context("child stdin unavailable")?;
 
+        // ffmpeg's stderr is read from the moment the child starts, so a failure report never has
+        // to wait for a thread to be spawned and scheduled before it can give the reason. The
+        // reader blocks until the pipe closes, which happens when the child exits.
+        let stderr_drain = child.stderr.take().map(stderr_reader);
+
         let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
         // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
@@ -770,8 +780,8 @@ impl FfmpegEncoder {
             owed_audio: 0,
             owed_mic_audio: 0,
             drained_stderr: None,
-            // No reader exists until a report asks for one.
-            stderr_drain: None,
+            // The reader has been running since the child was spawned.
+            stderr_drain,
         })
     }
 }
@@ -1225,7 +1235,9 @@ impl FfmpegEncoder {
                 _ => return None,
             }
         };
-        let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+        // The child is reaped, so its stderr is complete: the only thing that can still delay the
+        // text is a descendant holding the pipe open, and the reason is worth waiting for.
+        let stderr = self.drain_stderr(STDERR_DRAIN_AFTER_REAP);
         Some(format!(
             "ffmpeg exited with {status} using encoder '{}': {}",
             self.encoder_name,
@@ -1252,46 +1264,55 @@ impl FfmpegEncoder {
         if let Some(text) = &self.drained_stderr {
             return text.clone();
         }
-        // Reuse a reader a shorter budget left in flight: `child.stderr` is already taken and that reader will see the words.
+        // The reader has been running since the encoder was spawned, so the words are usually
+        // already waiting. One that is not there yet is started now: the direct constructors in
+        // the tests build the encoder without going through `spawn`.
         let rx = match self.stderr_drain.take() {
             Some(rx) => rx,
             None => {
-                let Some(mut stderr) = self.child.stderr.take() else {
+                let Some(stderr) = self.child.stderr.take() else {
                     return String::new();
                 };
-                let (tx, rx) = mpsc::channel();
-                std::thread::spawn(move || {
-                    use std::io::Read;
-                    let mut text = String::new();
-                    let _ = stderr.read_to_string(&mut text);
-                    let _ = tx.send(text);
-                });
-                rx
+                stderr_reader(stderr)
             }
         };
-        let deadline = Instant::now() + budget;
-        loop {
-            match rx.try_recv() {
-                Ok(text) => {
-                    self.drained_stderr = Some(text.clone());
-                    return text;
-                }
-                // The reader ended without sending: nothing more can arrive, so an empty answer is its own verdict and may be pinned.
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.drained_stderr = Some(String::new());
-                    return String::new();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        // Nothing yet and no budget left: keep the reader so a later, longer call can still collect it.
-                        self.stderr_drain = Some(rx);
-                        return String::new();
-                    }
-                    std::thread::sleep(STDERR_DRAIN_POLL);
-                }
+        // Wait for the reader's verdict rather than polling for it: the wait ends the instant the
+        // text arrives, and a poll loop cannot out-run a machine that is busy running the tests
+        // that are busy starting the encoders.
+        match rx.recv_timeout(budget) {
+            Ok(text) => {
+                self.drained_stderr = Some(text.clone());
+                text
+            }
+            // The reader ended without sending: nothing more can arrive, so an empty answer is its own verdict and may be pinned.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.drained_stderr = Some(String::new());
+                String::new()
+            }
+            // Nothing yet and no budget left: keep the reader so a later, longer call can still collect it.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.stderr_drain = Some(rx);
+                String::new()
             }
         }
     }
+}
+
+/// Read ffmpeg's stderr on its own thread and hand back the channel the words arrive on.
+///
+/// The reader starts when the encoder is spawned, not when a report asks for the text. A report
+/// that has to wait for a *newly spawned* thread to be scheduled can lose ffmpeg's reason on a
+/// loaded machine — and the reason is the one thing the report exists to give.
+fn stderr_reader(stderr: std::process::ChildStderr) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stderr = stderr;
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+    rx
 }
 
 /// Whether a writer error is an audio thread's connect deadline. `accept_within` is the only
