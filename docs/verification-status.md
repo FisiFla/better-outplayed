@@ -2214,18 +2214,75 @@ at all.
    end — the event that caused a clip happened before the post-roll did, so a marker past
    that point names a moment the pre-roll does not cover.
 
+### The clip, after the fixes
+
+With the two fixes in place, the same run was repeated on the same machine, with the game still
+running, and the run completed:
+
+```
+WARN replayed_capture::audio_timeline: an audio packet carried a timestamp the recording cannot account for, so the timestamp is ignored: the audio carries on on the clock instead of the gap being padded with silence distance_secs=42949672.992895834
+WARN replayed_recorder: encode.fps = 60 is not achievable at 3840x2160 on this machine: 46.3fps sustainable at 3840x2160 with h264_nvenc
+INFO replayed_recorder: capture geometry 3840x2160 at 46fps (frame counter starts at 0)
+INFO replayed_cli: self-test: the ring holds 40950ms of media; taking the clip
+INFO replayed_recorder: hotkey pressed: media=40950ms wall=41337ms (drift 387ms); waiting for post-roll
+INFO replayed_recorder::memory_ring: clip from RAM: trigger=40950ms window=[10950ms, 45950ms) selected=36001ms held=45968ms footage=[8958ms, 45968ms] bytes=181444620
+INFO replayed_replay::splice: clip clip-1792539498696: video 36002ms audio 35989ms drift -4ms
+INFO replayed_recorder: wrote H:\Replayed\clip-1792539498696.mp4 (36006ms, 181467700 bytes, encoder=h264_nvenc)
+INFO replayed_recorder::index: indexed clip #1 (media t=9967ms, 36006ms, 181467700 bytes, h264_nvenc)
+INFO replayed_recorder::index: recorded bookmark event #25 at media t=39967ms against clip #Some(1)
+INFO replayed_recorder: buffer session #4 closed: 37 segment(s), 183095776 bytes held in RAM, no session file and nothing written while buffering
+```
+
+and the file itself, probed with the bundled ffprobe:
+
+```
+clip: H:\Replayed\clip-1792539498696.mp4  181467700 bytes
+codec_name=h264
+width=3840
+height=2160
+r_frame_rate=92/1
+codec_name=aac
+sample_rate=48000
+channels=2
+format_name=mov,mp4,m4a,3gp,3g2,mj2
+duration=36.006021
+size=181467700
+```
+
+So the **whole path is now seen on real hardware**: the display capture at 3840x2160, the hardware
+encoder, the audio timeline refusing the 497-day gap instead of materialising it, the RAM ring
+holding 37 segments, the splice (video 36002 ms against audio 35989 ms — a drift of -4 ms), the
+MP4 on disk with a 48 kHz stereo track, and the index row with a bookmark event against it.
+
+Two things in that log are worth reading twice.
+
+**The warning is the fix, working.** `distance_secs=42949672.99` is **497.1 days** — the gap the
+abort used to try to fill with 8.25 terabytes of zeroes. The timeline now names it, refuses it,
+and carries on. The audio is one stretch short of the video, which is the trade the fix records:
+inventing 497 days of silence is not an option, and a run of silence long enough to cover it
+would push the real audio out of the encoder's 300-block queue.
+
+**The machine was busier this time, and the recorder said so.** The first run measured 64.7 fps
+sustainable at 4K and captured at the configured 60; this one measured **46.3 fps** and captured at
+46, saying plainly that `encode.fps = 60 is not achievable at 3840x2160 on this machine` and
+naming the two ways out. It also reported that the encoder could not sustain even the 46 fps it
+was told — 38 fps were reaching it, and 8 frames were dropped. **A 4K capture of a full-screen
+game at 60 fps is not a thing this machine does while the game is running**; the honest number is
+lower, and the recorder reports it instead of quietly dropping frames.
+
 ### What was NOT verified
 
-- **No clip was produced.** The process aborted before the self-test clip was taken, so the
-  end-to-end path — capture, splice, chapter, index row — has still not been seen on real
-  hardware. That is the one thing this section cannot claim.
+- The **first** attempt produced no clip, because the process aborted (above). After the fixes
+  the path has been seen end to end — capture, splice, index row, and a 36-second 4K file probed
+  on disk — but **only once**, and only on the primary display. The 72-hour soak the release
+  checklist asks for has still not been done.
 - The game's own audio was not captured: the run deliberately used the endpoint loopback, and
   the per-application path was not exercised.
 - The game integrations (CS2's and Dota 2's GSI, League's live client) were **not** exercised
   against a real game. R6 has no game-event integration, so no event reached the recorder.
 - **No person watched a clip and heard its audio.** The window was opened on the machine and
   moved to the second display, but nobody has watched a recorded clip of a real game.
-- The capture was **one run**, not a soak. The 72-hour stability check the release checklist
+- The capture was **two runs**, not a soak. The 72-hour stability check the release checklist
   asks for has not been done.
 - The `silence_detector` check has still not been *performed*; what is new is that the
   conversion path was observed to run.
