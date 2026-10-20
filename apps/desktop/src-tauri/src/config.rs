@@ -1736,38 +1736,196 @@ pub fn app_data_dir() -> PathBuf {
 ///
 /// The product was renamed; the directory holding the index, the clips, the sessions and the
 /// settings was not, and a user who had been running the older build would have found an
-/// empty library. If the old directory is here and the new one is not, it is moved across in
-/// one rename, so the library and the settings survive.
+/// empty library.
 ///
-/// If **both** are there, the old one is left alone: something is already using the new
-/// name, and merging two directories is not something to do to somebody's library without
-/// being asked. The move is a rename, not a copy, so a failure leaves the old directory
-/// exactly as it was — the user loses nothing, and the next start tries again.
+/// The new directory usually **already exists** by the time this runs, and that is the whole
+/// subtlety: the installer puts the application in `%LOCALAPPDATA%\replayed`, and the data
+/// directory is that same path, so the installer creates the directory before the application
+/// has ever started. A rule of "the old directory is adopted only if the new one is absent"
+/// therefore never fires on a real upgrade, and the user gets an empty library with their old
+/// one stranded next to it.
+///
+/// What decides it is not the directory but the *data in it*. If the new directory already
+/// holds an index or a configuration of its own, this build has been used, and the old
+/// directory is left exactly where it is: merging two libraries is not something to do to
+/// somebody's clips without being asked.
+///
+/// Otherwise each entry of the old directory is moved across one at a time, skipping anything
+/// whose destination already exists, and the index is renamed with the project. Nothing is
+/// copied, so a failure part way through loses nothing: whatever did not move is still in the
+/// old directory, which is left in place, and the next start tries again.
 fn migrate_legacy_data_dir(base: &std::path::Path, dir: &std::path::Path) {
+    use std::ffi::{OsStr, OsString};
+
     // The name before the rename, spelled out rather than derived: it must stay this
     // literal forever, because it is the name of a directory that exists on disk.
     const LEGACY: &str = "localplay";
+    // The index was renamed with the project, so the old file has to be renamed on the way.
+    const LEGACY_INDEX: &str = "localplay.db";
+    const INDEX: &str = "replayed.db";
+
     let legacy = base.join(LEGACY);
-    if !legacy.is_dir() || dir.exists() {
+    if !legacy.is_dir() {
         return;
     }
-    match std::fs::rename(&legacy, dir) {
-        Ok(()) => tracing::info!(
-            "the data directory was renamed from `{}` to `{}`",
+    if dir.join(INDEX).exists() || dir.join("config.toml").exists() {
+        // The new directory has data of its own. It is not ours to merge into.
+        return;
+    }
+    let entries = match std::fs::read_dir(&legacy) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                "the old data directory at `{}` could not be read: {err}",
+                legacy.display()
+            );
+            return;
+        }
+    };
+    let mut moved: Vec<String> = Vec::new();
+    let mut left: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let target_name: OsString = if name.as_os_str() == OsStr::new(LEGACY_INDEX) {
+            OsString::from(INDEX)
+        } else {
+            name.clone()
+        };
+        let target = dir.join(&target_name);
+        if target.exists() {
+            left.push(name.to_string_lossy().into_owned());
+            continue;
+        }
+        // The new directory may not exist yet, when the application is run from a build
+        // rather than from the installer.
+        let _ = std::fs::create_dir_all(dir);
+        match std::fs::rename(entry.path(), &target) {
+            Ok(()) => moved.push(name.to_string_lossy().into_owned()),
+            Err(err) => {
+                tracing::warn!(
+                    "`{}` could not be moved to `{}`: {err}",
+                    name.to_string_lossy(),
+                    target.display()
+                );
+                left.push(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // Only an empty directory is removed, and `remove_dir` refuses anything else — so this
+    // cannot delete a leftover the user still needs.
+    let _ = std::fs::remove_dir(&legacy);
+    if !moved.is_empty() {
+        tracing::info!(
+            "the data from the old `{}` directory was moved to `{}`: {}",
             legacy.display(),
-            dir.display()
-        ),
-        Err(err) => tracing::warn!(
-            "the old data directory at `{}` could not be moved to `{}`: {err}",
+            dir.display(),
+            moved.join(", ")
+        );
+    }
+    if !left.is_empty() {
+        tracing::warn!(
+            "these are still in the old `{}` directory and were not moved: {}",
             legacy.display(),
-            dir.display()
-        ),
+            left.join(", ")
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A base directory holding the pre-rename data directory beside the new one, with the new
+    /// one **already there** — which is what the installer leaves behind, because it puts the
+    /// application in `%LOCALAPPDATA%\replayed` and that is also where the data lives.
+    fn legacy_case() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        let base = tmp.path().to_path_buf();
+        let legacy = base.join("localplay");
+        let dir = base.join("replayed");
+        std::fs::create_dir_all(&legacy).expect("the legacy directory");
+        std::fs::create_dir_all(&dir).expect("the new directory, as the installer leaves it");
+        (tmp, base, dir)
+    }
+
+    #[test]
+    fn the_legacy_data_is_adopted_even_when_the_new_directory_already_exists() {
+        // The regression this whole function exists for: the installer creates the new directory
+        // before the application has ever run, so a rule of "adopt the old one only if the new one
+        // is absent" never fires on a real upgrade, and the user's clips and settings stay behind
+        // in the old directory while the application reads and writes the new one.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(legacy.join("config.toml"), b"[storage]\n").expect("the old settings");
+        std::fs::write(legacy.join("localplay.db"), b"index").expect("the old index");
+        std::fs::create_dir_all(legacy.join("clips")).expect("the old clips");
+
+        migrate_legacy_data_dir(&base, &dir);
+
+        assert!(
+            dir.join("config.toml").is_file(),
+            "the settings moved across"
+        );
+        assert!(
+            dir.join("replayed.db").is_file(),
+            "the index arrived under its new name"
+        );
+        assert!(dir.join("clips").is_dir(), "the clips moved across");
+        assert!(
+            !legacy.join("config.toml").exists(),
+            "the old settings are gone"
+        );
+        assert!(
+            !legacy.join("localplay.db").exists(),
+            "the old index is gone"
+        );
+    }
+
+    #[test]
+    fn a_new_directory_with_its_own_data_is_left_alone() {
+        // The new build has been used and has settings of its own. Merging somebody's library
+        // into it without being asked is not something to do.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(legacy.join("config.toml"), b"old").expect("the old settings");
+        std::fs::write(dir.join("config.toml"), b"new").expect("the new settings");
+
+        migrate_legacy_data_dir(&base, &dir);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).expect("the new settings"),
+            "new",
+            "the new directory's own settings are untouched"
+        );
+        assert!(
+            legacy.join("config.toml").is_file(),
+            "the old settings are still where they were"
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_target_already_exists_is_skipped_and_the_rest_moves() {
+        // One file's name is taken; the rest still moves, and the skipped file is left exactly
+        // where it was rather than being overwritten.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(legacy.join("notes.txt"), b"old").expect("the old file");
+        std::fs::write(dir.join("notes.txt"), b"new").expect("the new file");
+        std::fs::write(legacy.join("localplay.db"), b"index").expect("the old index");
+
+        migrate_legacy_data_dir(&base, &dir);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).expect("the new file"),
+            "new",
+            "an existing file is not overwritten"
+        );
+        assert!(dir.join("replayed.db").is_file(), "the rest moved across");
+        assert!(
+            legacy.join("notes.txt").is_file(),
+            "the skipped file is still where it was"
+        );
+    }
 
     #[test]
     fn reads_the_storage_section_of_the_example_config() {
