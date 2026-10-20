@@ -3044,7 +3044,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "replayed-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "drag",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-encoder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "replayed-capture",
@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "getrandom 0.4.3",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3120,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-recorder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "replayed-capture",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-replay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "replayed-media",
@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "replayed-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rusqlite",

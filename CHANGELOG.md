@@ -1,12 +1,26 @@
 # Changelog
 
 All notable changes to replayed. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No release has been tagged yet, so
-everything is under *Unreleased*; the dated headings below are when the work landed, not
-versions. For what has and has not been *verified* on real hardware, read
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). `0.2.0` is the first versioned
+entry in this file; the dated headings below it are when the work landed, not versions. For
+what has and has not been *verified* on real hardware, read
 [`docs/verification-status.md`](docs/verification-status.md), not this file.
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.2.0] - 2026-10-20
+
+The first versioned entry, and the first release of the renamed project. It carries the
+2026-10-19 review sweep — thirty-six issues, opened as #27-#62 — and everything that
+followed it up to this date.
+
+**What is verified and what is not.** The sweep was built and tested on the **development
+host (macOS)**; the Windows target compiles and lints clean, but the Windows *runtime* is
+unverified for it, and the game-state work has never been exercised against a real CS2 or
+Dota 2 client. The ledger says so item by item in §25 and §26; nothing here claims more
+than it supports.
 
 ### Added
 - **Game audio by process loopback** (`83eaa0c`): the game track now records only the
@@ -47,8 +61,8 @@ versions. For what has and has not been *verified* on real hardware, read
   warnings and errors from the log.
 - **Game integration installer** in Settings: finds Counter-Strike 2 and Dota 2 in the Steam
   libraries and writes `gamestate_integration_replayed.cfg` into the game's `cfg` folder when
-  you press Install. The webview only names the game; the destination is checked to stay
-  inside the game's install folder (symlinks and `..` refused).
+  you press Install. The webview only names the game; the destination is checked against the
+  library the game is in (symlinks and `..` refused).
 - **Privacy section** in the README: what is recorded, that it stays local, and that there is
   no telemetry.
 - This changelog.
@@ -60,8 +74,26 @@ versions. For what has and has not been *verified* on real hardware, read
   coalescing (2026-10-16).
 - Backup of the clip database before a migration; `SECURITY.md`, an anti-cheat policy with an
   API guard, and a release checklist (2026-10-16).
+- **`[events] gsi_ephemeral_port`** (default `false`): the operating system picks the port
+  the game-state listener binds, so the port cannot be squatted on before the application
+  starts. The generated `.cfg` names the port the listener actually bound either way.
+  `events.gsi_port = 0` still switches the listener off entirely, in both modes.
 
 ### Changed
+- **The project is `replayed`.** Until this release the same application answered to three
+  names: `better-outplayed` in the installer, the window and the tray; `localplay` in the
+  binary, the data directory, the database and the game's own configuration file; and
+  `localplay-*` on the seven crates. Everything is `replayed` now: the crates, the CLI
+  package, the binary, the database (`replayed.db`), the game's
+  `gamestate_integration_replayed.cfg`, the asset scope and the Tauri identifier. The one
+  name left alone is the bare word "Outplayed" in the README, which names the commercial
+  product this one is compared against.
+- **The data directory moves with it, and the old one is migrated in place.** The directory
+  was `%LOCALAPPDATA%\localplay` and is now `%LOCALAPPDATA%\replayed`. Both binaries rename
+  the old directory over when it exists and the new one does not, and leave the old one alone
+  if both are there — merging two directories is not something to do to somebody's library
+  unasked — so a user keeps their clips, their index and their settings. The move is a
+  rename, not a copy, so a failure leaves the old directory exactly as it was.
 - `RecorderStatus` reports the encoder in use; the event driver reports how each source
   started (`SourceReport`).
 - `docs/verification-status.md` and the README no longer say the desktop GUI or
@@ -82,6 +114,14 @@ versions. For what has and has not been *verified* on real hardware, read
   — 52 `cfg(windows)` blocks across 16 files had never been linted at all. `cargo fmt --check`
   and a `cargo xtask verify` run now happen in CI too, and every action is pinned to a full
   commit SHA.
+- The Windows job found something the macOS cross-check could not: `frame_gaps`, a helper in
+  the recorder's test module, is called only by the `#[cfg(unix)]` splice test, so on Windows
+  nothing calls it and `dead_code` fires under `-D warnings`. It is gated like its only
+  caller. The workflow comment now also says **why** `replayed-recorder`, `replayed-store` and
+  `replayed-cli` are missing from the macOS cross-check — rusqlite's bundled SQLite is
+  compiled from C source and building it for the MSVC target needs the MSVC C toolchain, which
+  a macOS host does not have. They are not left unlinted: the `windows` job covers them, and
+  that is how the finding surfaced.
 - **`cargo xtask verify` gained `--strict`**, which makes a *not performed* check a non-zero
   exit, and its verdict line now reads `PASS with N check(s) not performed` instead of a bare
   `PASS`. The harness's two ring rows were rewritten to match the engine: the cap row is
@@ -100,6 +140,13 @@ versions. For what has and has not been *verified* on real hardware, read
 ### Fixed
 - **The game state integration can no longer be squatted, go stale, or be forged with another game's token.** Each game now has its own token and its own path, and the listener refuses a payload whose provider app id is not that game's, so a token lifted from one game's installed `.cfg` cannot forge the other game's events. The listener is bound before any `.cfg` is written, and every `.cfg` -- in the app's data directory and in the game's own folder -- names the port it actually bound rather than the configured one. The desktop shell no longer re-reads the token file on its own: the installed `.cfg` is written from the live binding, it is written atomically, it is refreshed when the listener's port moves, and an install is refused outright when no listener is running. `[events] gsi_ephemeral_port` opts into an unguessable port for anyone who does not need a fixed one. The old single token file is migrated into the per-game files, so an existing install keeps working.
 
+- **The installer writes where the library is, not where the game folder is.** The destination
+  must be exactly a known library's `steamapps/common/<game folder>`, and the containment root
+  is the **library**, so a symlink planted inside the game folder that escapes the library is
+  refused. A game in a secondary library — one the user's own `libraryfolders.vdf` lists — is
+  installed: that file is the user's own Steam configuration, no other unprivileged account
+  can edit it, and the application writes with that user's own permissions either way.
+  Refusing it would break a game on a second drive for no security gain.
 - **The screenshot harness drives the whole clip-source contract, and the build now checks
   that it does.** The harness's fake `ClipSource` had fallen behind the interface: the
   method that opens the native folder picker was missing, so the settings screenshot
@@ -120,6 +167,16 @@ versions. For what has and has not been *verified* on real hardware, read
 - **The webview can no longer forge log lines.** The frontend's own log command flattened its
   input to one line and capped it, and every frontend line is tagged `[webview]`, so a newline
   in the text can no longer end the log line and have the rest of it read as a backend entry.
+- **The log is written under an exclusive lock, and the lock works on Windows.** Two shells
+  would otherwise interleave their lines into one file, and the rotation would rename a file
+  the other process holds open — which fails on Windows. `LockFileEx` refuses a handle that
+  was not opened with the `GENERIC_READ` or `GENERIC_WRITE` access right, and `append(true)`
+  on its own opens the file with `FILE_APPEND_DATA` and nothing else, so the lock failed with
+  `ERROR_ACCESS_DENIED` ("Access is denied") rather than with the "somebody else holds it"
+  the caller asks about: the second shell was handed a permission error, and the log it was
+  supposed to fall back to was never reached. Both handles that get locked now carry
+  `read(true)`, and the test makes the second holder a real second process, because a
+  byte-range lock is scoped to a process and the case that matters is two shells.
 - Dependabot bumps applied together with the code changes they needed (2026-10-16).
 - **A failed recording start no longer bricks games mode.** The recorder took its single
   SQLite connection out of the struct before the fallible half of the start handshake and only
@@ -150,7 +207,8 @@ versions. For what has and has not been *verified* on real hardware, read
   2 MB of JSON per request on a single thread and hold the real game's events off the socket.
 - The zero-egress guard is a capability denylist with an explicit per-file exemption list
   rather than a three-literal allowlist, so `reqwest::get`, `ureq::get` and
-  `Command::new("curl")` no longer pass it unnoticed.
+  `Command::new("curl")` no longer pass it unnoticed. A dependency check was added beside it:
+  no HTTP client may be a direct dependency of any manifest.
 - The anti-cheat guard covers the APIs the policy names but the script did not
   (`OpenProcess`, `LoadLibraryEx`, the `Nt`/`Zw` memory calls, `DeviceIoControl`,
   `PostMessage`, `GetProcAddress`, and more) and now scans `scripts/` as well.
@@ -165,7 +223,14 @@ versions. For what has and has not been *verified* on real hardware, read
 - The README, the ledger, the runbooks, the packaging notes and `apps/desktop/README.md` were
   corrected against the code: the status block, the TLS story, the ring buffer, the DXGI
   fallback, the encoder path, the audio source, the CI description, 25 commit hashes that did
-  not exist in this history, and the "there is no Windows runner" claim.
+  not exist in this history, and the "there is no Windows runner" claim. The test counts
+  follow the tests: the desktop README and the ledger's §25 said 249 frontend cases, which
+  stopped being true when the screenshot harness's contract guard added two.
+- **`SECURITY.md` was brought back in line with the code.** It still described the single
+  token, the single path and the configured port, and it did not mention the app-id scoping,
+  the `gsi_ephemeral_port` key, the installer's live binding, the cleartext token in the
+  game's own folder, the release signing status or the test seam in `main.ts`. It says now
+  what the code does, and it names the residual risks as risks.
 
 ## 2026-10-15 - encoder and capture rate honesty
 - The configured video and audio bitrates are now actually sent to the encoder; the rate is set
@@ -186,7 +251,7 @@ versions. For what has and has not been *verified* on real hardware, read
 ## 2026-09-25 - zero-copy capture
 - Hybrid GPU video path removes the CPU readback (CPU per 4K capture from ~50% of a core to
   ~3%); the hardware encoder runs on its own thread.
-- Project renamed to replayed.
+- Project renamed to `better-outplayed`; renamed to `replayed` again on 2026-10-20.
 
 ## 2026-09-24 - first Windows runs
 - Whole workspace built and tested on Windows; first real capture, clip and hardware encode.
