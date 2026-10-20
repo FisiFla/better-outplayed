@@ -23,9 +23,9 @@ This document is written the same way as
 
 | Target | Config | Artifact | Built in this repository? |
 |---|---|---|---|
-| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `replayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
+| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `better-outplayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
 | macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `replayed.app` | **Yes**, on this development host (§4) |
-| macOS | (not enabled) `.dmg` | `replayed_0.1.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
+| macOS | (not enabled) `.dmg` | `replayed_0.2.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
 | Linux | — | — | No target: the capture path is Windows-only (spec §2) |
 
 Common metadata, from `apps/desktop/src-tauri/tauri.conf.json`, all of it consistent with the
@@ -35,7 +35,7 @@ rest of the repository rather than invented here:
 |---|---|---|
 | `productName` | `replayed` | the product's own name, and what the installer shows; §3.3 records when it changed and why the install directory follows it |
 | `mainBinaryName` | `replayed` | without it the installed executable would be `replayed-desktop`, the Cargo package name |
-| `version` | `0.1.0` | `[workspace.package] version` in the root `Cargo.toml`, and `package.json` |
+| `version` | `0.2.0` | `[workspace.package] version` in the root `Cargo.toml`, and `package.json` |
 | `identifier` | `io.github.fisifla.replayed` | reverse-DNS of the project's owner (`github.com/FisiFla`, the maintainer's address in the git history). Fixed now on purpose: it is the Windows uninstall key and the macOS bundle id |
 | `publisher` | `FisiFla` | the copyright holder in `LICENSE-MIT` and the GitHub account that owns the repository |
 | `copyright` | `Copyright (c) 2026 FisiFla` | verbatim from `LICENSE-MIT` |
@@ -161,8 +161,8 @@ produced from macOS**, because the installer cannot be built here — §3.5 reco
 that was built on the Windows test machine, and it is named as above):
 
 ```text
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\replayed_0.1.0_x64-setup.exe
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\replayed_0.1.0_x64_en-US.msi   # only with --bundles msi
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\replayed_0.2.0_x64-setup.exe
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\replayed_0.2.0_x64_en-US.msi   # only with --bundles msi
 ```
 
 **This is a compile-and-bundle step and nothing else. It does not launch the application.**
@@ -226,7 +226,7 @@ Both *were* read out of the NSIS template; §3.5 records what they actually did 
 ### 3.4 Checking an installer without installing it
 
 On the Windows test machine, the installer's contents can be listed without running either it or the
-app (`7z l replayed_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
+app (`7z l better-outplayed_0.1.0_x64-setup.exe`, 7-Zip understands NSIS archives) — useful as a
 first-pass check that `binaries\ffmpeg.exe` is inside. `npm run sidecars:check` already prints
 what was embedded at build time, and that *is* verified here (§4.2).
 
@@ -241,7 +241,7 @@ is a real, persistent one, so the install was real and left installed at the end
   installed — `node-v22.12.0-win-x64` extracted into the working directory, `PATH` and npm's cache
   set per run — so nothing was added to the system. Then `cargo xtask sidecars fetch --target
   x86_64-pc-windows-msvc` verified and extracted both sidecars, `npm ci` installed the frontend,
-  and the bundle produced **`replayed_0.1.0_x64-setup.exe`, 262.6 MB**. That size is the
+  and the bundle produced **`better-outplayed_0.1.0_x64-setup.exe`, 262.6 MB**. That size is the
   ~201 MiB of sidecars plus the embedded WebView2 that §5.4's `offlineInstaller` decision buys, and
   it is the first Windows installer this project has ever produced.
 * **The installer.** Silent, per-user, **no UAC prompt**, 21 seconds. It landed in
@@ -280,26 +280,29 @@ npm run tauri -- build            # -> src-tauri/target/release/bundle/macos/rep
 
 ### 4.1 What was built here
 
-The command above, on this host (exit status 0), with the host pair staged by hand (§4.2):
+The command above, on this host (exit status 0), with the host pair staged by hand (§4.2).
+The transcript below is **verbatim**: it is what the build printed on 2026-09-23, when the
+product was still called `localplay`. It is kept as a transcript, not rewritten, because a
+build log that has been edited is not evidence.
 
 ```console
 $ cd apps/desktop && CARGO_HOME="$PWD/../../target/cargo-home" npm run tauri -- build
-       Built application at: .../apps/desktop/src-tauri/target/release/replayed
+       Built application at: .../apps/desktop/src-tauri/target/release/localplay
      Running beforeBundleCommand `npm run sidecars:check`
 
-> replayed-desktop@0.1.0 sidecars:check
+> localplay-desktop@0.1.0 sidecars:check
 > node scripts/require-sidecars.mjs
 
-bundling sidecars from .../replayed/binaries: ffmpeg (0.0 MiB), ffprobe (0.0 MiB)
-    Bundling replayed.app (.../bundle/macos/replayed.app)
+bundling sidecars from .../localplay/binaries: ffmpeg (0.0 MiB), ffprobe (0.0 MiB)
+    Bundling localplay.app (.../bundle/macos/localplay.app)
     Finished 1 bundle at:
-        .../apps/desktop/src-tauri/target/release/bundle/macos/replayed.app
+        .../apps/desktop/src-tauri/target/release/bundle/macos/localplay.app
 ```
 
-Artifact: **`apps/desktop/src-tauri/target/release/bundle/macos/replayed.app`**, ad-hoc signed
-only (§4.4). The bundle is named after `productName`, and that was still `replayed` when
-this build ran: the product was renamed to `replayed` on 2026-09-26 (§3.3), so a
-build from the current tree produces `replayed.app`. Its size is decided entirely by what sits in `binaries/` when it is built:
+Artifact: **`apps/desktop/src-tauri/target/release/bundle/macos/localplay.app`**, ad-hoc signed
+only (§4.4). The bundle is named after `productName`, and that was still `localplay` when
+this build ran: the product was renamed to `better-outplayed` on 2026-09-26 (§3.3) and to
+`replayed` on 2026-10-20, so a build from the current tree produces `replayed.app`. Its size is decided entirely by what sits in `binaries/` when it is built:
 
 | `binaries/` held | `.app` size | Of which sidecars |
 |---|---|---|
@@ -314,13 +317,13 @@ ballast in an installer, so a real Windows build must not be staged with a macOS
 The listing below is from the first, smaller build:
 
 ```console
-$ find replayed.app -type f -exec ls -l {} \; | awk '{print $5, $9}'
-1135    replayed.app/Contents/Info.plist
-13244960 replayed.app/Contents/MacOS/replayed
-0       replayed.app/Contents/Resources/binaries/.gitkeep
-242     replayed.app/Contents/Resources/binaries/ffmpeg
-243     replayed.app/Contents/Resources/binaries/ffprobe
-117998  replayed.app/Contents/Resources/icon.icns
+$ find localplay.app -type f -exec ls -l {} \; | awk '{print $5, $9}'
+1135    localplay.app/Contents/Info.plist
+13244960 localplay.app/Contents/MacOS/localplay
+0       localplay.app/Contents/Resources/binaries/.gitkeep
+242     localplay.app/Contents/Resources/binaries/ffmpeg
+243     localplay.app/Contents/Resources/binaries/ffprobe
+117998  localplay.app/Contents/Resources/icon.icns
 ```
 
 `Contents/Resources/binaries/{ffmpeg,ffprobe}` is exactly where `discover` looks once the
@@ -328,7 +331,7 @@ executable is at `Contents/MacOS/`, and the executable bit survived the copy —
 real macOS ffmpeg is ever bundled. (The zero-byte `.gitkeep` is copied along with them: it
 exists so that `tauri-build` can resolve the directory in a fresh clone, §2.4, and discovery
 ignores it.) `Info.plist` carries the metadata from §1
-(`CFBundleIdentifier=io.github.fisifla.replayed`, `CFBundleShortVersionString=0.1.0`,
+(`CFBundleIdentifier=io.github.fisifla.replayed`, `CFBundleShortVersionString=0.2.0`,
 `LSApplicationCategoryType=public.app-category.video`, `NSHumanReadableCopyright=Copyright (c)
 2026 FisiFla`).
 
@@ -384,9 +387,9 @@ one: Tauri's bundler runs its `bundle_dmg.sh`, which shells out to `hdiutil`, an
 is not permitted to create disk images.
 
 ```console
-$ ./bundle_dmg.sh --volname replayed ... replayed_0.1.0_aarch64.dmg replayed.app
+$ ./bundle_dmg.sh --volname localplay ... localplay_0.1.0_aarch64.dmg localplay.app
 Creating disk image...
-could not access /Volumes/replayed - Operation not permitted
+could not access /Volumes/localplay - Operation not permitted
 hdiutil: create failed - Operation not permitted
 failed to bundle project: error running bundle_dmg.sh
 ```
