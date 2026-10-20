@@ -22,11 +22,26 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { errorCode, errorMessage, isCommandError, tauriIpc } from './ipc';
+import type { EncoderSettings } from './ipc';
 
 const mockedInvoke = vi.mocked(invoke);
 const mockedConvert = vi.mocked(convertFileSrc);
 
 const LIB_RS = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
+
+/** The encoder settings the wire assertions below travel with. */
+const ENCODER_SETTINGS: EncoderSettings = {
+  vendor: 'nvenc',
+  codec: 'hevc',
+  bitrate_kbps: 20000,
+  fps: 60,
+  output_size: '1920x1080',
+  adapt_fps: true,
+  zero_copy: null,
+  rate_control: 'cbr',
+  preset: 'p4',
+  audio_bitrate_kbps: 192,
+};
 
 /** The command names registered in `generate_handler![...]`. */
 function registeredCommands(): string[] {
@@ -104,6 +119,12 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.gsiTargets())).toBe('gsi_targets');
     expect(await wireName(() => tauriIpc.listAudioDevices())).toBe('list_audio_devices');
     expect(await wireName(() => tauriIpc.installGsiCfg('dota2'))).toBe('install_gsi_cfg');
+    expect(await wireName(() => tauriIpc.encoderSettings())).toBe('encoder_settings');
+    expect(await wireName(() => tauriIpc.encoderStatus())).toBe('encoder_status');
+    expect(await wireName(() => tauriIpc.copyDiagnostics())).toBe('copy_diagnostics');
+    expect(await wireName(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS))).toBe(
+      'update_encoder_settings',
+    );
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
@@ -143,6 +164,10 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.listAudioDevices()),
       await wireName(() => tauriIpc.installGsiCfg('cs2')),
       await wireName(() => tauriIpc.logFromFrontend('info', 'a message', 'a detail')),
+      await wireName(() => tauriIpc.encoderSettings()),
+      await wireName(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS)),
+      await wireName(() => tauriIpc.encoderStatus()),
+      await wireName(() => tauriIpc.copyDiagnostics()),
     ];
 
     expect([...reached].sort()).toEqual([...registeredCommands()].sort());
@@ -167,6 +192,15 @@ describe('the argument keys', () => {
       id: 3,
       at_ms: 1_000,
     });
+  });
+
+  it('sends the whole encoder settings table under one key', async () => {
+    // `update_encoder_settings` takes one argument — the settings object — and the object
+    // keeps its snake_case keys: the backend reads it into a Rust struct whose fields are
+    // named the same way, so `bitrate_kbps` must not travel as `bitrateKbps`.
+    const args = await wireArgs(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS));
+    expect(Object.keys(args)).toEqual(['settings']);
+    expect(args.settings).toEqual(ENCODER_SETTINGS);
   });
 
   it('sends exactly the parameters each Rust command declares', async () => {
@@ -197,6 +231,9 @@ describe('the argument keys', () => {
       clip_now: await wireArgs(() => tauriIpc.clipNow()),
       get_settings: await wireArgs(() => tauriIpc.getSettings()),
       update_settings: await wireArgs(() => tauriIpc.updateSettings({ fps: 30 })),
+      update_encoder_settings: await wireArgs(() =>
+        tauriIpc.updateEncoderSettings(ENCODER_SETTINGS),
+      ),
     };
 
     for (const [command, args] of Object.entries(sent)) {
@@ -224,6 +261,14 @@ describe('the argument keys', () => {
     // `app_status` takes nothing either: the shell knows its own config path and hotkey.
     await tauriIpc.appStatus();
     expect(mockedInvoke).toHaveBeenCalledWith('app_status');
+    // The encoder's three reads are the same: the settings, the status and the diagnostics
+    // report are all answered from the backend's own state.
+    await tauriIpc.encoderSettings();
+    expect(mockedInvoke).toHaveBeenCalledWith('encoder_settings');
+    await tauriIpc.encoderStatus();
+    expect(mockedInvoke).toHaveBeenCalledWith('encoder_status');
+    await tauriIpc.copyDiagnostics();
+    expect(mockedInvoke).toHaveBeenCalledWith('copy_diagnostics');
   });
 });
 

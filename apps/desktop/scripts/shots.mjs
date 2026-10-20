@@ -540,6 +540,38 @@ function installMockSource(fixture) {
   // (The install scope forbids closing over module constants, so the default clips
   // directory comes from the fixture's own stats, which every fixture carries.)
   const defaultClipsDir = (fixture.stats ?? {}).clips_dir ?? '';
+  // The encoder settings, mutated by `updateEncoderSettings` the same way. The values are
+  // the shipped defaults, so the settings view photographs a real configuration rather than
+  // a row of blanks.
+  let encoderSettings = {
+    vendor: 'auto',
+    codec: 'h264',
+    bitrate_kbps: 20000,
+    fps: 60,
+    output_size: '',
+    adapt_fps: true,
+    zero_copy: null,
+    rate_control: 'cbr',
+    preset: '',
+    audio_bitrate_kbps: 192,
+    ...(fixture.encoderSettings ?? {}),
+  };
+  // What the backend would use: NVENC, chosen because it is the fastest encoder this
+  // machine has. The capabilities are the chosen encoder's own, which is what the panel
+  // filters its choices by.
+  const encoderStatus = {
+    requested_vendor: 'auto',
+    selected_vendor: 'nvenc',
+    selected_codec: 'h264',
+    capabilities: {
+      rate_control_modes: ['cbr', 'vbr', 'quality'],
+      presets: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'],
+      supports_scaling: true,
+      max_bitrate_kbps: 100000,
+    },
+    message: 'NVENC was chosen: it is the fastest encoder this machine has.',
+    ...(fixture.encoderStatus ?? {}),
+  };
   const settings = {
     clips_dir: '',
     clips_dir_resolved: defaultClipsDir,
@@ -812,6 +844,31 @@ function installMockSource(fixture) {
       // the pick is dismissed. The panel treats that as "no directory" and leaves its
       // draft alone, which is what the panel's own contract says a cancelled picker does.
       throw { code: 'cancelled', message: 'the folder picker was dismissed' };
+    },
+    // The encoder section's three commands. The settings are state, like the panel's
+    // other settings: `updateEncoderSettings` writes them the way the backend does.
+    async encoderSettings() {
+      return { ...encoderSettings };
+    },
+    async encoderStatus() {
+      return { ...encoderStatus, capabilities: { ...encoderStatus.capabilities } };
+    },
+    async updateEncoderSettings(settings) {
+      encoderSettings = { ...encoderSettings, ...settings };
+      return { ...encoderSettings };
+    },
+    // The diagnostics export. A harness cannot put anything on the system clipboard, but
+    // it can answer with the report the backend would have assembled — which is what the
+    // panel shows the user.
+    async copyDiagnostics() {
+      return {
+        version: '0.2.0',
+        platform: 'windows 11 x86_64',
+        generated_at: '2026-09-23T19:24:00Z',
+        config: '[encode]\nvendor = "auto"\ncodec = "h264"\nbitrate_kbps = 20000\nfps = 60',
+        problems: ['ffmpeg was not found on PATH'],
+        log_tail: 'INFO the recorder started\nWARN the encoder was asked for 60 fps and can hold 45',
+      };
     },
     async clipNow() {
       const written = { ...fixture.clipNow };
@@ -2038,6 +2095,7 @@ const states = [
     title: 'settings: values, the auto-record toggle, and a rejected framerate',
     group: 'settings',
     fixture: SETTINGS_FIXTURE,
+    extraShots: [{ name: '14-settings-encoder-closeup', selector: '#settings-encoder' }],
     async verify(page) {
       await waitForThumbnails(page, 6);
       check(
@@ -2123,6 +2181,40 @@ const states = [
         'and leaves the draft alone',
       );
 
+      // The encoder section: the encoder that was chosen is named, and the pickers offer
+      // the chosen encoder's own choices rather than the union of every vendor's.
+      const encoder = panel.locator('#settings-encoder');
+      check(this.name, await encoder.isVisible(), 'the encoder section is on the page');
+      const encoderText = ((await encoder.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(
+        this.name,
+        encoderText.includes('Selected: NVIDIA (NVENC), H.264'),
+        'and names the encoder that will actually run',
+      );
+      const modes = await encoder
+        .getByLabel('Rate control')
+        .locator('option')
+        .evaluateAll((options) => options.map((option) => option.value));
+      check(
+        this.name,
+        modes.join(',') === 'cbr,vbr,quality',
+        `the rate control offers only the chosen encoder's modes (${modes.join(', ')})`,
+      );
+      const presets = await encoder
+        .getByLabel('Preset')
+        .locator('option')
+        .evaluateAll((options) => options.map((option) => option.value));
+      check(
+        this.name,
+        presets.join(',') === ',p1,p2,p3,p4,p5,p6,p7',
+        `and the presets are the encoder's own (${presets.join(', ')})`,
+      );
+      check(
+        this.name,
+        encoderText.includes('applied on the next recording start'),
+        'and the panel says when the change takes effect',
+      );
+
       await auditContrast(page, this.name, {
         '.settings .subnav button': 'settings sub-nav',
         '.settings input[type="text"]': 'settings field',
@@ -2184,6 +2276,26 @@ const states = [
         await page.locator('[data-region=session-list] ul li').first().isVisible(),
         'Sessions lists its rows with the detail pane beside them',
       );
+
+      // The diagnostics button: one click, and the panel says what was copied — and that
+      // nothing was sent anywhere.
+      await showView(page, 'Health');
+      const health = page.locator('[data-region=health] .health');
+      await health.getByRole('button', { name: 'Copy diagnostics' }).click();
+      const copied = page.locator('.copied');
+      await copied.waitFor({ state: 'visible', timeout: 10_000 });
+      const copiedText = ((await copied.textContent()) ?? '').replace(/\s+/g, ' ');
+      check(
+        this.name,
+        copiedText.includes('0.2.0') && copiedText.includes('windows 11 x86_64'),
+        'the copied report names the build and the machine',
+      );
+      check(
+        this.name,
+        ((await health.textContent()) ?? '').replace(/\s+/g, ' ').includes('Nothing is sent anywhere'),
+        'and the panel says that nothing left the machine',
+      );
+
       await showView(page, 'Library');
     },
   },

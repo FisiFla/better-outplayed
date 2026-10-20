@@ -4,6 +4,7 @@ import { mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import type { ClipSource } from './lib/ipc';
+import type { EncoderSettings, EncoderStatus } from './lib/ipc';
 import type {
   ClipDto,
   MatchDto,
@@ -58,6 +59,20 @@ const recording: RecordingStatus = {
   skipped: 0, fps: 0, configured_fps: 60, effective_fps: 0, drift_ms: 0, clips: 0, error: null,
   watching_games: true, matched_game: null, recorder_mode: 'buffer', mic_enabled: false,
 };
+const encoderSettings: EncoderSettings = {
+  vendor: 'auto', codec: 'h264', bitrate_kbps: 20000, fps: 60, output_size: '', adapt_fps: true,
+  zero_copy: null, rate_control: 'cbr', preset: '', audio_bitrate_kbps: 192,
+};
+const encoderStatus: EncoderStatus = {
+  requested_vendor: 'auto', selected_vendor: 'nvenc', selected_codec: 'h264',
+  capabilities: {
+    rate_control_modes: ['cbr', 'vbr', 'quality'],
+    presets: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'],
+    supports_scaling: true,
+    max_bitrate_kbps: 100000,
+  },
+  message: 'the last recording used h264_nvenc: the startup smoke test chose nvenc.',
+};
 
 /** Explicit answers for what the window reads on open; any other command resolves to nothing. */
 function fakeSource(): ClipSource {
@@ -81,12 +96,31 @@ function fakeSource(): ClipSource {
         recorder_state: 'idle', recorder_error: null, encoder: null, ffmpeg_available: true,
         disk: null, event_sources: [], recent_errors: [], log_path: '/cfg/app.log',
       }),
+    encoderSettings: () => Promise.resolve(encoderSettings),
+    encoderStatus: () => Promise.resolve(encoderStatus),
+    copyDiagnostics: () =>
+      Promise.resolve({
+        version: '0.2.0', platform: 'windows 11 x86_64', generated_at: '2026-10-20 09:00:00',
+        config: '[encode]\nvendor = "auto"', problems: [], log_tail: 'INFO all good',
+      }),
     assetUrl: (p: string) => `asset://${p}`,
   };
   return new Proxy(known, {
     get: (t, k: string) => t[k] ?? (() => Promise.resolve(undefined)),
   }) as unknown as ClipSource;
 }
+
+/**
+ * Arm the same test-only seam `main.ts` arms, so the panels *below* the window find this
+ * fake too.
+ *
+ * `App` takes its source as a prop, but the encoder section and the diagnostics button are
+ * their own components and resolve their own source (see `activeSource`), so without the
+ * global they would read the mocked Tauri runtime — which answers nothing — and the encoder
+ * controls would never be on the page for axe to check.
+ */
+window.history.replaceState({}, '', '/?test-clip-source=1');
+(globalThis as { __replayedClipSource?: ClipSource }).__replayedClipSource = fakeSource();
 
 async function settle() {
   for (let i = 0; i < 10; i++) {
@@ -148,6 +182,17 @@ describe('accessibility (axe)', () => {
     const el = target.querySelector(`[data-region="${region}"]`);
     expect(el?.textContent?.trim().length ?? 0).toBeGreaterThan(0);
     expect(await violations(target)).toEqual([]);
+  });
+
+  it('the encoder controls are really on the page, so the run above is not vacuous', async () => {
+    const target = await openView('Settings');
+    // The encoder section reads its own settings, so it renders its controls only when the
+    // source answered. Without this, an axe run over an empty section would pass quietly.
+    const encoder = target.querySelector('#settings-encoder');
+    expect(encoder, 'the encoder section').not.toBeNull();
+    expect(encoder?.querySelectorAll('select').length ?? 0).toBeGreaterThan(3);
+    expect(encoder?.querySelectorAll('input[type="number"]').length ?? 0).toBe(2);
+    expect(encoder?.querySelector('label')?.textContent?.trim()).toBeTruthy();
   });
 
   it('a clip page has no axe violations', async () => {

@@ -18,6 +18,7 @@
     SettingsUpdate,
   } from '../types';
   import { QUALITY_OPTIONS, captureUpdate, deviceOptions, monitorIndex } from '../settings';
+  import EncoderPanel from './EncoderPanel.svelte';
 
   interface Props {
     /** `null` until the first read answers; the panel is hidden meanwhile. */
@@ -152,6 +153,7 @@
   const SECTIONS = [
     { id: 'settings-library', label: 'Library' },
     { id: 'settings-capture', label: 'Capture' },
+    { id: 'settings-encoder', label: 'Encoder' },
     { id: 'settings-automatic', label: 'Automatic recording' },
     { id: 'settings-games', label: 'Game integrations' },
   ];
@@ -369,6 +371,8 @@
         Apply capture
       </button>
     </div>
+
+    <EncoderPanel />
 
     <div class="group" id="settings-automatic">
       <h3>Automatic recording</h3>

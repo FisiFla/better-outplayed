@@ -45,6 +45,84 @@ import type {
   UpdateSettingsOutcome,
 } from './types';
 
+/**
+ * The encoder settings, as `encoder_settings` and `update_encoder_settings` return them.
+ *
+ * Mirrors the Rust side's `[encode]` table (see `config.example.toml`): the vendor asked
+ * for, the codec, the bitrate and the frame-rate ceiling, the output size, whether the frame
+ * rate adapts to what the machine can sustain, whether the zero-copy path is wanted, and the
+ * rate control and preset.
+ *
+ * `zero_copy` is three-valued on purpose: `null` is "use the hardware path when it is
+ * there", which is not the same as `false` ("never use it"). The difference is the difference
+ * between a default that works on every machine and one that refuses to start.
+ */
+export interface EncoderSettings {
+  /** `"auto"`, `"nvenc"`, `"qsv"` or `"amf"`. */
+  vendor: string;
+  /** `"h264"` or `"hevc"`. */
+  codec: string;
+  bitrate_kbps: number;
+  /** A ceiling, not a promise: `adapt_fps` may record at less. */
+  fps: number;
+  /** `""` for the native capture size, else `"WIDTHxHEIGHT"`. */
+  output_size: string;
+  adapt_fps: boolean;
+  /** `null` means "use the hardware path when it is there". */
+  zero_copy: boolean | null;
+  rate_control: string;
+  /** `""` for the encoder's own default. */
+  preset: string;
+  audio_bitrate_kbps: number;
+}
+
+/**
+ * What the encoder that was selected can actually do.
+ *
+ * The panel reads this instead of offering the union of every vendor's knobs: an encoder
+ * that has no CRF has no CRF, and a control that offers one and quietly drops it is worse
+ * than no control at all.
+ */
+export interface EncoderCapabilities {
+  /** The rate-control modes this encoder has: `cbr`, `vbr`, `crf`, `quality`. */
+  rate_control_modes: string[];
+  /** The presets this encoder has. Empty means it has none of its own. */
+  presets: string[];
+  /** False when the chosen path cannot scale — the output is the capture size. */
+  supports_scaling: boolean;
+  max_bitrate_kbps: number;
+}
+
+/** Which encoder the backend would use, and what it can do. */
+export interface EncoderStatus {
+  /** The vendor the settings ask for — `"auto"` means "probe this machine". */
+  requested_vendor: string;
+  /** The vendor that was actually chosen; `null` when none is available. */
+  selected_vendor: string | null;
+  /** The codec that was actually chosen; `null` when none is available. */
+  selected_codec: string | null;
+  capabilities: EncoderCapabilities;
+  /** The backend's own explanation of the choice, in words. */
+  message: string;
+}
+
+/**
+ * A diagnostics report, as `copy_diagnostics` returns it.
+ *
+ * `config` is the effective configuration with the secrets already redacted by the backend;
+ * `log_tail` is the end of the application's log. The report is put on the clipboard by the
+ * same command and is never sent anywhere: this application has no telemetry, and the point
+ * of the button is that the user decides where it goes.
+ */
+export interface DiagnosticsReport {
+  version: string;
+  platform: string;
+  generated_at: string;
+  config: string;
+  problems: string[];
+  log_tail: string;
+}
+
 /** The commands this window can call, as an interface. */
 export interface ClipSource {
   listClips(): Promise<ClipDto[]>;
@@ -133,6 +211,35 @@ export interface ClipSource {
    */
   /** Recorder, encoder, disk, event sources and the log's recent problems. */
   health(): Promise<Health>;
+  /**
+   * The encoder settings, as the backend reads them (`[encode]` in `config.toml`).
+   *
+   * Read-only apart from `updateEncoderSettings`: the engine that writes a recording is the
+   * recorder, not this window.
+   */
+  encoderSettings(): Promise<EncoderSettings>;
+  /**
+   * Validate and write the encoder settings, and answer with the values that were written.
+   *
+   * The whole table travels in one object — there is no partial update — because the backend
+   * validates it as a whole and refuses a combination it cannot record with. A refusal comes
+   * back as a rejection carrying the reason, which the panel shows.
+   */
+  updateEncoderSettings(settings: EncoderSettings): Promise<EncoderSettings>;
+  /**
+   * Which encoder the backend would use, and what it can do.
+   *
+   * The capabilities belong to the encoder that was *selected*, not to the union of every
+   * vendor's: the panel offers only the modes and presets this one has.
+   */
+  encoderStatus(): Promise<EncoderStatus>;
+  /**
+   * Assemble a diagnostics report, put it on the clipboard, and answer with it.
+   *
+   * Nothing is sent anywhere: the report is on the clipboard and the user pastes it wherever
+   * they want to. This application has no telemetry, and the report says so.
+   */
+  copyDiagnostics(): Promise<DiagnosticsReport>;
   /** Which of CS2 / Dota 2 Steam has installed, and whether the cfg is already there. */
   gsiTargets(): Promise<GsiTarget[]>;
   /** The active microphones and outputs, for the settings pickers. */
@@ -216,6 +323,11 @@ export const tauriIpc: ClipSource = {
     invoke<UpdateSettingsOutcome>('update_settings', { update }),
   chooseClipsDir: () => invoke<string>('choose_clips_dir'),
   health: () => invoke<Health>('health'),
+  encoderSettings: () => invoke<EncoderSettings>('encoder_settings'),
+  updateEncoderSettings: (settings: EncoderSettings) =>
+    invoke<EncoderSettings>('update_encoder_settings', { settings }),
+  encoderStatus: () => invoke<EncoderStatus>('encoder_status'),
+  copyDiagnostics: () => invoke<DiagnosticsReport>('copy_diagnostics'),
   gsiTargets: () => invoke<GsiTarget[]>('gsi_targets'),
   listAudioDevices: () => invoke<AudioDevices>('list_audio_devices'),
   installGsiCfg: (game) => invoke<GsiInstallOutcome>('install_gsi_cfg', { game }),
@@ -223,6 +335,27 @@ export const tauriIpc: ClipSource = {
     invoke<void>('log_from_frontend', { level, message, detail }),
   assetUrl: (path) => convertFileSrc(path),
 };
+
+/**
+ * The source a component talks to when it has none of its own.
+ *
+ * `App` takes its source as a prop, which is how the screenshot harness and the tests drive
+ * the whole window. But the panels *below* it own commands of their own — the encoder
+ * settings in the settings panel, the diagnostics export in the health panel — and the shell
+ * that would hand them the source sits above them, so a prop cannot reach them without
+ * threading it through every component in between.
+ *
+ * So the seam is resolved here, once, with the same two halves `main.ts` requires: the
+ * `?test-clip-source` query string *and* the `globalThis.__replayedClipSource` object. A
+ * shipped window is loaded with neither, so this is the real Tauri IPC there — exactly as it
+ * is for `App`.
+ */
+export function activeSource(): ClipSource {
+  if (typeof location === 'undefined') return tauriIpc;
+  if (!new URLSearchParams(location.search).has('test-clip-source')) return tauriIpc;
+  const injected = (globalThis as { __replayedClipSource?: ClipSource }).__replayedClipSource;
+  return injected ?? tauriIpc;
+}
 
 /**
  * Whether a rejection is one of our structured command errors.

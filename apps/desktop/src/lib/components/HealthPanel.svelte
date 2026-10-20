@@ -11,18 +11,60 @@
     diskIsLow,
     needsAttention,
   } from '../health';
+  import { activeSource, errorMessage } from '../ipc';
+  import type { ClipSource, DiagnosticsReport } from '../ipc';
   import type { Health } from '../types';
   import Icon from './Icon.svelte';
 
   interface Props {
     health: Health;
+    /**
+     * The command seam: the real Tauri IPC, or whatever a test or the screenshot harness
+     * injects. See `activeSource`.
+     */
+    source?: ClipSource;
   }
 
-  let { health }: Props = $props();
+  let { health, source = activeSource() }: Props = $props();
   const attention = $derived(needsAttention(health));
   const recorderBad = $derived(health.recorder_state === 'failed');
   const encoderBad = $derived(!health.ffmpeg_available);
   const diskLow = $derived(diskIsLow(health.disk));
+
+  /** The report that was copied, once one has been. */
+  let report = $state<DiagnosticsReport | null>(null);
+  /** A refusal from the backend, in words the user can act on. */
+  let error = $state<string | null>(null);
+  /** The copy is in flight; the button is held while it is. */
+  let busy = $state(false);
+
+  function isDiagnosticsReport(value: unknown): value is DiagnosticsReport {
+    return typeof value === 'object' && value !== null && 'version' in value;
+  }
+
+  /**
+   * Put a diagnostics report on the clipboard.
+   *
+   * The report never leaves the machine by itself: it is on the clipboard, and the user
+   * pastes it wherever they want to — a bug report, a forum, a friend. This application has
+   * no telemetry, and the button says so rather than letting the word "diagnostics" imply a
+   * upload.
+   */
+  async function copyDiagnostics(): Promise<void> {
+    busy = true;
+    error = null;
+    try {
+      const copied = await source.copyDiagnostics();
+      report = isDiagnosticsReport(copied) ? copied : null;
+      if (report === null) {
+        error = 'The diagnostics command answered with nothing.';
+      }
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <section class="panel health">
@@ -89,6 +131,49 @@
       <Icon name="info" />
       <dt>Log file</dt>
       <dd class="path mono">{health.log_path}</dd>
+    </div>
+    <div class="row group diagnostics">
+      <Icon name="copy" />
+      <dt>Diagnostics</dt>
+      <dd>
+        <p class="muted footnote">
+          One click copies a report — this build, this machine's configuration with the
+          secrets redacted, and the end of the log — to the clipboard. Nothing is sent
+          anywhere: the report stays on this machine until you paste it wherever you want to.
+        </p>
+        <button type="button" onclick={() => void copyDiagnostics()} disabled={busy}>
+          Copy diagnostics
+        </button>
+        {#if error !== null}
+          <p class="invalid" role="alert">{error}</p>
+        {/if}
+        {#if report !== null}
+          <p class="copied" role="status">
+            Copied to the clipboard: version {report.version}, {report.platform}, taken at
+            {report.generated_at}.
+          </p>
+          <details>
+            <summary>What was copied</summary>
+            <p class="muted footnote">
+              Version {report.version} · {report.platform} · {report.generated_at}
+            </p>
+            {#if report.problems.length === 0}
+              <p class="muted footnote">No problems were found.</p>
+            {:else}
+              <p class="warn-text">Problems found:</p>
+              <ul class="problems">
+                {#each report.problems as problem (problem)}
+                  <li>{problem}</li>
+                {/each}
+              </ul>
+            {/if}
+            <p class="muted footnote">Configuration (secrets redacted):</p>
+            <pre class="mono block">{report.config}</pre>
+            <p class="muted footnote">The end of the log:</p>
+            <pre class="mono block">{report.log_tail}</pre>
+          </details>
+        {/if}
+      </dd>
     </div>
   </dl>
 </section>
@@ -209,6 +294,61 @@
     margin: 0;
     padding-left: var(--s-4);
     font: var(--t-small);
+    overflow-wrap: anywhere;
+  }
+
+  .diagnostics dd {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--s-2);
+  }
+
+  .diagnostics button {
+    align-self: flex-start;
+  }
+
+  .copied {
+    color: var(--ok);
+    font: var(--t-small);
+  }
+
+  .invalid {
+    color: var(--warn);
+    font: var(--t-small);
+  }
+
+  .warn-text {
+    color: var(--warn);
+    font: var(--t-small);
+  }
+
+  .problems {
+    margin: 0;
+    padding-left: var(--s-4);
+    font: var(--t-small);
+    overflow-wrap: anywhere;
+  }
+
+  details {
+    width: 100%;
+    font: var(--t-small);
+  }
+
+  summary {
+    cursor: pointer;
+    color: var(--text-muted);
+  }
+
+  .block {
+    margin: 0;
+    padding: var(--s-2);
+    max-height: 220px;
+    overflow: auto;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
