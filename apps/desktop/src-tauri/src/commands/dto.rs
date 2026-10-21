@@ -208,6 +208,20 @@ pub struct DeleteOutcome {
     pub thumbnails_removed: usize,
 }
 
+/// The displays this machine has, and the one the capture is pointed at.
+///
+/// The rate is here so the framerate setting can be made against the display's own: a capture
+/// rate above the display's refresh rate buys nothing, because the display has nothing new to
+/// show. Empty off Windows, where there is no screen to enumerate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaptureDisplaysDto {
+    /// Every display, in `[capture] monitor` order: index 0 is the primary.
+    pub displays: Vec<replayed_capture::DisplayInfo>,
+    /// The index `[capture] monitor` selects, or `None` when the settings could not be read —
+    /// in which case the capture target is unknown rather than assumed.
+    pub selected: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::commands::test_support::*;

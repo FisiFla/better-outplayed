@@ -7,7 +7,12 @@
    * window cannot be opened in the suite: what these say is pinned by tests instead of by
    * eyeballing a window (the same reason `lib/health.ts` and `lib/settings.ts` exist).
    */
-  import type { EncoderCapabilities, EncoderSettings } from '../ipc';
+  import type {
+    CaptureDisplay,
+    CaptureDisplays,
+    EncoderCapabilities,
+    EncoderSettings,
+  } from '../ipc';
 
   /**
    * The settings this application ships with, as `config.example.toml` states them.
@@ -156,6 +161,72 @@
   }
 
   /**
+   * The display the capture is pointed at, or `null` when that is not known.
+   *
+   * `selected` is the index `[capture] monitor` carries, and the list is in that same
+   * order, so the answer is the display with that index. A null selection means the
+   * settings could not be read, and an index the list does not have means the settings
+   * name a display this machine does not have: neither of those names a display, and
+   * guessing one would be worse than saying nothing.
+   */
+  export function selectedDisplay(displays: CaptureDisplays | null): CaptureDisplay | null {
+    if (displays === null) return null;
+    const selected = displays.selected;
+    if (selected === null) return null;
+    return displays.displays.find((display) => display.index === selected) ?? null;
+  }
+
+  /**
+   * What the panel says about the display the capture is pointed at, or `null`.
+   *
+   * Nothing is said when there is nothing to say: off Windows there are no displays to
+   * enumerate, and a read that failed is not a fact about the display. What is said names
+   * the display by the index `[capture] monitor` uses — the number the settings carry —
+   * and gives the refresh rate only when the OS reported one. A rate that was not
+   * reported is unknown, not 60 Hz, and a made-up rate would send the user to the wrong
+   * setting.
+   */
+  export function captureDisplayNote(displays: CaptureDisplays | null): string | null {
+    if (displays === null || displays.displays.length === 0) return null;
+    const display = selectedDisplay(displays);
+    if (display === null) {
+      // The machine has displays, but which one the capture is pointed at is unknown.
+      return 'The display being recorded is not known, so its refresh rate is not shown.';
+    }
+    const size =
+      display.width > 0 && display.height > 0
+        ? `${display.width}×${display.height}`
+        : 'size not reported';
+    if (display.refresh_hz === null) {
+      return `Recording display ${display.index} — ${size}, refresh rate not reported`;
+    }
+    return `Recording display ${display.index} — ${size} at ${display.refresh_hz} Hz`;
+  }
+
+  /**
+   * The frame rates the picker offers.
+   *
+   * The four the panel ships with, plus two more when they are worth having: the rate the
+   * settings were saved with, so a saved value is never dropped from its own picker, and
+   * the capture display's own refresh rate, so a 144 Hz display can be recorded at 144 fps
+   * — a picker that does not offer it cannot be told to.
+   */
+  export function fpsChoices(savedFps: number | null, displayRefreshHz: number | null): number[] {
+    const extra: number[] = [];
+    if (savedFps !== null && !FPS_CHOICES.includes(savedFps)) extra.push(savedFps);
+    if (
+      displayRefreshHz !== null &&
+      Number.isInteger(displayRefreshHz) &&
+      displayRefreshHz > 0 &&
+      !FPS_CHOICES.includes(displayRefreshHz) &&
+      !extra.includes(displayRefreshHz)
+    ) {
+      extra.push(displayRefreshHz);
+    }
+    return [...FPS_CHOICES, ...extra].sort((a, b) => a - b);
+  }
+
+  /**
    * A custom output size, as the backend wants it: `WIDTHxHEIGHT`, lower case.
    *
    * `null` when the text is not a size. The backend refuses a size it cannot record with, so
@@ -229,6 +300,8 @@
   let saved = $state<EncoderSettings | null>(null);
   /** What the backend would use, and what it can do. */
   let status = $state<EncoderStatus | null>(null);
+  /** The displays this machine has, and the one the capture is pointed at. */
+  let displays = $state<CaptureDisplays | null>(null);
   /** A refusal from the backend, in words the user can act on. */
   let error = $state<string | null>(null);
   /** A confirmation that something was saved. */
@@ -297,10 +370,26 @@
   const customSizeValid = $derived(
     sizeChoice !== 'custom' || parseOutputSize(customSize) !== null,
   );
+  /** The display the capture is pointed at, or `null` when that is not known. */
+  const captureDisplay = $derived(selectedDisplay(displays));
+  /** What the panel says about that display, or `null` when it has nothing to say. */
+  const displayNote = $derived(captureDisplayNote(displays));
   const fpsOptions = $derived(
-    saved !== null && !FPS_CHOICES.includes(saved.fps)
-      ? [...FPS_CHOICES, saved.fps].sort((a, b) => a - b)
-      : [...FPS_CHOICES],
+    fpsChoices(saved?.fps ?? null, captureDisplay?.refresh_hz ?? null),
+  );
+  /**
+   * The note about a rate the display cannot show, or `null`.
+   *
+   * A capture rate above the display's refresh rate records frames the display never
+   * shows. That is a fact, not a scolding — the user may want them anyway — so the panel
+   * says it once, in its own voice, and leaves the choice alone.
+   */
+  const aboveDisplayNote = $derived(
+    captureDisplay !== null &&
+      captureDisplay.refresh_hz !== null &&
+      fps > captureDisplay.refresh_hz
+      ? `The display runs at ${captureDisplay.refresh_hz} Hz, so a rate above ${captureDisplay.refresh_hz} fps records frames it never shows.`
+      : null,
   );
   const estimate = $derived(estimateBytesPerMinute(bitrate ?? 0, audioBitrate ?? 0));
   const zeroCopyValue = $derived(zeroCopy === null ? 'auto' : zeroCopy ? 'on' : 'off');
@@ -346,13 +435,20 @@
     return typeof value === 'object' && value !== null && 'capabilities' in value;
   }
 
+  function isCaptureDisplays(value: unknown): value is CaptureDisplays {
+    if (typeof value !== 'object' || value === null) return false;
+    if (!('displays' in value) || !('selected' in value)) return false;
+    return Array.isArray(value.displays);
+  }
+
   /** Read the settings and the status, each on its own, so one failure hides neither. */
   async function load(): Promise<void> {
     busy = true;
     error = null;
-    const [settings, encoderStatus] = await Promise.allSettled([
+    const [settings, encoderStatus, capture] = await Promise.allSettled([
       source.encoderSettings(),
       source.encoderStatus(),
+      source.captureDisplays(),
     ]);
     if (settings.status === 'fulfilled') {
       saved = isEncoderSettings(settings.value) ? settings.value : null;
@@ -360,6 +456,12 @@
     if (encoderStatus.status === 'fulfilled') {
       status = isEncoderStatus(encoderStatus.value) ? encoderStatus.value : null;
     }
+    if (capture.status === 'fulfilled' && isCaptureDisplays(capture.value)) {
+      displays = capture.value;
+    }
+    // The display list is context for the framerate picker, not a setting: a read that
+    // failed leaves the picker exactly as it was, rather than raising a banner the user
+    // cannot act on. It is never reported as a failure of the settings.
     const failed = [settings, encoderStatus].find((result) => result.status === 'rejected');
     if (failed !== undefined && failed.status === 'rejected') {
       error = errorMessage(failed.reason);
@@ -522,6 +624,12 @@
       <p class="invalid">
         The selected path cannot scale: the recording is written at the capture size.
       </p>
+    {/if}
+    {#if displayNote !== null}
+      <p class="muted footnote">{displayNote}</p>
+    {/if}
+    {#if aboveDisplayNote !== null}
+      <p class="muted footnote">{aboveDisplayNote}</p>
     {/if}
     <p class="muted footnote">
       Resolution and frame rate are the same two settings as the ones under Capture, so the

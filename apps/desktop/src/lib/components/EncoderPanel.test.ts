@@ -11,7 +11,7 @@
 
 import axe from 'axe-core';
 import { mount, tick, unmount } from 'svelte';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import EncoderPanel, {
   DEFAULT_ENCODER_SETTINGS,
@@ -21,7 +21,7 @@ import EncoderPanel, {
   presetChoices,
   rateControlChoices,
 } from './EncoderPanel.svelte';
-import type { ClipSource } from '../ipc';
+import type { CaptureDisplays, ClipSource } from '../ipc';
 import type { EncoderCapabilities, EncoderSettings, EncoderStatus } from '../ipc';
 
 const SAVED: EncoderSettings = {
@@ -50,6 +50,30 @@ const STATUS: EncoderStatus = {
   selected_codec: 'h264',
   capabilities: CAPABILITIES,
   message: 'NVENC was chosen: it is the fastest encoder this machine has.',
+};
+
+/** The machine has one 120 Hz screen, and the capture is pointed at it. */
+const DISPLAYS_120: CaptureDisplays = {
+  displays: [{ index: 0, width: 3840, height: 2160, refresh_hz: 120 }],
+  selected: 0,
+};
+
+/** The machine has one 60 Hz screen — a rate the shipped picker does carry. */
+const DISPLAYS_60: CaptureDisplays = {
+  displays: [{ index: 0, width: 1920, height: 1080, refresh_hz: 60 }],
+  selected: 0,
+};
+
+/** A 144 Hz screen: a rate the four shipped choices do not carry. */
+const DISPLAYS_144: CaptureDisplays = {
+  displays: [{ index: 0, width: 2560, height: 1440, refresh_hz: 144 }],
+  selected: 0,
+};
+
+/** A screen the OS would not name a rate for. */
+const DISPLAYS_UNKNOWN_RATE: CaptureDisplays = {
+  displays: [{ index: 0, width: 1920, height: 1080, refresh_hz: null }],
+  selected: 0,
 };
 
 /** A source that answers the three encoder commands and nothing else. */
@@ -314,6 +338,84 @@ describe('the encoder section', () => {
     button(target, 'Apply encoder')?.click();
     await settle();
     expect(sent.value?.zero_copy).toBe(false);
+  });
+
+  it('names the display it is recording and the rate that display runs at', async () => {
+    const source = fakeSource({ captureDisplays: () => Promise.resolve(DISPLAYS_120) });
+    const target = await mountPanel(source);
+    // The framerate is chosen against this number, so the number has to be on screen.
+    expect(text(target)).toContain('Recording display 0 — 3840×2160 at 120 Hz');
+  });
+
+  it('says the rate was not reported instead of inventing one', async () => {
+    const source = fakeSource({
+      captureDisplays: () => Promise.resolve(DISPLAYS_UNKNOWN_RATE),
+    });
+    const target = await mountPanel(source);
+    expect(text(target)).toContain('refresh rate not reported');
+    // No rate is made up: the panel names no hertz at all.
+    expect(text(target)).not.toMatch(/\d+ Hz/);
+  });
+
+  it('offers the display’s own rate when it is not one of the four', async () => {
+    const source = fakeSource({ captureDisplays: () => Promise.resolve(DISPLAYS_144) });
+    const target = await mountPanel(source);
+    const options = [...(select(target, 'Frame rate (ceiling)')?.options ?? [])];
+    // A 144 Hz screen can be recorded at 144 fps, so the picker has to offer it.
+    expect(options.map((option) => option.value)).toEqual(['24', '30', '60', '120', '144']);
+    // And the rate is offered, not chosen: the saved rate still stands.
+    expect(select(target, 'Frame rate (ceiling)')?.value).toBe('60');
+  });
+
+  it('leaves the panel as it was when the machine reports no displays', async () => {
+    const captureDisplays = vi.fn(() => Promise.resolve({ displays: [], selected: 0 }));
+    const source = fakeSource({ captureDisplays });
+    const target = await mountPanel(source);
+    // The panel asked what the machine has, and the answer was "none" — which is what a
+    // machine that is not Windows says.
+    expect(captureDisplays, 'the panel read the display list').toHaveBeenCalled();
+    expect(text(target)).not.toContain('Recording display');
+    expect(text(target)).not.toContain('refresh rate');
+    // The picker is exactly what it was: the four shipped rates, and still working.
+    const fps = select(target, 'Frame rate (ceiling)');
+    expect([...(fps?.options ?? [])].map((option) => option.value)).toEqual([
+      '24',
+      '30',
+      '60',
+      '120',
+    ]);
+    fps!.value = '120';
+    fps!.dispatchEvent(new Event('change', { bubbles: true }));
+    await tick();
+    expect(select(target, 'Frame rate (ceiling)')?.value).toBe('120');
+  });
+
+  it('keeps the panel working when the display list cannot be read', async () => {
+    const captureDisplays = vi.fn(() => Promise.reject(new Error('capture_displays failed')));
+    const source = fakeSource({ captureDisplays });
+    const target = await mountPanel(source);
+    expect(captureDisplays, 'the panel asked anyway').toHaveBeenCalled();
+    // Nothing is said about a display, and nothing is claimed to have gone wrong: the
+    // display list is context for the picker, not a setting the user can change.
+    expect(text(target)).not.toContain('Recording display');
+    expect(target.querySelector('[role="alert"]'), 'and no error banner').toBeNull();
+    expect(select(target, 'Frame rate (ceiling)')?.options.length).toBe(4);
+  });
+
+  it('says when the chosen rate is above the display’s own rate', async () => {
+    const source = fakeSource({ captureDisplays: () => Promise.resolve(DISPLAYS_60) });
+    const target = await mountPanel(source);
+    // The saved rate matches the display's, so there is nothing to say yet.
+    expect(text(target)).not.toContain('records frames it never shows');
+
+    const fps = select(target, 'Frame rate (ceiling)');
+    fps!.value = '120';
+    fps!.dispatchEvent(new Event('change', { bubbles: true }));
+    await tick();
+
+    expect(text(target)).toContain(
+      'The display runs at 60 Hz, so a rate above 60 fps records frames it never shows.',
+    );
   });
 });
 

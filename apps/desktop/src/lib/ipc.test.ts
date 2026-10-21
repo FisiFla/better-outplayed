@@ -121,6 +121,7 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.installGsiCfg('dota2'))).toBe('install_gsi_cfg');
     expect(await wireName(() => tauriIpc.encoderSettings())).toBe('encoder_settings');
     expect(await wireName(() => tauriIpc.encoderStatus())).toBe('encoder_status');
+    expect(await wireName(() => tauriIpc.captureDisplays())).toBe('capture_displays');
     expect(await wireName(() => tauriIpc.copyDiagnostics())).toBe('copy_diagnostics');
     expect(await wireName(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS))).toBe(
       'update_encoder_settings',
@@ -167,6 +168,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.encoderSettings()),
       await wireName(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS)),
       await wireName(() => tauriIpc.encoderStatus()),
+      await wireName(() => tauriIpc.captureDisplays()),
       await wireName(() => tauriIpc.copyDiagnostics()),
     ];
 
@@ -234,6 +236,7 @@ describe('the argument keys', () => {
       update_encoder_settings: await wireArgs(() =>
         tauriIpc.updateEncoderSettings(ENCODER_SETTINGS),
       ),
+      capture_displays: await wireArgs(() => tauriIpc.captureDisplays()),
     };
 
     for (const [command, args] of Object.entries(sent)) {
@@ -269,6 +272,9 @@ describe('the argument keys', () => {
     expect(mockedInvoke).toHaveBeenCalledWith('encoder_status');
     await tauriIpc.copyDiagnostics();
     expect(mockedInvoke).toHaveBeenCalledWith('copy_diagnostics');
+    // The display list is read from the machine itself, so it takes no arguments either.
+    await tauriIpc.captureDisplays();
+    expect(mockedInvoke).toHaveBeenCalledWith('capture_displays');
   });
 });
 

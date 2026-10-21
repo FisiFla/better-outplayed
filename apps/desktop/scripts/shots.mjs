@@ -857,6 +857,15 @@ function installMockSource(fixture) {
       encoderSettings = { ...encoderSettings, ...settings };
       return { ...encoderSettings };
     },
+    // The displays this machine has, and the one the capture is pointed at. The fixture
+    // machine has a single 60 Hz screen, so the framerate picker has one display's rate to
+    // be made against.
+    async captureDisplays() {
+      return {
+        displays: [{ index: 0, width: 1920, height: 1080, refresh_hz: 60 }],
+        selected: 0,
+      };
+    },
     // The diagnostics export. A harness cannot put anything on the system clipboard, but
     // it can answer with the report the backend would have assembled — which is what the
     // panel shows the user.

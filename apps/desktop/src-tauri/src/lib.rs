@@ -814,6 +814,27 @@ fn list_audio_devices() -> Result<replayed_capture::audio_devices::AudioDevices,
         .map_err(|e| CommandError::new(ErrorCode::Recording, format!("{e:#}")))
 }
 
+/// The displays this machine has, and the one the capture is pointed at.
+///
+/// Read so the framerate setting can be made against the display's own refresh rate: a capture
+/// rate above the display's rate buys nothing, because the display has nothing new to show.
+/// Empty off Windows, where there is no screen to enumerate.
+#[tauri::command(async, rename_all = "snake_case")]
+fn capture_displays(
+    state: State<'_, AppState>,
+) -> Result<commands::CaptureDisplaysDto, CommandError> {
+    // The settings may be unreadable — a malformed config starts the shell degraded — and the
+    // displays are worth reporting either way, so a failure here costs the selection, not the
+    // answer. An unknown target is honest; a guessed one is not.
+    let selected = commands::read_settings(&state.app_data_dir, &state.config_path())
+        .ok()
+        .map(|settings| settings.capture_monitor);
+    Ok(commands::CaptureDisplaysDto {
+        displays: replayed_capture::displays(),
+        selected,
+    })
+}
+
 /// Pick the clips directory, in the native folder picker, and approve it.
 ///
 /// The picker runs here rather than in the webview because its answer decides what the webview
@@ -1232,6 +1253,7 @@ pub fn run() {
             app_status,
             get_settings,
             list_audio_devices,
+            capture_displays,
             update_settings,
             choose_clips_dir,
             health,

@@ -107,6 +107,28 @@ export interface EncoderStatus {
 }
 
 /**
+ * One display the machine has, in `[capture] monitor` order.
+ *
+ * `refresh_hz` is `null` when the OS does not report a real rate — Windows answers 0 or 1
+ * for a mode that inherits the display's default rate — and that is "unknown", not a rate
+ * a person could pick from.
+ */
+export interface CaptureDisplay {
+  index: number;
+  width: number;
+  height: number;
+  /** The mode's refresh rate in Hz, or null when the OS does not report a real one. */
+  refresh_hz: number | null;
+}
+
+/** The displays this machine has, and the one the capture is pointed at. */
+export interface CaptureDisplays {
+  displays: CaptureDisplay[];
+  /** The index the capture is pointed at, or null when the settings could not be read. */
+  selected: number | null;
+}
+
+/**
  * A diagnostics report, as `copy_diagnostics` returns it.
  *
  * `config` is the effective configuration with the secrets already redacted by the backend;
@@ -234,6 +256,14 @@ export interface ClipSource {
    */
   encoderStatus(): Promise<EncoderStatus>;
   /**
+   * The displays this machine has, and the one the capture is pointed at.
+   *
+   * Read so the framerate setting can be made against the display's own refresh rate: a
+   * capture rate above the display's rate buys nothing, because the display has nothing
+   * new to show. The list is empty off Windows, where there is no screen to enumerate.
+   */
+  captureDisplays(): Promise<CaptureDisplays>;
+  /**
    * Assemble a diagnostics report, put it on the clipboard, and answer with it.
    *
    * Nothing is sent anywhere: the report is on the clipboard and the user pastes it wherever
@@ -327,6 +357,7 @@ export const tauriIpc: ClipSource = {
   updateEncoderSettings: (settings: EncoderSettings) =>
     invoke<EncoderSettings>('update_encoder_settings', { settings }),
   encoderStatus: () => invoke<EncoderStatus>('encoder_status'),
+  captureDisplays: () => invoke<CaptureDisplays>('capture_displays'),
   copyDiagnostics: () => invoke<DiagnosticsReport>('copy_diagnostics'),
   gsiTargets: () => invoke<GsiTarget[]>('gsi_targets'),
   listAudioDevices: () => invoke<AudioDevices>('list_audio_devices'),
