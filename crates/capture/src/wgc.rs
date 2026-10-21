@@ -30,20 +30,26 @@
 //! - Monitor and window selection (`[capture]`) has never run on Windows; it is type-checked
 //!   only. A captured window resized mid-capture hits the same size-divergence gap, and a
 //!   minimised one stops delivering frames.
+//! - The display list ([`crate::displays`]) and the refresh rates in it have never run on
+//!   Windows either; they are type-checked only. The rules that decide what counts as a real
+//!   rate are tested on every host, but what the API answers on a given machine is not.
 //! - Every frame the caller keeps is copied through a staging texture, the cost accepted to keep
 //!   the encoder an ffmpeg sidecar; discarded frames skip it.
 
 #![cfg(windows)]
 
 use crate::platform::init_com;
-use crate::target::{ordered_monitors, pick_monitor, pick_window, CaptureTarget};
+use crate::target::{
+    indexed_displays, ordered_monitors, pick_monitor, pick_window, CaptureTarget, DisplayInfo,
+    DisplayMode,
+};
 use crate::{clock_base, take_or_wait, CaptureBackend, Frame, FrameSignal, PixelFormat};
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::BOOL;
-use windows::core::{factory, IInspectable, Interface};
+use windows::core::{factory, IInspectable, Interface, PCWSTR};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess,
@@ -67,7 +73,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, MonitorFromWindow, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW,
+    ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::CoUninitialize;
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -834,6 +841,93 @@ fn create_capture_item(target: &CaptureTarget) -> Result<GraphicsCaptureItem> {
             ),
         },
     }
+}
+
+/// Every display this machine has, in the order `[capture] monitor` indexes them.
+///
+/// The order is the capture target's own: the primary first, the rest in the order the OS
+/// enumerated them. It is built by the same [`ordered_monitors`] call the capture target makes, so
+/// the index of a display here cannot drift from the index `[capture] monitor` takes for it.
+pub(crate) fn displays() -> Vec<DisplayInfo> {
+    // SAFETY: a null HWND with MONITOR_DEFAULTTOPRIMARY is the documented way to ask for the
+    // primary monitor, and it touches nothing the caller owns.
+    let primary = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
+    let modes: Vec<DisplayMode> = ordered_monitors(primary, &enumerate_monitors())
+        .into_iter()
+        .map(current_mode)
+        .collect();
+    indexed_displays(&modes)
+}
+
+/// A display's current mode: the size it runs at and the rate it runs it.
+///
+/// The rate comes from `EnumDisplaySettingsW`, which wants the device name; only
+/// `GetMonitorInfoW` knows that name. A display the OS will not describe is reported as an
+/// unknown mode rather than as a guess, and the rate it does report is passed on raw: deciding
+/// what counts as a real rate is [`crate::target::reported_refresh_rate`]'s job.
+fn current_mode(monitor: HMONITOR) -> DisplayMode {
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            // The API takes the size of the structure it is given, and this one is the extended
+            // one, so that is the size to offer.
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        szDevice: [0; 32],
+    };
+    // SAFETY: `info` is a valid out-parameter for this monitor. `MONITORINFOEXW` begins with the
+    // `MONITORINFO` the API takes, which is why the cast is sound.
+    let told = unsafe {
+        GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
+    };
+    if !told.as_bool() {
+        tracing::warn!("the OS would not describe this display");
+        return unknown_mode();
+    }
+    let device = device_name(&info.szDevice);
+    let mut mode = DEVMODEW {
+        // The API checks this against its own structure size and refuses the call without it.
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: `device` is NUL-terminated and outlives the call; `mode` is a valid out-parameter.
+    let told =
+        unsafe { EnumDisplaySettingsW(PCWSTR(device.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) };
+    if !told.as_bool() {
+        tracing::warn!("the OS would not report this display's current mode");
+        return unknown_mode();
+    }
+    DisplayMode {
+        width: mode.dmPelsWidth,
+        height: mode.dmPelsHeight,
+        frequency: mode.dmDisplayFrequency,
+    }
+}
+
+/// The mode of a display the OS would not describe: no size and no rate.
+fn unknown_mode() -> DisplayMode {
+    DisplayMode {
+        width: 0,
+        height: 0,
+        // 0 is one of the two values Windows uses for "no rate reported".
+        frequency: 0,
+    }
+}
+
+/// The device name as a NUL-terminated string, which is what the display-settings API takes.
+fn device_name(sz_device: &[u16; 32]) -> Vec<u16> {
+    let end = sz_device
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(sz_device.len());
+    sz_device[..end]
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Every monitor, in the OS's enumeration order.

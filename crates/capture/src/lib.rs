@@ -36,10 +36,31 @@ mod audio_target;
 mod audio_timeline;
 pub use audio_target::{GameAudioSource, GameFinder};
 
+// The shape of a display the capture can target, re-exported from the module that holds the rules
+// about it so the rest of the app does not have to know where they live.
+pub use target::DisplayInfo;
+
 #[cfg(windows)]
 pub mod wasapi;
 #[cfg(windows)]
 pub mod wgc;
+
+/// Every display this machine has, in the order `[capture] monitor` indexes them.
+///
+/// The primary is first and the rest follow in the order the OS enumerated them, so a display's
+/// index here is the index `[capture] monitor` takes for it.
+///
+/// Empty off Windows: there is no screen to enumerate.
+pub fn displays() -> Vec<DisplayInfo> {
+    #[cfg(windows)]
+    {
+        wgc::displays()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
 
 /// The monotonic clock base shared by the video and audio backends.
 ///
@@ -636,6 +657,13 @@ mod tests {
         assert!(!is_silent_block(&[0, 0, 1, 0]));
         assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
         assert!(!is_silent_block(&[0, 0, 0, 0x80]));
+    }
+
+    #[test]
+    fn off_windows_there_is_no_screen_to_enumerate() {
+        if cfg!(not(windows)) {
+            assert!(displays().is_empty());
+        }
     }
 
     /// The signal exists so a report that lands before the consumer waits is not missed. Miss

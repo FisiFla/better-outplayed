@@ -42,6 +42,74 @@ pub fn ordered_monitors<T: Copy + PartialEq>(primary: T, enumerated: &[T]) -> Ve
     out
 }
 
+/// One display the capture can target.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DisplayInfo {
+    /// The index `[capture] monitor` uses for this display (0 is the primary).
+    pub index: usize,
+    /// The display's current mode width, in pixels. 0 when the OS would not describe the mode.
+    pub width: u32,
+    /// The display's current mode height, in pixels. 0 when the OS would not describe the mode.
+    pub height: u32,
+    /// The mode's refresh rate in Hz, or `None` when the OS does not report a real one.
+    pub refresh_hz: Option<u32>,
+}
+
+/// A display's current mode, as the operating system reports it.
+///
+/// The rate is raw because the OS does not always report a rate at all: see
+/// [`reported_refresh_rate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMode {
+    /// The mode's width in pixels.
+    pub width: u32,
+    /// The mode's height in pixels.
+    pub height: u32,
+    /// The rate the OS reports, in Hz.
+    pub frequency: u32,
+}
+
+/// The highest refresh rate worth believing, in Hz.
+///
+/// The fastest displays that ship run at a few hundred Hz, so a driver reporting thousands of
+/// them is reporting a number that means nothing. An unknown rate is honest; a wrong one is not.
+pub const MAX_PLAUSIBLE_REFRESH_HZ: u32 = 1000;
+
+/// The refresh rate a display mode reports, or `None` when it does not report a real one.
+///
+/// Windows answers 0 or 1 for a mode that inherits the display's default rate rather than naming
+/// one, so neither is a rate a person could pick from: both are unknown, not "0 Hz" and "1 Hz".
+///
+/// A rate above [`MAX_PLAUSIBLE_REFRESH_HZ`] is unknown for the same reason: the number is not
+/// one any display runs at.
+pub fn reported_refresh_rate(frequency: u32) -> Option<u32> {
+    if frequency < 2 {
+        return None;
+    }
+    if frequency > MAX_PLAUSIBLE_REFRESH_HZ {
+        return None;
+    }
+    Some(frequency)
+}
+
+/// The displays to report, numbered in the order `[capture] monitor` indexes them.
+///
+/// `modes` are the current modes in that same order, so a mode's position is its
+/// [`DisplayInfo::index`]. A rate the OS did not report stays unknown here rather than being
+/// guessed at.
+pub fn indexed_displays(modes: &[DisplayMode]) -> Vec<DisplayInfo> {
+    modes
+        .iter()
+        .enumerate()
+        .map(|(index, mode)| DisplayInfo {
+            index,
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: reported_refresh_rate(mode.frequency),
+        })
+        .collect()
+}
+
 /// The monitor at `index`, or an error naming how many exist.
 pub fn pick_monitor<T: Copy>(monitors: &[T], index: usize) -> Result<T> {
     match monitors.get(index) {
@@ -124,5 +192,79 @@ mod tests {
         assert_eq!(pick_window(&w, "game").unwrap(), 1);
         assert!(pick_window(&w, "other").is_err());
         assert!(pick_window(&w, "  ").is_err());
+    }
+
+    // --- Displays and their refresh rates ---
+
+    #[test]
+    fn a_rate_of_zero_or_one_is_not_a_rate() {
+        // Windows answers 0 or 1 for a mode that inherits the display's default rate; neither is
+        // a rate a person could pick from, so neither is reported as one.
+        assert_eq!(reported_refresh_rate(0), None);
+        assert_eq!(reported_refresh_rate(1), None);
+    }
+
+    #[test]
+    fn the_rates_a_person_can_pick_from_are_reported_as_they_are() {
+        assert_eq!(reported_refresh_rate(60), Some(60));
+        assert_eq!(reported_refresh_rate(120), Some(120));
+        assert_eq!(reported_refresh_rate(144), Some(144));
+    }
+
+    #[test]
+    fn an_absurd_rate_is_unknown_rather_than_believed() {
+        // A driver reporting thousands of Hz is reporting nonsense; an unknown rate is honest and
+        // a wrong one is not.
+        assert_eq!(reported_refresh_rate(5_000), None);
+        assert_eq!(reported_refresh_rate(u32::MAX), None);
+        // The ceiling itself is still a number, so it is reported.
+        assert_eq!(
+            reported_refresh_rate(MAX_PLAUSIBLE_REFRESH_HZ),
+            Some(MAX_PLAUSIBLE_REFRESH_HZ)
+        );
+        // One above it is not.
+        assert_eq!(reported_refresh_rate(MAX_PLAUSIBLE_REFRESH_HZ + 1), None);
+    }
+
+    #[test]
+    fn the_displays_are_numbered_in_the_order_the_capture_target_indexes_them() {
+        let modes = [
+            DisplayMode {
+                width: 3840,
+                height: 2160,
+                frequency: 120,
+            },
+            DisplayMode {
+                width: 1920,
+                height: 1080,
+                frequency: 60,
+            },
+        ];
+        let displays = indexed_displays(&modes);
+        assert_eq!(displays.len(), 2);
+        // The index is the position, which is what `[capture] monitor` means by it.
+        assert_eq!(displays[0].index, 0);
+        assert_eq!(displays[1].index, 1);
+        assert_eq!(displays[0].width, 3840);
+        assert_eq!(displays[0].height, 2160);
+        assert_eq!(displays[0].refresh_hz, Some(120));
+        assert_eq!(displays[1].refresh_hz, Some(60));
+    }
+
+    #[test]
+    fn a_display_whose_rate_was_not_reported_stays_unknown() {
+        // The mode is real; the rate was not reported, so the size is still worth having.
+        let displays = indexed_displays(&[DisplayMode {
+            width: 1920,
+            height: 1080,
+            frequency: 1,
+        }]);
+        assert_eq!(displays[0].width, 1920);
+        assert_eq!(displays[0].refresh_hz, None);
+    }
+
+    #[test]
+    fn no_displays_means_no_displays() {
+        assert!(indexed_displays(&[]).is_empty());
     }
 }
