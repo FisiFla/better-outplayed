@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::BOOL;
 use windows::core::{factory, IInspectable, Interface, PCWSTR};
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess,
     GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -234,9 +234,29 @@ struct Session {
     capture: GraphicsCaptureSession,
     /// Re-created when the frame size or format changes (resolution switch).
     staging: Option<Staging>,
+    /// The capture's clock, and the frame pool's presentation times on it.
+    ///
+    /// The pool stamps every frame with the moment the compositor presented it, and that is the
+    /// frame's real capture time — the moment the pool is asked for it is later, by however long
+    /// the frame waited here. The video's timeline is built from these times.
+    clock: crate::CaptureClock,
 }
 
 type Staging = (u32, u32, ID3D11Texture2D);
+
+/// The capture pool's presentation stamp, as a duration.
+///
+/// The pool stamps every frame with the moment the compositor presented it, in 100-nanosecond
+/// units. A negative stamp is not a time before anything — it is a stamp the platform did not
+/// fill in — so it reads as the epoch rather than as a time far in the past.
+fn presentation_stamp(stamp: TimeSpan) -> Duration {
+    if stamp.Duration < 0 {
+        return Duration::ZERO;
+    }
+    // Saturating: the multiplication is the only one here that can overflow, and a stamp that
+    // cannot be represented is not a time that can be believed.
+    Duration::from_nanos((stamp.Duration as u64).saturating_mul(100))
+}
 
 impl WgcCapture {
     /// `target` defaults to the primary monitor; an unknown monitor or window is an error, not a
@@ -491,6 +511,7 @@ impl Session {
             capture,
             staging: None,
             handover: None,
+            clock: crate::CaptureClock::new(),
         })
     }
 
@@ -504,9 +525,15 @@ impl Session {
             Err(e) => bail!("Direct3D11CaptureFramePool::TryGetNextFrame failed: {e}"),
         };
 
-        // Same clock base as the audio backend, so A/V alignment is derivable. `elapsed` is monotonic,
-        // which is all `Frame::pts` promises.
-        let pts = clock_base().elapsed();
+        // The frame's real capture time: the moment the compositor presented it, which the pool
+        // stamps on every frame in 100-nanosecond units. The moment the frame is asked for is later
+        // by however long it waited in the pool, and that wait is not the same for every frame, so
+        // the two cannot be used for the same thing.
+        //
+        // Same clock base as the audio backend, so A/V alignment is derivable. `elapsed` is
+        // monotonic, which is all `Frame::pts` promises.
+        let stamp = frame.SystemRelativeTime().ok().map(presentation_stamp);
+        let pts = self.clock.at(stamp, clock_base().elapsed());
         let staged = self.copy_out(&frame, pts);
         // Release the frame whether or not the copy worked, or the pool starves after BUFFER_COUNT frames.
         let closed = frame.Close();

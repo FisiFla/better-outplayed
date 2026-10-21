@@ -20,6 +20,18 @@
 //! Fed in real time through the CLI's pacing, the only way a media timeline can be measured
 //! against a wall clock.
 //!
+//! # The third test: the arrival time is not the capture time
+//!
+//! `-use_wallclock_as_timestamps 1` stamps a frame with the wall clock at the moment the child
+//! *read* it out of the pipe, and a child that reads a burst of frames stamps them all at once.
+//! The hardware encoder finishes several frames at a time, so the reads came in bursts, and the
+//! measured frame intervals swung between 8.1 ms and 36.4 ms against the 16.7 ms a 60fps video
+//! has: a picture that judders and lags.
+//!
+//! So the frames are written to the pipe at their capture times. The third test drives that
+//! mechanism on a host: the frames are handed over in one burst, exactly as the hardware encoder
+//! hands them over, and the file's frame timestamps must come out at the capture intervals.
+//!
 //! # The rule every timing assertion in this project follows
 //!
 //! These tests observe a machine under load, and CI's runner is oversubscribed. No assertion may
@@ -52,7 +64,9 @@
 // The test bodies use `unwrap()` throughout; production code does not.
 #![allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks)]
 use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
-use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend, Frame, PixelFormat};
+use replayed_capture::{
+    AudioBackend, AudioBuffer, AudioFormat, CaptureBackend, Frame, PixelFormat,
+};
 use replayed_encoder::{EncodeConfig, Encoder, FfmpegEncoder, VideoCodec};
 use replayed_media::{FfmpegBinaries, MediaInfo};
 use std::path::{Path, PathBuf};
@@ -681,4 +695,199 @@ fn decode_every_frame(bin: &FfmpegBinaries, path: &Path, width: u32, height: u32
     // what it decodes and complains about the clip's repeated and (at a segment boundary) slightly
     // out-of-order display timestamps. The frame count below is the check.
     out.stdout.len() as u64 / (u64::from(width) * u64::from(height) * 4)
+}
+
+// ---------------------------------------------------------------------------------------
+// The frames' capture times, not the moments the child read them.
+// ---------------------------------------------------------------------------------------
+
+/// The span a capture of `frames` frames, captured `interval` apart, took.
+fn submitted_total(interval: Duration, frames: u64) -> u64 {
+    interval.as_micros() as u64 * frames / 1_000
+}
+/// The video is timed by the frames' capture times, not by the moments the child read them.
+///
+/// The defect this prevents: the hardware encoder finishes several frames at once, the child
+/// reads them at once, and the frames of a burst share a timestamp. Measured on the 4K recording
+/// that started this, the frame intervals swung between 8.1 ms and 36.4 ms against the 16.7 ms a
+/// 60fps video has — only 2.3% of them right — and the picture juddered and lagged.
+///
+/// The mechanism is the same on both paths (the frames are written to the pipe at their capture
+/// times, and the child stamps each frame with the wall clock it read it at), so it is driven
+/// here on the raw path, where a host can drive it: the frames are handed over in bursts, exactly
+/// as the hardware encoder hands them over, and the file's frame timestamps must come out at the
+/// capture intervals.
+///
+/// The capture interval is the configured rate's, because this path's container can only say so
+/// much: the rawvideo demuxer's timebase is the declared frame rate, so the container's grid is
+/// 1/60s here and the frame timestamps are quantised to it. (The zero-copy path's container is
+/// finer — its timebase is 1/1200000 — so there the capture's own intervals survive whole.) What
+/// the grid cannot hide is the defect: without the pacing the frames of a burst share a
+/// timestamp, and the deltas come out as zeroes and double steps.
+#[test]
+fn the_video_is_timed_by_the_capture_times_and_not_by_when_the_child_read_the_frames() {
+    let _slot = wall_clock_slot();
+    let bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+    let dir = tempfile::tempdir().expect("a scratch temp dir");
+
+    /// The interval the capture delivered: the configured rate's, so that the container's grid
+    /// can carry it.
+    const CAPTURE_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+    /// The rate the child is told the stream is.
+    const CONFIGURED: u32 = 60;
+    /// How many frames are handed over at once: the hardware encoder finishes several at a time.
+    const BURST: u64 = 2;
+    /// How many frames the capture produced.
+    const FRAMES: u64 = 120;
+    /// How late the first frame is handed over, against its capture time.
+    ///
+    /// The first frame is the one the encoder's pipeline waits for: it comes out after the
+    /// encoder has filled up, so it is the latest of the lot. The writer's schedule is anchored on
+    /// it, which is what puts the schedule *ahead* of the frames that follow — and a schedule
+    /// ahead of the arrivals is what spreads a burst out. The frames after it are handed over on
+    /// time, as a capture delivers them.
+    const FIRST_LATENCY: Duration = Duration::from_millis(20);
+
+    let cfg = EncodeConfig::for_tests_software(
+        VideoCodec::H264,
+        WIDTH,
+        HEIGHT,
+        CONFIGURED,
+        dir.path().to_path_buf(),
+        // One segment: the frame timestamps are measured inside one file, not across a boundary.
+        30_000,
+    );
+    let mut encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn encoder");
+
+    // The capture's span: 120 frames captured 17.4ms apart.
+    let capture_ms = submitted_total(CAPTURE_INTERVAL, FRAMES);
+    // The audio, which is timed by its byte count and not by when it was handed over: it is the
+    // capture's span, and the video has to match it.
+    //
+    // It is handed over *first*, and all of it: the child reads the audio input's header before it
+    // looks at the video at all (issue #78), so a child that has no audio yet is not reading the
+    // video pipe, and the frames pile up in the queue and are dropped.
+    let block = AudioFormat::default().bytes_per_10ms();
+    for block_index in 0..(capture_ms / 10) {
+        encoder
+            .submit_audio(AudioBuffer {
+                data: vec![0u8; block],
+                frames: AudioFormat::default().sample_rate as usize / 100,
+                pts: Duration::from_millis(block_index * 10),
+                format: AudioFormat::default(),
+            })
+            .expect("submit audio");
+    }
+
+    // The frames, each carrying the capture time it was captured at, handed over in bursts.
+    //
+    // The bursts are timed against the capture's own clock, so the writer is never handed a frame
+    // later than the frame before it: a frame that arrives late is written at once (the timeline
+    // may not be stretched to hide it), and a burst that arrives late keeps its shared timestamp.
+    //
+    // The wait is the encoder's own precise one: an ordinary sleep is only accurate to a
+    // millisecond or so, and a burst handed over late is a burst the writer cannot spread.
+    let start = Instant::now();
+    let mut submitted = 0u64;
+    for burst in 0..(FRAMES / BURST) {
+        let first = burst * BURST;
+        // When this burst is due: the capture's own time for its first frame, plus the latency the
+        // first frame had.
+        let due = start + FIRST_LATENCY + CAPTURE_INTERVAL * (first as u32);
+        replayed_encoder::timeline::wait_until(due);
+        for within in 0..BURST {
+            let index = first + within;
+            let mut frame = noise_frame(WIDTH, HEIGHT, 0x1234_5678 + index * 31);
+            // The capture time, measured from the first frame.
+            frame.pts = Duration::from_micros(index * CAPTURE_INTERVAL.as_micros() as u64);
+            encoder.submit_video(frame).expect("submit video");
+            submitted += 1;
+        }
+    }
+
+    encoder.finish().expect("flush encoder");
+
+    let segments = segments_in(dir.path());
+    assert_eq!(
+        segments.len(),
+        1,
+        "the whole capture fits in one segment: {segments:?}"
+    );
+    let segment = &segments[0];
+    let info = MediaInfo::probe(&bin, segment).expect("probe the segment");
+    let video_ms = info
+        .video
+        .as_ref()
+        .and_then(|v| v.duration_ms)
+        .expect("the segment must have a video duration");
+    let audio_ms = info.audio.as_ref().and_then(|a| a.duration_ms).unwrap_or(0);
+
+    // The frame timestamps, which are the thing the defect was about.
+    let times = display_times(&bin, segment);
+    let deltas: Vec<f64> = times.windows(2).map(|w| (w[1] - w[0]) * 1000.0).collect();
+
+    // The load-bearing assertion: the frames are shown at their capture intervals, so the
+    // picture does not judder. Without the pacing the frames of a burst share a timestamp and
+    // the intervals alternate between nothing and a whole burst's worth.
+    //
+    // The first frames are the container's own: a track's first samples are written at the track's
+    // origin, so the first few of them are bunched whatever the frames were. The rest are the
+    // frames' own timestamps, and they are what this is about.
+    //
+    // The *median* interval is what is asserted, not the worst one: a machine that is busy can
+    // take a thread off its schedule for longer than a frame interval, and one such frame in a
+    // dozen is a machine's noise, not the defect. The median is what tells the two apart — the
+    // defect puts every frame of a burst in the same instant.
+    let capture_ms_f64 = CAPTURE_INTERVAL.as_secs_f64() * 1000.0;
+    let rest = &deltas[3..];
+    let mut sorted = rest.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("the deltas are numbers"));
+    let median = sorted[sorted.len() / 2];
+    let mean = rest.iter().sum::<f64>() / rest.len() as f64;
+    eprintln!(
+        "{submitted} frames handed over in bursts of {BURST}, captured {CAPTURE_INTERVAL:?} apart \
+         against {CONFIGURED}fps configured: {segments:?} carry {video_ms}ms of video and \
+         {audio_ms}ms of audio; {} frames; the first three are the container's, and the rest have a \
+         median interval of {median:.3}ms and a mean of {mean:.3}ms",
+        times.len(),
+    );
+    assert!(
+        (median - capture_ms_f64).abs() < 0.5,
+        "the frame intervals must be the capture's ({capture_ms_f64:.3}ms), not the bursts': the \
+         median was {median:.3}ms",
+    );
+    // And the frames of a burst must not share a timestamp: the judder itself, stated as the
+    // property the user sees.
+    let shared = rest.iter().filter(|d| **d < capture_ms_f64 / 2.0).count();
+    assert!(
+        shared * 50 <= rest.len(),
+        "no two frames may share a timestamp: {shared} of {} did (the shortest interval was \
+         {:.3}ms)",
+        rest.len(),
+        rest.iter().cloned().fold(f64::MAX, f64::min),
+    );
+
+    // The video is as long as the capture was, and not as long as the frame count implies: the
+    // frame-count clock is what trades the judder for an A/V drift.
+    //
+    // The tolerance is the container's own first-frame handling (a track's first samples are
+    // written at its origin, so the first few of them are bunched) and the grid it carries the
+    // timestamps on. On the zero-copy path, whose container is finer, the same property holds
+    // exactly — the schedule's own test covers that half.
+    let frame_count_ms = submitted * 1000 / u64::from(CONFIGURED);
+    assert!(
+        video_ms.abs_diff(capture_ms) < 100,
+        "the video must cover the {capture_ms}ms the capture took, not the {frame_count_ms}ms the \
+         frame count implies: {video_ms}ms"
+    );
+    // And the A/V drift does not grow: the audio's timeline is the sample count, and the two
+    // must still agree.
+    let drift = info.av_drift().expect("both streams are present");
+    assert!(
+        drift.delta_ms.abs() < 120,
+        "the video and the audio must still agree: video {}ms, audio {}ms, drift {}ms",
+        drift.video_ms,
+        drift.audio_ms,
+        drift.delta_ms,
+    );
 }

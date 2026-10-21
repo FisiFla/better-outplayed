@@ -193,7 +193,15 @@ pub enum GpuTexture {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub data: Vec<u8>,
-    /// Monotonic, from the same clock as `AudioBuffer::pts`.
+    /// When the frame was captured, on the same clock as [`AudioBuffer::pts`].
+    ///
+    /// **The frame's capture time, not the moment it was asked for.** The two differ by however
+    /// long the frame waited in the capture pool, and that wait is not the same for every frame:
+    /// a frame that waited a long time was on the screen earlier than a frame that did not. The
+    /// video's timeline is built from these times, so a frame that is stamped with the moment it
+    /// was asked for is stamped with the wrong time.
+    ///
+    /// Monotonic, and on the clock the audio is on, so the two can be compared.
     pub pts: Duration,
     pub width: u32,
     pub height: u32,
@@ -210,6 +218,58 @@ impl Frame {
     /// is a bug.
     pub fn has_pixels(&self) -> bool {
         !self.data.is_empty()
+    }
+}
+
+/// The capture's clock, and the capture pool's presentation times on it.
+///
+/// Windows Graphics Capture stamps every frame with the moment the compositor presented it, in
+/// 100-nanosecond units. That is the frame's real capture time — the moment the pool was asked
+/// for it is later, by however long the frame waited in the pool — and it is the only clock that
+/// says when the picture was on the screen.
+///
+/// The pool's stamps are on the system timeline and the pipeline counts from [`clock_base`], so
+/// the two are related by an offset. The offset is taken from the first frame that carries a stamp
+/// and is never revised, which leaves every frame's *interval* exact — the differences of the
+/// pool's own stamps — and moves the whole timeline by one constant: the first frame's wait in
+/// the pool. A constant moves every frame the same amount, so it cannot make the picture judder;
+/// it is a shift of the video against the audio, and the video's timeline is measured against the
+/// audio's anyway.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureClock {
+    /// The pool's stamp for the first frame that carried one, and the pipeline time it was taken
+    /// at: the offset between the two timelines.
+    origin: Option<(Duration, Duration)>,
+}
+
+impl CaptureClock {
+    /// A clock that has not seen a frame yet.
+    pub fn new() -> Self {
+        Self { origin: None }
+    }
+
+    /// The pipeline time of a frame the pool stamped at `stamp`, taken at `now`.
+    ///
+    /// `stamp` is `None` when the pool did not give one, which is a failure of the capture
+    /// backend rather than of the clock: the moment the frame was taken is then the best there is,
+    /// and the frame's interval to its neighbour is the capture pool's own.
+    pub fn at(&mut self, stamp: Option<Duration>, now: Duration) -> Duration {
+        match self.origin {
+            // The offset is known: the frame's time is its own stamp, moved onto the pipeline's
+            // clock by that offset.
+            Some((origin_stamp, origin)) => match stamp {
+                Some(stamp) => origin + stamp.saturating_sub(origin_stamp),
+                None => now,
+            },
+            // The first frame with a stamp establishes the offset, which is its own pipeline time:
+            // the frame's time is the moment it was taken.
+            None => {
+                if let Some(stamp) = stamp {
+                    self.origin = Some((stamp, now));
+                }
+                now
+            }
+        }
     }
 }
 
@@ -743,6 +803,63 @@ mod tests {
         assert!(!is_silent_block(&[0, 0, 1, 0]));
         assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
         assert!(!is_silent_block(&[0, 0, 0, 0x80]));
+    }
+
+    // --- The capture clock ---
+
+    /// The frames' capture times are the pool's own stamps, moved onto the pipeline's clock.
+    ///
+    /// The intervals are the pool's: a frame captured 16.7ms after the one before it says so, and
+    /// the video's timeline is built on that.
+    #[test]
+    fn the_frames_intervals_are_the_capture_pools_own() {
+        let mut clock = CaptureClock::new();
+        // The first frame: its stamp and the moment it was taken.
+        let first = clock.at(
+            Some(Duration::from_millis(1_000)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            first,
+            Duration::from_millis(10),
+            "the first frame is the origin"
+        );
+        // The next one, 17ms later in the pool's time.
+        let second = clock.at(
+            Some(Duration::from_millis(1_017)),
+            Duration::from_millis(28),
+        );
+        assert_eq!(
+            second - first,
+            Duration::from_millis(17),
+            "the interval between two frames is the pool's own, not the delay in taking them",
+        );
+    }
+
+    /// A frame with no stamp falls back to the moment it was taken.
+    ///
+    /// The pool does not always give one, and a frame whose time is the moment it was asked for is
+    /// better than a frame whose time is a guess.
+    #[test]
+    fn a_frame_without_a_stamp_is_timed_by_when_it_was_taken() {
+        let mut clock = CaptureClock::new();
+        clock.at(Some(Duration::from_secs(1_000)), Duration::from_millis(10));
+        let unstamped = clock.at(None, Duration::from_millis(28));
+        assert_eq!(
+            unstamped,
+            Duration::from_millis(28),
+            "the moment it was taken is the best there is"
+        );
+    }
+
+    /// A pool that never stamps its frames leaves the capture on the times it took them.
+    #[test]
+    fn a_pool_that_never_stamps_leaves_the_capture_where_it_was() {
+        let mut clock = CaptureClock::new();
+        let first = clock.at(None, Duration::from_millis(10));
+        let second = clock.at(None, Duration::from_millis(28));
+        assert_eq!(first, Duration::from_millis(10));
+        assert_eq!(second, Duration::from_millis(28));
     }
 
     #[test]
