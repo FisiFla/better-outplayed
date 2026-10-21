@@ -9,9 +9,25 @@
 //! (`MFT_MESSAGE_SET_D3D_MANAGER` with a real device manager over a real D3D11 device of the
 //! capture path's kind). No window is opened, nothing is captured and no input is synthesised,
 //! which matters because the machine runs an anti-cheat.
+//!
+//! # When the encoder changes its type
+//!
+//! Media Foundation's encoders may change their output type mid-stream, and they report it by
+//! refusing to produce output: `ProcessOutput` answers `MF_E_TRANSFORM_STREAM_CHANGE`
+//! (0xC00D6D61, "a stream change has occurred. Output cannot be produced until the streams have
+//! been renegotiated"). The caller must then set a new output type — one the encoder itself
+//! offers — and set the input type again with it, or the encoder produces nothing for the rest of
+//! the stream.
+//!
+//! Both the recording and the throughput probe take their output through
+//! [`MftEncoder::take_output`], so both renegotiate, and there is one implementation of it rather
+//! than two that can disagree.
 
 use crate::ffmpeg::MFT_TIMEOUT;
-use crate::{RateControl, VideoCodec};
+use crate::{
+    choose_output_type, classify_output_failure, type_change_refusal, OutputFailure,
+    OutputTypeSpec, RateControl, VideoCodec,
+};
 use anyhow::{bail, Context, Result};
 use replayed_capture::GpuTexture;
 use std::time::{Duration, Instant};
@@ -48,10 +64,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
-    MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_LEVEL,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION,
 };
 
 /// What an encoder asked for, when its events were drained.
@@ -837,8 +853,12 @@ pub struct MftEncoder {
     /// over it is the dangling-association case Media Foundation warns about.
     device: ID3D11Device,
     size: (u32, u32),
-    /// The frame rate the types declare, which is also each sample's duration.
-    fps: u32,
+    /// The codec, the rate and the mode it was opened with.
+    ///
+    /// Kept because a renegotiation has to put the same ones back: the type an encoder offers
+    /// after it changed its own may declare a different rate, and the clip's size follows the
+    /// bitrate this pins.
+    params: MftEncoderParams,
     /// Which MFT was selected, for the log.
     pub encoder_name: String,
     /// Which input format it actually took, at this size.
@@ -846,6 +866,15 @@ pub struct MftEncoder {
     /// `ARGB32` is what WGC delivers, so taking it means the texture goes straight in; taking only
     /// `NV12` means something must convert, and it has to be on the GPU or the copy is moved, not removed.
     pub input_format: String,
+    /// The input subtype it took, so the input type can be set again.
+    ///
+    /// The input type is negotiated against the output type, and Media Foundation requires it to
+    /// be set again when the output type changes. Without this, an encoder that changed its
+    /// type would refuse every frame that followed with nothing to say why.
+    input_subtype: windows::core::GUID,
+    /// How many times it changed its type and was renegotiated, for the log and for the probe's
+    /// own failure message.
+    renegotiated: u32,
 }
 
 // SAFETY: the members are COM interfaces the `windows` crate marks `Send`+`Sync` for the ones that
@@ -853,6 +882,35 @@ pub struct MftEncoder {
 // to the encoder's own thread and used there, never concurrently. The device is additionally
 // expected to be multithread-protected by its owner once capture and this encoder both touch it.
 unsafe impl Send for MftEncoder {}
+
+/// How many times `ProcessOutput` may be asked again after the encoder changed its type.
+///
+/// A renegotiation that leads straight to another type change is a fault to report, not a loop to
+/// spin in: an encoder that will not settle is not going to settle on its own.
+const RENEGOTIATION_ATTEMPTS: u32 = 3;
+
+/// How many output types an encoder is asked for before the enumeration is given up on.
+///
+/// The enumeration ends with a refusal and that refusal is the end; the bound is here so that an
+/// MFT answering for ever cannot hang the probe.
+const MAX_OFFERED_TYPES: u32 = 16;
+
+/// The parts of an output type the choice between types is made in.
+///
+/// Plain data out of a COM object, so the choice can be made — and tested — off Windows.
+fn output_type_spec(media_type: &IMFMediaType) -> OutputTypeSpec {
+    // SAFETY: each call reads one attribute out of a type this function does not own.
+    let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }
+        .map(|guid| describe_subtype(&guid))
+        .unwrap_or_else(|_| "<no subtype>".to_string());
+    let size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .map(|packed| ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32))
+        .unwrap_or((0, 0));
+    let fps = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) }
+        .map(|packed| (packed >> 32) as u32)
+        .unwrap_or(0);
+    OutputTypeSpec { subtype, size, fps }
+}
 
 impl MftEncoder {
     /// Open a hardware encoder for `codec` on `device` for frames of `size`.
@@ -926,8 +984,8 @@ impl MftEncoder {
             let name = attribute_string(candidate, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|| "<unnamed MFT>".to_string());
             match configure_encoder(candidate, &manager, size, preferred, params) {
-                Ok((transform, input_format)) => {
-                    chosen = Some((transform, name, input_format));
+                Ok((transform, input_format, input_subtype)) => {
+                    chosen = Some((transform, name, input_format, input_subtype));
                     break;
                 }
                 // Not fatal: the hardware flag enumerates encoders this machine cannot instantiate.
@@ -937,7 +995,7 @@ impl MftEncoder {
         // SAFETY: as above.
         unsafe { CoTaskMemFree(Some(activates as *const std::ffi::c_void)) };
 
-        let (transform, encoder_name, input_format) = chosen.ok_or_else(|| {
+        let (transform, encoder_name, input_format, input_subtype) = chosen.ok_or_else(|| {
             anyhow::anyhow!(
                 "no hardware encoder here could be configured for {size:?}: {}",
                 refusals.join("; ")
@@ -953,9 +1011,11 @@ impl MftEncoder {
             events,
             device: device.clone(),
             size,
-            fps: params.fps,
+            params,
             encoder_name,
             input_format,
+            input_subtype,
+            renegotiated: 0,
         })
     }
 
@@ -1104,57 +1164,179 @@ impl MftEncoder {
     }
 
     /// Take one finished sample's bytes out of the encoder, and say how many samples it was.
+    ///
+    /// A type change is renegotiated and the call is made again. Media Foundation's own words for
+    /// `MF_E_TRANSFORM_STREAM_CHANGE` (0xC00D6D61) are "a stream change has occurred. Output
+    /// cannot be produced until the streams have been renegotiated", so there is nothing to take
+    /// until the new type is set, and asking again once it is set is what produces the frame the
+    /// encoder was working on.
     fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<u64> {
-        // `ManuallyDrop` because that is how the struct is generated: the sample is the caller's once
-        // taken, and leaving the field un-taken must not release it twice.
-        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: 0,
-            pSample: std::mem::ManuallyDrop::new(None),
-            dwStatus: 0,
-            pEvents: std::mem::ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        // SAFETY: one output stream, and the sample is the MFT's to allocate (an encoder that provides
-        // samples is the case here, so `dwFlags` is zero and the buffer carries no sample of ours). The
-        // slice is exactly one element, which is what this stream has, and `status` is the documented
-        // out-parameter for the per-stream flags.
-        let taken = unsafe {
-            self.transform
-                .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
-        };
-        // The MFT hands back a sample only when it has one; asking earlier is the documented
-        // `MF_E_TRANSFORM_NEED_MORE_INPUT`, not an error to propagate.
-        match taken {
-            Ok(()) => {}
-            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(0),
-            Err(err) => return Err(err).context("IMFTransform::ProcessOutput"),
+        let mut attempts = 0u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            // `ManuallyDrop` because that is how the struct is generated: the sample is the caller's once
+            // taken, and leaving the field un-taken must not release it twice.
+            let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: std::mem::ManuallyDrop::new(None),
+                dwStatus: 0,
+                pEvents: std::mem::ManuallyDrop::new(None),
+            };
+            let mut status = 0u32;
+            // SAFETY: one output stream, and the sample is the MFT's to allocate (an encoder that provides
+            // samples is the case here, so `dwFlags` is zero and the buffer carries no sample of ours). The
+            // slice is exactly one element, which is what this stream has, and `status` is the documented
+            // out-parameter for the per-stream flags.
+            let taken = unsafe {
+                self.transform
+                    .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
+            };
+            // The MFT hands back a sample only when it has one; asking earlier is the documented
+            // `MF_E_TRANSFORM_NEED_MORE_INPUT`, not an error to propagate.
+            match taken {
+                Ok(()) => {}
+                Err(err) => match classify_output_failure(err.code().0 as u32) {
+                    OutputFailure::NeedsInput => return Ok(0),
+                    // The encoder changed its output type. The streams have to be renegotiated
+                    // before anything can be produced; see `renegotiate_output_type`.
+                    OutputFailure::TypeChanged => {
+                        if attempts >= RENEGOTIATION_ATTEMPTS {
+                            return Err(err).context(format!(
+                                "the encoder changed its output type {attempts} times in a row and \
+                                 the streams could not be renegotiated"
+                            ));
+                        }
+                        self.renegotiate_output_type()?;
+                        continue;
+                    }
+                    OutputFailure::Failed => {
+                        return Err(err).context("IMFTransform::ProcessOutput")
+                    }
+                },
+            }
+            // SAFETY: taken exactly once, which is the contract for a `ManuallyDrop` field the callee
+            // filled in.
+            let Some(sample) = (unsafe { std::mem::ManuallyDrop::take(&mut buffer.pSample) })
+            else {
+                return Ok(0);
+            };
+            // SAFETY: this sample is the one the encoder just produced, and the contiguous buffer is a
+            // view of it that is locked and unlocked around the copy.
+            let bytes = unsafe { sample.ConvertToContiguousBuffer() }
+                .context("ConvertToContiguousBuffer")?;
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut length = 0u32;
+            // SAFETY: `data`/`length` are the out-parameters; the buffer is unlocked on every path below.
+            unsafe { bytes.Lock(&mut data, None, Some(&mut length)) }
+                .context("IMFMediaBuffer::Lock")?;
+            if !data.is_null() && length > 0 {
+                // SAFETY: `Lock` guarantees `length` readable bytes at `data` until `Unlock`.
+                produced.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(data, length as usize)
+                });
+            }
+            // SAFETY: pairs the `Lock` above.
+            unsafe {
+                let _ = bytes.Unlock();
+            };
+            // One frame in, one frame out: the count the throughput probe reports is the number of
+            // frames the encoder actually finished, not the number of frames it was handed.
+            return Ok(1);
         }
-        // SAFETY: taken exactly once, which is the contract for a `ManuallyDrop` field the callee
-        // filled in.
-        let Some(sample) = (unsafe { std::mem::ManuallyDrop::take(&mut buffer.pSample) }) else {
-            return Ok(0);
-        };
-        // SAFETY: this sample is the one the encoder just produced, and the contiguous buffer is a
-        // view of it that is locked and unlocked around the copy.
-        let bytes =
-            unsafe { sample.ConvertToContiguousBuffer() }.context("ConvertToContiguousBuffer")?;
-        let mut data: *mut u8 = std::ptr::null_mut();
-        let mut length = 0u32;
-        // SAFETY: `data`/`length` are the out-parameters; the buffer is unlocked on every path below.
-        unsafe { bytes.Lock(&mut data, None, Some(&mut length)) }
-            .context("IMFMediaBuffer::Lock")?;
-        if !data.is_null() && length > 0 {
-            // SAFETY: `Lock` guarantees `length` readable bytes at `data` until `Unlock`.
-            produced
-                .extend_from_slice(unsafe { std::slice::from_raw_parts(data, length as usize) });
+    }
+
+    /// The output types the encoder will now take, with the parts of each that matter here.
+    ///
+    /// Bounded, because an MFT that answered for ever would hang the probe: the enumeration ends
+    /// with a refusal, and that refusal is the end. The refusal is kept, because "the encoder
+    /// offers nothing" and "the encoder would not say" are different failures.
+    fn available_output_types(
+        &self,
+    ) -> (
+        Vec<(IMFMediaType, OutputTypeSpec)>,
+        Option<windows::core::Error>,
+    ) {
+        let mut offered = Vec::new();
+        let mut refused = None;
+        for index in 0..MAX_OFFERED_TYPES {
+            // SAFETY: the transform's own enumeration; the type it returns is owned by the caller.
+            let media_type = match unsafe { self.transform.GetOutputAvailableType(0, index) } {
+                Ok(media_type) => media_type,
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            };
+            let spec = output_type_spec(&media_type);
+            offered.push((media_type, spec));
         }
-        // SAFETY: pairs the `Lock` above.
-        unsafe {
-            let _ = bytes.Unlock();
+        (offered, refused)
+    }
+
+    /// Set the encoder's output type again, after it said it changed it.
+    ///
+    /// Media Foundation's contract, and every part of it is load-bearing:
+    ///
+    /// * the new type comes from the encoder itself (`GetOutputAvailableType`), because the encoder
+    ///   is the one that changed its mind; a type built here would be the type it just refused;
+    /// * the input type is set again with it, because the input type is negotiated against the
+    ///   output type and Media Foundation requires it to be set again when that changes. Without
+    ///   this the encoder refuses every frame that follows, with nothing to say why;
+    /// * the rate is pinned again, because the clip's size follows `encode.bitrate_kbps` and an
+    ///   encoder that changed its type may have gone back to its own default.
+    ///
+    /// Which type to set is [`choose_output_type`]'s answer, and that is not Windows-only: the
+    /// choice is a rule, and a rule that can only run on one platform is a rule only tested there.
+    fn renegotiate_output_type(&mut self) -> Result<()> {
+        let wanted = OutputTypeSpec {
+            subtype: self.params.codec.as_str().to_string(),
+            size: self.size,
+            fps: self.params.fps,
         };
-        // One frame in, one frame out: the count the throughput probe reports is the number of
-        // frames the encoder actually finished, not the number of frames it was handed.
-        Ok(1)
+        let (offered, refused) = self.available_output_types();
+        let specs: Vec<OutputTypeSpec> = offered.iter().map(|(_, spec)| spec.clone()).collect();
+        let Some(index) = choose_output_type(&specs, &wanted) else {
+            // What was on offer, in the driver's own spelling: a refusal that does not say what was
+            // on offer is a refusal the reader cannot act on.
+            for (media_type, _) in &offered {
+                tracing::warn!(
+                    "the output type it offers: {}",
+                    describe_media_type(media_type)
+                );
+            }
+            let refusal = type_change_refusal(&wanted, &specs);
+            match refused {
+                Some(err) => {
+                    bail!("{refusal}; asking it what it offers failed: {err}")
+                }
+                None => bail!("{refusal}"),
+            }
+        };
+        let (media_type, spec) = &offered[index];
+        // SAFETY: the type is one the transform itself offered, and it outlives the call.
+        unsafe { self.transform.SetOutputType(0, media_type, 0) }.with_context(|| {
+            format!("SetOutputType after the encoder changed its type (it offered {spec:?})")
+        })?;
+        // The input type again: it is negotiated against the output type, which has just changed.
+        let input = video_type(&self.input_subtype, self.size, self.params.fps)?;
+        // SAFETY: setting the input type on the transform's own input stream, with a type that
+        // outlives the call.
+        unsafe { self.transform.SetInputType(0, &input, 0) }.with_context(|| {
+            format!(
+                "SetInputType after the encoder changed its output type ({:?})",
+                self.input_subtype
+            )
+        })?;
+        pin_bitrate(&self.transform, self.params.bitrate_kbps, self.params.mode);
+        self.renegotiated = self.renegotiated.saturating_add(1);
+        tracing::info!(
+            encoder = %self.encoder_name,
+            size = ?self.size,
+            fps = self.params.fps,
+            subtype = %spec.subtype,
+            "the encoder changed its output type and the stream was renegotiated"
+        );
+        Ok(())
     }
 
     /// Ask for the next frame to be a keyframe.
@@ -1202,7 +1384,7 @@ impl MftEncoder {
         // SAFETY: setting the sample's timestamps; 100ns units are what Media Foundation counts in.
         unsafe {
             sample.SetSampleTime(pts_ms.saturating_mul(10_000))?;
-            sample.SetSampleDuration(10_000_000 / i64::from(self.fps.max(1)))?;
+            sample.SetSampleDuration(10_000_000 / i64::from(self.params.fps.max(1)))?;
         }
         // SAFETY: the encoder's own input stream, with a sample that outlives the call.
         unsafe { self.transform.ProcessInput(0, &sample, 0) }.context("IMFTransform::ProcessInput")
@@ -1255,7 +1437,7 @@ fn configure_encoder(
     size: (u32, u32),
     preferred: Option<DXGI_FORMAT>,
     params: MftEncoderParams,
-) -> Result<(IMFTransform, String)> {
+) -> Result<(IMFTransform, String, windows::core::GUID)> {
     // SAFETY: this `IMFActivate`'s own method; the transform it returns is returned to the caller.
     let transform: IMFTransform = unsafe { activate.ActivateObject() }
         .context("IMFActivate::ActivateObject(IMFTransform)")?;
@@ -1281,7 +1463,9 @@ fn configure_encoder(
         // SAFETY: setting the input type on a configured transform, with a media type that outlives
         // the call. A refusal here is expected for some formats at some sizes.
         match unsafe { transform.SetInputType(0, &input, 0) } {
-            Ok(()) => return Ok((transform, name.to_string())),
+            // The subtype comes back with the name: the input type has to be set again if the
+            // output type ever changes, and the name alone cannot be set again.
+            Ok(()) => return Ok((transform, name.to_string(), *subtype)),
             Err(err) => refusals.push(format!("{name}: {err}")),
         }
     }
@@ -2176,6 +2360,12 @@ pub struct MftThroughput {
     pub encoder_name: String,
     /// Which input format it took. The texture's own format, so the pixels never leave the GPU.
     pub input_format: String,
+    /// How many times the encoder changed its output type and was renegotiated.
+    ///
+    /// Reported because it changes what the number means: a rate measured across a renegotiation
+    /// is the encoder's rate on both sides of it, and a reader who knows it happened can trust it
+    /// more than one who does not.
+    pub renegotiations: u32,
 }
 
 /// How long the encoder is given to settle before the measured window opens.
@@ -2199,6 +2389,23 @@ const PROBE_SLACK: Duration = Duration::from_secs(5);
 /// relative to the sleep. Yielding every so often keeps the machine's other threads (the
 /// encoder's own, and the game) from waiting behind the spin.
 const SPIN_ROUNDS: u32 = 4_096;
+
+/// What to say about the type changes an encoder made, in a failure message.
+///
+/// Empty when there were none, so a message that has nothing to add does not carry a sentence
+/// about nothing. Said at all when there were: a probe that failed after the encoder changed its
+/// type failed for a reason the reader cannot guess, and "the encoder changed its type" is the
+/// difference between a machine that is too slow and a machine that renegotiated.
+fn renegotiation_note(renegotiated: u32) -> String {
+    if renegotiated == 0 {
+        String::new()
+    } else {
+        format!(
+            " The encoder changed its output type {renegotiated} time(s) and the stream was \
+             renegotiated."
+        )
+    }
+}
 
 /// Measure how many frames per second this machine's hardware encoder encodes at `size`.
 ///
@@ -2259,7 +2466,8 @@ pub fn measure_encode_fps(
             bail!(
                 "the hardware encoder did not finish a {budget:?} window: it was handed {fed} \
                  frames and finished {frames}, and the deadline (a {WARM_UP:?} warm-up, the \
-                 window and a {PROBE_SLACK:?} slack) passed. This is a bound, not a measurement"
+                 window and a {PROBE_SLACK:?} slack) passed.{} This is a bound, not a measurement",
+                renegotiation_note(encoder.renegotiated)
             );
         }
         match encoder.next_event()? {
@@ -2303,8 +2511,9 @@ pub fn measure_encode_fps(
     let Some((start, end)) = window else {
         bail!(
             "the hardware encoder finished no frames to measure ({size:?} at {fps}fps): it was \
-             handed {fed} frames and none of them came back. The encoder is not usable at this \
-             size, so no rate can be declared for it"
+             handed {fed} frames and none of them came back.{} The encoder is not usable at this \
+             size, so no rate can be declared for it",
+            renegotiation_note(encoder.renegotiated)
         );
     };
     let window = end.duration_since(start);
@@ -2320,6 +2529,7 @@ pub fn measure_encode_fps(
         window,
         encoder_name,
         input_format,
+        renegotiations: encoder.renegotiated,
     })
 }
 
@@ -2451,6 +2661,106 @@ mod tests {
             highest <= lowest * 2.0,
             "the rate must not swing by more than two to one between runs on an idle machine: \
              {lowest:.1}fps to {highest:.1}fps over {RUNS} runs at {size:?}"
+        );
+    }
+
+    /// The codes the crate root classifies are the SDK's own codes.
+    ///
+    /// The classification lives in the crate root, where the `windows` crate is not available at
+    /// all, so the numbers are written out there. This is where they are checked against the SDK:
+    /// a code that was written down wrong would classify every error as a failure, which is the
+    /// bug this whole change is about.
+    #[test]
+    fn the_output_failure_codes_are_the_sdk_s_own() {
+        use windows::Win32::Media::MediaFoundation::{
+            MF_E_TRANSFORM_NEED_MORE_INPUT as SDK_NEED_MORE_INPUT,
+            MF_E_TRANSFORM_STREAM_CHANGE as SDK_STREAM_CHANGE,
+        };
+        assert_eq!(
+            crate::MF_STREAM_CHANGE,
+            SDK_STREAM_CHANGE.0 as u32,
+            "the stream-change code the crate classifies is the SDK's"
+        );
+        assert_eq!(
+            crate::MF_NEED_MORE_INPUT,
+            SDK_NEED_MORE_INPUT.0 as u32,
+            "the need-more-input code the crate classifies is the SDK's"
+        );
+    }
+
+    /// The renegotiation is a legal sequence of calls on a live encoder, and the encoder keeps
+    /// encoding afterwards.
+    ///
+    /// This is the path a type change takes: `ProcessOutput` answers
+    /// `MF_E_TRANSFORM_STREAM_CHANGE` (0xC00D6D61, "a stream change has occurred. Output cannot
+    /// be produced until the streams have been renegotiated"), the output type is set again from
+    /// the types the encoder itself offers, the input type is set again with it, and the exchange
+    /// carries on. Before this, the type change ended the exchange: the probe could not measure,
+    /// and the recording stopped encoding.
+    ///
+    /// Windows only, and it needs a machine with a hardware encoder that takes a GPU texture: the
+    /// calls are Media Foundation's, and there is nothing to renegotiate without an encoder.
+    ///
+    /// What it cannot prove is that a particular encoder will change its type, or when: that is
+    /// the machine's business, and the machine that reported the failure is the one that would
+    /// show it. What it does prove is that the renegotiation itself works, on a live transform,
+    /// which is the part that had never been run.
+    #[test]
+    fn an_encoder_can_be_renegotiated_and_keeps_encoding_afterwards() {
+        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
+        if !encoders.iter().any(|encoder| encoder.accepts_d3d11) {
+            eprintln!(
+                "this machine has no hardware encoder that takes a GPU texture: there is nothing \
+                 to renegotiate"
+            );
+            return;
+        }
+        // A size the encoder is known to take: the warm-up size the HEVC path uses.
+        let size = WARM_UP_SIZE;
+        let device = create_capture_kind_device().expect("a capture-kind device");
+        let mut encoder = MftEncoder::open(
+            &device,
+            size,
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+            MftEncoderParams {
+                codec: VideoCodec::H264,
+                bitrate_kbps: PROBE_BITRATE_KBPS,
+                fps: FRAME_RATE.0,
+                mode: RateControl::Cbr,
+            },
+        )
+        .expect("a hardware encoder that takes a texture");
+
+        // The renegotiation itself: the type the encoder offers, then the input type again.
+        encoder
+            .renegotiate_output_type()
+            .expect("the encoder offers a type it can be renegotiated to");
+        assert_eq!(
+            encoder.renegotiated, 1,
+            "the renegotiation is counted, so a probe that failed later can say it happened"
+        );
+
+        // And the encoder still encodes afterwards: a renegotiation that broke the encoder would
+        // be worse than the type change it was meant to answer. This is the exchange the
+        // recording uses, not the probe's.
+        let texture =
+            synthetic_capture_texture(&device, size, dxgi_for_input(&encoder.input_format))
+                .expect("a texture in the format the encoder takes");
+        encoder.start().expect("the encoder starts");
+        let mut produced = 0usize;
+        for index in 0..10 {
+            let bytes = encoder
+                .encode_texture(&texture, i64::from(index) * 33, Duration::from_secs(2))
+                .expect("the encoder takes the frame");
+            produced += bytes.len();
+        }
+        produced += encoder
+            .finish(Duration::from_secs(2))
+            .expect("the drain")
+            .len();
+        assert!(
+            produced > 0,
+            "the encoder produced no bitstream after the renegotiation, so it did not survive it"
         );
     }
 }

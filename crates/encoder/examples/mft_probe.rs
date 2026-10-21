@@ -8,6 +8,11 @@
 //! ```text
 //! cargo run --release -p replayed-encoder --example mft_probe
 //! ```
+//!
+//! The encoder may change its output type mid-stream — Media Foundation says so by refusing to
+//! produce output until the streams are renegotiated — and the library renegotiates for this
+//! example and for the recording alike, so a type change is a renegotiation rather than a dead
+//! encoder.
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {

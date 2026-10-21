@@ -68,6 +68,26 @@
 //! * It measures the machine's spare CPU as much as the encoder's speed, because the raw-pixel
 //!   path is a CPU conversion: on a machine that is also running a game, that number moves.
 //!
+//! # When the encoder changes its type
+//!
+//! Media Foundation's encoders may change their output type mid-stream, and they say so by
+//! refusing to produce output: `ProcessOutput` answers `MF_E_TRANSFORM_STREAM_CHANGE`
+//! (0xC00D6D61, "a stream change has occurred. Output cannot be produced until the streams have
+//! been renegotiated"). A caller that does not renegotiate gets nothing from that encoder ever
+//! again, which is why a probe that never set a new type could not measure at all on a machine
+//! whose encoder renegotiates.
+//!
+//! The renegotiation is in the `mft` module, and it is the one the recording uses as well: the
+//! output type the encoder itself offers is set again, the input type is set again with it, and
+//! the exchange carries on. The choice between the types on offer is a rule that does not need
+//! Windows to be tested on, so it lives outside the Windows-only module (`choose_output_type`)
+//! and is tested on every host.
+//!
+//! When the renegotiation cannot be done — the encoder offers nothing for this codec at this
+//! size — the probe fails and says what was on offer, and the recording falls back to the
+//! configured rate (`replayed_recorder::fps::decide_rate`). A plausible-looking number would be
+//! worse than none: it would be written into the capture pacer and the encoder's frame rate.
+//!
 //! # Bounds
 //!
 //! The raw-pixel path feeds frames for [`PROBE_BUDGET`] and the child has
@@ -200,6 +220,16 @@ fn measure_hardware_encoder_fps(
         cfg.rate_control,
         budget,
     )?;
+    if measured.renegotiations > 0 {
+        // Said out loud, because it changes what the number is: the encoder changed its output
+        // type during the measurement and the stream was renegotiated, which is a thing that
+        // used to end the measurement and the recording.
+        tracing::info!(
+            "the hardware encoder changed its output type {} time(s) during the measurement, and \
+             the stream was renegotiated",
+            measured.renegotiations
+        );
+    }
     Ok(ThroughputMeasurement {
         fps: measured.fps,
         frames: measured.frames,

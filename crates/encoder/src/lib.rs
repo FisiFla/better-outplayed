@@ -236,6 +236,111 @@ impl RateControl {
 /// must not offer a mode the encoder cannot be told to use.
 pub const MFT_RATE_CONTROLS: [RateControl; 2] = [RateControl::Cbr, RateControl::Vbr];
 
+/// The Media Foundation code for "a stream change has occurred. Output cannot be produced until
+/// the streams have been renegotiated" (`MF_E_TRANSFORM_STREAM_CHANGE`).
+///
+/// The SDK's name for it is `MF_E_TRANSFORM_STREAM_CHANGE`; there is no `MF_E_TRANSFORM_TYPE_CHANGE`
+/// in the SDK, and 0xC00D6D61 is this code. It is a number here because the `windows` crate's
+/// `HRESULT` is not available off Windows, and the decision it drives has to be testable there.
+pub(crate) const MF_STREAM_CHANGE: u32 = 0xC00D6D61;
+
+/// The Media Foundation code for "the transform needs more input" (`MF_E_TRANSFORM_NEED_MORE_INPUT`).
+pub(crate) const MF_NEED_MORE_INPUT: u32 = 0xC00D6D72;
+
+/// What an error from an encoder's output call means, and what to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFailure {
+    /// It has no output yet and wants more input. Not a failure at all: asking before the
+    /// encoder has anything is the documented answer.
+    NeedsInput,
+    /// It changed its output type. The streams have to be renegotiated before anything can be
+    /// produced, and asking again afterwards is what produces the frame.
+    TypeChanged,
+    /// Something else went wrong. The driver's own words are the report.
+    Failed,
+}
+
+/// What an error code from an encoder's output call means.
+///
+/// The classification is here, and not in the Windows-only module, because it is the decision the
+/// bug was in: a type change is not a failure to report but a renegotiation to perform, and a
+/// caller that cannot tell the two apart can do neither.
+pub fn classify_output_failure(code: u32) -> OutputFailure {
+    match code {
+        MF_NEED_MORE_INPUT => OutputFailure::NeedsInput,
+        MF_STREAM_CHANGE => OutputFailure::TypeChanged,
+        _ => OutputFailure::Failed,
+    }
+}
+
+/// An output type an encoder offers, in the terms the choice between types is made in.
+///
+/// Plain data on purpose. The Media Foundation calls that produce these are Windows-only, but the
+/// choice between them is not, and a choice that can only be made on one platform is a choice
+/// that is only ever tested on one platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTypeSpec {
+    /// The subtype's name, as the codec spells it (`"h264"`) or as the encoder's registry spells
+    /// it (`"H264"`). Compared without regard to case, because both spellings are the SDK's and
+    /// the codec's, not this app's.
+    pub subtype: String,
+    /// The frame size the type encodes.
+    pub size: (u32, u32),
+    /// The frame rate the type declares.
+    pub fps: u32,
+}
+
+/// Which of the offered output types to set, when an encoder says it changed its type.
+///
+/// The rules, and why each is what it is:
+///
+/// * the **codec and the size are requirements**: a type for another codec is not this
+///   recording's stream, and a type at another size does not describe the texture that goes in;
+/// * the **frame rate is a preference**: an encoder that changed its type may have settled on a
+///   rate of its own, and the recording follows the encoder rather than arguing with it.
+///
+/// `None` when no offer is usable. The caller must then refuse out loud rather than set a type
+/// it cannot encode with: a stream in the wrong codec or at the wrong size is not a recording.
+pub fn choose_output_type(offers: &[OutputTypeSpec], wanted: &OutputTypeSpec) -> Option<usize> {
+    let usable = |offer: &OutputTypeSpec| {
+        offer.subtype.eq_ignore_ascii_case(&wanted.subtype) && offer.size == wanted.size
+    };
+    let first = offers.iter().position(usable)?;
+    // Two types can share a codec and a size and differ only in the rate they declare, so the
+    // rate the recording asked for wins whenever the encoder offers it.
+    offers
+        .iter()
+        .position(|offer| usable(offer) && offer.fps == wanted.fps)
+        .or(Some(first))
+}
+
+/// What to say when an encoder changed its output type and none of the types it offers is usable.
+///
+/// A message rather than an error: the caller holds the driver's own words for why the set
+/// failed, and this says what was needed and what was on offer, which is what makes the refusal
+/// readable rather than merely a refusal.
+pub fn type_change_refusal(wanted: &OutputTypeSpec, offers: &[OutputTypeSpec]) -> String {
+    let offered = if offers.is_empty() {
+        "no output type at all".to_string()
+    } else {
+        offers
+            .iter()
+            .map(|offer| {
+                format!(
+                    "{} {}x{} at {}fps",
+                    offer.subtype, offer.size.0, offer.size.1, offer.fps
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "the encoder changed its output type and the stream cannot be renegotiated: it needs {} \
+         at {}x{}, and it offers {offered}",
+        wanted.subtype, wanted.size.0, wanted.size.1
+    )
+}
+
 /// The PCM sample encoding an audio input is declared with (`-f <name>`).
 ///
 /// A type rather than a bare string: the audio timeline is derived from the byte count, so a
@@ -664,5 +769,134 @@ mod tests {
             assert!(!qsv.contains(name), "{name} is in two families' lists");
             assert!(!amf.contains(name), "{name} is in two families' lists");
         }
+    }
+
+    // ---- the output type to set when an encoder says it changed its type ---------------
+
+    /// A type change is a renegotiation, not a failure.
+    ///
+    /// This is the decision the bug was in: an output call answering "a stream change has
+    /// occurred" (0xC00D6D61) used to travel the same road as every other error, so the probe
+    /// could not measure on a machine whose encoder renegotiates, and the recording stopped
+    /// encoding on one.
+    #[test]
+    fn a_type_change_is_a_renegotiation_and_not_a_failure() {
+        assert_eq!(
+            classify_output_failure(MF_STREAM_CHANGE),
+            OutputFailure::TypeChanged,
+            "the type change has to be told apart from the failures, or nothing renegotiates it"
+        );
+        assert_eq!(
+            classify_output_failure(MF_NEED_MORE_INPUT),
+            OutputFailure::NeedsInput,
+            "asking before the encoder has output is not a failure"
+        );
+        assert_eq!(
+            classify_output_failure(0xC00D6D60),
+            OutputFailure::Failed,
+            "anything else is the driver's own words to report"
+        );
+    }
+
+    /// The type the recording needs, as the codec spells it.
+    fn wanted_h264() -> OutputTypeSpec {
+        OutputTypeSpec {
+            subtype: "h264".to_string(),
+            size: (2560, 1080),
+            fps: 60,
+        }
+    }
+
+    /// An offered type, in the encoder's own spelling.
+    fn offer(subtype: &str, size: (u32, u32), fps: u32) -> OutputTypeSpec {
+        OutputTypeSpec {
+            subtype: subtype.to_string(),
+            size,
+            fps,
+        }
+    }
+
+    /// The type that matches the codec and the size is the one to set, and the rate the
+    /// recording asked for wins over another rate at the same codec and size.
+    ///
+    /// The codec and the size are requirements: a type at another size does not describe the
+    /// texture that goes in, and a type for another codec is not this recording's stream. The
+    /// rate is a preference, because an encoder that changed its type may have settled on a rate
+    /// of its own.
+    #[test]
+    fn the_output_type_to_set_is_the_one_that_matches_the_codec_and_the_size() {
+        let wanted = wanted_h264();
+        let offers = vec![
+            offer("H264", (1920, 1080), 60),
+            offer("H264", (2560, 1080), 30),
+            offer("H264", (2560, 1080), 60),
+        ];
+        assert_eq!(
+            choose_output_type(&offers, &wanted),
+            Some(2),
+            "the type at the wanted size, declaring the wanted rate, is the one to set"
+        );
+    }
+
+    /// Nothing usable is nothing chosen: the caller has to refuse rather than set a type the
+    /// encoder will not encode with.
+    #[test]
+    fn no_usable_offer_means_no_type_is_chosen() {
+        let wanted = wanted_h264();
+        // Another size: the texture does not fit it.
+        assert_eq!(
+            choose_output_type(&[offer("H264", (1920, 1080), 60)], &wanted),
+            None,
+            "a type at another size does not describe the texture that goes in"
+        );
+        // Another codec: not this recording's stream.
+        assert_eq!(
+            choose_output_type(&[offer("HEVC", (2560, 1080), 60)], &wanted),
+            None,
+            "a type for another codec is not this recording's stream"
+        );
+        // Nothing offered at all.
+        assert_eq!(
+            choose_output_type(&[], &wanted),
+            None,
+            "an encoder that offers no type cannot be renegotiated"
+        );
+    }
+
+    /// The subtype's spelling is the SDK's and the codec's, not this app's: the registry says
+    /// "H264" and the codec says "h264", and they are the same type.
+    #[test]
+    fn the_subtypes_spelling_does_not_have_to_match_exactly() {
+        let wanted = wanted_h264();
+        assert_eq!(
+            choose_output_type(&[offer("H264", (2560, 1080), 60)], &wanted),
+            Some(0),
+            "the registry's spelling of the codec's subtype is the same type"
+        );
+    }
+
+    /// A refusal has to say what was needed and what was on offer, or it is only a refusal.
+    #[test]
+    fn the_refusal_names_what_was_needed_and_what_was_offered() {
+        let wanted = wanted_h264();
+        let offers = vec![
+            offer("H264", (1920, 1080), 60),
+            offer("HEVC", (2560, 1080), 60),
+        ];
+        let message = type_change_refusal(&wanted, &offers);
+        assert!(
+            message.contains("h264") && message.contains("2560x1080"),
+            "the message names what the recording needs: {message}"
+        );
+        assert!(
+            message.contains("1920x1080") && message.contains("HEVC"),
+            "and what was on offer instead: {message}"
+        );
+
+        let nothing = type_change_refusal(&wanted, &[]);
+        assert!(
+            nothing.contains("no output type at all"),
+            "an encoder that offers nothing says so rather than listing nothing: {nothing}"
+        );
     }
 }
