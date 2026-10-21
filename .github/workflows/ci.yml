@@ -184,7 +184,16 @@ jobs:
         # The suite the project treats as its gate. `replayed-encoder/test-encoders`
         # turns on the software-encoder path the encoder, replay and CLI integration
         # tests build against; a bare `cargo test` would skip those targets.
-        run: cargo test --workspace --features replayed-encoder/test-encoders
+        #
+        # `replayed-cli/test-encoders` is the CLI package's own flag, and it is the one
+        # that lets the CLI's self-test drive the *synthetic* capture and audio sources.
+        # Without it the self-test falls back to the platform's — on a Windows runner
+        # that means the real WGC and WASAPI, and the runner's default render endpoint
+        # is a virtual device whose whole-endpoint open faults the test binary outright
+        # (0xc0000005). With it, the test drives the sources its own documentation says
+        # it drives, and the real path stays available to a person on real hardware
+        # through `REPLAYED_REAL_SOURCES=1`.
+        run: cargo test --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
 
       - name: Windows cross-check (cross-checkable crates only)
         # Type / API / ownership checking of the Windows-only code from macOS. The
@@ -203,7 +212,7 @@ jobs:
           cargo check
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
-          --features replayed-encoder/test-encoders
+          --features replayed-encoder/test-encoders,replayed-cli/test-encoders
           --tests
           --target x86_64-pc-windows-msvc
 
@@ -272,7 +281,7 @@ jobs:
         # without it — an integration test is its own crate, and `cfg(test)` does not
         # reach the library it links.
         run: |
-          cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders -- -D warnings
+          cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
           cd apps/desktop/src-tauri && cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (Windows target; cross-checkable crates only)
@@ -295,7 +304,7 @@ jobs:
           cargo clippy
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
-          --features replayed-encoder/test-encoders
+          --features replayed-encoder/test-encoders,replayed-cli/test-encoders
           --all-targets
           --target x86_64-pc-windows-msvc
           -- -D warnings
@@ -353,7 +362,7 @@ jobs:
           # was doing would be lost with everything else. The file is uploaded below
           # whatever happens.
           REPLAYED_TEST_LOG: ${{ github.workspace }}\target\self_test_clip.log
-        run: cargo test --workspace --features replayed-encoder/test-encoders
+        run: cargo test --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
       - name: Upload the self-test's log
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -376,7 +385,7 @@ jobs:
         # SQLite needs an MSVC C toolchain. The same rules as the macOS job: warnings
         # are fatal and no lint is switched off on the command line. The feature flag
         # is the one the test suite above uses, for the reason given there.
-        run: cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders -- -D warnings
+        run: cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
       - name: Clippy (desktop shell)
         working-directory: apps/desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings

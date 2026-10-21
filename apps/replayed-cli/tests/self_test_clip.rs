@@ -11,6 +11,22 @@
 //! reachable because this package's dev dependencies enable `test-encoders`, which no shipping
 //! build does.
 //!
+//! The sources are synthetic because the real ones are a machine's display and its speakers. A
+//! CI runner has neither, and the virtual render endpoint it does have is a device whose
+//! whole-endpoint open has taken this test binary down with it: an access violation inside
+//! the WASAPI open, which no Rust code can catch, so the process dies with the runner's exit
+//! code instead of a failure anybody can read. The synthetic path has nothing that can fault.
+//!
+//! The synthetic sources are selectable only in a build carrying `replayed-cli`'s own
+//! `test-encoders` feature, which the suite's feature set does not carry. Where they cannot be
+//! selected the platform's sources stand in, and off Windows those are the same synthetic pair;
+//! on Windows they are the real ones, and the run is skipped rather than risk them.
+//!
+//! The real path is still exercised, by a person on a real machine: the second test in this
+//! file runs it when `REPLAYED_REAL_SOURCES=1` is set. That run is opt-in for the same reason
+//! — on a machine whose default render endpoint is a headless or virtual device, that open
+//! faults hard and takes the test binary down with it.
+//!
 //! Gating: not `#![cfg(feature = "test-encoders")]`, deliberately: that feature is enabled on
 //! the encoder package, so a `cfg` gate here would quietly drop the test (the trap `post_roll.rs`
 //! documents).
@@ -31,6 +47,9 @@ const WINDOW_MS: u64 = 3_000;
 /// What `--self-test-clip-after` asks for. Above the window on purpose, so the wait under
 /// test is the *requested* one rather than the pre-roll floor (which the unit tests pin).
 const SELF_TEST_AFTER_S: u64 = 4;
+
+/// The environment variable that asks for the real-source run.
+const REAL_SOURCES_ENV: &str = "REPLAYED_REAL_SOURCES";
 
 /// The config the run uses. Small and fast: the point is the trigger, not a soak.
 const CONFIG: &str = r#"
@@ -66,24 +85,129 @@ lol_poll_enabled = false
 gsi_port = 0
 "#;
 
+/// Whether this build can select the synthetic sources.
+///
+/// `replayed-cli` gates `--dev-stub-sources` behind its own `test-encoders` feature: a build
+/// without it must not be able to record nothing while looking like a recording. The suite's
+/// feature set does not carry that feature, so the answer is usually "no" — and off Windows
+/// the platform's sources *are* the synthetic pair, so the run is the same one either way.
+const CAN_SELECT_SYNTHETIC_SOURCES: bool = cfg!(feature = "test-encoders");
+
+/// Which sources a run captures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sources {
+    /// The synthetic capture and audio sources: a test pattern and silence, no display and no
+    /// speakers.
+    Synthetic,
+    /// The platform's own: the display and the render endpoint, on Windows.
+    Real,
+}
+
+impl Sources {
+    /// The `--dev-stub-sources` flag this run carries.
+    ///
+    /// The synthetic sources are selectable only in a build that can select them (see
+    /// [`CAN_SELECT_SYNTHETIC_SOURCES`]). Where they cannot be selected the platform's
+    /// sources stand in, and off Windows those are the same synthetic pair.
+    fn stub_sources(self) -> bool {
+        matches!(self, Sources::Synthetic) && CAN_SELECT_SYNTHETIC_SOURCES
+    }
+}
+
+/// The runs in this file, one at a time.
+///
+/// The clip hotkey is a system-wide registration on Windows, so two runs at once would fight
+/// over `Ctrl+F8`, and the log buffer is shared, so one run's lines would answer for the
+/// other's. A run that panics must not stop the other one from running, so a poisoned lock is
+/// taken anyway.
+static RUN: Mutex<()> = Mutex::new(());
+
+/// The self-test trigger, over the synthetic sources.
+///
+/// Everything either side of the hotkey is exercised: the wait for the ring, the trigger, the
+/// splice, the clip on disk.
 #[test]
 fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
+    // The synthetic sources, so the run never opens a display or an audio endpoint.
+    //
+    // They are selectable only in a build carrying `replayed-cli`'s own `test-encoders`
+    // feature. Where they cannot be selected the platform's sources stand in, and off
+    // Windows those are the same synthetic pair; on Windows they are the real ones, and the
+    // whole-endpoint open on a runner's virtual render endpoint has taken this test binary
+    // down with it. An environment limit, not a defect: skip loudly rather than fake a
+    // device.
+    if !CAN_SELECT_SYNTHETIC_SOURCES && cfg!(windows) {
+        eprintln!(
+            "SKIPPED: this build cannot select the synthetic sources (replayed-cli's \
+             `test-encoders` feature is off) and the real ones are what took the Windows \
+             runner's test binary down; build with --features replayed-cli/test-encoders to \
+             run it here"
+        );
+        return;
+    }
+    run_the_self_test(Sources::Synthetic);
+}
+
+/// The same run over the real capture path, for a person on a real machine.
+///
+/// Opt-in: `REPLAYED_REAL_SOURCES=1 cargo test -p replayed-cli --test self_test_clip`.
+///
+/// The hazard, plainly: on a machine whose default render endpoint is a headless or virtual
+/// device, the whole-endpoint audio open can fault hard and take the test binary down with it
+/// — an access violation, not a failure a test can report. That is exactly what the CI
+/// runner did, which is why this run is opt-in and the synthetic one is not.
+#[test]
+fn the_self_test_trigger_writes_a_clip_through_the_real_capture_path() {
+    if !real_sources_requested() {
+        eprintln!(
+            "SKIPPED: the real-source run was not requested (set {REAL_SOURCES_ENV}=1 to ask \
+             for it): the real capture path opens the machine's display and its render \
+             endpoint, and a virtual endpoint has taken this test binary down with it"
+        );
+        return;
+    }
+    if !cfg!(windows) {
+        eprintln!(
+            "SKIPPED: the real capture path is Windows-only (WGC and WASAPI); this platform's \
+             sources are the synthetic ones, which the other test in this file already runs"
+        );
+        return;
+    }
+    run_the_self_test(Sources::Real);
+}
+
+/// Whether the real-source run was asked for.
+fn real_sources_requested() -> bool {
+    matches!(std::env::var(REAL_SOURCES_ENV), Ok(value) if !value.is_empty() && value != "0")
+}
+
+/// The run both tests make, and the assertions both make.
+///
+/// One body, so the opt-in real-source run cannot drift from the synthetic one: it is the
+/// same run with a different answer to one question.
+fn run_the_self_test(sources: Sources) {
+    // One run at a time: the hotkey is a system-wide registration, and the log is shared.
+    let _run = RUN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let app_dir = tempfile::tempdir().expect("a scratch application data directory");
     std::fs::write(app_dir.path().join("config.toml"), CONFIG).expect("writing config.toml");
 
     let logs = capture_logs();
+    // Only this run's lines: the buffer belongs to the process, and the other run's lines
+    // would answer for this one's.
+    let from = logs.lock().expect("the log sink is not poisoned").len();
     let started = Instant::now();
     let result = run_buffer_with(BufferOptions {
         app_dir: app_dir.path().to_path_buf(),
         self_test_clip_after: Some(SELF_TEST_AFTER_S),
         dev_software_encoder: true,
-        // The file decides the mode (its `[recorder] mode`), and the real sources are used: this test
-        // is about the shipping path.
+        // The file decides the mode (its `[recorder] mode`).
         mode: None,
-        stub_sources: false,
+        stub_sources: sources.stub_sources(),
     });
-    // A headless CI runner has no audio render endpoint, so the real audio source cannot start
-    // there. An environment limit, not a defect: skip loudly rather than fake a device.
+    // A machine with no audio render endpoint cannot open the real one, so the real audio
+    // source cannot start there. An environment limit, not a defect: skip loudly rather than
+    // fake a device. The synthetic path never gets here.
     if let Err(err) = &result {
         if format!("{err:#}").contains("GetDefaultAudioEndpoint") {
             eprintln!("SKIPPED: no default audio render endpoint on this machine: {err:#}");
@@ -144,7 +268,7 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
     // The lines produced by the hotkey's own trigger path: the `hotkey pressed:` line (media time,
     // wall time, drift) and the `wrote` line. The self-test line beside them says what triggered
     // it, so it cannot be mistaken for a keypress.
-    let log = logs.lock().expect("the log sink is not poisoned").clone();
+    let log = logs.lock().expect("the log sink is not poisoned")[from..].to_string();
     assert!(
         log.contains("no keyboard or mouse input is sent, simulated or injected"),
         "the self-test line must say that no input is involved; log:\n{log}"
@@ -179,6 +303,25 @@ fn the_self_test_trigger_writes_a_clip_through_the_hotkey_path() {
         log.contains("buffering 2s pre / 1s post at 10fps; press Ctrl+F8 to clip"),
         "the shipping startup line must be unchanged; log:\n{log}"
     );
+    // The synthetic run opened no real device. The real one is the opposite: a display and a
+    // render endpoint, which is the whole point of the opt-in run.
+    if sources == Sources::Synthetic {
+        assert!(
+            !log.contains("opening the WASAPI game-audio backend")
+                && !log.contains("WGC capture started"),
+            "the synthetic run must not open a real audio endpoint or a real display capture; \
+             log:\n{log}"
+        );
+        // The synthetic sources were the ones the run used, not the platform's. The CLI says
+        // so when it selects them, and that line is the only thing that tells the two apart
+        // on a platform whose own sources are the synthetic pair anyway.
+        if CAN_SELECT_SYNTHETIC_SOURCES {
+            assert!(
+                log.contains("--dev-stub-sources"),
+                "the run must have selected the synthetic sources; log:\n{log}"
+            );
+        }
+    }
 }
 
 /// The run's tracing output, for the assertions above.
@@ -211,9 +354,7 @@ fn log_file() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("REPLAYED_TEST_LOG") {
         return Some(std::path::PathBuf::from(path));
     }
-    Some(
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("self_test_clip.log"),
-    )
+    Some(std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("self_test_clip.log"))
 }
 
 /// `tracing_subscriber::fmt`'s writer: appends into the shared string.
@@ -233,7 +374,6 @@ impl Write for SinkWriter {
         // and to a file, which survives even the runner losing the child's output.
         eprint!("{text}");
         if let Some(path) = log_file() {
-            use std::io::Write as _;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
