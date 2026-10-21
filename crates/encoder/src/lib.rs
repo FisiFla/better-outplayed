@@ -16,7 +16,9 @@ pub mod throughput;
 
 pub use ffmpeg::{video_input_args, video_output_args, FfmpegEncoder};
 pub use probe::select_vendor;
-pub use throughput::{frames_per_second, measure_sustainable_fps, ThroughputMeasurement};
+pub use throughput::{
+    frames_per_second, measure_sustainable_fps, measured_path, MeasuredPath, ThroughputMeasurement,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {

@@ -7,42 +7,77 @@
 //! the muxer keep each frame's arrival timestamp. A machine that cannot keep up drops frames
 //! (a held frame in the picture) while the clock stays honest.
 //!
-//! What this number answers is how fast this machine encodes at the resolution and with the
-//! encoder that will be used. Pacing capture to it (`replayed_recorder::FpsDecision`) stops the
-//! pipeline paying for captures (on Windows a 33 MB GPU-to-CPU readback each) that the encoder
-//! would throw away, and tells a user that `encode.fps = 30` is not reachable at 4K here.
+//! What this number answers is how fast *the encoder this recording will use* encodes at the
+//! resolution this recording will use. Pacing capture to it (`replayed_recorder::FpsDecision`)
+//! stops the pipeline paying for captures (on the raw-pixel path, a 33 MB GPU-to-CPU readback
+//! each) that the encoder would throw away, and tells a user that `encode.fps = 30` is not
+//! reachable at 4K here.
 //!
-//! # Why it cannot be a timeline guarantee
+//! # Which path it measures
 //!
-//! It measures the encode path only: raw frames into an encoder, out to the null muxer. The live
-//! pipeline adds capture readback, copy, pipe and segment muxing, and the gap is large: at a 4K
+//! There are two pipelines in this app, and the probe measures the one the recording will take
+//! ([`measured_path`]):
+//!
+//! * **the raw-pixel pipe** ([`VideoInput::RawPixels`]): the same ffmpeg invocation the recorder
+//!   uses ([`video_input_args`] and [`video_output_args`], shared with
+//!   [`crate::FfmpegEncoder::spawn`]) writing to the null muxer. Frames go in over `pipe:0` as
+//!   raw BGRA, and only a frame ffmpeg accepted is counted: a completed write means the encoder
+//!   consumed that much of the stream.
+//! * **the hardware encoder** ([`VideoInput::EncodedBitstream`], the zero-copy path): the Media
+//!   Foundation transform the recording uses (the `mft` module, Windows only), fed synthetic GPU
+//!   textures on a device of the kind capture creates. No window is opened and nothing is
+//!   captured, which matters because the machine runs an anti-cheat.
+//!
+//! # Why the raw-pixel probe was the wrong number for the zero-copy path
+//!
+//! It was the only probe there was, and the zero-copy run does not use the path it measures.
+//! That probe writes a 33.2 MB raw BGRA frame into a pipe and lets ffmpeg convert it on the CPU
+//! — work the zero-copy run never does, because the hardware encoder takes the captured texture
+//! straight from VRAM and ffmpeg only copies the resulting bitstream.
+//!
+//! So the number was a measurement of a pipeline that was not running, and it showed: on a 4K
+//! machine it reported 46.3, 59.6, 64.7 and 85.7 fps across four runs of the same idle machine,
+//! while the recording in the same runs reached the encoder at 26.9 fps in one and about 59.5 fps
+//! in another. It was wrong (about a pipeline that was not running) and unstable (nearly two to
+//! one), and the instability has a cause: what it measured — a 33 MB pipe write and the CPU
+//! conversion behind it — shares the machine with the game that is being recorded.
+//!
+//! The old claim in this file, that on Windows "the probe is more optimistic there, not less",
+//! was wrong in the only way that mattered: it was not optimistic about Windows, it was
+//! measuring a different pipeline altogether.
+//!
+//! The hardware-encoder probe measures the pipeline that will run, with no pixels crossing the
+//! CPU, and it counts the frames the encoder *finished* rather than the frames it was handed.
+//! Its window opens on the first frame the encoder finished and closes a budget later, so the
+//! number is the encoder's pace rather than the pace at which a probe managed to hand it frames.
+//!
+//! # What it cannot be
+//!
+//! It measures the encode path only: the live pipeline adds the capture (a readback, a copy or a
+//! texture handover), the pump's pacing and the segment muxing, and the gap is large: at a 4K
 //! output with a software encoder the probe reported 62fps sustainable and the pipeline achieved
-//! 8 frames a second end to end. On Windows NVENC is cheap and the WGC readback is not, so the
-//! probe is more optimistic there, not less.
+//! 8 frames a second end to end. So the number is an upper bound on what the pipeline can do,
+//! never a promise about it: the encoder's drop counter and rate-limited warning remain the
+//! report of what the pipeline achieved.
 //!
-//! # What it measures, exactly
-//!
-//! The same ffmpeg invocation the recorder uses ([`video_input_args`] and [`video_output_args`],
-//! shared with [`crate::FfmpegEncoder::spawn`]) writing to the null muxer. Frames go in over
-//! `pipe:0` as raw BGRA, and only a frame ffmpeg accepted is counted: a completed write means the
-//! encoder consumed that much of the stream.
-//!
-//! Two limitations:
+//! Two more limits of the raw-pixel probe, which the hardware-encoder probe does not have:
 //!
 //! * It is a lower bound on a software encoder and accurate on a hardware one: a GPU encoder's
 //!   throughput depends on resolution, not picture, while libx264's depends on content, so the
 //!   probe frames carry a detailed moving pattern (see [`probe_frame`]).
-//! * It does not measure the capture path (no readback, window composition or game), so the
-//!   encoder's drop counter and rate-limited warning remain the report of what the pipeline achieved.
+//! * It measures the machine's spare CPU as much as the encoder's speed, because the raw-pixel
+//!   path is a CPU conversion: on a machine that is also running a game, that number moves.
 //!
 //! # Bounds
 //!
-//! Frames are fed for [`PROBE_BUDGET`] and the child has [`PROBE_DRAIN_TIMEOUT`] to finish, past
-//! which it is killed and reaped. Memory is one frame buffer at the capture's own size (33.2 MB
-//! at 3840x2160).
+//! The raw-pixel path feeds frames for [`PROBE_BUDGET`] and the child has
+//! [`PROBE_DRAIN_TIMEOUT`] to finish, past which it is killed and reaped. Memory is one frame
+//! buffer at the capture's own size (33.2 MB at 3840x2160). The hardware-encoder path opens a
+//! warm-up (in the `mft` module), measures for the same budget, and is bounded past that by the
+//! encoder's own slack; it holds one texture, not a frame buffer.
 
 use crate::ffmpeg::{video_input_args, video_output_args};
-use crate::EncodeConfig;
+use crate::{EncodeConfig, VideoInput};
 use anyhow::{bail, Context, Result};
 use replayed_media::{ffmpeg_reason, wait_with_deadline, FfmpegBinaries};
 use std::io::Write;
@@ -89,30 +124,128 @@ pub struct ThroughputMeasurement {
     pub output_size: (u32, u32),
 }
 
+/// Which path the probe measures for a configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasuredPath {
+    /// The ffmpeg child's raw-pixel pipe: raw BGRA frames in, an encoded stream out.
+    RawPixelsPipe,
+    /// The hardware encoder's own transform: GPU textures in, an encoded stream out.
+    HardwareEncoder,
+}
+
+/// The path the probe measures for `cfg`: the path the recording will take.
+///
+/// The configuration decides, and it is the same thing the recording decides: a zero-copy
+/// recording hands the captured texture to the hardware encoder and never writes raw pixels
+/// into ffmpeg, so the encoder is what has to be measured; a recording that writes raw pixels
+/// into ffmpeg's own encoder is measured there.
+///
+/// Public so a caller can say in its log which pipeline a number is about.
+pub fn measured_path(cfg: &EncodeConfig) -> MeasuredPath {
+    match cfg.video {
+        VideoInput::RawPixels => MeasuredPath::RawPixelsPipe,
+        VideoInput::EncodedBitstream => MeasuredPath::HardwareEncoder,
+    }
+}
+
 /// Measure the encode rate this machine can sustain at `cfg.source_size`.
 ///
-/// `cfg` is the recording's configuration (codec, encoder, geometry, bitrate, keyframe schedule)
-/// with `budget` replacing the live pipeline as the source of frames. `cfg.fps` is passed to
-/// ffmpeg unchanged, and the caller decides what to do with the number.
+/// The probe measures the path the recording will take ([`measured_path`]), so the number is
+/// about the encoder that will do the work rather than about a pipeline that will not run.
 ///
-/// Fails, with ffmpeg's own words where there are any, rather than guessing: an encoder that
-/// cannot start, dies mid-probe, accepts no frames or refuses to exit is a failed measurement,
-/// never "fast enough".
+/// `cfg` is the recording's configuration (codec, encoder, geometry, bitrate, keyframe schedule)
+/// with `budget` replacing the live pipeline as the source of frames. `cfg.fps` is passed to the
+/// encoder unchanged, and the caller decides what to do with the number.
+///
+/// Fails, with the encoder's own words where there are any, rather than guessing: an encoder
+/// that cannot start, dies mid-probe, accepts no frames or refuses to exit is a failed
+/// measurement, never "fast enough".
 pub fn measure_sustainable_fps(
     bin: &FfmpegBinaries,
     cfg: &EncodeConfig,
     budget: Duration,
 ) -> Result<ThroughputMeasurement> {
-    measure_with_drain(bin, cfg, budget, PROBE_DRAIN_TIMEOUT)
+    let measured = match measured_path(cfg) {
+        MeasuredPath::RawPixelsPipe => {
+            measure_raw_pixels_fps(bin, cfg, budget, PROBE_DRAIN_TIMEOUT)
+        }
+        MeasuredPath::HardwareEncoder => measure_hardware_encoder_fps(cfg, budget),
+    }?;
+    tracing::info!(
+        path = ?measured_path(cfg),
+        fps = measured.fps,
+        frames = measured.frames,
+        window_ms = measured.window.as_millis(),
+        size = ?measured.source_size,
+        "the encode rate was measured"
+    );
+    Ok(measured)
 }
 
-/// [`measure_sustainable_fps`] with the drain ceiling as a parameter, so the bound can be tested quickly.
-fn measure_with_drain(
+/// The hardware encoder's own rate: the path a zero-copy recording takes.
+///
+/// Windows only, because the transform is Media Foundation's. Off Windows there is no
+/// hardware-encoder path to measure, and saying so is the honest answer: a number from the
+/// raw-pixel probe would be about a pipeline this recording will not run.
+#[cfg(windows)]
+fn measure_hardware_encoder_fps(
+    cfg: &EncodeConfig,
+    budget: Duration,
+) -> Result<ThroughputMeasurement> {
+    let measured = crate::mft::measure_encode_fps(
+        cfg.source_size,
+        cfg.codec,
+        cfg.bitrate_kbps,
+        cfg.fps,
+        cfg.rate_control,
+        budget,
+    )?;
+    Ok(ThroughputMeasurement {
+        fps: measured.fps,
+        frames: measured.frames,
+        window: measured.window,
+        source_size: cfg.source_size,
+        // The hardware encoder cannot scale: ffmpeg copies the bitstream it produced, and
+        // scaling would mean decoding it. So the size written is the size measured.
+        output_size: cfg.source_size,
+    })
+}
+
+#[cfg(not(windows))]
+fn measure_hardware_encoder_fps(
+    _cfg: &EncodeConfig,
+    _budget: Duration,
+) -> Result<ThroughputMeasurement> {
+    bail!(
+        "this recording's video goes through the hardware encoder, and there is no hardware \
+         encoder to measure on this host: the encoder is Media Foundation's, which is Windows \
+         only. Measure the raw-pixel path instead (encode.zero_copy = false), or set \
+         encode.adapt_fps = false to declare the configured rate and let the encoder's drop \
+         counter report what the pipeline achieved."
+    )
+}
+
+/// The raw-pixel path's rate: the same ffmpeg invocation the recorder uses, writing to the null
+/// muxer.
+///
+/// The drain ceiling is a parameter so the bound can be tested quickly.
+fn measure_raw_pixels_fps(
     bin: &FfmpegBinaries,
     cfg: &EncodeConfig,
     budget: Duration,
     drain: Duration,
 ) -> Result<ThroughputMeasurement> {
+    // This probe measures the ffmpeg child's raw-pixel path, and a configuration whose recording
+    // will not use that path must not be measured by it: the number would be about a pipeline
+    // that is not running, which is how a 4K machine was told its 60fps was not achievable.
+    if cfg.video != VideoInput::RawPixels {
+        bail!(
+            "the raw-pixel probe cannot measure a {:?} configuration: that recording hands the \
+             captured texture to the hardware encoder and never writes raw pixels into ffmpeg, \
+             so a rate measured here would be about a pipeline that is not running",
+            cfg.video
+        );
+    }
     let encoder = cfg.encoder_name();
     let describe = format!(
         "{encoder} at {}x{} ({}s budget)",
@@ -346,6 +479,71 @@ mod tests {
         );
     }
 
+    // ---- which path is measured -------------------------------------------------------
+
+    /// The probe measures the path the recording will take, and the configuration decides.
+    ///
+    /// This is the whole point of the dispatch: a zero-copy recording hands the captured
+    /// texture to the hardware encoder and never writes raw pixels into ffmpeg, so a rate
+    /// measured through the raw-pixel pipe would be about a pipeline that is not running.
+    #[test]
+    fn the_probe_measures_the_path_the_recording_will_take() {
+        let mut cfg = cfg(30);
+        assert_eq!(
+            measured_path(&cfg),
+            MeasuredPath::RawPixelsPipe,
+            "a recording that writes raw pixels into ffmpeg is measured there"
+        );
+        cfg.video = VideoInput::EncodedBitstream;
+        assert_eq!(
+            measured_path(&cfg),
+            MeasuredPath::HardwareEncoder,
+            "a zero-copy recording hands the texture to the hardware encoder, so that is what \
+             has to be measured"
+        );
+    }
+
+    /// The raw-pixel probe measures the ffmpeg child's raw-pixel path, and a configuration
+    /// whose recording will not use that path must not be measured by it.
+    ///
+    /// The guard is in the probe rather than in the caller, because the caller is the thing
+    /// that was wrong: it asked for a rate and got one about a different pipeline.
+    #[test]
+    fn the_raw_pixel_probe_refuses_a_configuration_that_will_not_use_it() {
+        let mut cfg = cfg(30);
+        cfg.video = VideoInput::EncodedBitstream;
+        let err = measure_raw_pixels_fps(
+            &ffmpeg(),
+            &cfg,
+            Duration::from_millis(100),
+            PROBE_DRAIN_TIMEOUT,
+        )
+        .expect_err("the raw-pixel pipe is not the zero-copy path's encoder");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not running"),
+            "the error says what is wrong with the number: {msg}"
+        );
+    }
+
+    /// End to end: a zero-copy configuration is never measured through the raw-pixel pipe.
+    ///
+    /// Off Windows there is no hardware encoder to measure, so the honest outcome is an error
+    /// naming that — never a number about a pipeline that will not run.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_zero_copy_configuration_is_never_measured_through_the_raw_pixel_pipe() {
+        let mut cfg = cfg(30);
+        cfg.video = VideoInput::EncodedBitstream;
+        let err = measure_sustainable_fps(&ffmpeg(), &cfg, Duration::from_millis(100))
+            .expect_err("this host has no hardware encoder to measure");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hardware encoder"),
+            "the error names what could not be measured: {msg}"
+        );
+    }
+
     // ---- the probe against a real ffmpeg ----------------------------------------------
 
     /// The probe frame is deterministic and not uniform; a flat frame would let a software encoder
@@ -480,7 +678,7 @@ mod tests {
         let budget = Duration::from_millis(100);
         let drain = Duration::from_millis(300);
         let started = Instant::now();
-        let err = measure_with_drain(&bin, &cfg(30), budget, drain)
+        let err = measure_raw_pixels_fps(&bin, &cfg(30), budget, drain)
             .expect_err("a child that never reads is not a measurement");
         let elapsed = started.elapsed();
         let msg = format!("{err:#}");

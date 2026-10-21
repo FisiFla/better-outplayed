@@ -19,11 +19,14 @@ use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
@@ -58,6 +61,17 @@ enum Asked {
     Input,
     /// Nothing queued: what a poll looks like when there is no work.
     Quiet,
+}
+
+/// One event from an encoder's queue, taken without waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderEvent {
+    /// `METransformNeedInput`: it will take a frame now.
+    NeedInput,
+    /// `METransformHaveOutput`: it has finished a frame.
+    HaveOutput,
+    /// Anything else (a drain completing, an error event): not this exchange's business.
+    Other,
 }
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -1054,27 +1068,43 @@ impl MftEncoder {
     /// Drain whatever the encoder has to say, collecting its output as it goes.
     fn pump_events(&mut self, produced: &mut Vec<u8>) -> Result<Asked> {
         loop {
-            // SAFETY: the event generator on this encoder's own transform. `NO_WAIT` makes an empty
-            // queue an error rather than a block, which is what a poll needs.
-            let event = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => event,
+            match self.next_event()? {
+                Some(EncoderEvent::NeedInput) => return Ok(Asked::Input),
+                Some(EncoderEvent::HaveOutput) => {
+                    self.take_output(produced)?;
+                }
+                // Anything else (a drain completing, an error event) is not this exchange's business.
+                Some(EncoderEvent::Other) => {}
                 // Nothing queued. Not a failure: this is how a poll ends.
-                Err(_) => return Ok(Asked::Quiet),
-            };
-            // SAFETY: reading this event's own type.
-            let kind = unsafe { event.GetType() }.context("IMFMediaEvent::GetType")?;
-            if kind == METransformNeedInput.0 as u32 {
-                return Ok(Asked::Input);
+                None => return Ok(Asked::Quiet),
             }
-            if kind == METransformHaveOutput.0 as u32 {
-                self.take_output(produced)?;
-            }
-            // Anything else (a drain completing, an error event) is not this exchange's business.
         }
     }
 
-    /// Take one finished sample's bytes out of the encoder.
-    fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<()> {
+    /// One event from the encoder's queue, taken without waiting.
+    ///
+    /// `None` when the queue is empty, which is what a poll looks like when the encoder is
+    /// busy with the frame it was given. The caller decides what to do about that; the
+    /// throughput probe spins on it and the recording's own thread sleeps on it.
+    fn next_event(&mut self) -> Result<Option<EncoderEvent>> {
+        // SAFETY: the event generator on this encoder's own transform. `NO_WAIT` makes an empty
+        // queue an error rather than a block, which is what a poll needs.
+        let Ok(event) = (unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) }) else {
+            return Ok(None);
+        };
+        // SAFETY: reading this event's own type.
+        let kind = unsafe { event.GetType() }.context("IMFMediaEvent::GetType")?;
+        Ok(Some(if kind == METransformNeedInput.0 as u32 {
+            EncoderEvent::NeedInput
+        } else if kind == METransformHaveOutput.0 as u32 {
+            EncoderEvent::HaveOutput
+        } else {
+            EncoderEvent::Other
+        }))
+    }
+
+    /// Take one finished sample's bytes out of the encoder, and say how many samples it was.
+    fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<u64> {
         // `ManuallyDrop` because that is how the struct is generated: the sample is the caller's once
         // taken, and leaving the field un-taken must not release it twice.
         let mut buffer = MFT_OUTPUT_DATA_BUFFER {
@@ -1096,13 +1126,13 @@ impl MftEncoder {
         // `MF_E_TRANSFORM_NEED_MORE_INPUT`, not an error to propagate.
         match taken {
             Ok(()) => {}
-            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(0),
             Err(err) => return Err(err).context("IMFTransform::ProcessOutput"),
         }
         // SAFETY: taken exactly once, which is the contract for a `ManuallyDrop` field the callee
         // filled in.
         let Some(sample) = (unsafe { std::mem::ManuallyDrop::take(&mut buffer.pSample) }) else {
-            return Ok(());
+            return Ok(0);
         };
         // SAFETY: this sample is the one the encoder just produced, and the contiguous buffer is a
         // view of it that is locked and unlocked around the copy.
@@ -1122,7 +1152,9 @@ impl MftEncoder {
         unsafe {
             let _ = bytes.Unlock();
         };
-        Ok(())
+        // One frame in, one frame out: the count the throughput probe reports is the number of
+        // frames the encoder actually finished, not the number of frames it was handed.
+        Ok(1)
     }
 
     /// Ask for the next frame to be a keyframe.
@@ -2077,6 +2109,220 @@ pub fn can_encode_with_textures(
     .is_ok()
 }
 
+/// A BGRA texture of `size` on `device`, standing in for a captured frame.
+///
+/// Zero-filled (pixel values do not matter). Created with the bind flags WGC's own frames carry,
+/// so a refusal on those grounds cannot be mistaken for a format refusal.
+///
+/// `format` is the format the encoder's input type names, because the media type and the
+/// surface have to agree: a texture in another format is refused at `ProcessInput` with
+/// nothing to say why.
+///
+/// Public because the throughput probe needs one, and because a texture created here is the
+/// only kind of input the probe can give: a captured one would need a live capture session, and
+/// this machine runs an anti-cheat.
+pub fn synthetic_capture_texture(
+    device: &ID3D11Device,
+    size: (u32, u32),
+    format: DXGI_FORMAT,
+) -> Result<ID3D11Texture2D> {
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: size.0,
+        Height: size.1,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture: Option<ID3D11Texture2D> = None;
+    // SAFETY: `texture` is the out-parameter and the description outlives the call.
+    unsafe { device.CreateTexture2D(&description, None, Some(&mut texture)) }
+        .context("ID3D11Device::CreateTexture2D")?;
+    texture.context("CreateTexture2D returned no texture")
+}
+
+/// The DXGI format that goes with an input type the encoder accepted.
+///
+/// The names are the ones [`MftEncoder`] reports: `RGB32` is BGRA in memory (what WGC
+/// delivers), `ARGB32` is the same bytes in the other order, and `NV12` is the planar one a
+/// GPU video processor would have to produce.
+fn dxgi_for_input(input_format: &str) -> DXGI_FORMAT {
+    if input_format.starts_with("ARGB32") {
+        DXGI_FORMAT_R8G8B8A8_UNORM
+    } else if input_format.starts_with("NV12") {
+        DXGI_FORMAT_NV12
+    } else {
+        DXGI_FORMAT_B8G8R8A8_UNORM
+    }
+}
+
+/// What the hardware encoder was measured to do.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MftThroughput {
+    /// Frames the encoder finished per second, over [`MftThroughput::window`].
+    pub fps: f64,
+    /// Frames it finished inside the measured window.
+    pub frames: u64,
+    /// How long that window lasted, from the first frame it finished to the last.
+    pub window: Duration,
+    /// Which encoder was measured.
+    pub encoder_name: String,
+    /// Which input format it took. The texture's own format, so the pixels never leave the GPU.
+    pub input_format: String,
+}
+
+/// How long the encoder is given to settle before the measured window opens.
+///
+/// The first frames of an encode session are not representative of the rest: the session is
+/// opened, the first frame pays for the opening, and the GPU may still be at the clock it
+/// idled at. A window that opened on those frames would report the slowest frames of the run.
+const WARM_UP: Duration = Duration::from_millis(200);
+
+/// How much longer than the window the probe may take before it is called wedged.
+///
+/// The window is the encoder's own pace, so it ends when it ends; this bounds the case where
+/// it does not end at all.
+const PROBE_SLACK: Duration = Duration::from_secs(5);
+
+/// How many pause instructions the probe spins between yields.
+///
+/// The wait for the encoder's next request for input is a spin, not a sleep: a sleep's
+/// granularity (Windows: about a millisecond) would be added to every frame, and the
+/// measured rate would then depend on where the encoder's own frame time happened to fall
+/// relative to the sleep. Yielding every so often keeps the machine's other threads (the
+/// encoder's own, and the game) from waiting behind the spin.
+const SPIN_ROUNDS: u32 = 4_096;
+
+/// Measure how many frames per second this machine's hardware encoder encodes at `size`.
+///
+/// This is the transform the recording uses, fed the kind of frame the recording feeds it: a
+/// GPU texture on a device of the kind capture creates. No window is opened, nothing is
+/// captured and no input is synthesised, which matters because the machine runs an anti-cheat.
+///
+/// `budget` is how long the measured window lasts. The window is bounded by the encoder's own
+/// pace and opens on the first frame it *finishes* after the warm-up, so the number is the
+/// encoder's rate rather than the rate at which this probe managed to hand it frames.
+///
+/// The measurement is of the encoder alone. It is not a promise about the pipeline: the
+/// pipeline also captures, copies and muxes, and the encoder's drop counter remains the report
+/// of what the pipeline achieved.
+pub fn measure_encode_fps(
+    size: (u32, u32),
+    codec: VideoCodec,
+    bitrate_kbps: u32,
+    fps: u32,
+    mode: RateControl,
+    budget: Duration,
+) -> Result<MftThroughput> {
+    let device = create_capture_kind_device()?;
+    // The encoder is opened first, because the texture has to be in the format its input type
+    // names, and the input type is what the encoder decides. The preferred format is BGRA,
+    // which is what the capture backend hands over.
+    let mut encoder = MftEncoder::open(
+        &device,
+        size,
+        Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+        MftEncoderParams {
+            codec,
+            bitrate_kbps,
+            fps,
+            mode,
+        },
+    )?;
+    let encoder_name = encoder.encoder_name.clone();
+    let input_format = encoder.input_format.clone();
+    let texture = synthetic_capture_texture(&device, size, dxgi_for_input(&input_format))?;
+    encoder.start()?;
+
+    // The exchange, counted. `frames` counts what the encoder *finished*, which is the only
+    // count that is not this probe's own doing: a frame handed over is a frame the encoder has
+    // not encoded yet.
+    let mut frames = 0u64;
+    let mut fed = 0u64;
+    // The measured window: the moment the encoder finished its first frame after the warm-up,
+    // and the moment it finished its last.
+    let mut window: Option<(Instant, Instant)> = None;
+    let mut scratch: Vec<u8> = Vec::new();
+    let warm_until = Instant::now() + WARM_UP;
+    let deadline = warm_until + budget + PROBE_SLACK;
+    let mut spins = 0u32;
+
+    loop {
+        if Instant::now() >= deadline {
+            bail!(
+                "the hardware encoder did not finish a {budget:?} window: it was handed {fed} \
+                 frames and finished {frames}, and the deadline (a {WARM_UP:?} warm-up, the \
+                 window and a {PROBE_SLACK:?} slack) passed. This is a bound, not a measurement"
+            );
+        }
+        match encoder.next_event()? {
+            Some(EncoderEvent::NeedInput) => {
+                // Media time in the pipeline's milliseconds; the encoder wants 100-nanosecond
+                // units and converts. The same count the recording keeps: the timestamp is
+                // the frame's place in the stream at the declared rate, not the wall clock.
+                fed = fed.saturating_add(1);
+                let pts_ms = (fed.saturating_mul(1_000) / u64::from(fps.max(1))) as i64;
+                encoder.push_texture(&texture, pts_ms)?;
+            }
+            Some(EncoderEvent::HaveOutput) => {
+                let produced = encoder.take_output(&mut scratch)?;
+                // The bytes are not the measurement; the count is. Dropped so the probe does
+                // not hold a window's worth of encoded video.
+                scratch.clear();
+                let now = Instant::now();
+                if now >= warm_until && produced > 0 {
+                    frames = frames.saturating_add(produced);
+                    let start = window.map_or(now, |(start, _)| start);
+                    window = Some((start, now));
+                    if now.duration_since(start) >= budget {
+                        break;
+                    }
+                }
+            }
+            Some(EncoderEvent::Other) => {}
+            // The encoder is busy with the frame it was given. Spin: see `SPIN_ROUNDS`.
+            None => {
+                spins = spins.saturating_add(1);
+                if spins >= SPIN_ROUNDS {
+                    spins = 0;
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    let Some((start, end)) = window else {
+        bail!(
+            "the hardware encoder finished no frames to measure ({size:?} at {fps}fps): it was \
+             handed {fed} frames and none of them came back. The encoder is not usable at this \
+             size, so no rate can be declared for it"
+        );
+    };
+    let window = end.duration_since(start);
+    let Some(fps) = crate::throughput::frames_per_second(frames, window) else {
+        bail!(
+            "the hardware encoder finished {frames} frames in a window too short to divide \
+             ({window:?}), which is not a rate"
+        );
+    };
+    Ok(MftThroughput {
+        fps,
+        frames,
+        window,
+        encoder_name,
+        input_format,
+    })
+}
+
 /// Every hardware video encoder MFT this machine admits to, with no type filter at all: whether
 /// an encoder for a codec exists here independent of what it will consume or produce.
 pub fn list_hardware_video_encoders() -> Result<Vec<String>> {
@@ -2144,5 +2390,67 @@ mod tests {
                 encoder.name
             );
         }
+    }
+
+    /// The hardware encoder's own rate, measured the way the recording will use it, and the
+    /// same way on every run.
+    ///
+    /// The stability is the point. The raw-pixel probe this replaced reported 46.3, 59.6, 64.7
+    /// and 85.7 fps in four runs of an idle 4K machine, and a number that moves like that
+    /// cannot be a pace: it was written into both the capture pacer and the encoder's
+    /// `-framerate`.
+    ///
+    /// At 4K because that is the size the complaint was about, and because the encoder's own
+    /// frame is long enough there that the measurement is the encoder's pace and not the
+    /// probe's.
+    ///
+    /// A machine with no hardware encoder that takes a GPU texture has nothing to measure,
+    /// and that is a finding rather than a failure: the test says so and stops.
+    #[test]
+    fn the_hardware_encoders_rate_is_measured_the_same_way_on_every_run() {
+        const RUNS: usize = 3;
+        let size = (3840u32, 2160u32);
+        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
+        if !encoders.iter().any(|encoder| encoder.accepts_d3d11) {
+            eprintln!(
+                "this machine has no hardware encoder that takes a GPU texture: there is \
+                       nothing to measure"
+            );
+            return;
+        }
+
+        let mut rates = Vec::new();
+        for _ in 0..RUNS {
+            let measured = measure_encode_fps(
+                size,
+                VideoCodec::H264,
+                20_000,
+                60,
+                RateControl::Cbr,
+                Duration::from_millis(500),
+            )
+            .expect("a hardware encoder that takes a texture can be measured");
+            eprintln!(
+                "the hardware encoder did {:.1}fps at {size:?} ({} frames over {:?}) with {} \
+                 taking {}",
+                measured.fps,
+                measured.frames,
+                measured.window,
+                measured.encoder_name,
+                measured.input_format
+            );
+            assert!(
+                measured.frames > 0 && measured.fps > 0.0,
+                "a measurement with no frames in it is not a measurement: {measured:?}"
+            );
+            rates.push(measured.fps);
+        }
+        let lowest = rates.iter().copied().fold(f64::INFINITY, f64::min);
+        let highest = rates.iter().copied().fold(0.0, f64::max);
+        assert!(
+            highest <= lowest * 2.0,
+            "the rate must not swing by more than two to one between runs on an idle machine: \
+             {lowest:.1}fps to {highest:.1}fps over {RUNS} runs at {size:?}"
+        );
     }
 }
