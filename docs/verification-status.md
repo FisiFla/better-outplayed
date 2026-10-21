@@ -2723,3 +2723,144 @@ a comment saying why it is there.
   microphone, so the microphone's own open has never run in CI. It needs `[mic] enabled = true`.
 - The 72-hour soak, the `silence_detector` check, and an update performed end to end are all
   still not done, as §29 and §30 recorded.
+
+## 34. The real game, recorded (2026-10-21)
+
+## The machine and the build
+The box (Windows 11, an RTX 3090, 24 logical processors) pulled `1e517d5` and rebuilt the
+recording CLI from it, so the deadlock fix (`2c3eb5f`), the thread-affinity fix (`9f2a551`) and
+the display-list command (`505a6fc`) were all in the binary that ran. The build was clean.
+
+## The display list — the first run of the refresh-rate code on real hardware
+`replayed-cli displays` — the capture backend's **own** enumeration, so the index it prints is
+the index `[capture] monitor` takes:
+
+```
+index=0 3840x2160 120 Hz
+index=1 2560x1080 120 Hz
+```
+
+**Both displays are 120 Hz.** The `DisplayInfo.refresh_hz` code (0 and 1 are not rates, over
+1000 Hz is not a rate) has until now been type-checked only; this is it running against a
+real `EnumDisplaySettingsW`.
+
+It also settles a confusion from the previous round: the capture's index 0 **is** the 4K
+primary, and the last measurement that captured 2560x1080 while meaning 4K was the *harness's*
+index being wrong, not the capture's. The new command exists so that a script cannot name a
+different screen than the capture does.
+
+## The capture — the game, running, under BattlEye
+`RainbowSix` pid 17596 and `RainbowSix_BE` pid 16752 were live throughout. The capture
+targeted **display index 0** — the 4K screen the game is on. The footprint was the smallest
+the app offers:
+
+- the **game watcher was off** (`auto_record = false`), so **no process list was enumerated**;
+- the audio was the **whole default output endpoint** (`game_audio = "system"`), so the game
+  process was **never named to the audio subsystem** — the per-application path, which asks the
+  OS about the game's pid, was not used;
+- **no input of any kind**: the clip was taken by the app's own `--self-test-clip-after` timer,
+  and the CLI says so on every run;
+- **no window was enumerated**: this is a *display* capture, and R6 runs fullscreen/exclusive
+  with no enumerable titled window.
+
+## What came out
+```
+INFO  hotkey pressed: media=60902ms wall=61295ms (drift 393ms); waiting for post-roll
+INFO  post-roll on disk: span=66230ms covers 65902ms after 5168ms (291 frames submitted while waiting)
+INFO  clip from RAM: trigger=60902ms window=[30902ms, 65902ms) selected=35604ms held=66230ms footage=[29519ms, 66230ms] bytes=165518757
+INFO  wrote H:\Replayed\clip-1792616998188.mp4 (35614ms, 165542933 bytes, encoder=h264_nvenc)
+INFO  indexed clip #1 (media t=30626ms, 35614ms, 165542933 bytes, h264_nvenc)
+INFO  recorded bookmark event #30 at media t=60626ms against clip #Some(1)
+INFO  buffer session #4 closed: 34 segment(s), 170269015 bytes held in RAM
+```
+**35.6 seconds of 4K, 165 MB, the real NVENC encoder, and the CLI exited 0.**
+
+## The frame rate
+```
+frames=4005 segments=34 bytes=171056189 span=69550ms evicted=32 dropped=9 dropped_audio=0 \
+  dropped_mic=0 audio_blocks=7037 mic_blocks=0 skipped=23 fps=53.8/60 configured=60 \
+  capture=85.4% discard=0.0% pacer_sleep=12.5% submit=1.7% capture_wait=84.2% capture_copy=1.1%
+```
+
+**52.9 to 57.0 fps of the 60 configured, against the 37.7 fps of the previous measurement** —
+the frame-arrival wait is worth about 45% of the rate, and the display can do 120.
+
+- `capture_wait=84.2%` — the wait for a frame is still the dominant cost, and it is now an
+  *honest* wait: the condition variable the frame pool's arrival event raises, not a one
+  millisecond sleep and a futile `TryGetNextFrame` repeated to the budget.
+- `capture_copy=1.1%` — the GPU-side texture copy is nearly free, as the zero-copy design
+  intended.
+- `discard=0.0%` — the frame-pool drain is free.
+- `submit=1.7%` — the handover to the encoder.
+- The shares add up: 85.4 + 12.5 + 1.7 = **99.6%**.
+- `dropped=9` over ~4000 frames for the whole run.
+- **`dropped_audio=0` with `audio_blocks=7037`.** The audio input opened, the audio flowed, and
+  the encoder's queue dropped none of it — which is the distinction #77 was opened for, now
+  measured.
+
+## The deadlock is over
+The audio input opened, the post-roll landed, the clip was cut from RAM and written. The
+failure this issue describes — ffmpeg blocked probing the video input and never opened the
+audio one — did not happen. **This is the first run of the fix on hardware.**
+
+## Two more runs — the still display, and 120 fps
+**Run 2 — the still display (the ultrawide, nothing drawn on it), 60 fps.** This is the
+deadlock's hardest form: the display's content barely changes, so the keyframe that lets
+ffmpeg probe arrives late, and every earlier attempt at a quiet display died on the
+ten-second audio deadline.
+```
+wrote H:\Replayed\clip-1792617264615.mp4 (19371ms, 6850472 bytes, encoder=h264_nvenc)
+```
+`cli exit: 0`, `dropped_audio=0` with `audio_blocks=9767`, `dropped=7` over ~2400 frames,
+`fps=36.9-42.8/60`, `capture_wait=88.5%`, `capture_copy=0.5%`.
+
+**The deadlock is over on the case that broke it.** The still display's rate is the display's
+own — a screen that does not change delivers no frames — and the pipeline kept up with 7
+drops over 2400 frames.
+
+**One thing the still run exposes and does not explain:** the clip is **19.4 seconds**, not the
+35 seconds a 30 s pre-roll and a 5 s post-roll ask for. The media is sparse when the display is
+still, so a window of media holds less footage than the same window of wall clock. Recorded as
+an observation, not as a claim about the cause.
+
+**Run 3 — the 4K display with the game live, at 120 fps.**
+```
+INFO  zero-copy is off for this run: it needs Windows, a detected hardware encoder, and one
+      that will open for H264 at this size. One of those is missing, so frames are read back
+      and encoded as usual
+INFO  hotkey pressed: media=76799ms wall=77611ms (drift 812ms); waiting for post-roll
+INFO  post-roll on disk: span=84313ms covers 81799ms after 7437ms (140 frames submitted while waiting)
+INFO  clip from RAM: trigger=76799ms window=[46799ms, 81799ms) selected=37071ms held=84313ms footage=[47242ms, 84313ms] bytes=50152142
+INFO  wrote H:\Replayed\clip-1792617379335.mp4 (37202ms, 50165390 bytes, encoder=h264_nvenc)
+```
+```
+frames=1704 segments=10 bytes=50150864 span=84313ms evicted=13 dropped=9 dropped_audio=0 \
+  dropped_mic=0 audio_blocks=8874 mic_blocks=0 skipped=2343 fps=19.5/70 configured=120 \
+  capture=80.4% discard=0.4% pacer_sleep=18.3% submit=1.1% capture_wait=10.0% capture_copy=70.0%
+```
+The clip is **37,202 ms** — the full 30 s pre-roll and 5 s post-roll, the longest window yet.
+The audio opened and flowed (`dropped_audio=0`, 8874 blocks), and the deadlock is absent.
+
+**But this run did NOT exercise the zero-copy path**, and that is the important part. The
+encoder would not open at this size and rate, so the frames were **read back** out of VRAM and
+encoded the ordinary way. The `capture_copy=70.0%` is therefore the **readback** cost — 33 MB
+per frame out of the graphics card — and not the shipping path's copy, which at 60 fps measured
+0.5 to 1.1%. The `skipped=2343` and `fps=19.5/70` are the readback path's numbers, not the
+zero-copy path's.
+
+**So the honest reading of run 3 is: the app can be *asked* for 120 fps, and the result is a
+correct clip of the right length, but the measurement is of the fallback path, not of the
+shipping one.** The 120 fps capability of the zero-copy path is still unmeasured, and the
+question it raises is specific: **why does the hardware encoder not open at 120 fps and 4K when
+it opens at 60 fps and 4K?** That is where the next piece of work is.
+
+## What was NOT verified
+- **The 120 fps capability of the shipping path is not measured.** Run 3 fell back to the
+  readback path, and the reason the encoder did not open is not yet known.
+- **Nobody has watched the clip or heard its audio.**
+- **The probe still cannot measure on this machine** (#79), so the app is running at the
+  configured rate and does not know what the machine can sustain.
+- The frame rate is **55 of 60, not 60**: the remaining gap is the pump's per-call frame
+  budget against the display's 16.7 ms interval, and it is not yet accounted for to the frame.
+- One run, not a soak. The 72-hour stability check the release checklist asks for is still
+  not done, and `silence_detector` is still not *performed*.
