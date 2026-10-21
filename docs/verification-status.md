@@ -2432,3 +2432,110 @@ failed. The clock is in nanoseconds now.
 - The moving display is a **synthetic pattern**, not a game: 16 ms redraws of two bars on black.
   A game's own frame cost is not the same thing.
 - The 72-hour soak the release checklist asks for has still not been done, at 60 fps or at 120.
+## 30. The two defects the failed measurement found (2026-10-21)
+
+The measurement of §29 could not complete, but it did find two defects of its own. Both are
+fixed; neither has been re-measured on hardware yet.
+
+### The encoder renegotiated its stream, and the recording stopped because of it
+
+The probe reported `0xC00D6D61` — *"A stream change has occurred. Output cannot be produced
+until the streams have been renegotiated."* Two things about that number are worth recording,
+because both were assumed and neither is true:
+
+- `0xC00D6D61` is **`MF_E_TRANSFORM_STREAM_CHANGE`** in the Windows SDK (`um/Mferror.h`).
+  There is no `MF_E_TRANSFORM_TYPE_CHANGE` in the SDK at all.
+- **There is no event route.** `MediaEventType` ends the transform events at
+  `METransformInputStreamStateChanged` (605): there is no `METransformTypeChanged`, and
+  `MF_EVENT_DATA_OUTPUT_TYPE` is not in the SDK either. A type change is reported **only** by
+  the `ProcessOutput` return code, and the only route to the new type is
+  `IMFTransform::GetOutputAvailableType`.
+
+**The recording path was affected, and worse than the probe.** `encode_texture` →
+`pump_events` → **`take_output`** is the same function the probe uses, so the type change
+became an `Err`, the encode loop logged *"the hardware encoder refused a frame"* and
+**broke** — ending the encode thread. The rest of the recording would have had no video at
+all, not merely no measurement.
+
+What Media Foundation requires is: set a new output type *the transform itself offers*, and
+then **set the input type again** — the input is negotiated against the output, so setting
+only the output leaves the encoder refusing every frame that follows. Both are now done, and
+the bitrate is re-pinned, because `encode.bitrate_kbps` has to keep following the clip. A
+renegotiation that *fails* still ends the encode loop: the encoder's state is then unknown,
+and guessing would be worse.
+
+The decisions are factored out of the COM code so that they can be tested where there is no
+Media Foundation at all: `classify_output_failure` (a type change is a renegotiation to
+perform, not a failure to report), `choose_output_type` (the codec and the size are
+*requirements*, the frame rate a *preference*) and `type_change_refusal` (the honest refusal,
+naming what was needed and what was on offer). Five host tests cover them, each proven by
+mutation; two more, Windows-only, cover the SDK's own constants and the legality of the
+renegotiation sequence.
+
+**Not verified:** any runtime behaviour of the COM calls. Whether the encoder offers a
+*usable* type at the moment it changes one, and whether `SetOutputType` is accepted while
+the transform is processing (`MF_E_TRANSFORM_CANNOT_CHANGE_MEDIATYPE_WHILE_PROCESSING`,
+0xC00D6D74), are both unknown — the log now names the types that were on offer when it
+happens, which is the evidence needed to answer them.
+
+### A start that produced nothing, silently
+
+The recording of §29 handed 379 frames to the encoder, finished no fragment at all, and
+printed only *"the recorder stopped: audio writer thread has stopped"* and *"ffmpeg never
+connected to the audio input"*. The three lines a healthy run logs about the audio backend
+were not in the excerpt, which made it look as though the backend had never started.
+
+**That reading was wrong, and the code says so.** `ffmpeg never connected to the audio input`
+can only exist if the game-audio input was *declared* — the listener is bound only when
+`cfg.game_audio` is set, and the `-i tcp://…` only then. A declared input means a backend was
+built, which means the start path ran it, and that start **cannot** fail silently: a failure
+aborts the recording, and a hang never returns. The run produced frames at 40.8 fps, so the
+start returned; and `dropped_audio` is the *encoder's* counter, which only advances when a
+block is handed over. **The WASAPI backend was up and producing.** What failed was the
+encoder's ffmpeg child never dialling its audio input — in the encoder's domain, and still
+undiagnosed.
+
+The silence was real all the same, and it was three defects in the start path:
+
+1. **Every line about the audio backend was a success line.** A failing or hanging open wrote
+   nothing at all.
+2. **Nothing bounded the open.** `IAudioClient::Initialize` and `Start` are COM calls into
+   the Windows audio service — a separate process — and they can wait. `audio.start()` ran on
+   the caller's thread inside `begin_recording` with no deadline, and because the CLI prints
+   its "buffering" line *after* `start_with_options` returns, a hang there prints nothing.
+3. **Nothing checked that audio actually flows.**
+
+The audio side now says what it is about to do **before** it does it: the opener announces the
+source and the endpoint before the open, the loopback and the microphone each name the
+endpoint they are asking for, and the endpoint's id goes into the success line. The open runs
+on its own thread under a five-second budget and is then held to a three-second budget for
+its **first block**, so a start either produces audio or says why it did not: *"the game audio
+backend did not come up within 5s"* and *"the game audio backend opened but delivered no
+audio within 3s"* are two different faults, and they now read as two different things.
+
+**A missing audio backend at start stays fatal**, which was already the project's decision
+(`RecoveringSource::start`: *"a recording that never had audio should say so at start"*). It
+is now loud and immediate rather than late and vague. A user who wants no audio already has
+an explicit way to ask — `[audio] enabled = false` removes the loopback *and* the encoder's
+audio input together — so a recording that degraded to video-only would only ever be reached
+by accident.
+
+The status line gained `audio_blocks=` and `mic_blocks=` beside `dropped_audio=`, and the
+stop and shutdown reports say how many blocks the audio side handed the encoder and how many
+the encoder's queue dropped, so the next run distinguishes *"the audio never came up"* from
+*"the child never took it"*.
+
+**Not verified:** the new WASAPI log lines and the endpoint-id reads are type-checked and
+never executed. The recorder's half — the bounded open, the first-block check, the two
+refusals, the counters and the reports — is verified by execution.
+
+### What is still not verified
+
+- **The re-measurement has not happened.** The frame path was healthy at 40.8 fps with
+  `capture_wait=77.4%`, but that run produced no fragment, so there is still no end-to-end
+  number, and the 37.7 → 60+ fps claim remains a prediction.
+- **The resolution confound is still there**: index 0 on that machine now resolves to the
+  2560×1080 display, so the next measurement must say which display it captured.
+- **The ffmpeg child never dialling its audio input is still undiagnosed.** The encoder's
+  diagnostics are a ten-second connect deadline and an exit status with an empty stderr.
+- **The 120 Hz capability is still proven in the schedule, not in a capture.**
