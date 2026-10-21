@@ -693,11 +693,22 @@ fn open_client(device: &IMMDevice, endpoint: &str) -> Result<Client> {
     // SAFETY: both out-parameters are valid.
     unsafe { audio.GetDevicePeriod(Some(&mut default_period), Some(&mut minimum_period)) }
         .context("IAudioClient::GetDevicePeriod")?;
-    let buffer_duration = if default_period > 0 {
-        default_period
-    } else {
-        10 * HNS_PER_MS
+    // The device's own numbers, bounded. The endpoint chooses its period and nothing else
+    // checks it, so the rules live in the crate's root, where they can be tested on a machine
+    // that has no audio device at all.
+    let buffer_duration = match crate::buffer_duration_for(default_period, minimum_period) {
+        Ok(duration) => duration,
+        Err(why) => bail!("{why}"),
     };
+    if default_period > crate::MAX_BUFFER_HNS {
+        tracing::warn!(
+            endpoint = endpoint,
+            default_period_hns = default_period,
+            maximum_hns = crate::MAX_BUFFER_HNS,
+            "the default render endpoint reports a device period longer than this capture waits \
+             for; the buffer was clamped"
+        );
+    }
 
     // What the engine is about to be asked for, before it is asked: the endpoint's own format
     // next to the request, so a refusal names both and a reader can see which conversion the

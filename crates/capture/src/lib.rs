@@ -62,6 +62,44 @@ pub fn displays() -> Vec<DisplayInfo> {
     }
 }
 
+/// The longest buffer the capture will ask the audio engine for, in 100-nanosecond units.
+///
+/// A real endpoint's device period is a few milliseconds. A virtual or remote endpoint on a
+/// machine with no sound card can report something else entirely, and the number is the
+/// device's to choose with nothing else to check it, so it is bounded here.
+#[cfg(any(windows, test))]
+pub(crate) const MAX_BUFFER_HNS: i64 = 100 * 10_000; // 100 ms
+
+/// The buffer duration to ask the audio engine for, given the device's own two numbers.
+///
+/// The engine requires the buffer to be at least one minimum period long, so a default
+/// period below the minimum is raised to it. A default period above the cap is clamped down:
+/// the engine allocates a buffer to match, and the capture would then wait that long for
+/// every block. A *minimum* period above the cap is a device this capture cannot use at
+/// all, and is refused rather than believed.
+///
+/// The rules live here rather than in the Windows backend so they can be tested on a machine
+/// that has no audio device at all — which is the machine that gets them wrong.
+#[cfg(any(windows, test))]
+pub(crate) fn buffer_duration_for(default_period: i64, minimum_period: i64) -> Result<i64, String> {
+    if minimum_period > MAX_BUFFER_HNS {
+        return Err(format!(
+            "the endpoint reports a minimum period of {minimum_period} 100-nanosecond units, which is \
+             longer than the {MAX_BUFFER_HNS} this capture will wait for; a device that takes that \
+             long to deliver a block cannot be recorded from"
+        ));
+    }
+    let mut duration = if default_period > 0 {
+        default_period
+    } else {
+        10 * 10_000
+    };
+    if minimum_period > 0 && duration < minimum_period {
+        duration = minimum_period;
+    }
+    Ok(duration.min(MAX_BUFFER_HNS))
+}
+
 /// The monotonic clock base shared by the video and audio backends.
 ///
 /// Both take their `pts` from this one `Instant` (QPC on Windows), so A/V alignment is derivable
@@ -515,6 +553,54 @@ pub trait AudioBackend: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_normal_device_period_is_used_as_it_is_reported() {
+        let duration = buffer_duration_for(100_000, 50_000).expect("a normal period is usable");
+        assert_eq!(
+            duration, 100_000,
+            "the device's own period is what the engine is asked for"
+        );
+    }
+
+    #[test]
+    fn a_device_that_reports_no_period_gets_the_ordinary_one() {
+        let duration = buffer_duration_for(0, 0).expect("a device with no period is still usable");
+        assert_eq!(
+            duration, 100_000,
+            "ten milliseconds, the same default the code always used"
+        );
+    }
+
+    #[test]
+    fn a_default_period_below_the_minimum_is_raised_to_it() {
+        let duration = buffer_duration_for(10_000, 100_000).expect("the minimum is usable");
+        assert_eq!(
+            duration, 100_000,
+            "the engine needs a buffer of at least one minimum period, or it will not signal"
+        );
+    }
+
+    #[test]
+    fn a_period_longer_than_the_capture_waits_for_is_clamped() {
+        let duration =
+            buffer_duration_for(60_000_000_000, 0).expect("a long period is still usable");
+        assert_eq!(
+            duration, MAX_BUFFER_HNS,
+            "the engine would allocate a buffer of an hour, and the capture would wait an hour \
+             for every block"
+        );
+    }
+
+    #[test]
+    fn a_device_whose_minimum_period_is_longer_than_the_capture_waits_for_is_refused() {
+        let refusal = buffer_duration_for(100_000, MAX_BUFFER_HNS + 1)
+            .expect_err("a device that cannot be recorded from must be refused");
+        assert!(
+            refusal.contains("minimum period") && refusal.contains("cannot be recorded from"),
+            "the refusal has to say what was wrong and what it means: {refusal}"
+        );
+    }
 
     fn native(sample_rate: u32, channels: u16, encoding: SampleEncoding) -> NativeAudioFormat {
         NativeAudioFormat {
