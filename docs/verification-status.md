@@ -2286,3 +2286,128 @@ lower, and the recorder reports it instead of quietly dropping frames.
   asks for has not been done.
 - The `silence_detector` check has still not been *performed*; what is new is that the
   conversion path was observed to run.
+
+## 29. The 4K frame rate, and the 120 Hz question (2026-10-21)
+
+The report was that a 4K capture dropped frames, and that the machine is a powerful one. The
+recorder agreed, and it was the software's fault. The second part of the report was that the
+display is 120 Hz capable, and that the app should be able to record at 120 and should let the
+user choose the rate.
+
+### What was measured, on the box, at 4K on the RTX 3090
+
+The pipeline's own status line is the instrument. It reports the achieved rate, the drop
+counter, and where the wall clock went:
+
+```
+frames=2124 segments=22 bytes=1725289 span=57920ms evicted=13 dropped=4 dropped_audio=0 dropped_mic=0 \
+  skipped=142 fps=33.9/60 configured=60 capture=80.2% discard=0.0% pacer_sleep=18.8% submit=0.8% \
+  capture_wait=46.5% capture_copy=0.8%
+```
+
+Three numbers matter there. `capture_copy=0.8%` — the readback of the frame out of video memory
+is nearly free, which is the whole point of the zero-copy path. `submit=0.8%` — handing the
+frame to the encoder costs nothing on the pump's books (the encode happens on the encoder's own
+thread; the evidence that it keeps up is the achieved rate and the drop counter, not this share).
+And `capture=80.2%` — **four fifths of the wall clock was spent in the capture backend**, of
+which `capture_wait=46.5%` was a one-millisecond sleep and most of the rest was
+`TryGetNextFrame` calls for a frame that had not arrived.
+
+A measurement on an **idle** desktop first read 9.2 fps, which is an artefact and was nearly
+taken for the answer: **Windows Graphics Capture delivers a frame when the display's content
+changes**, and an idle 4K desktop changes almost nothing. The numbers above are from a run with
+a 16 ms pattern repainting the screen, so the content changed every tick.
+
+### Three defects, all found by measuring
+
+**The probe measured a path the recording does not take.** The throughput probe spawned an
+ffmpeg child with a raw-pixel pipe and fed it a 33 MB BGRA frame per frame — about 97% of the
+pipeline's work, the very cost the zero-copy path removes. It read 46.3, 59.6, 64.7 and 85.7 fps
+across four runs, and the number was used to cap the recording, so the recorder told a machine
+that does 4K fine that "encode.fps = 60 is not achievable at 3840x2160". The probe is now
+**path-aware**: the raw-pixel configuration is measured with the raw-pixel probe, and the
+zero-copy configuration is measured with the same Media Foundation encoder the recording uses,
+counting the frames the encoder **finished**. On this machine that reads **154.3 fps** — the
+real capacity, and the reason the spurious warning stopped.
+
+**The status line's shares did not add up.** The pacer's sleep was counted in neither `capture`
+nor `submit`, so a share of every second was unattributed. There are now two more shares,
+`discard` and `pacer_sleep`, and the line adds up to 99.8%. The `discard` share is the frame-pool
+drain, and it is **0.0%** — the drain is free. That is worth recording because it was the
+hypothesis: the drain was believed to be a third of the wall clock, and the measurement says
+otherwise.
+
+**The warning blamed the user.** It said "the encoder cannot sustain the {}fps it was told: only
+{:.1} frames per second are reaching it" — reporting the rate it *did* sustain as evidence it
+could not sustain it, and advising "Lower encode.fps" as if the user were at fault. It now
+describes what is happening: the encoder is taking that many frames per second of what the
+pipeline is offering it, so its queue is dropping the rest, and the frames that do get through
+are fine.
+
+**And a failed probe no longer stops the recording.** The measurement is a benchmark of a
+*separate* encoder instance; the recording's own encoder is opened moments later, and if that
+one opens, the recording works whether or not the benchmark could run. A probe failure now costs
+the recording the *measured* rate, not the recording itself, and says which of the two it is
+using — "60fps because you asked for it" and "60fps because the machine can sustain it" are not
+the same claim.
+
+### Waiting for the frame instead of knocking for it
+
+The frame pool already says when it has something. The backend now registers a `FrameArrived`
+handler that does nothing but raise a flag and let go of the lock, and the consumer waits on a
+condition variable instead of sleeping a millisecond and knocking again — **79% of the wall
+clock** was the knocking. The `windows` crate's projection offers that event and nothing else
+(there is no Win32 handle to wait on), so a condition variable is the shape the API allows. The
+handler is not kept by the session — the delegate type is not `Send` and the pool holds its own
+reference, so there is no cycle back to the pool — and the registration is taken back before the
+pool is closed. The machinery lives in the crate's root so it can be tested off Windows, and the
+test that proves a report landing before the wait is not missed **fails with a five-second wait
+when the check is removed**, which is the cost the change exists to remove.
+
+### The display's rate, and the rate the user picks
+
+The framerate setting already existed in the panel (`24, 30, 60, 120`) and the backend already
+permitted anything from 1 to 240; there was no 60 fps cap anywhere in the code. What was missing
+is the app saying what the display runs at, so the choice is informed rather than a guess.
+
+The capture crate now enumerates the displays with the same ordering the capture target uses —
+so an index cannot drift from `[capture] monitor` — and reports each one's size and refresh
+rate. The rules are conservative on purpose: a rate of 0 or 1 is what Windows answers for a mode
+that inherits the display's default, and a rate over 1000 Hz is not a rate any display runs at;
+both are reported as **unknown** rather than believed. A display whose mode cannot be described
+keeps its index and reports no size, because a shifting index would change which screen is
+recorded. The panel then says what it knows — "Recording display 0 — 3840×2160 at 120 Hz" — and
+offers the display's own rate in the list next to the saved one. **The rate is offered, never
+chosen**: the saved rate stands unless the user changes it, and the panel says so plainly when
+the chosen rate is above the display's ("a rate above 60 fps records frames it never shows").
+
+### Is 120 fps reachable?
+
+The zero-copy path is **seven frames deep**: the frame pool holds 2, the capture-to-encoder
+handover is a GPU texture ring of 3, and the encoder's feed channel is 2. At 60 fps that is
+117 ms of slack; at 120 fps it is 58 ms. The encoder measures **154.3 fps** at 4K, so it can
+sustain 120 with about a quarter to spare. The pacer's per-call budget is 5 ms against an 8.3 ms
+interval at 120, which is more than half an interval and therefore tight but workable. **So 120
+fps is architecturally feasible on this machine** — the buffers are sized for 60, and the pool's
+two buffers mean the capture must be drained within one frame interval or the OS drops the
+oldest. The recorder's own schedule now has a test that admits 120 frames in a simulated second,
+and it **caught a real defect on the way**: the first version simulated the clock in whole
+microseconds, and at 120 fps the 8,333,333.33 ns interval drifts a third of a microsecond per
+frame, which by the hundred-and-nineteenth frame is a whole frame late. The test admitted 119 and
+failed. The clock is in nanoseconds now.
+
+### What was NOT verified
+
+- **The machine went offline before the `FrameArrived` change could be measured.** The code is
+  in, the tests pass, and the arithmetic says the 79% should go — but **the 37.7 → 60+ fps
+  claim is unproven on hardware**, and it is stated here as a prediction, not a result.
+- The **Windows display enumeration never ran** — the refresh rate is type-checked for the
+  Windows target and unit-tested against synthetic modes, and nothing on a real 120 Hz panel has
+  read `EnumDisplaySettingsW`. Whether it reports 120, and whether it reports 0 or 1 for an
+  inherited mode, is unknown here.
+- **120 fps is proven in the schedule, not in a capture.** The test asserts the pacer admits 120
+  slots in a second; it does not assert that the machine delivers 120 frames a second, which is
+  the measurement the box would give.
+- The moving display is a **synthetic pattern**, not a game: 16 ms redraws of two bars on black.
+  A game's own frame cost is not the same thing.
+- The 72-hour soak the release checklist asks for has still not been done, at 60 fps or at 120.

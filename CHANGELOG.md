@@ -8,7 +8,45 @@ what has and has not been *verified* on real hardware, read
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **The display's refresh rate, and the framerate the user picks** (`capture_displays`): the
+  encoder panel now says which display is being recorded and the rate that display runs at
+  ("Recording display 0 — 3840×2160 at 120 Hz"), and offers that rate in the framerate list
+  next to the saved one. The rate is **offered, never chosen** — the saved rate stands unless
+  you change it — and the panel says so plainly when the chosen rate is above the display's
+  ("a rate above 60 fps records frames it never shows"). A rate the operating system does not
+  really report is reported as unknown rather than believed.
+
+### Changed
+- **The capture backend waits for a frame instead of knocking for one**: the frame pool's
+  `FrameArrived` event is registered, and the consumer waits on a condition variable the
+  handler raises. The backend had been spending **79% of the recording's wall clock** asleep
+  for a millisecond at a time and asking the frame pool for a frame that had not arrived.
+- **The throughput probe measures the path the recording will actually take.** It used to
+  measure a raw-pixel pipe — about 97% of the pipeline's work, the very cost the zero-copy
+  path removes — and the number it produced was used to cap the recording, so a machine that
+  does 4K fine was told "encode.fps = 60 is not achievable at 3840x2160". The zero-copy
+  configuration is now measured with the same hardware encoder the recording uses. On an
+  RTX 3090 at 4K that reads **154.3 fps**.
+- **A failed probe no longer stops the recording.** The measurement is a benchmark of a
+  separate encoder instance; the recording's own encoder is opened moments later. A probe
+  that cannot run now costs the recording the measured rate, and says so, instead of costing
+  it the recording.
+- **The status line accounts for all of the wall clock.** Two shares were added — the
+  frame-pool drain and the pacer's sleep — so the line adds up to 99.8% instead of leaving a
+  share of every second unattributed.
+
+### Fixed
+- **The warning that blamed you for the encoder's rate** ("the encoder cannot sustain the
+  {}fps it was told: only {:.1} frames per second **are reaching it**") reported the rate the
+  encoder *did* sustain as evidence it could not sustain it, and advised lowering
+  `encode.fps` as if the request were the problem. It now describes what is happening: the
+  encoder is taking that many frames per second of what the pipeline is offering it, so its
+  queue is dropping the rest.
+- **The pacer no longer loses a frame a second at 120 fps.** At that rate the frame interval
+  is 8,333,333.33 ns, and a clock in whole microseconds drifts a third of a microsecond per
+  frame — a whole frame late by the hundred-and-nineteenth. The schedule is in nanoseconds
+  now, and there is a test that admits 120 frames in a simulated second.
 
 ## [0.2.0] - 2026-10-20
 

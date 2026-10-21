@@ -218,6 +218,18 @@ Two places, and they are not the same thing:
 - **`config.toml`** — everything the panel does not edit: the hotkey chords, the start-with-Windows
   switch, the watch list, the GSI port and the event rules.
 
+**The frame rate is yours to pick, and the panel tells you what the display can show.** The
+encoder section names the display being recorded and the rate that display runs at — *"Recording
+display 0 — 3840×2160 at 120 Hz"* — and offers that rate in the list next to your saved one. It
+**does not choose it for you**: your saved rate stands until you change it. If you pick a rate
+above the display's own, the panel says what that costs (*"a rate above 60 fps records frames it
+never shows"*), because the frames are real and the display simply never shows them. A rate your
+operating system does not really report is shown as *not reported* rather than guessed at.
+
+Recording above 60 fps at 4K asks more of the machine than 4K at 60 does, and a frame that
+cannot be encoded in time is dropped rather than held — the panel's live counters say so while
+it happens.
+
 ---
 
 ## The games that are supported
