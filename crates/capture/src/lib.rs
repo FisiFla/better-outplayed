@@ -6,6 +6,13 @@
 
 use std::time::Duration;
 
+// The waiting machinery below is the Windows capture backend's, and its own tests'. Off Windows
+// and outside this crate's test build there is nothing that uses it, so it is not compiled.
+#[cfg(any(windows, test))]
+use std::sync::{Condvar, Mutex};
+#[cfg(any(windows, test))]
+use std::time::Instant;
+
 pub mod platform;
 pub mod stub;
 pub mod target;
@@ -159,6 +166,112 @@ pub struct FrameTimings {
     pub waiting: Duration,
     /// Time spent converting a frame: the readback and its copy, or the handover blit.
     pub copying: Duration,
+}
+
+// --- Waiting for a frame ---
+//
+// The Windows capture backend used to ask the frame pool for a frame it did not have, every
+// millisecond, until one arrived. That is a COM call into the pool per millisecond per frame
+// wanted, and on a 4K desktop it was the largest share of the recording's wall clock. The pool
+// itself says when a frame has arrived, so the wait is on that instead.
+//
+// The machinery is plain concurrency with no platform in it, so it lives here where it can be
+// tested off Windows; the backend supplies the producer's half of it.
+
+/// A producer's "something arrived" latch, and the wait a consumer does on it.
+///
+/// A flag and a condvar. The producer sets the flag and wakes the condvar; the consumer waits on
+/// it. The flag is what makes an early report safe: a consumer that reaches the wait after the
+/// producer reported finds the flag set and does not wait at all, so a report is never lost
+/// between the producer's check and the consumer's wait.
+///
+/// The producer's half must be cheap and must not block: it runs on a thread of the producer's
+/// own, and the consumer may hold the lock for as long as it likes.
+#[cfg(any(windows, test))]
+pub(crate) struct FrameSignal {
+    /// Whether the producer has reported something since the flag was last taken.
+    arrived: Mutex<bool>,
+    /// Raised with `arrived` whenever the producer reports something.
+    wake: Condvar,
+}
+
+#[cfg(any(windows, test))]
+impl FrameSignal {
+    /// A signal with nothing reported yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            arrived: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Report that the producer has something for the consumer.
+    ///
+    /// Cheap, and it never waits for the consumer: this takes the lock, sets the flag and lets go.
+    pub(crate) fn arrive(&self) {
+        let mut arrived = self.arrived.lock().unwrap_or_else(|p| p.into_inner());
+        *arrived = true;
+        self.wake.notify_all();
+    }
+
+    /// Wait up to `timeout` for the producer to report something.
+    ///
+    /// `true` when the producer reported something — the report is consumed — and `false` when
+    /// the wait ran out. A report that landed before this call is not missed: the flag is set
+    /// under the same lock this takes, so a report that has already happened is seen here and the
+    /// wait returns at once.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let mut arrived = self.arrived.lock().unwrap_or_else(|p| p.into_inner());
+        if *arrived {
+            *arrived = false;
+            return true;
+        }
+        let (mut arrived, _timed_out) = self
+            .wake
+            .wait_timeout(arrived, timeout)
+            .unwrap_or_else(|p| p.into_inner());
+        let reported = *arrived;
+        if reported {
+            *arrived = false;
+        }
+        reported
+    }
+}
+
+/// Take the next thing a producer has, waiting for it to arrive if it has not.
+///
+/// `take` is asked first: whatever the producer already holds costs nothing to take and no wait
+/// at all. When it has nothing, the wait blocks on `signal` until the producer reports that
+/// something is there, or `timeout` runs out — and then `take` is asked one last time, because
+/// something may have landed while the wait was waking up.
+///
+/// Returns what `take` produced and how long the wait blocked. The wait is timed as it happened
+/// and not as it was asked for: a wait overshoots by the scheduler's granularity, and the
+/// overshoot is part of the cost.
+#[cfg(any(windows, test))]
+pub(crate) fn take_or_wait<T, E>(
+    take: &mut dyn FnMut() -> Result<Option<T>, E>,
+    signal: &FrameSignal,
+    timeout: Duration,
+) -> Result<(Option<T>, Duration), E> {
+    let deadline = Instant::now() + timeout;
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(found) = take()? {
+            return Ok((Some(found), waited));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok((None, waited));
+        }
+        let before = Instant::now();
+        let reported = signal.wait(remaining);
+        waited += before.elapsed();
+        if !reported {
+            // The wait ran out. One last look: something may have landed as we woke up.
+            return take().map(|found| (found, waited));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,5 +636,63 @@ mod tests {
         assert!(!is_silent_block(&[0, 0, 1, 0]));
         assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
         assert!(!is_silent_block(&[0, 0, 0, 0x80]));
+    }
+
+    /// The signal exists so a report that lands before the consumer waits is not missed. Miss
+    /// it and the consumer waits a whole timeout for a frame that is already there.
+    #[test]
+    fn a_report_that_landed_before_the_wait_is_not_missed() {
+        let signal = FrameSignal::new();
+        // The producer reports first. The consumer's first ask finds nothing — the frame is not
+        // there yet — but the report was.
+        signal.arrive();
+        let mut asks = 0u32;
+        let mut take = || {
+            asks += 1;
+            Ok::<Option<u32>, ()>(if asks >= 2 { Some(7) } else { None })
+        };
+        let (found, waited) = take_or_wait(&mut take, &signal, Duration::from_secs(5))
+            .expect("the take does not fail");
+        assert_eq!(found, Some(7), "the frame the report announced was taken");
+        assert!(
+            waited < Duration::from_secs(1),
+            "the consumer waited a real timeout for a report that had already landed: {waited:?}"
+        );
+    }
+
+    /// A wait that finds nothing must give up inside its budget, and must report the wait it
+    /// actually did rather than the one it asked for.
+    #[test]
+    fn a_wait_that_finds_nothing_gives_up_inside_its_budget() {
+        let signal = FrameSignal::new();
+        let mut take = || Ok::<Option<u32>, ()>(None);
+        let before = Instant::now();
+        let (found, waited) = take_or_wait(&mut take, &signal, Duration::from_millis(50))
+            .expect("the take does not fail");
+        let elapsed = before.elapsed();
+        assert_eq!(found, None, "there was nothing to take");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the wait ran past its budget: {elapsed:?}"
+        );
+        assert!(
+            waited > Duration::ZERO,
+            "the wait blocked, and says how long it blocked"
+        );
+    }
+
+    /// A frame the producer already holds costs no wait at all. This is the case the old
+    /// polling loop paid for with a millisecond of sleep on every single frame.
+    #[test]
+    fn a_frame_that_is_already_there_costs_no_wait() {
+        let signal = FrameSignal::new();
+        let mut take = || Ok::<Option<u32>, ()>(Some(42));
+        let (found, waited) = take_or_wait(&mut take, &signal, Duration::from_secs(5))
+            .expect("the take does not fail");
+        assert_eq!(found, Some(42));
+        assert!(
+            waited < Duration::from_millis(50),
+            "a frame that was already there should not have waited: {waited:?}"
+        );
     }
 }

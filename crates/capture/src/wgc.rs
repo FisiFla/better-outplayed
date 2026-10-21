@@ -14,10 +14,11 @@
 //!
 //! # Frame arrival
 //!
-//! `CaptureBackend::next_frame` is a pull API, so this backend polls
-//! `Direct3D11CaptureFramePool::TryGetNextFrame` on the caller's thread rather than registering
-//! a `FrameArrived` handler. The pool is created free-threaded, which makes polling without a
-//! dispatcher legal.
+//! `CaptureBackend::next_frame` is a pull API, so this backend waits on the frame pool rather
+//! than polling it. The pool is created free-threaded, which removes the need for a dispatcher
+//! queue and makes the pool raise `FrameArrived` on its own worker thread; the handler behind
+//! that event does nothing but set a flag and wake the condvar the wait is on. The wait therefore
+//! ends when the pool says a frame is there, not a millisecond later.
 //!
 //! # Known gaps
 //!
@@ -36,12 +37,14 @@
 
 use crate::platform::init_com;
 use crate::target::{ordered_monitors, pick_monitor, pick_window, CaptureTarget};
-use crate::{clock_base, CaptureBackend, Frame, PixelFormat};
+use crate::{clock_base, take_or_wait, CaptureBackend, Frame, FrameSignal, PixelFormat};
 use anyhow::{bail, Context, Result};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::BOOL;
-use windows::core::{factory, Interface};
+use windows::core::{factory, IInspectable, Interface};
+use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess,
     GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -78,10 +81,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Buffers in the frame pool. A consumer that copies each frame out before asking for the next needs only a couple.
 const BUFFER_COUNT: i32 = 2;
 
-/// Sleep between polls while waiting for a frame. WGC has no blocking wait outside the
-/// `FrameArrived` callback; 1ms adds well under one 60fps frame interval of latency.
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
 /// Upper bound on the frames one `discard_pending` call closes.
 ///
 /// A well-behaved pool holds only `BUFFER_COUNT`; the bound stops a pool that keeps answering from
@@ -106,8 +105,17 @@ pub struct WgcCapture {
     want_textures: bool,
     /// Time spent inside `poll_frame` (the copy), accumulated. See [`replayed_capture::FrameTimings`].
     copying: Duration,
-    /// Time inside `next_frame` that was not inside `poll_frame`: the polling loop's sleeps.
+    /// Time blocked waiting for the frame pool to say a frame arrived, accumulated.
+    ///
+    /// The wait itself, as it happened: a wait overshoots by the scheduler's granularity, and the
+    /// overshoot is part of the cost.
     waiting: Duration,
+    /// The pool's frame-arrival signal: the flag the `FrameArrived` handler sets and the wait
+    /// blocks on.
+    ///
+    /// Shared with that handler, which the pool owns, so it is an `Arc`. Held here as well as in
+    /// the session so the wait can be taken without borrowing the session the poll needs.
+    signal: Arc<FrameSignal>,
     /// Whether `start` has been called and `stop` has not.
     ///
     /// Separate from `session`, which is built in [`Self::new`] because the item size must be known
@@ -196,6 +204,11 @@ struct Session {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     pool: Direct3D11CaptureFramePool,
+    /// The token the pool gave for the `FrameArrived` registration, so it can be taken back.
+    ///
+    /// The handler behind the registration is a COM object the pool holds a reference to;
+    /// removing the registration is what lets the pool let it go.
+    arrival: i64,
     /// The capture item's size in physical pixels; the frame pool is created with it, so it is the
     /// size of the frames to come.
     size: (u32, u32),
@@ -229,6 +242,7 @@ impl WgcCapture {
             want_textures: false,
             copying: Duration::ZERO,
             waiting: Duration::ZERO,
+            signal: Arc::new(FrameSignal::new()),
             started: false,
             com_owned: false,
         };
@@ -239,7 +253,7 @@ impl WgcCapture {
     /// Take this thread's COM apartment and build the WGC session on it.
     fn start_session(&mut self) -> Result<()> {
         self.com_owned = init_com()?;
-        match Session::new(&self.target) {
+        match Session::new(&self.target, Arc::clone(&self.signal)) {
             Ok(mut session) => {
                 self.size = session.size;
                 // Carry the caller's answer into the session: the encoder is configured, and asks, between
@@ -293,12 +307,13 @@ impl CaptureBackend for WgcCapture {
         Ok(())
     }
 
-    /// Polls for the next frame, splitting its time into copying and waiting. Returns `Ok(None)` when
-    /// no frame arrives within `timeout`, per the `CaptureBackend` contract.
+    /// Waits for the next frame, splitting its time into copying and waiting. Returns `Ok(None)`
+    /// when no frame arrives within `timeout`, per the `CaptureBackend` contract.
     ///
-    /// Each is timed where it happens rather than by timing the whole call and subtracting:
-    /// `poll_frame` either copies a frame or finds none, and everything else is a sleep. The loop's
-    /// own clock reads (nanoseconds) are left out of both. See [`crate::FrameTimings`].
+    /// Each is timed where it happens rather than by timing the whole call and subtracting: the
+    /// copy is the handover of a frame the pool has, and everything else is the wait for one to
+    /// arrive. The wait's own clock reads (nanoseconds) are left out of both. See
+    /// [`crate::FrameTimings`].
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         if !self.started {
             bail!("WGC capture is not started");
@@ -307,22 +322,23 @@ impl CaptureBackend for WgcCapture {
             .session
             .as_mut()
             .context("WGC capture has no session (already stopped)")?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let before = Instant::now();
-            let polled = session.poll_frame()?;
-            self.copying += before.elapsed();
-            if let Some(frame) = polled {
-                return Ok(Some(frame));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            let slept = POLL_INTERVAL.min(deadline - now);
-            std::thread::sleep(slept);
-            self.waiting += slept;
-        }
+        let mut copied = Duration::ZERO;
+        // The pool is asked for a frame first, because a frame it already holds costs nothing to
+        // take; when it has none, the wait blocks until the pool's own `FrameArrived` handler
+        // says one is there. Nothing polls in between.
+        let (frame, waited) = take_or_wait(
+            &mut || {
+                let before = Instant::now();
+                let polled = session.poll_frame();
+                copied += before.elapsed();
+                polled
+            },
+            &self.signal,
+            timeout,
+        )?;
+        self.copying += copied;
+        self.waiting += waited;
+        Ok(frame)
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -332,6 +348,12 @@ impl CaptureBackend for WgcCapture {
             // either rather than pretending it stopped.
             if let Err(e) = session.capture.Close() {
                 tracing::warn!("closing the WGC capture session failed: {e}");
+            }
+            // Take the arrival handler back before the pool goes. The pool holds the handler and
+            // the handler holds the signal the wait is on: a pool closed with the handler still
+            // registered is a pool whose worker thread may raise it once more.
+            if let Err(e) = session.pool.RemoveFrameArrived(session.arrival) {
+                tracing::warn!("removing the WGC frame-arrival handler failed: {e}");
             }
             if let Err(e) = session.pool.Close() {
                 tracing::warn!("closing the WGC frame pool failed: {e}");
@@ -396,7 +418,11 @@ impl Drop for WgcCapture {
 }
 
 impl Session {
-    fn new(target: &CaptureTarget) -> Result<Self> {
+    /// Build the pool, the session and the frame-arrival registration.
+    ///
+    /// `signal` is the latch the wait blocks on; the pool's own `FrameArrived` event is what
+    /// raises it.
+    fn new(target: &CaptureTarget, signal: Arc<FrameSignal>) -> Result<Self> {
         let (device, context) = create_device()?;
         let item = create_capture_item(target)?;
         let item_size = item.Size().context("GraphicsCaptureItem::Size")?;
@@ -415,6 +441,23 @@ impl Session {
             item_size,
         )
         .context("Direct3D11CaptureFramePool::CreateFreeThreaded")?;
+        // The pool says when a frame has arrived, and this is the only thing that acts on it: set
+        // the flag and wake the wait. The handler runs on the pool's own worker thread (a
+        // free-threaded pool has no dispatcher queue), so it must be cheap and must not block.
+        //
+        // It holds the signal and nothing else, so there is no cycle back to the pool: the pool
+        // holds the handler, the handler holds the signal, and the signal holds nothing.
+        let handler_signal = Arc::clone(&signal);
+        let handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
+            TypedEventHandler::new(move |_sender, _args| -> windows::core::Result<()> {
+                handler_signal.arrive();
+                Ok(())
+            });
+        // The handler is not kept: the pool holds its own reference to the delegate, and the
+        // delegate type is not `Send`, so a session that kept one could not be sent.
+        let arrival = pool
+            .FrameArrived(&handler)
+            .context("Direct3D11CaptureFramePool::FrameArrived")?;
         let capture = pool
             .CreateCaptureSession(&item)
             .context("Direct3D11CaptureFramePool::CreateCaptureSession")?;
@@ -435,6 +478,7 @@ impl Session {
             device,
             context,
             pool,
+            arrival,
             size,
             _item: item,
             capture,
