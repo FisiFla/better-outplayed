@@ -9,15 +9,25 @@
 //!
 //! | input | stream | transport |
 //! |---|---|---|
-//! | 0 | raw BGRA video | `pipe:0` |
-//! | 1 | system/game audio ([`EncodeConfig::game_audio`]) | `tcp://127.0.0.1:{game_audio_port}` |
-//! | 2 | microphone (`EncodeConfig::mic_audio`) | `tcp://127.0.0.1:{mic_audio_port}` |
+//! | 0 | system/game audio ([`EncodeConfig::game_audio`]) | `tcp://127.0.0.1:{game_audio_port}` |
+//! | 1 | microphone (`EncodeConfig::mic_audio`) | `tcp://127.0.0.1:{mic_audio_port}` |
+//! | last | raw BGRA video | `pipe:0` |
 //!
-//! Input 1 exists only when `game_audio` is true and input 2 only when `mic_audio` is `Some`.
+//! **The audio is declared first on purpose** (issue #78). ffmpeg opens its inputs in the order
+//! they are declared, and the raw video input's *probe blocks*: a raw H.264 demuxer cannot probe
+//! the stream until it has seen a keyframe carrying the sequence header. With the video declared
+//! first, the child sat inside that probe and **never opened the audio socket**, so the recorder's
+//! audio writer waited out its ten-second connect deadline for a connection that could not happen
+//! and the recording died before it began. With the audio first, the child dials the audio socket
+//! before it looks at the video at all.
+//!
+//! Input 0 exists only when `game_audio` is true and input 1 only when `mic_audio` is `Some`.
 //! With `game_audio` off there is no audio input at all (no listener, no `-c:a`, no audio
-//! stream). With both on the output is `-map 0:v -map 1:a -map 2:a`, tagged `Game Audio` and
-//! `Microphone`. A microphone with the game audio off is refused at [`FfmpegEncoder::spawn`],
-//! because a one-track container would carry it as `Game Audio`.
+//! stream). The output is mapped explicitly, and the mapping is what fixes the places the tracks
+//! are named by: the video first, then the game audio (`Game Audio`), then the microphone
+//! (`Microphone`) — the order the file has always had. A microphone with the game audio off is
+//! refused at [`FfmpegEncoder::spawn`], because a one-track container would carry it as
+//! `Game Audio`.
 //!
 //! The microphone is pumped by the same [`pump_audio`] on its own thread: PCM is written as
 //! submitted, the media timeline is the sample count, and a full queue drops and counts a block
@@ -402,8 +412,24 @@ fn audio_input_args(
 /// The complete ffmpeg argument list for one recording child, program name excepted.
 ///
 /// A pure function of the configuration and the two loopback URLs, so a test can assert the whole
-/// list element for element. With [`EncodeConfig::mic_audio`] `None` it is the one-track list
-/// byte for byte (`the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list`).
+/// list element for element.
+///
+/// **The input order is the fix for issue #78, and it is load-bearing.** ffmpeg opens its inputs
+/// in the order they are declared, and the raw video input's probe *blocks*: a raw H.264 demuxer
+/// cannot probe the stream until it has seen a keyframe carrying the sequence header. With the
+/// video declared first, the child sat inside input 0's probe and **input 1, the audio socket, was
+/// never opened**: the recorder's audio writer waited out its ten-second connect deadline for a
+/// connection that could not happen, and the recording died before it began.
+///
+/// So the audio inputs are declared first, and the video last. The child then dials the audio
+/// socket before it looks at the video at all, so the connection cannot be behind the probe, and
+/// the video's probe may take as long as it needs — the sequence header the hardware encoder
+/// publishes is prepended to the bitstream (`crate::mft`), so it does not take long.
+///
+/// The output is mapped explicitly, because the default stream selection cannot be relied on
+/// once the inputs are in this order, and because the mapping is what fixes the *positions* the
+/// audio tracks are named by (`replayed_media::edit::audio_titles`): the game audio is the first
+/// audio stream and the microphone the second.
 ///
 /// `OsString` because the segment pattern is a real path: a non-UTF-8 `scratch_dir` must reach
 /// ffmpeg as the bytes it is.
@@ -415,20 +441,15 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
     // `-nostdin` keeps ffmpeg from consuming our stdin for interactive commands, which would steal
     // raw video frames; `-loglevel error` is why a failure's reason is read from stderr by `drain_stderr`.
 
-    // Input 0, video, in one of two shapes: raw BGRA frames copied out of VRAM
-    // ([`video_input_args`], shared with the throughput probe), or an H.264 elementary stream
-    // encoded on the GPU ([`video_input_args_bitstream`]). See [`VideoInput`].
-    args.extend(
-        match cfg.video {
-            VideoInput::RawPixels => video_input_args(cfg),
-            VideoInput::EncodedBitstream => video_input_args_bitstream(cfg.codec),
-        }
-        .into_iter()
-        .map(OsString::from),
-    );
+    // The input index each one gets, in the order they are declared. The video is last, so the
+    // audio indices are 0 and 1 and the video's is whatever the audio left.
+    let mut next_input = 0u32;
+    let mut game_audio_input = None;
+    let mut mic_input = None;
 
-    // Input 1, system/game audio: raw s16le PCM over loopback TCP (see the module comment). Declared
-    // only when `game_audio` is on, since a declared input would have to be mapped, tagged and ended.
+    // Input 0, the system/game audio: raw s16le PCM over loopback TCP (see the module comment).
+    // Declared only when `game_audio` is on, since a declared input would have to be mapped,
+    // tagged and ended.
     if cfg.game_audio {
         args.extend(
             audio_input_args(
@@ -440,9 +461,11 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
             .into_iter()
             .map(OsString::from),
         );
+        game_audio_input = Some(next_input);
+        next_input = next_input.saturating_add(1);
     }
 
-    // Input 2, the microphone, declared and pumped by the same functions as input 1 so the second
+    // Input 1, the microphone, declared and pumped by the same functions as input 0 so the second
     // track cannot invent its own timing conventions; only the numbers come from `MicAudioSpec`.
     if let Some(mic_url) = mic_url {
         let spec = cfg
@@ -453,10 +476,25 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
                 .into_iter()
                 .map(OsString::from),
         );
+        mic_input = Some(next_input);
+        next_input = next_input.saturating_add(1);
     }
 
-    // What to do with input 0: scale, codec, bitrate and keyframe schedule, or a plain copy for a
-    // stream that arrived encoded. Shared with the probe.
+    // The video input, last: raw BGRA frames copied out of VRAM ([`video_input_args`], shared
+    // with the throughput probe), or an H.264 elementary stream encoded on the GPU
+    // ([`video_input_args_bitstream`]). See [`VideoInput`].
+    args.extend(
+        match cfg.video {
+            VideoInput::RawPixels => video_input_args(cfg),
+            VideoInput::EncodedBitstream => video_input_args_bitstream(cfg.codec),
+        }
+        .into_iter()
+        .map(OsString::from),
+    );
+    let video_input = next_input;
+
+    // What to do with the video input: scale, codec, bitrate and keyframe schedule, or a plain
+    // copy for a stream that arrived encoded. Shared with the probe.
     args.extend(
         match cfg.video {
             VideoInput::RawPixels => video_output_args(cfg),
@@ -472,21 +510,32 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
         args.push(format!("{}k", cfg.audio_bitrate_kbps).into());
     }
 
-    // Only with a second audio input does the output need an explicit `-map`: with one, ffmpeg's
-    // default selection already picks input 0's video and input 1's audio (and the single-track
-    // list must stay unchanged). With two, the default would pick one, so both are mapped and
-    // tagged. Input order sets the indices: 1 is the game audio (`Encoder::submit_audio`), 2 the
-    // microphone (`Encoder::submit_mic_audio`); a microphone with `game_audio` off would shift them,
-    // which is why that combination is refused at spawn.
-    if mic_url.is_some() {
-        args.extend(
-            ["-map", "0:v", "-map", "1:a", "-map", "2:a"]
-                .iter()
-                .map(OsString::from),
-        );
-        // The tag strings come from `replayed-media`, which applies the same names again when it
-        // concatenates segments (`-c copy` does not carry per-stream metadata); two literals could drift
-        // and leave a track anonymous.
+    // The mapping, written out rather than left to ffmpeg's default selection.
+    //
+    // The order here is the order the output has always had — the video first, then the game
+    // audio, then the microphone — so the file is the same file it was, with the same tracks in
+    // the same places. What the mapping fixes is *which* track is which: the video is the input
+    // the video came from and the audio inputs are the ones the audio came from, and the audio
+    // tracks keep the positions they are named by (the game audio is the first audio stream, the
+    // microphone the second — `replayed_media::edit::audio_titles`).
+    args.push("-map".into());
+    args.push(format!("{video_input}:v").into());
+    if let Some(index) = game_audio_input {
+        args.push("-map".into());
+        args.push(format!("{index}:a").into());
+    }
+    if let Some(index) = mic_input {
+        args.push("-map".into());
+        args.push(format!("{index}:a").into());
+    }
+
+    // The tag strings come from `replayed-media`, which applies the same names again when it
+    // concatenates segments (`-c copy` does not carry per-stream metadata); two literals could drift
+    // and leave a track anonymous.
+    //
+    // Only the two-track path is tagged, as it always was: the single-track path has no tags, and
+    // the names are applied again when the segments are concatenated.
+    if mic_input.is_some() {
         for (index, title) in replayed_media::edit::audio_titles(2).iter().enumerate() {
             args.push(format!("-metadata:s:a:{index}").into());
             args.push(format!("title={title}").into());
@@ -1935,6 +1984,83 @@ mod tests {
         refuse_audio_without_input(true).expect("an encoder with the game audio accepts the block");
     }
 
+    /// The child reaches the audio input before the video input blocks it — the behaviour the
+    /// input order is for.
+    ///
+    /// The deadlock of issue #78: ffmpeg opens its inputs in the order they are declared, and the
+    /// raw H.264 input's *probe blocks* until it has seen a keyframe carrying the sequence
+    /// header. With the video declared first the child sat inside that probe and never opened the
+    /// audio socket, so the recorder's audio writer waited out its ten-second connect deadline for
+    /// a connection that could not happen and the recording died before it began.
+    ///
+    /// Asserting the order of the arguments does not prove the behaviour, so the stand-in child
+    /// emulates it: it opens its inputs in the order it was given them, and the video input blocks
+    /// until it has seen a keyframe — which never comes, because only raw pixels are on that pipe.
+    /// So the stand-in reaches the audio input only if the audio input was declared first, and it
+    /// records having reached it.
+    ///
+    /// Unix-only: the stand-in is a `#!/bin/bash` script.
+    #[cfg(unix)]
+    #[test]
+    fn the_child_reaches_the_audio_input_before_the_video_input_blocks_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("audio-input-opened");
+        let stub = dir.path().join("ffmpeg");
+        std::fs::write(
+            &stub,
+            format!(
+                r#"#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in
+    tcp://*)
+      port="${{arg##*:}}"
+      # Dial the recorder's listener, as ffmpeg does when it opens this input.
+      ( exec 3<>/dev/tcp/127.0.0.1/"$port" ) 2>/dev/null
+      echo "$arg" > '{marker}'
+      ;;
+    pipe:0)
+      # The video input's probe: it cannot be opened until a keyframe has been seen.
+      while IFS= read -r line; do :; done
+      ;;
+  esac
+done
+sleep 30
+"#,
+                marker = marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = FfmpegBinaries {
+            ffmpeg: stub.clone(),
+            ffprobe: stub,
+        };
+        let cfg = EncodeConfig::for_tests_software(
+            crate::VideoCodec::H264,
+            64,
+            64,
+            30,
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        let encoder = FfmpegEncoder::spawn(&bin, &cfg).expect("spawn");
+
+        // Nothing is fed to the child, so the video input would block for ever if it came
+        // first: the stand-in has to reach the audio input on its own.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            marker.exists(),
+            "the child must reach the audio input before the video input's probe blocks it: it \
+             never opened the audio input. It was asked to: {}",
+            encoder.argv_text()
+        );
+    }
+
     /// The argument list as the os-string vector `Command::args` receives it. Every element is
     /// ASCII except the segment pattern path, which is derived the same way on both sides.
     fn strings(args: &[OsString]) -> Vec<String> {
@@ -1949,8 +2075,14 @@ mod tests {
     /// under test would assert nothing. Adding, removing, reordering or re-spelling anything on the
     /// single-audio path fails here (the `-start_number` and `-r` mistakes looked equivalent; see
     /// [`ffmpeg_args`]).
+    ///
+    /// **This list changed on purpose** (issue #78): the audio input is declared before the video
+    /// one, and the output is mapped explicitly because the default stream selection cannot be
+    /// relied on once the inputs are in that order. What did *not* change is the file: the video
+    /// is still the first output stream and the game audio the first audio stream, so the track
+    /// names (`replayed_media::edit::audio_titles`) still land on the right tracks.
     #[test]
-    fn the_argument_list_without_a_microphone_is_byte_identical_to_the_pre_change_list() {
+    fn the_argument_list_without_a_microphone_declares_the_audio_first_and_maps_it_explicitly() {
         let cfg = args_cfg(30, 1_000);
 
         let got = strings(&ffmpeg_args(&cfg, "tcp://127.0.0.1:41234", None));
@@ -1959,7 +2091,17 @@ mod tests {
             "-loglevel",
             "error",
             "-nostdin",
-            // Input 0: raw BGRA video on stdin, at the declared rate, timed from arrival.
+            // Input 0: raw s16le PCM over loopback TCP. FIRST, because the video input's probe
+            // blocks and the audio socket must not be behind it (issue #78).
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            "tcp://127.0.0.1:41234",
+            // Input 1: raw BGRA video on stdin, at the declared rate, timed from arrival.
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -1972,15 +2114,6 @@ mod tests {
             "1",
             "-i",
             "pipe:0",
-            // Input 1: raw s16le PCM over loopback TCP.
-            "-f",
-            "s16le",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-i",
-            "tcp://127.0.0.1:41234",
             // The video encoder: passthrough frame-rate mode, codec, bitrate, GOP and forced keyframes.
             "-fps_mode",
             "passthrough",
@@ -2001,6 +2134,13 @@ mod tests {
             "aac",
             "-b:a",
             "128k",
+            // The mapping: the video is input 1 and the game audio is input 0. The order is the
+            // order the output has always had — the video first, then the game audio — so the
+            // file is the same file it was.
+            "-map",
+            "1:v",
+            "-map",
+            "0:a",
             "-f",
             "segment",
             "-segment_time",
@@ -2025,18 +2165,83 @@ mod tests {
 
         assert_eq!(
             got, expected,
-            "the single-audio argument list must be byte-identical to the pre-change list. \
-             Note what is absent: no `-map` and no `-metadata` — with one audio input \
-             ffmpeg's default stream selection already picks exactly input 0's video and \
-             input 1's audio, which is why the microphone is the only thing that adds them"
+            "the single-audio argument list must be exactly this: the audio input first, the \
+             video second, and the two mapped explicitly onto the tracks they have always been"
+        );
+    }
+
+    /// The audio input is declared before the video one, and the mapping says which input each
+    /// track came from.
+    ///
+    /// The order is the fix for issue #78 and it is worth a test of its own, because it is the
+    /// one thing in the argument list that is not visible in the file: ffmpeg opens its inputs in
+    /// the order they are declared, and the raw video input's probe blocks until it has seen a
+    /// keyframe carrying the sequence header. With the video first, the child never opened the
+    /// audio socket and the recording died on the audio writer's connect deadline.
+    ///
+    /// The mapping is the other half: the input order changed, so the tracks cannot be left to
+    /// ffmpeg's default selection. The game audio has to stay the *first audio stream* and the
+    /// microphone the second, because that is the position they are named by
+    /// (`replayed_media::edit::audio_titles`).
+    #[test]
+    fn the_audio_input_is_declared_before_the_video_one_and_the_tracks_are_mapped_explicitly() {
+        let mut cfg = args_cfg(30, 1_000);
+        cfg.mic_audio = Some(crate::MicAudioSpec::default());
+        let text = strings(&ffmpeg_args(
+            &cfg,
+            "tcp://127.0.0.1:41234",
+            Some("tcp://127.0.0.1:43210"),
+        ));
+
+        // The inputs, in the order they are declared.
+        let inputs: Vec<&str> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.starts_with("tcp://") || *arg == "pipe:0")
+            .map(|(_, arg)| arg.as_str())
+            .collect();
+        assert_eq!(
+            inputs,
+            ["tcp://127.0.0.1:41234", "tcp://127.0.0.1:43210", "pipe:0"],
+            "the audio inputs are declared before the video: the child's connection to them \
+             cannot be stuck behind the video's probe"
+        );
+
+        // The mapping, in the order the output has.
+        let maps: Vec<&str> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| *arg == "-map")
+            .map(|(index, _)| text[index + 1].as_str())
+            .collect();
+        assert_eq!(
+            maps,
+            ["2:v", "0:a", "1:a"],
+            "the video is the last input and the audio the first two, and the output keeps the \
+             order it always had: the video, the game audio, the microphone"
+        );
+
+        // And the audio tracks are named by the position the mapping gives them: the game audio
+        // is the first audio stream, the microphone the second.
+        let titles: Vec<&str> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.starts_with("-metadata:s:a:"))
+            .map(|(index, _)| text[index + 1].as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["title=Game Audio", "title=Microphone"],
+            "the tags follow the audio streams, and the audio streams follow the mapping"
         );
     }
 
     /// Enabling the microphone adds its own input and the mapping/tagging, and moves nothing else.
     ///
-    /// Input 2 is `tcp://127.0.0.1:{mic_audio_port}` declared from the caller's `MicAudioSpec`, and
-    /// the output carries `-map 0:v -map 1:a -map 2:a` with `title=Game Audio` and `title=Microphone`.
-    /// The video arguments are the same elements in the same order as the single-audio list.
+    /// Input 1 is `tcp://127.0.0.1:{mic_audio_port}` declared from the caller's `MicAudioSpec`, and
+    /// the output carries `-map 2:v -map 0:a -map 1:a` with `title=Game Audio` and
+    /// `title=Microphone`. The video arguments are the same elements in the same order as the
+    /// single-audio list.
     #[test]
     fn enabling_the_microphone_adds_its_own_input_its_mapping_and_its_tags() {
         let mut cfg = args_cfg(30, 1_000);
@@ -2058,6 +2263,25 @@ mod tests {
             "-loglevel",
             "error",
             "-nostdin",
+            // Input 0: the game audio, over loopback TCP.
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            "tcp://127.0.0.1:41234",
+            // Input 1, from the configuration's spec.
+            "-f",
+            "s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-i",
+            "tcp://127.0.0.1:43210",
+            // Input 2: the video, on stdin.
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -2070,23 +2294,6 @@ mod tests {
             "1",
             "-i",
             "pipe:0",
-            "-f",
-            "s16le",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-i",
-            "tcp://127.0.0.1:41234",
-            // Input 2, from the configuration's spec.
-            "-f",
-            "s16le",
-            "-ar",
-            "44100",
-            "-ac",
-            "1",
-            "-i",
-            "tcp://127.0.0.1:43210",
             "-fps_mode",
             "passthrough",
             "-c:v",
@@ -2105,13 +2312,14 @@ mod tests {
             "aac",
             "-b:a",
             "128k",
-            // What a second audio input needs: both streams mapped explicitly (without maps ffmpeg picks one) and tagged.
+            // What the changed input order needs: the tracks mapped explicitly, in the order the
+            // output has always had — the video, the game audio, the microphone.
             "-map",
-            "0:v",
+            "2:v",
+            "-map",
+            "0:a",
             "-map",
             "1:a",
-            "-map",
-            "2:a",
             "-metadata:s:a:0",
             "title=Game Audio",
             "-metadata:s:a:1",

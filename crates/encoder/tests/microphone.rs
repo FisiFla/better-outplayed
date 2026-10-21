@@ -206,6 +206,22 @@ fn the_microphone_lands_as_a_second_tagged_track_carrying_its_own_tone() {
         "and the second one is named: {streams:#?}"
     );
 
+    // The tracks sit in the file in the order they always have: the video first, then the game
+    // audio, then the microphone.
+    //
+    // The *input* order changed (the audio is declared before the video, so the child's
+    // connection to it cannot be stuck behind the video's probe — issue #78), and this is what
+    // says the change did not reach the file: the audio tracks keep their positions among the
+    // audio streams, which is what they are named by, and the video is still the first track.
+    assert_eq!(
+        streams
+            .iter()
+            .map(|stream| stream.codec_type.as_str())
+            .collect::<Vec<_>>(),
+        ["video", "audio", "audio"],
+        "the video is still the first track and the two audio tracks follow it: {streams:#?}"
+    );
+
     // The media crate's probe must agree with the scanner about the file.
     let info = MediaInfo::from_ffprobe_json(&json).expect("the media crate parses this probe");
     assert!(info.video.is_some(), "a video stream is still there");
@@ -338,6 +354,15 @@ fn without_a_microphone_the_segment_still_carries_exactly_one_audio_track() {
             .and_then(|s| s.title.clone()),
         None,
         "the single-track path gains no metadata: {streams:#?}"
+    );
+    // And the video is still the first track, as it always was.
+    assert_eq!(
+        streams
+            .iter()
+            .map(|stream| stream.codec_type.as_str())
+            .collect::<Vec<_>>(),
+        ["video", "audio"],
+        "the video is the first track and the game audio the only other one: {streams:#?}"
     );
 }
 

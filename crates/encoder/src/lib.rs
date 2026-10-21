@@ -341,6 +341,164 @@ pub fn type_change_refusal(wanted: &OutputTypeSpec, offers: &[OutputTypeSpec]) -
     )
 }
 
+// ---- the sequence header of a raw video bitstream ----------------------------------------
+
+/// The start code that begins an Annex-B NAL unit.
+const ANNEX_B_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+/// The sequence header of a video stream, as the bytes to put in front of a raw bitstream.
+///
+/// Media Foundation publishes the sequence header of an encoded stream on the encoder's output
+/// type (`MF_MT_MPEG_SEQUENCE_HEADER`), and the SDK documents that blob as "concatenated NAL units
+/// in Annex B format, along with their start codes" — for H.264 the SPS and the PPS, for HEVC the
+/// VPS, the SPS and the PPS.
+///
+/// A raw bitstream has no container to carry those parameter sets, so a demuxer reading one has
+/// nothing to probe with until a keyframe carries them in band. That is the starvation of issue
+/// #78: on a display that barely changes the first keyframe arrives later than the audio input's
+/// connect deadline, and the recording dies before it begins.
+///
+/// So the header goes in front of the bitstream. A blob in the length-prefixed (AVCC) form is
+/// converted here; a blob in neither form is refused rather than guessed at, because a header
+/// that is wrong is a stream that decodes to noise.
+///
+/// A pure function, so the conversion can be tested off Windows: the Media Foundation half that
+/// reads the blob out of the encoder's output type cannot run anywhere else.
+pub fn annex_b_sequence_header(codec_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if codec_data.is_empty() {
+        anyhow::bail!(
+            "the encoder published no sequence header at all: there is nothing to put in front of \
+             the bitstream, and a raw demuxer has nothing to probe with"
+        );
+    }
+    if is_annex_b(codec_data) {
+        // Already Annex-B, which is the form the SDK documents: passed through byte for byte.
+        return Ok(codec_data.to_vec());
+    }
+    if let Some(parameters) = avcc_parameter_sets(codec_data) {
+        return Ok(parameters);
+    }
+    if let Some(parameters) = length_prefixed_units(codec_data) {
+        return Ok(parameters);
+    }
+    anyhow::bail!(
+        "the encoder's sequence header is {} bytes in a form this build cannot read (it starts \
+         {}): expected Annex-B start codes, an AVCDecoderConfigurationRecord, or length-prefixed \
+         NAL units",
+        codec_data.len(),
+        hex_bytes(&codec_data[..codec_data.len().min(8)])
+    )
+}
+
+/// Whether the bytes are in Annex-B form: they carry a start code.
+///
+/// The three-byte form (`00 00 01`) is the tail of the four-byte one (`00 00 00 01`), so looking
+/// for the three-byte form finds both.
+///
+/// Public because it is the check the encoder's own published header has to pass before it goes
+/// in front of the bitstream, and the check the Windows-only test makes on the machine's own
+/// hardware encoder.
+pub fn is_annex_b(data: &[u8]) -> bool {
+    data.windows(3).any(|window| window == [0x00, 0x00, 0x01])
+}
+
+/// The parameter sets of an AVCDecoderConfigurationRecord, as Annex-B bytes.
+///
+/// The record is the shape an MP4 file carries the sequence header in: a version byte, the
+/// profile and the level, the size of a NAL unit's length prefix, then the SPS and the PPS, each
+/// with its own two-byte length. Media Foundation's own blob is Annex-B (see
+/// [`annex_b_sequence_header`]); this is the form an encoder that speaks AVCC would publish, and
+/// it is converted rather than written out as it stands: a length-prefixed parameter set is not a
+/// parameter set a raw Annex-B demuxer can read.
+///
+/// `None` for anything that is not a record this parses, so the caller can try the other form
+/// and finally refuse.
+fn avcc_parameter_sets(record: &[u8]) -> Option<Vec<u8>> {
+    // configurationVersion(1) profile(1) compatibility(1) level(1) lengthSize(1) numOfSps(1).
+    // The length size is not read: it describes the NAL stream the record goes with, and the
+    // parameter sets inside the record always carry a two-byte length.
+    if record.len() < 7 || record[0] != 1 {
+        return None;
+    }
+    let sps_count = usize::from(record[5] & 0x1f);
+    if sps_count == 0 {
+        return None;
+    }
+    let mut cursor = 6usize;
+    let mut out = Vec::new();
+    for _ in 0..sps_count {
+        let (unit, next) = length_prefixed_unit(record, cursor, 2)?;
+        out.extend_from_slice(&ANNEX_B_START_CODE);
+        out.extend_from_slice(&unit);
+        cursor = next;
+    }
+    let pps_count = usize::from(*record.get(cursor)?);
+    if pps_count == 0 {
+        return None;
+    }
+    cursor = cursor.saturating_add(1);
+    for _ in 0..pps_count {
+        let (unit, next) = length_prefixed_unit(record, cursor, 2)?;
+        out.extend_from_slice(&ANNEX_B_START_CODE);
+        out.extend_from_slice(&unit);
+        cursor = next;
+    }
+    // The record ends with its picture parameter sets, so a record that has bytes left over is
+    // not one this parsed. That is what tells this form apart from a blob that merely starts
+    // like one.
+    if cursor != record.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The NAL units of a length-prefixed bitstream, as Annex-B bytes.
+///
+/// The form an MP4 file carries: each unit is preceded by its length, big-endian. The first byte
+/// of such a stream is zero for any unit this small, which is what tells it apart from a
+/// configuration record (whose first byte is the version).
+fn length_prefixed_units(data: &[u8]) -> Option<Vec<u8>> {
+    if data.first() != Some(&0) {
+        return None;
+    }
+    let mut cursor = 0usize;
+    let mut out = Vec::new();
+    while cursor < data.len() {
+        let (unit, next) = length_prefixed_unit(data, cursor, 4)?;
+        out.extend_from_slice(&ANNEX_B_START_CODE);
+        out.extend_from_slice(&unit);
+        cursor = next;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// One length-prefixed NAL unit: a length of `width` bytes, then the unit's bytes.
+///
+/// `None` for a length that does not fit the data: a truncated record is not a record, and
+/// reading past the end of it would be a panic in the middle of a recording.
+fn length_prefixed_unit(data: &[u8], at: usize, width: usize) -> Option<(Vec<u8>, usize)> {
+    let length_bytes = data.get(at..at.checked_add(width)?)?;
+    let mut length = 0usize;
+    for byte in length_bytes {
+        length = length.checked_mul(256)?.checked_add(usize::from(*byte))?;
+    }
+    if length == 0 {
+        return None;
+    }
+    let end = at.checked_add(width)?.checked_add(length)?;
+    let unit = data.get(at.checked_add(width)?..end)?;
+    Some((unit.to_vec(), end))
+}
+
+/// The bytes as hex, for a message that has to say what was read.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The PCM sample encoding an audio input is declared with (`-f <name>`).
 ///
 /// A type rather than a bare string: the audio timeline is derived from the byte count, so a
@@ -422,8 +580,8 @@ pub struct EncodeConfig {
     /// track (`Microphone`); the first stays `Game Audio`. When `None` the argument list is the
     /// one-track list, byte for byte.
     ///
-    /// The encoder binds the port, owns the pump thread and feeds ffmpeg's input 2, as it does for
-    /// the game audio on input 1. The caller hands PCM to [`Encoder::submit_mic_audio`] and reads
+    /// The encoder binds the port, owns the pump thread and feeds ffmpeg's input 1, as it does for
+    /// the game audio on input 0. The caller hands PCM to [`Encoder::submit_mic_audio`] and reads
     /// the port back with [`Encoder::mic_port`].
     ///
     /// A configured microphone that cannot be brought up fails the start; it never degrades to a
@@ -492,6 +650,9 @@ pub enum VideoInput {
     ///   so segment boundaries come from the MFT's own keyframe interval.
     /// * The output cannot be scaled: that needs decoding, which is the cost this variant removes.
     ///   A scaled `output_size` is refused at spawn.
+    /// * The bitstream carries the encoder's sequence header in front of it (see [`crate::mft`]):
+    ///   a raw demuxer has nothing to probe with until it has seen a keyframe carrying the
+    ///   parameter sets, and on a still display that keyframe is a long way off (issue #78).
     EncodedBitstream,
 }
 
@@ -897,6 +1058,107 @@ mod tests {
         assert!(
             nothing.contains("no output type at all"),
             "an encoder that offers nothing says so rather than listing nothing: {nothing}"
+        );
+    }
+
+    // ---- the sequence header of a raw bitstream ----
+
+    /// The blob Media Foundation publishes is already Annex-B — "concatenated NAL units in Annex
+    /// B format, along with their start codes" — so it is passed through byte for byte.
+    ///
+    /// The bytes are the shape the SDK documents: an SPS and a PPS, each behind its start code.
+    #[test]
+    fn a_sequence_header_in_annex_b_is_passed_through_unchanged() {
+        let blob = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, // the SPS
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x3c, 0x80, // the PPS
+        ];
+        assert_eq!(
+            annex_b_sequence_header(&blob).expect("an Annex-B header is read as it stands"),
+            blob.to_vec(),
+            "the header the encoder published is already what a raw demuxer reads"
+        );
+    }
+
+    /// The Annex-B test is the check the encoder's own published header has to pass, and the
+    /// check the Windows-only test makes on the machine's hardware encoder.
+    #[test]
+    fn annex_b_is_recognised_by_its_start_code() {
+        assert!(
+            is_annex_b(&[0x00, 0x00, 0x00, 0x01, 0x67]),
+            "the four-byte start code is Annex-B"
+        );
+        assert!(
+            is_annex_b(&[0x00, 0x00, 0x01, 0x67]),
+            "and so is the three-byte one"
+        );
+        assert!(
+            !is_annex_b(&[0x67, 0x64, 0x00, 0x28]),
+            "a parameter set without a start code is not Annex-B"
+        );
+        assert!(!is_annex_b(&[]), "and nothing at all is not either");
+    }
+
+    /// A configuration record — the form an MP4 file carries the sequence header in — is
+    /// converted: the parameter sets come out behind start codes, which is what a raw bitstream
+    /// needs.
+    #[test]
+    fn a_configuration_record_is_converted_to_annex_b() {
+        let record = [
+            0x01, // configurationVersion
+            0x64, 0x00, 0x28, // the profile, the compatibility flags and the level
+            0xff, // the NAL length size: four bytes
+            0xe1, // one sequence parameter set
+            0x00, 0x04, 0x67, 0x64, 0x00, 0x28, // the SPS, with its two-byte length
+            0x01, // one picture parameter set
+            0x00, 0x04, 0x68, 0xee, 0x3c, 0x80, // the PPS, with its two-byte length
+        ];
+        let expected = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, // the SPS, in Annex-B
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x3c, 0x80, // the PPS, in Annex-B
+        ];
+        assert_eq!(
+            annex_b_sequence_header(&record).expect("a configuration record is converted"),
+            expected.to_vec(),
+            "the parameter sets come out with the start codes a raw demuxer reads"
+        );
+    }
+
+    /// A length-prefixed bitstream is converted the same way: each unit is put behind a start
+    /// code.
+    #[test]
+    fn a_length_prefixed_bitstream_is_converted_to_annex_b() {
+        let stream = [0x00, 0x00, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28];
+        let expected = [0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28];
+        assert_eq!(
+            annex_b_sequence_header(&stream).expect("a length-prefixed stream is converted"),
+            expected.to_vec(),
+            "the length prefix becomes a start code"
+        );
+    }
+
+    /// A blob in neither form is refused, and so is no blob at all.
+    ///
+    /// A header that is wrong is worse than no header: it is a stream that decodes to noise, and
+    /// nothing in the file says why. So the refusal is out loud, and it names what was read.
+    #[test]
+    fn a_sequence_header_that_cannot_be_read_is_refused() {
+        let unreadable = annex_b_sequence_header(&[0x01, 0x02, 0x03])
+            .expect_err("three bytes are not a sequence header in any form");
+        let message = unreadable.to_string();
+        assert!(
+            message.contains("cannot read"),
+            "the refusal says what is wrong with it: {message}"
+        );
+        assert!(
+            message.contains("3 bytes"),
+            "and how much there was: {message}"
+        );
+
+        let nothing = annex_b_sequence_header(&[]).expect_err("there is no header at all");
+        assert!(
+            nothing.to_string().contains("no sequence header"),
+            "and an absent header says so: {nothing}"
         );
     }
 }

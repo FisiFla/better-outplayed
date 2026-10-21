@@ -66,8 +66,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_LEVEL,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MF_VERSION,
+    MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 
 /// What an encoder asked for, when its events were drained.
@@ -1367,6 +1367,67 @@ impl MftEncoder {
         let _ = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant) };
     }
 
+    /// The sequence header the encoder published on its output type, in Annex-B form.
+    ///
+    /// Media Foundation's encoders add `MF_MT_MPEG_SEQUENCE_HEADER` to the output type once the
+    /// type is set ("After the output type is set, the video encoder updates the type by adding
+    /// the MF_MT_MPEG_SEQUENCE_HEADER attribute"), and the SDK documents the blob as "concatenated
+    /// NAL units in Annex B format, along with their start codes" — the SPS and the PPS for H.264,
+    /// the VPS, the SPS and the PPS for HEVC.
+    ///
+    /// The type is read back through `GetOutputAvailableType`, which is where the encoder
+    /// publishes the type it negotiated; on a hardware encoder the attribute is on one of the
+    /// offered types rather than on the first, so every one of them is asked. The blob is then
+    /// converted to Annex-B, because the bitstream the child's stdin carries is a raw Annex-B
+    /// stream, and a length-prefixed parameter set is not one a raw demuxer can read.
+    ///
+    /// This is what the raw H.264 demuxer probes with. Without it the demuxer waits for the first
+    /// keyframe to carry the parameter sets in band, and on a display that barely changes that
+    /// keyframe arrives after the audio input's connect deadline (issue #78).
+    pub fn sequence_header(&self) -> Result<Vec<u8>> {
+        let Some(blob) = self.output_type_blob(&MF_MT_MPEG_SEQUENCE_HEADER) else {
+            anyhow::bail!(
+                "the encoder's output type carries no MF_MT_MPEG_SEQUENCE_HEADER attribute, so \
+                 there is no sequence header to put in front of the bitstream"
+            );
+        };
+        crate::annex_b_sequence_header(&blob).context("converting the encoder's sequence header")
+    }
+
+    /// A blob attribute of the encoder's own output type, if it has one.
+    ///
+    /// Every type the encoder offers is asked, because which one carries the attribute is the
+    /// encoder's own business: the hardware encoders answer the enumeration with more than one
+    /// type, and the sequence header is not always on the first.
+    fn output_type_blob(&self, key: &windows::core::GUID) -> Option<Vec<u8>> {
+        for index in 0..MAX_OFFERED_TYPES {
+            // SAFETY: the transform's own enumeration; the type it returns is owned here.
+            let Ok(media_type) = (unsafe { self.transform.GetOutputAvailableType(0, index) })
+            else {
+                continue;
+            };
+            // SAFETY: reading one attribute out of a type this function owns.
+            let Ok(size) = (unsafe { media_type.GetBlobSize(key) }) else {
+                continue;
+            };
+            if size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u8; size as usize];
+            let mut written = size;
+            // SAFETY: the buffer is exactly the size the attribute reported, and it outlives the
+            // call.
+            if unsafe { media_type.GetBlob(key, &mut buffer, Some(&mut written)) }.is_err() {
+                continue;
+            }
+            buffer.truncate(written as usize);
+            if !buffer.is_empty() {
+                return Some(buffer);
+            }
+        }
+        None
+    }
+
     /// Hand one captured texture to the encoder, with no copy of its pixels.
     ///
     /// `pts_ms` is media time in the pipeline's milliseconds; the encoder wants 100-nanosecond units.
@@ -1660,6 +1721,38 @@ fn encode_loop(
                     if let Err(err) = opened.start() {
                         tracing::error!("could not start the hardware encoder: {err:#}");
                         break;
+                    }
+                    // The sequence header goes in front of the bitstream, before the first frame.
+                    //
+                    // The child reads the video as a raw H.264 elementary stream, and a raw
+                    // demuxer has nothing to probe with until it has seen a keyframe carrying the
+                    // parameter sets. The encoder's own first keyframe can be a long way off on a
+                    // display that barely changes (the keyframe interval is counted in frames
+                    // fed, so at four frames a second it is seconds away), and until the probe
+                    // completes the child has not opened the audio input either — which is the
+                    // deadlock of issue #78. With the header in front, the probe completes at
+                    // once.
+                    match opened.sequence_header() {
+                        Ok(header) => match hand_over(&out, header, &stopping) {
+                            Handover::Queued => {}
+                            Handover::Dropped => {
+                                tracing::warn!(
+                                    "the sequence header did not fit the video queue, so the raw \
+                                     bitstream has nothing to probe with until the first keyframe"
+                                );
+                            }
+                            Handover::Closed => break,
+                        },
+                        Err(err) => {
+                            // Said out loud, because the alternative is a recording that dies on a
+                            // quiet display with nothing in the log to say why.
+                            tracing::error!(
+                                "the hardware encoder published no usable sequence header \
+                                 ({err:#}); the raw bitstream the child reads has nothing to \
+                                 probe with until the first keyframe carries the parameter sets, \
+                                 so a still display can still starve the recording (issue #78)"
+                            );
+                        }
                     }
                     tracing::info!(
                         encoder = %opened.encoder_name,
@@ -2661,6 +2754,70 @@ mod tests {
             highest <= lowest * 2.0,
             "the rate must not swing by more than two to one between runs on an idle machine: \
              {lowest:.1}fps to {highest:.1}fps over {RUNS} runs at {size:?}"
+        );
+    }
+
+    /// The hardware encoder publishes a sequence header, and it is the Annex-B form a raw
+    /// demuxer can read.
+    ///
+    /// This is the question issue #78 turns on: the raw H.264 demuxer the child reads has nothing
+    /// to probe with until it has seen a keyframe carrying the parameter sets, so the header has
+    /// to come from the encoder's output type (`MF_MT_MPEG_SEQUENCE_HEADER`) and go in front of the
+    /// bitstream.
+    ///
+    /// Whether a given encoder publishes it is that encoder's own business — the SDK says the
+    /// video encoder adds the attribute to the output type once the type is set, and that the blob
+    /// is "concatenated NAL units in Annex B format, along with their start codes" — so this asks
+    /// the machine rather than assuming.
+    ///
+    /// Windows only, and it needs a machine with a hardware encoder that takes a GPU texture: the
+    /// calls are Media Foundation's, and there is nothing to ask without an encoder. On a machine
+    /// with no such encoder it says so and stops, as the other probes here do.
+    #[test]
+    fn the_encoder_publishes_a_sequence_header_a_raw_demuxer_can_read() {
+        let encoders = probe_hardware_encoders(VideoCodec::H264).expect("the machine can be asked");
+        if !encoders.iter().any(|encoder| encoder.accepts_d3d11) {
+            eprintln!(
+                "this machine has no hardware encoder that takes a GPU texture: there is nothing \
+                 to ask for a sequence header"
+            );
+            return;
+        }
+        let device = create_capture_kind_device().expect("a capture-kind device");
+        let encoder = MftEncoder::open(
+            &device,
+            WARM_UP_SIZE,
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+            MftEncoderParams {
+                codec: VideoCodec::H264,
+                bitrate_kbps: PROBE_BITRATE_KBPS,
+                fps: FRAME_RATE.0,
+                mode: RateControl::Cbr,
+            },
+        )
+        .expect("a hardware encoder that takes a texture");
+
+        let header = encoder
+            .sequence_header()
+            .expect("the encoder publishes its sequence header");
+        eprintln!(
+            "the encoder's sequence header is {} bytes: {}",
+            header.len(),
+            header
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            !header.is_empty(),
+            "a sequence header with nothing in it is not one: the raw demuxer would have nothing \
+             to probe with"
+        );
+        assert!(
+            crate::is_annex_b(&header),
+            "the header has to be Annex-B, because the bitstream the child reads is: {:02x?}",
+            header
         );
     }
 
