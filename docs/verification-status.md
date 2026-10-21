@@ -2864,3 +2864,129 @@ it opens at 60 fps and 4K?** That is where the next piece of work is.
   budget against the display's 16.7 ms interval, and it is not yet accounted for to the frame.
 - One run, not a soak. The 72-hour stability check the release checklist asks for is still
   not done, and `silence_detector` is still not *performed*.
+# 35. The choppy clip, and what it was (2026-10-22)
+
+## The report
+A person watched a real 4K recording of a game — the box, an RTX 3090, R6 under BattlEye, 60 fps
+configured — and said:
+
+> "the clip ending in 35 is choppy and laggy as hell, the other 2 are fine"
+
+The audio was right in all three clips. The other two were fine for two different reasons: one
+recorded a **still display**, so the picture has no motion to judder, and one ran the **readback
+path**, because the hardware encoder would not open at that size and rate, so the frames were
+read back out of VRAM rather than copied. Only the one that took the shipping path — the
+zero-copy capture of a live, moving 4K display — was wrong.
+
+## The measurement
+Every frame's presentation timestamp, read with ffprobe on the box:
+
+| clip | path | frames | mean delta | median | stdev | min to max |
+|---|---|---|---|---|---|---|
+| the choppy one | zero-copy, 4K | 1980 over 35.588 s | 17.98 ms | 17.16 ms | **4.11 ms** | **8.10 to 36.37 ms** |
+| fine | zero-copy, still display | 179 over 18.597 s | 104.5 ms | 19.9 ms | 195.9 ms | 15.5 to 1016.6 ms |
+| fine | readback, 4K | 700 over 37.043 s | 53.0 ms | 57.1 ms | 14.2 ms | 14.3 to 85.7 ms |
+
+**Only 45 of the choppy clip's 1979 intervals are exactly 1/60 s.** A 60 fps video should have
+16.667 ms intervals. The mean is about right and the distribution is not: the picture advances in
+clumps and freezes between them. The frames were not being shown when they were captured.
+
+## What it was
+Three things, and they had to be together.
+
+1. The bitstream input is declared `-f h264 -use_wallclock_as_timestamps 1`, so **ffmpeg stamps
+   each frame with the wall clock at the moment it READ the frame out of the pipe** — a reading
+   time, not a capture time.
+2. **The frame's capture time was thrown away.** The video queue carried `Vec<u8>`, and
+   `encode_texture(texture, frame.pts)` had a parameter literally named `_pts` and ignored it,
+   on the reasoning that "Media Foundation's timestamps are the stream's, not the caller's clock".
+   The encoder's own input timestamps were a **counter grid** — `frames * 1000 / fps` — so they
+   were the nominal rate's times and never the picture's.
+3. The hardware encoder finishes several frames at a time, so the frames reached the pipe in
+   **bursts** and ffmpeg read them in bursts. The frames of a burst shared a reading time, and
+   the picture juddered.
+
+**The audio is timed by byte count, so it is exactly real time.** That is why it was right and
+the video was not, and why the fault was invisible in every test that checked the audio.
+
+## The fix
+Carry the real capture time to the pipe, and write the pipe **at** those times, so the wall clock
+ffmpeg stamps is the capture clock.
+
+- The pool's own presentation stamp (`Direct3D11CaptureFrame::SystemRelativeTime()`) is the
+  capture time; it is read instead of the moment the pool was asked, and mapped onto the
+  pipeline's clock with an offset taken from the first frame and never revised — so the frames'
+  **intervals** stay exact and the whole timeline moves by one constant.
+- The video queue carries `VideoChunk { bytes, captured_at }`; the writer paces each frame to
+  its own time; the Media Foundation input is stamped with the capture time, and each finished
+  frame is matched back to the frame it is by order.
+- The pure decisions — the write schedule, the pairing, the 100 ns conversion, the wait — live in
+  a new `crates/encoder/src/timeline.rs`, so they are testable without Windows.
+
+**The wait is not a plain sleep.** Measured on this machine, `thread::sleep(16 ms)` takes up to
+**8.75 ms** longer, and the overshoot scales with the request — so a sleeping writer would have
+reproduced the very judder this removes. The wait sleeps in 1 ms steps and spins the last
+millisecond: measured overshoot **under 0.1 ms**.
+
+**The trap this avoids.** Making the intervals even at 60 fps would give 1979/60 = 32.98 s of
+video for 35.588 s of audio — a **2.61 s** drift. The intervals telescope, so the span is the
+capture's own span: the video's duration stays 35.588 s and the drift does not grow. A test pins
+exactly that.
+
+## What was NOT verified
+- The Windows-only halves — the pool's presentation stamp, the Media Foundation timestamps, the
+  output-to-input pairing, and the whole zero-copy path — are type-checked and linted from macOS
+  but **have never been executed**. The box is the only place they can be.
+- The residual judder is bounded by the OS scheduler: if the writer's thread is off-schedule for
+  longer than a frame interval, that frame lands late. The tests assert the **median** interval
+  for that reason.
+- The pacing costs about 1 ms of spinning per frame — roughly 6% of a core at 60 fps — and that
+  was not measured on the recording machine.
+- The **readback** path's timestamps are quantised to 1/60 s by the rawvideo demuxer's own grid
+  (the raw container's timebase is 1/15360). That is a pre-existing property of that path, not
+  touched here.
+
+## The mechanism, confirmed
+The MFT's input timestamps were `frames * 1000 / fps` — **milliseconds, passed as 100-nanosecond
+units**. The encoder was therefore told that each frame arrived **1.667 microseconds** after the
+last rather than 16.667 milliseconds: the whole 60 fps stream looked like **one burst** inside
+1.7 ms, the encoder encoded it as one burst, and ffmpeg — which stamps each frame with the wall
+clock at the moment it *reads* the frame out of the pipe — gave the frames of a burst the same
+reading time. That is the judder, and it is the same shape as the deadlock of §31: ffmpeg's
+timestamps are reading times.
+
+## The first implementation broke the recording, and was reverted
+The capture time was carried to the pipe and the pipe written *at* those times (`3d26d64`). On
+the box, with the game live, it was **much worse**:
+
+```
+frames=3878 ... dropped=4200 dropped_audio=426 fps=0.2/60 configured=60
+bytes=9739403 span=74781ms
+WARN the encoder is taking 0.2 frames per second of the 60fps the pipeline is offering it
+Error: taking the self-test clip
+```
+
+The capture collapsed from **53.8 fps to 0.2-6 fps** and no clip was produced. The writing thread
+produced **9,739,403 bytes — about two seconds of video — in 75 seconds of wall clock**: the
+pacing ran at roughly **1/37 of real time**, so the capture intervals it paced to were roughly
+**100x** the true 18 ms.
+
+**It is reverted** (`e05902a`). An application that records at 0.2 fps and produces no clip is
+worse than one that judders, and the box is the only place this can be measured. The approach is
+not in question; the implementation was. What the next attempt has to settle is the 100x: the
+pool's presentation stamp is converted with `Duration::from_nanos(stamp.Duration * 100)` on the
+reasoning that the SDK's `TimeSpan::Duration` is in 100-nanosecond units, and yet the intervals
+came out about a hundred times too large — so either the unit is not what that conversion
+assumes, or the presentation stamp is not the frame's capture time. The decisive measurement is
+to print the first few capture intervals on the box.
+
+## What was NOT verified
+- **The fix, in any form, on any machine.** The measurement above is of the broken attempt.
+- The Windows-only halves of the attempt — the pool's presentation stamp, the Media Foundation
+  timestamps, the output-to-input pairing, the whole zero-copy path — were type-checked and
+  linted from macOS, and the one that mattered turned out to be wrong in a way only the box
+  could show.
+- Nobody has watched a clip; the microphone path is still unexercised; **#79 stays open** (the
+  probe cannot measure on the box, `0x8000FFFF`); the 19.4 s sparse-media observation on a still
+  display is still unexplained; the code-signing certificate is still the one open Tier-0 item.
+
