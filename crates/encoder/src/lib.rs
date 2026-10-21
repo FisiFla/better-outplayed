@@ -13,7 +13,6 @@ pub mod ffmpeg;
 pub mod mft;
 pub mod probe;
 pub mod throughput;
-pub mod timeline;
 
 pub use ffmpeg::{video_input_args, video_output_args, FfmpegEncoder};
 pub use probe::select_vendor;

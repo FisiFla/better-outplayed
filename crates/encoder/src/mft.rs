@@ -23,8 +23,7 @@
 //! [`MftEncoder::take_output`], so both renegotiate, and there is one implementation of it rather
 //! than two that can disagree.
 
-use crate::ffmpeg::{VideoChunk, MFT_TIMEOUT};
-use crate::timeline::{capture_pts, FramePairing};
+use crate::ffmpeg::MFT_TIMEOUT;
 use crate::{
     choose_output_type, classify_output_failure, type_change_refusal, OutputFailure,
     OutputTypeSpec, RateControl, VideoCodec,
@@ -876,28 +875,6 @@ pub struct MftEncoder {
     /// How many times it changed its type and was renegotiated, for the log and for the probe's
     /// own failure message.
     renegotiated: u32,
-    /// The frames handed over and the capture times they were captured at.
-    ///
-    /// The encoder returns one frame for each frame it was given, in the same order, so this is
-    /// how a finished frame is matched back to the frame it is: the oldest frame handed over is
-    /// the next frame finished. The capture time is what the child's timeline is built from, and
-    /// it cannot be recovered from the encoder's own timestamps — those are the encoder's, and
-    /// they are not the picture's.
-    pairing: FramePairing,
-    /// The capture time of the first frame handed over, which is the encoder stream's origin.
-    origin: Option<Duration>,
-}
-
-/// One frame the encoder finished: its bytes, and the capture time of the frame it is.
-///
-/// `captured_at` is `None` when the encoder produced a frame that was never handed over, which is
-/// a mismatch rather than a fact about the picture: such a frame is written as soon as it can be,
-/// which is what happened before the frames were matched back.
-pub struct EncodedFrame {
-    /// The encoded bytes: one access unit of the elementary stream.
-    pub bytes: Vec<u8>,
-    /// When the frame that produced them was captured.
-    pub captured_at: Option<Duration>,
 }
 
 // SAFETY: the members are COM interfaces the `windows` crate marks `Send`+`Sync` for the ones that
@@ -1039,8 +1016,6 @@ impl MftEncoder {
             input_format,
             input_subtype,
             renegotiated: 0,
-            pairing: FramePairing::default(),
-            origin: None,
         })
     }
 
@@ -1100,17 +1075,13 @@ impl MftEncoder {
     /// generator. `ProcessInput` at any other moment answers `MF_E_NOTACCEPTING`, which is why the
     /// wait is here rather than at the call site.
     ///
-    /// `captured_at` is when the frame was captured. It is the frame's own time: it becomes the
-    /// encoder's timestamp for the frame, and it comes back with the frame the encoder finished,
-    /// so the child's timeline is the capture's own.
-    ///
     /// `deadline` bounds the wait: an encoder that never asks is a fault to report, not a hang.
     pub fn encode_texture(
         &mut self,
         texture: &ID3D11Texture2D,
-        captured_at: Duration,
+        pts_ms: i64,
         deadline: Duration,
-    ) -> Result<Vec<EncodedFrame>> {
+    ) -> Result<Vec<u8>> {
         let mut produced = Vec::new();
         let started = Instant::now();
         loop {
@@ -1125,7 +1096,7 @@ impl MftEncoder {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        self.push_texture(texture, captured_at)?;
+        self.push_texture(texture, pts_ms)?;
         // Collect without waiting further: what this frame produced is already queued once it was accepted.
         let _ = self.pump_events(&mut produced);
         Ok(produced)
@@ -1133,7 +1104,7 @@ impl MftEncoder {
 
     /// Tell the encoder no more input is coming, and take everything it still has. Without a drain
     /// the last few frames sit inside the encoder and never reach the container.
-    pub fn finish(&mut self, deadline: Duration) -> Result<Vec<EncodedFrame>> {
+    pub fn finish(&mut self, deadline: Duration) -> Result<Vec<u8>> {
         // SAFETY: a message to the encoder's own transform, with no parameter.
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
             .context("MFT_MESSAGE_COMMAND_DRAIN")?;
@@ -1155,18 +1126,12 @@ impl MftEncoder {
     }
 
     /// Drain whatever the encoder has to say, collecting its output as it goes.
-    fn pump_events(&mut self, produced: &mut Vec<EncodedFrame>) -> Result<Asked> {
-        // The scratch the sample's bytes are copied into, before they are moved into the frame.
-        // Reused across the frames of one exchange: the allocation is the size of a frame.
-        let mut scratch: Vec<u8> = Vec::new();
+    fn pump_events(&mut self, produced: &mut Vec<u8>) -> Result<Asked> {
         loop {
             match self.next_event()? {
                 Some(EncoderEvent::NeedInput) => return Ok(Asked::Input),
                 Some(EncoderEvent::HaveOutput) => {
-                    scratch.clear();
-                    if let Some(frame) = self.take_output(&mut scratch)? {
-                        produced.push(frame);
-                    }
+                    self.take_output(produced)?;
                 }
                 // Anything else (a drain completing, an error event) is not this exchange's business.
                 Some(EncoderEvent::Other) => {}
@@ -1198,17 +1163,14 @@ impl MftEncoder {
         }))
     }
 
-    /// Take one finished sample's bytes out of the encoder, and say which captured frame it is.
+    /// Take one finished sample's bytes out of the encoder, and say how many samples it was.
     ///
     /// A type change is renegotiated and the call is made again. Media Foundation's own words for
     /// `MF_E_TRANSFORM_STREAM_CHANGE` (0xC00D6D61) are "a stream change has occurred. Output
     /// cannot be produced until the streams have been renegotiated", so there is nothing to take
     /// until the new type is set, and asking again once it is set is what produces the frame the
     /// encoder was working on.
-    ///
-    /// `None` when the encoder had nothing to give, which is not a failure: it answers
-    /// `MF_E_TRANSFORM_NEED_MORE_INPUT` until it has a frame.
-    fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<Option<EncodedFrame>> {
+    fn take_output(&mut self, produced: &mut Vec<u8>) -> Result<u64> {
         let mut attempts = 0u32;
         loop {
             attempts = attempts.saturating_add(1);
@@ -1234,7 +1196,7 @@ impl MftEncoder {
             match taken {
                 Ok(()) => {}
                 Err(err) => match classify_output_failure(err.code().0 as u32) {
-                    OutputFailure::NeedsInput => return Ok(None),
+                    OutputFailure::NeedsInput => return Ok(0),
                     // The encoder changed its output type. The streams have to be renegotiated
                     // before anything can be produced; see `renegotiate_output_type`.
                     OutputFailure::TypeChanged => {
@@ -1256,7 +1218,7 @@ impl MftEncoder {
             // filled in.
             let Some(sample) = (unsafe { std::mem::ManuallyDrop::take(&mut buffer.pSample) })
             else {
-                return Ok(None);
+                return Ok(0);
             };
             // SAFETY: this sample is the one the encoder just produced, and the contiguous buffer is a
             // view of it that is locked and unlocked around the copy.
@@ -1279,14 +1241,7 @@ impl MftEncoder {
             };
             // One frame in, one frame out: the count the throughput probe reports is the number of
             // frames the encoder actually finished, not the number of frames it was handed.
-            //
-            // The frame is the oldest one handed over: the encoder returns them in the order they
-            // went in, and the capture time is what the child's timeline is built from.
-            let captured_at = self.pairing.finished();
-            return Ok(Some(EncodedFrame {
-                bytes: std::mem::take(produced),
-                captured_at,
-            }));
+            return Ok(1);
         }
     }
 
@@ -1475,16 +1430,8 @@ impl MftEncoder {
 
     /// Hand one captured texture to the encoder, with no copy of its pixels.
     ///
-    /// `captured_at` is when the frame was captured, and the encoder is told so: the sample's
-    /// timestamp is the frame's real capture time, measured from the first frame handed over. The
-    /// stream the encoder sees is then the capture's own timeline rather than a nominal grid — a
-    /// frame captured 17.4 ms after the one before it says so — which is what the rate control
-    /// budgets the bits against.
-    ///
-    /// The frame is also remembered, so the frame the encoder finishes can be matched back to the
-    /// frame it is: the encoder returns them in order, and the capture time is what the child's
-    /// timeline is built from.
-    pub fn push_texture(&mut self, texture: &ID3D11Texture2D, captured_at: Duration) -> Result<()> {
+    /// `pts_ms` is media time in the pipeline's milliseconds; the encoder wants 100-nanosecond units.
+    pub fn push_texture(&mut self, texture: &ID3D11Texture2D, pts_ms: i64) -> Result<()> {
         // The documented way to wrap a DXGI surface as a media buffer. `fbottomupwhenlinear` is false
         // because a captured texture is top-down.
         // SAFETY: `texture` is a live D3D11 texture on this encoder's device, and the IID names the
@@ -1495,14 +1442,9 @@ impl MftEncoder {
         let sample = unsafe { MFCreateSample() }.context("MFCreateSample")?;
         // SAFETY: both calls act on that sample, and the buffer is referenced by it.
         unsafe { sample.AddBuffer(&buffer) }.context("IMFSample::AddBuffer")?;
-        // The first frame is the stream's origin, so the encoder's timestamps start at zero and
-        // march by the real capture intervals.
-        let origin = *self.origin.get_or_insert(captured_at);
-        let pts = capture_pts(origin, captured_at);
-        self.pairing.handed_over(captured_at);
         // SAFETY: setting the sample's timestamps; 100ns units are what Media Foundation counts in.
         unsafe {
-            sample.SetSampleTime(pts)?;
+            sample.SetSampleTime(pts_ms.saturating_mul(10_000))?;
             sample.SetSampleDuration(10_000_000 / i64::from(self.params.fps.max(1)))?;
         }
         // SAFETY: the encoder's own input stream, with a sample that outlives the call.
@@ -1645,7 +1587,7 @@ const HANDOVER_BUDGET: Duration = MFT_TIMEOUT;
 /// pump only hands over textures (owned, nothing copied or read back).
 pub struct MftFeed {
     /// `None` once shut down. Dropping it is the shutdown signal (see [`MftFeed::shutdown`]).
-    tx: Option<std::sync::mpsc::SyncSender<(GpuTexture, Duration)>>,
+    tx: Option<std::sync::mpsc::SyncSender<GpuTexture>>,
     handle: Option<std::thread::JoinHandle<()>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Set by [`MftFeed::shutdown`] before it joins the thread, so a handover waiting for room stops
@@ -1656,7 +1598,7 @@ pub struct MftFeed {
 impl MftFeed {
     /// Start the encoder's thread, whose output goes into `out`, the video queue the pump writes to,
     /// so depth accounting stays in one place.
-    pub fn spawn(params: MftEncoderParams, out: std::sync::mpsc::SyncSender<VideoChunk>) -> Self {
+    pub fn spawn(params: MftEncoderParams, out: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&dropped);
@@ -1676,13 +1618,9 @@ impl MftFeed {
 
     /// Hand a frame to the encoder. Never blocks and never queues deeper than [`QUEUE_DEPTH`]: a
     /// full queue drops and counts the frame, as the video queue does when ffmpeg is behind.
-    ///
-    /// `captured_at` is when the frame was captured. It travels with the texture because it is
-    /// what the finished frame is given back with, and the finished frame's time is what the
-    /// child's timeline is built from.
-    pub fn submit(&self, texture: GpuTexture, captured_at: Duration) {
+    pub fn submit(&self, texture: GpuTexture) {
         let Some(tx) = self.tx.as_ref() else { return };
-        match tx.try_send((texture, captured_at)) {
+        match tx.try_send(texture) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped
@@ -1736,8 +1674,8 @@ enum Handover {
 /// So the wait is bounded and a frame that cannot be queued in time is dropped and counted: the
 /// timeline is wall-clock, and a gap beats a recording that will not stop.
 fn hand_over(
-    out: &std::sync::mpsc::SyncSender<VideoChunk>,
-    units: VideoChunk,
+    out: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    units: Vec<u8>,
     stopping: &std::sync::atomic::AtomicBool,
 ) -> Handover {
     let deadline = Instant::now() + HANDOVER_BUDGET;
@@ -1761,8 +1699,8 @@ fn hand_over(
 
 /// The encoder thread's body.
 fn encode_loop(
-    rx: std::sync::mpsc::Receiver<(GpuTexture, Duration)>,
-    out: std::sync::mpsc::SyncSender<VideoChunk>,
+    rx: std::sync::mpsc::Receiver<GpuTexture>,
+    out: std::sync::mpsc::SyncSender<Vec<u8>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     params: MftEncoderParams,
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1771,12 +1709,12 @@ fn encode_loop(
     // the open off the capture path.
     let mut encoder: Option<MftEncoder> = None;
     let fps = params.fps.max(1);
-    // Frames handed to the encoder so far; the keyframe cadence counts from it.
+    // Frames handed to the encoder so far; media time and the keyframe cadence both count from it.
     let mut frames: u64 = 0;
     // Frames encoded and then not queued, counted rather than logged one by one: a stalled queue drops every frame behind it.
     let mut unqueued: u64 = 0;
 
-    while let Ok((texture, captured_at)) = rx.recv() {
+    while let Ok(texture) = rx.recv() {
         if encoder.is_none() {
             match MftEncoder::open_for_texture(texture.as_raw(), params) {
                 Ok(mut opened) => {
@@ -1795,16 +1733,7 @@ fn encode_loop(
                     // deadlock of issue #78. With the header in front, the probe completes at
                     // once.
                     match opened.sequence_header() {
-                        Ok(header) => match hand_over(
-                            &out,
-                            VideoChunk {
-                                bytes: header,
-                                // The header is not a frame: it has to be in front of the first
-                                // frame, so it is written as soon as it can be.
-                                captured_at: None,
-                            },
-                            &stopping,
-                        ) {
+                        Ok(header) => match hand_over(&out, header, &stopping) {
                             Handover::Queued => {}
                             Handover::Dropped => {
                                 tracing::warn!(
@@ -1843,29 +1772,22 @@ fn encode_loop(
             }
         }
         let mft = encoder.as_mut().expect("just opened");
-        // The frame's own time is the encoder's timestamp for it: the stream the encoder sees is
-        // the capture's own timeline, and the finished frame carries that time back to the pipe.
-        // The keyframe cadence is a count, not a time: it is the segmenter's business, and it must
-        // not move when the capture's rate differs from the configured one.
+        // Media time is counted per frame handed over, not taken from the caller's clock: the stream is
+        // at the configured frame rate and its timestamps must march at that rate whether or not frames
+        // were dropped on the way here. `MftEncoder::push_texture` converts to 100ns units.
+        // From the count rather than a rounded per-frame step, which at 60fps (16 ms) would lose 4%.
         frames += 1;
+        let pts_ms = (frames * 1000 / u64::from(fps)) as i64;
         if frames.is_multiple_of(u64::from(fps)) {
             mft.force_keyframe();
         }
-        match mft.encode_texture(texture.as_raw(), captured_at, MFT_TIMEOUT) {
+        match mft.encode_texture(texture.as_raw(), pts_ms, MFT_TIMEOUT) {
             Ok(units) if units.is_empty() => {}
-            Ok(units) => {
-                for unit in units {
-                    let chunk = VideoChunk {
-                        bytes: unit.bytes,
-                        captured_at: unit.captured_at,
-                    };
-                    match hand_over(&out, chunk, &stopping) {
-                        Handover::Queued => {}
-                        Handover::Dropped => unqueued += 1,
-                        Handover::Closed => break,
-                    }
-                }
-            }
+            Ok(units) => match hand_over(&out, units, &stopping) {
+                Handover::Queued => {}
+                Handover::Dropped => unqueued += 1,
+                Handover::Closed => break,
+            },
             Err(err) => {
                 tracing::warn!("the hardware encoder refused a frame: {err:#}");
                 break;
@@ -1884,16 +1806,10 @@ fn encode_loop(
     if let Some(mut mft) = encoder {
         match mft.finish(MFT_TIMEOUT) {
             Ok(tail) if !tail.is_empty() => {
-                for unit in tail {
-                    let chunk = VideoChunk {
-                        bytes: unit.bytes,
-                        captured_at: unit.captured_at,
-                    };
-                    if let Err(err) = out.try_send(chunk) {
-                        tracing::warn!(
-                            "the hardware encoder's last frames did not fit the queue: {err}"
-                        );
-                    }
+                if let Err(err) = out.try_send(tail) {
+                    tracing::warn!(
+                        "the hardware encoder's last frames did not fit the queue: {err}"
+                    );
                 }
             }
             Ok(_) => {}
@@ -2649,13 +2565,12 @@ pub fn measure_encode_fps(
         }
         match encoder.next_event()? {
             Some(EncoderEvent::NeedInput) => {
-                // The probe has no capture behind it, so it makes up a capture time: the frames
-                // it hands over are a second apart, which is what the recording's own frames are
-                // not. The encoder is told the frame's time so that the stream it sees is a
-                // timeline, exactly as the recording's is.
+                // Media time in the pipeline's milliseconds; the encoder wants 100-nanosecond
+                // units and converts. The same count the recording keeps: the timestamp is
+                // the frame's place in the stream at the declared rate, not the wall clock.
                 fed = fed.saturating_add(1);
-                let captured_at = Duration::from_secs(fed.saturating_sub(1));
-                encoder.push_texture(&texture, captured_at)?;
+                let pts_ms = (fed.saturating_mul(1_000) / u64::from(fps.max(1))) as i64;
+                encoder.push_texture(&texture, pts_ms)?;
             }
             Some(EncoderEvent::HaveOutput) => {
                 let produced = encoder.take_output(&mut scratch)?;
@@ -2663,8 +2578,8 @@ pub fn measure_encode_fps(
                 // not hold a window's worth of encoded video.
                 scratch.clear();
                 let now = Instant::now();
-                if now >= warm_until && produced.is_some() {
-                    frames = frames.saturating_add(1);
+                if now >= warm_until && produced > 0 {
+                    frames = frames.saturating_add(produced);
                     let start = window.map_or(now, |(start, _)| start);
                     window = Some((start, now));
                     if now.duration_since(start) >= budget {
@@ -2990,12 +2905,9 @@ mod tests {
                 .expect("a texture in the format the encoder takes");
         encoder.start().expect("the encoder starts");
         let mut produced = 0usize;
-        for index in 0..10u64 {
-            // A capture time a frame apart, so the encoder is handed a timeline rather than a
-            // count: the frames it is given were captured 33ms apart.
-            let captured_at = Duration::from_millis(index * 33);
+        for index in 0..10 {
             let bytes = encoder
-                .encode_texture(&texture, captured_at, Duration::from_secs(2))
+                .encode_texture(&texture, i64::from(index) * 33, Duration::from_secs(2))
                 .expect("the encoder takes the frame");
             produced += bytes.len();
         }

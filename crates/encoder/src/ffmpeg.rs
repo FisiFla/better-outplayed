@@ -61,21 +61,6 @@
 //! as a gap, not a slower clock. The capture loop also rate-limits itself to `encode.fps`
 //! (`FramePacer`), so normally the two agree.
 //!
-//! ## The wall clock at the moment the child *reads* the frame is not the frame's time
-//!
-//! `-use_wallclock_as_timestamps 1` stamps a frame with the wall clock at the moment the child
-//! read it out of the pipe. That is a reading time, not a capture time, and the two come apart
-//! as soon as the child reads in bursts: the hardware encoder finishes several frames at a time,
-//! so the reads came in bursts too, and the frames of a burst shared a timestamp. A 4K recording
-//! measured frame intervals swinging between 8.1 ms and 36.4 ms against the 16.7 ms a 60fps
-//! video has — only 2.3% of them right — which is a picture that judders and lags.
-//!
-//! So the capture time of every frame is carried to the pipe ([`VideoChunk::captured_at`]) and
-//! the pipe is written *at* those times ([`crate::timeline::FrameSchedule`]). The child then reads
-//! the frames one at a time, spread out the way the picture was, and the wall clock it stamps them
-//! with is the capture clock. The frames' gaps are the capture's own gaps, so the video is as
-//! long as the picture was: the duration does not move, and neither does the A/V alignment.
-//!
 //! The nominal rate is declared with the rawvideo demuxer's own `-framerate`, never the CLI's
 //! input `-r`: `-r` makes ffmpeg re-stamp every frame onto a rigid 1/fps grid, throwing the
 //! arrival time away (`-debug_ts`: a 15fps pipe with `-r 30` reached the muxer as pts 0, 1/30,
@@ -92,7 +77,6 @@
 //! `submit_video`/`submit_audio` never block the caller. The payload's buffer is moved into the
 //! channel, not cloned (a 3840x2160 BGRA frame is 33.2MB).
 
-use crate::timeline::FrameSchedule;
 use crate::{EncodeConfig, EncodeOutput, Encoder, RateControl, SampleFormat, VideoInput};
 use anyhow::{bail, Context, Result};
 use replayed_capture::{AudioBuffer, Frame};
@@ -170,22 +154,6 @@ const MICROPHONE_LABEL: &str = "microphone";
 
 /// Bytes queued by the caller, written to the child by a dedicated thread.
 type WriterHandle = JoinHandle<std::io::Result<()>>;
-
-/// One piece of video on its way to the child, with the time the frame it carries was captured.
-///
-/// The capture time is what the child's timeline is built from. ffmpeg stamps a frame with the
-/// wall clock at the moment it *read* the frame from the pipe, so the pipe has to be written at
-/// the times the frames were captured — see [`crate::timeline::FrameSchedule`].
-///
-/// `captured_at` is `None` for a chunk that is not a frame: the hardware encoder's sequence
-/// header, which has to be in front of the first frame and is written as soon as it can be.
-#[derive(Debug)]
-pub struct VideoChunk {
-    /// The bytes: raw pixels, or a piece of an encoded elementary stream.
-    pub bytes: Vec<u8>,
-    /// When the frame was captured, on the pipeline's clock.
-    pub captured_at: Option<Duration>,
-}
 
 /// Seconds per scratch segment, which is also the forced-keyframe interval and so what makes a
 /// clip a lossless concatenation of whole segments.
@@ -619,7 +587,7 @@ pub struct FfmpegEncoder {
     /// The child's stdout, when spawned with [`EncodeOutput::FragmentedStream`]. Taken by the first
     /// caller (`Encoder::take_output_stream`): a pipe has one reader, which should be the in-memory buffer.
     output_stream: Option<std::process::ChildStdout>,
-    video_tx: Option<SyncSender<VideoChunk>>,
+    video_tx: Option<SyncSender<Vec<u8>>>,
     audio_tx: Option<SyncSender<Vec<u8>>>,
     /// The microphone's queue into its own pump thread; `None` without a second audio input.
     mic_tx: Option<SyncSender<Vec<u8>>>,
@@ -783,7 +751,7 @@ impl FfmpegEncoder {
         // reader blocks until the pipe closes, which happens when the child exits.
         let stderr_drain = child.stderr.take().map(stderr_reader);
 
-        let (video_tx, video_rx) = mpsc::sync_channel::<VideoChunk>(VIDEO_QUEUE_FRAMES);
+        let (video_tx, video_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_FRAMES);
         // The hardware encoder's thread writes into this same video queue, so a frame reaches ffmpeg the same way either way.
         #[cfg(windows)]
         let mft = (cfg.video == VideoInput::EncodedBitstream).then(|| {
@@ -799,7 +767,7 @@ impl FfmpegEncoder {
         });
         let video_writer = std::thread::Builder::new()
             .name("ffmpeg-video-in".into())
-            .spawn(move || pump_video(video_rx, video_in))
+            .spawn(move || pump(video_rx, video_in))
             .context("spawning video writer thread")?;
 
         // The game-audio queue and writer exist only when the input does. `pump_audio` accepts the
@@ -869,30 +837,6 @@ impl FfmpegEncoder {
 fn pump<W: Write>(rx: mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<()> {
     for chunk in rx {
         sink.write_all(&chunk)?;
-    }
-    sink.flush()
-}
-
-/// Copy queued video into the child's stdin, one frame at a time and at the frames' capture times.
-///
-/// The pacing is the load-bearing part. The child stamps a frame with the wall clock at the moment
-/// it read the frame, so a child that reads a burst of frames gets a burst of timestamps and a
-/// picture that judders. Writing the frames at their capture times spreads the reads out: the
-/// child reads one frame per capture interval, and the wall clock it stamps them with is the
-/// capture clock.
-///
-/// The audio is not paced: its timeline is the exact 48kHz sample count, and a socket's arrival
-/// times would only add jitter to it.
-fn pump_video<W: Write>(rx: mpsc::Receiver<VideoChunk>, mut sink: W) -> std::io::Result<()> {
-    let mut schedule = FrameSchedule::default();
-    for chunk in rx {
-        if let Some(captured_at) = chunk.captured_at {
-            let wait = schedule.wait_for(captured_at, Instant::now());
-            if !wait.is_zero() {
-                crate::timeline::wait_until(Instant::now() + wait);
-            }
-        }
-        sink.write_all(&chunk.bytes)?;
     }
     sink.flush()
 }
@@ -1003,13 +947,14 @@ impl Encoder for FfmpegEncoder {
         // A GPU-texture frame is encoded here by the hardware MFT and the H.264 it produced reaches the
         // queue (kilobytes instead of tens of megabytes); the queue, writer thread and child arguments
         // are unchanged.
-        //
-        // The capture time travels with the frame on both paths: it is what the child's timeline is
-        // built from, and the two paths differ only in what the bytes are.
         #[cfg(windows)]
         if let Some(texture) = frame.texture {
-            self.encode_texture(texture, frame.pts)?;
-            return Ok(());
+            let bytes = self.encode_texture(texture, frame.pts)?;
+            let queued = match self.video_tx.as_ref() {
+                Some(tx) => enqueue_or_drop(tx, bytes, &self.dropped_video, "video"),
+                None => bail!("encoder already finished"),
+            };
+            return queued.map_err(|e| self.explain_dead_writer(e));
         }
 
         // The caller cannot check whether the frame has pixels at all. A frame whose pixels stayed in
@@ -1021,12 +966,8 @@ impl Encoder for FfmpegEncoder {
                 "this frame's pixels are not in CPU memory, and this encoder feeds ffmpeg a raw                  byte stream: a zero-length frame would be read as the next frame's bytes. A                  frame must carry pixels to reach this encoder."
             );
         }
-        let chunk = VideoChunk {
-            bytes: frame.data,
-            captured_at: Some(frame.pts),
-        };
         let queued = match self.video_tx.as_ref() {
-            Some(tx) => enqueue_or_drop(tx, chunk, &self.dropped_video, "video"),
+            Some(tx) => enqueue_or_drop(tx, frame.data, &self.dropped_video, "video"),
             None => bail!("encoder already finished"),
         };
         queued.map_err(|e| self.explain_dead_writer(e))
@@ -1305,21 +1246,19 @@ impl FfmpegEncoder {
     /// recording came out at 35.0 with 2288 of 5700 frames dropped. The texture is now handed over
     /// and the bytes travel from the encoder's thread straight into the video queue.
     ///
-    /// `captured_at` is the frame's capture time, and it is handed over with the texture: the
-    /// encoder's finished frames are matched back to the frames that went in (the encoder returns
-    /// them in order), and the child's timeline is built from those times. Media Foundation's own
-    /// timestamps are the encoder's business — the frames are stamped with the capture times here
-    /// so that the stream the encoder sees is the capture's own timeline.
+    /// `pts` is ignored on purpose: Media Foundation's timestamps are the stream's, not the caller's
+    /// clock. They must march at `FRAME_RATE` whether or not a frame was dropped on the way here;
+    /// passing the wall clock through would turn a dropped frame into a gap in a variable-rate stream.
     #[cfg(windows)]
     fn encode_texture(
         &mut self,
         texture: replayed_capture::GpuTexture,
-        captured_at: Duration,
-    ) -> Result<()> {
+        _pts: Duration,
+    ) -> Result<Vec<u8>> {
         if let Some(mft) = self.mft.as_ref() {
-            mft.submit(texture, captured_at);
+            mft.submit(texture);
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Complete a writer failure with ffmpeg's own exit status and stderr, if it has died.
@@ -1597,78 +1536,6 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    /// A sink that remembers when each write happened, so a test can ask when the frames went out.
-    struct StampedSink(Arc<std::sync::Mutex<Vec<Instant>>>);
-
-    impl Write for StampedSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(Instant::now());
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The frames are written to the pipe at their capture times, not at the moments they arrive.
-    ///
-    /// The defect this prevents: the hardware encoder finishes several frames at once, the child
-    /// reads them at once, and the frames of a burst share a timestamp — a picture that judders.
-    /// The measured frame intervals of a 4K recording swung between 8.1 ms and 36.4 ms against the
-    /// 16.7 ms a 60fps video has.
-    ///
-    /// The frames are handed over in one burst here, exactly as the hardware encoder hands them
-    /// over, and the writes must still come out one capture interval apart.
-    ///
-    /// The *median* interval is what is asserted, not the worst one: a machine that is busy can
-    /// take a thread off its schedule for longer than a frame interval, and one such frame in a
-    /// dozen is a machine's noise, not the defect. The median is what tells the two apart — the
-    /// defect puts every frame of a burst in the same instant.
-    #[test]
-    fn the_frames_are_written_at_their_capture_times() {
-        /// The interval the capture delivered, 17.4ms apart: about 57.5fps.
-        const INTERVAL: Duration = Duration::from_micros(17_400);
-        const FRAMES: u64 = 12;
-
-        let (tx, rx) = mpsc::sync_channel::<VideoChunk>(FRAMES as usize);
-        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&writes);
-        let writer = std::thread::spawn(move || {
-            pump_video(rx, StampedSink(sink)).expect("the writer finishes");
-        });
-
-        // The whole burst, handed over at once: every frame carries the time it was captured at.
-        for frame in 0..FRAMES {
-            tx.send(VideoChunk {
-                bytes: vec![0u8; 16],
-                captured_at: Some(Duration::from_micros(frame * INTERVAL.as_micros() as u64)),
-            })
-            .expect("the queue takes the frame");
-        }
-        drop(tx);
-        writer.join().expect("the writer thread ends");
-
-        let writes = writes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        assert_eq!(writes.len(), FRAMES as usize, "every frame was written");
-        let mut deltas: Vec<Duration> = writes.windows(2).map(|w| w[1] - w[0]).collect();
-        deltas.sort();
-        let median = deltas[deltas.len() / 2];
-        assert!(
-            median.abs_diff(INTERVAL) < Duration::from_millis(1),
-            "the frames must be written one capture interval ({INTERVAL:?}) apart, not as they \
-             arrive: the median interval was {median:?} ({deltas:?})",
-        );
-    }
-
     /// A child that exits on its own is not a child that was killed, and on Windows the two report
     /// the same number. A report that cannot tell them apart cannot say what happened.
     #[test]

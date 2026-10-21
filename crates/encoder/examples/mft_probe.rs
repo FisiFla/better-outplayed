@@ -209,20 +209,15 @@ fn main() -> anyhow::Result<()> {
                 let seconds = 3;
                 for index in 0..(30 * seconds) {
                     let at = std::time::Instant::now();
-                    // The frame's own capture time: the encoder is told when the frame was
-                    // captured, so the stream it produces is on the capture's timeline.
-                    let captured_at = std::time::Duration::from_millis(index * 33);
                     match encoder.encode_texture(
                         &texture,
-                        captured_at,
+                        index * 33,
                         std::time::Duration::from_secs(2),
                     ) {
-                        Ok(encoded) => {
-                            for frame in encoded {
-                                total += frame.bytes.len();
-                                stream.extend_from_slice(&frame.bytes);
-                                sink.write(&frame.bytes)?;
-                            }
+                        Ok(bytes) => {
+                            total += bytes.len();
+                            stream.extend_from_slice(&bytes);
+                            sink.write(&bytes)?;
                             frames += 1;
                         }
                         Err(err) => {
@@ -236,11 +231,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 match encoder.finish(std::time::Duration::from_secs(2)) {
-                    Ok(encoded) => {
-                        for frame in encoded {
-                            total += frame.bytes.len();
-                        }
-                    }
+                    Ok(bytes) => total += bytes.len(),
                     Err(err) => println!("drain failed: {err:#}"),
                 }
                 println!("{frames} frames submitted, {total} bytes of H.264 out");
