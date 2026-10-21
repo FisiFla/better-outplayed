@@ -546,6 +546,11 @@ pub struct FfmpegEncoder {
     audio_writer: Option<WriterHandle>,
     mic_writer: Option<WriterHandle>,
     encoder_name: &'static str,
+    /// The child's argument list, kept so a failure report can say what it was asked to do.
+    ///
+    /// A child that exits without a word on its stderr is otherwise unanswerable: the report can
+    /// say that it failed, but not what it was told. The arguments are the only record of that.
+    argv: Vec<OsString>,
     /// The geometry the rawvideo pipe was declared with (`-s {w}x{h}`), so a frame of any other size
     /// can be refused instead of sliced at the wrong stride (`Encoder::source_size`).
     source_size: (u32, u32),
@@ -663,11 +668,12 @@ impl FfmpegEncoder {
             .as_ref()
             .map(|(_, port)| format!("tcp://127.0.0.1:{port}"));
 
+        let argv = ffmpeg_args(cfg, &audio_url, mic_url.as_deref());
         let mut cmd = replayed_media::sidecar_command(&bin.ffmpeg);
         cmd
             // The whole argument list is built in [`ffmpeg_args`] so what a test asserts is what the child
             // is spawned with.
-            .args(ffmpeg_args(cfg, &audio_url, mic_url.as_deref()))
+            .args(argv.clone())
             .stdin(Stdio::piped())
             // Stdout carries the encoded stream in `FragmentedStream` mode. In `Segmented` mode it goes to
             // the null device so ffmpeg can never write into our stdout.
@@ -773,6 +779,7 @@ impl FfmpegEncoder {
             drained_stderr: None,
             // The reader has been running since the child was spawned.
             stderr_drain,
+            argv,
         })
     }
 }
@@ -1010,7 +1017,7 @@ impl Encoder for FfmpegEncoder {
         // will not go is killed, its death breaks the pipes, and the writers follow.
         //
         // A killed ffmpeg is reported below, since its status and stderr explain a failed start.
-        let status = wait_bounded(&mut self.child, SHUTDOWN_BUDGET);
+        let end = wait_bounded(&mut self.child, SHUTDOWN_BUDGET);
 
         // Join every writer before reporting: an audio thread may still be waiting out its connect
         // deadline, and abandoning it would leave a listener a later connection could reach. Its own
@@ -1030,34 +1037,46 @@ impl Encoder for FfmpegEncoder {
         if let Some(err) = deadline {
             // Already waited for (and killed if it would not go): this reports rather than waits.
             let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
+            let how = if end.killed {
+                "was still running and had to be killed (on Windows a killed process reports exit \
+                 code 1, so the number alone does not say what happened)"
+            } else {
+                "had already exited on its own"
+            };
             bail!(
-                "{err:#}; ffmpeg status after the deadline was {}, stderr: {}",
-                status
+                "{err:#}; ffmpeg status after the deadline: {status}; the child {how}; \
+                 stderr: {stderr}\nit was asked to: {argv}",
+                status = end
+                    .status
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| "no status (it had to be killed)".to_string()),
-                stderr.trim()
+                    .unwrap_or_else(|| "none (it could not be asked)".to_string()),
+                how = how,
+                stderr = stderr.trim(),
+                argv = self.argv_text()
             );
         }
 
         // ffmpeg's exit status and stderr explain a failed start (a bad encoder name, say); the writer
         // threads only see a broken pipe. Report the cause first, then the writer errors.
-        match status {
+        match end.status {
             Some(status) if status.success() => {}
             Some(status) => {
                 let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
                 bail!(
-                    "ffmpeg exited with {status} using encoder '{}': {}",
+                    "ffmpeg exited with {status} using encoder '{}': {}\nit was asked to: {}",
                     self.encoder_name,
-                    stderr.trim()
+                    stderr.trim(),
+                    self.argv_text()
                 );
             }
             None => {
                 let stderr = self.drain_stderr(STDERR_DRAIN_BUDGET);
                 bail!(
                     "ffmpeg did not exit within {SHUTDOWN_BUDGET:?} and had to be killed, using \
-                     encoder '{}': {}",
+                     encoder '{}': {}\nit was asked to: {}",
                     self.encoder_name,
-                    stderr.trim()
+                    stderr.trim(),
+                    self.argv_text()
                 );
             }
         }
@@ -1253,6 +1272,15 @@ impl FfmpegEncoder {
     ///
     /// The text is remembered because a pipe can be drained once and both the writer-failure report
     /// and [`Encoder::finish`] want it.
+    /// The child's argument list, as one line, for a failure report.
+    fn argv_text(&self) -> String {
+        self.argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn drain_stderr(&mut self, budget: Duration) -> String {
         if let Some(text) = &self.drained_stderr {
             return text.clone();
@@ -1397,16 +1425,37 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 /// `Child::wait` has no timeout and an unbounded shutdown is a hang: a hybrid recording once sat
 /// alive for eight minutes with its logger already stopped. Returns the status, or `None` when
 /// the child had to be killed for not providing one.
-fn wait_bounded(child: &mut Child, budget: Duration) -> Option<std::process::ExitStatus> {
+/// How the child ended.
+///
+/// Whether the child exited on its own or had to be killed is kept apart from its status, because
+/// on Windows a killed process reports "exit code: 1" — the same number a child that failed on
+/// purpose reports. A message that says only "exit code: 1" therefore cannot say what happened,
+/// and a child killed because it was still waiting has written nothing to its stderr.
+struct ChildEnd {
+    /// The child's exit status, when it had one.
+    status: Option<std::process::ExitStatus>,
+    /// Whether the child had to be killed to end the wait.
+    killed: bool,
+}
+
+fn wait_bounded(child: &mut Child, budget: Duration) -> ChildEnd {
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
+            Ok(Some(status)) => {
+                return ChildEnd {
+                    status: Some(status),
+                    killed: false,
+                };
+            }
             Ok(None) => {}
             // A child that cannot be asked at all is not something to wait on.
             Err(err) => {
                 tracing::warn!("could not ask ffmpeg whether it had exited: {err}");
-                return None;
+                return ChildEnd {
+                    status: None,
+                    killed: false,
+                };
             }
         }
         if Instant::now() >= deadline {
@@ -1415,7 +1464,10 @@ fn wait_bounded(child: &mut Child, budget: Duration) -> Option<std::process::Exi
             );
             let _ = child.kill();
             // Not a wait: the process is gone, and this only reaps it.
-            return child.wait().ok();
+            return ChildEnd {
+                status: child.wait().ok(),
+                killed: true,
+            };
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1435,6 +1487,35 @@ fn join_writer(handle: Option<WriterHandle>, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A child that exits on its own is not a child that was killed, and on Windows the two report
+    /// the same number. A report that cannot tell them apart cannot say what happened.
+    #[test]
+    fn a_child_that_exits_is_not_reported_as_killed() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .expect("the stand-in starts");
+        let end = wait_bounded(&mut child, std::time::Duration::from_secs(5));
+        assert!(!end.killed, "a child that exited on its own was not killed");
+        assert!(
+            end.status.is_some(),
+            "a child that exited on its own has a status"
+        );
+    }
+
+    #[test]
+    fn a_child_that_will_not_go_is_reported_as_killed() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("the stand-in starts");
+        let end = wait_bounded(&mut child, std::time::Duration::from_millis(100));
+        assert!(
+            end.killed,
+            "a child that had to be killed is reported as killed"
+        );
+    }
+
     // The stand-in children are `#!/bin/sh` scripts and their liveness is checked with
     // `kill -0`, so both imports belong to the Unix-only tests.
     #[cfg(unix)]
@@ -2181,6 +2262,7 @@ mod tests {
             drained_stderr: None,
             // No report has asked for stderr yet, so no reader is in flight.
             stderr_drain: None,
+            argv: Vec::new(),
         };
         encoder.child.wait().unwrap();
 
