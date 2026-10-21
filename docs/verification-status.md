@@ -2578,3 +2578,30 @@ stops the starvation. Filed as **#78**.
 
 **Not verified:** the fix. The diagnosis is from the argument list, the code and the timing; the fix
 has not been written, and the deadlock has not been observed to end.
+
+## 32. The access violation the Windows CI found (2026-10-21)
+
+CI run `39652883107` (head `b4b8695`) failed the "Windows tests (no GPU)" job at "Rust workspace tests":
+
+```
+Running tests\self_test_clip.rs
+error: test failed, to rerun pass `-p replayed-cli --test self_test_clip`
+Caused by:
+  process didn't exit successfully: `…\self_test_clip-….exe` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+```
+
+A **segfault**, not an assertion failure, about 2.9 s into the test. Every other CLI test in that job passed. The last known-green Windows run was `39639920503` (head `3f82958`, five of five jobs green), so the cause is in `3f82958..b4b8695`: the Media Foundation renegotiation (`871b040`), the #77 audio fix (`be7682b`), the ledger (`fa83567`) and the diagnostics (`b4b8695`).
+
+**The cause: a COM apartment is thread-affine, and the #77 fix opened the audio backend on a thread of its own.** The apartment was taken in `WasapiLoopback::start` and released in `stop()`/`Drop`; the #77 fix moved the open onto the thread that carries the bounded open, so the apartment was taken on one thread, the `IAudioCaptureClient` calls were made from the recorder's caller thread (which had no apartment at all), and `CoUninitialize` ran on the pump thread. Initialising an apartment on one thread and using or releasing it on another is an access violation on Windows.
+
+`crates/capture/src/wasapi.rs` and `wasapi_mic.rs` are `#[cfg(windows)]`, and the CLI's `self_test_clip` test exercises the real WASAPI backend on the Windows runner — so this was the first time that code had ever run.
+
+**The fix: one thread per audio backend, for its whole life.** The recorder gives each backend a worker thread that initialises the apartment, opens the device, reads the packets, stops and drops it — all on that one thread — and talks to it through channels. The recorder still waits with a deadline, so every #77 bound survives: the open is still bounded by `AUDIO_OPEN_BUDGET`, the first block by `AUDIO_FIRST_BLOCK_BUDGET`, the two refusals still read "did not come up within 5s" and "opened but delivered no audio within 3s", and a third refusal was added for a backend that opens and then never answers. The `audio_blocks=` / `mic_blocks=` counters and the stop and shutdown reports are unchanged.
+
+The backends also now **refuse** the two illegal moves instead of crashing: a read from a thread other than the one that took the apartment is an error naming both threads, and a `CoUninitialize` of an apartment the backend does not own is logged rather than corrupting another thread's apartment.
+
+**The regression test is the one that crashed** — `replayed-cli --test self_test_clip` on the Windows runner. Two host-testable tests were added as well: `every_audio_backend_runs_on_a_thread_of_its_own` (before the fix it recorded `["start on ThreadId(10)", "next_buffer on ThreadId(2)", "stop on ThreadId(11)", "drop on ThreadId(11)"]` — three threads for one backend) and `a_game_audio_backend_that_opens_and_hangs_is_refused_at_start` (before the fix the run took 31.56 s waiting the hang out; after, it is refused in about 750 ms).
+
+**Not verified:** the `#[cfg(windows)]` half is type-checked and has never been executed. The Windows CI run is what proves it, and what it must show is `self_test_clip` exiting 0, the log going "opening the WASAPI game-audio backend" → "WASAPI loopback capture started on the default render endpoint" → the clip written, and the new guard **not** appearing. The microphone path is not covered by that test and still needs `[mic] enabled = true` on Windows.
+
+**One related imbalance was found and left alone.** `crates/capture/src/wgc.rs` takes its apartment in `start_session` and releases it in `stop()` on the pump thread. It does not crash, because the WGC frame pool is created free-threaded and is therefore agile — but it is the same shape, and it is in the capture backend's domain rather than the recorder's.
