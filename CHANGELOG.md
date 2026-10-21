@@ -16,6 +16,11 @@ what has and has not been *verified* on real hardware, read
   you change it — and the panel says so plainly when the chosen rate is above the display's
   ("a rate above 60 fps records frames it never shows"). A rate the operating system does not
   really report is reported as unknown rather than believed.
+- **`replayed-cli displays`** — the displays the capture can target, each with the index
+  `[capture] monitor` takes, its size and its refresh rate. The index printed is the capture's
+  own: a list assembled anywhere else can order the displays differently, and then its
+  "index 1" names a different screen than the capture's "index 1". That is not hypothetical —
+  it is how a measurement came to capture the wrong display and report a frame rate for it.
 
 ### Changed
 - **The capture backend waits for a frame instead of knocking for one**: the frame pool's
@@ -47,6 +52,30 @@ what has and has not been *verified* on real hardware, read
   is 8,333,333.33 ns, and a clock in whole microseconds drifts a third of a microsecond per
   frame — a whole frame late by the hundred-and-nineteenth. The schedule is in nanoseconds
   now, and there is a test that admits 120 frames in a simulated second.
+- **A recording could hang and produce nothing at all.** ffmpeg opens its inputs in the order
+  they are declared, and the raw-H.264 video input blocked: the demuxer cannot probe the
+  stream until it has seen a keyframe carrying the sequence header. So ffmpeg sat in the video
+  input's probe, the **audio input was never opened**, and the recorder's audio writer waited
+  ten seconds for a connection that could not happen. It was intermittent in the worst
+  possible way — a display that changes often delivers keyframes quickly, and a quiet one
+  does not, so a recording of a still screen failed and a recording of a moving one did not.
+  The audio inputs are now declared first, and the encoder's sequence header is sent with the
+  first frame, so the demuxer has something to probe.
+- **A hardware encoder that renegotiates its stream no longer ends the recording.** Media
+  Foundation reports a stream change by its return code, not by an event. The code read that
+  as a failure and stopped the encode loop, so the rest of the recording would have had no
+  video at all. A stream change is now renegotiated — a new output type the transform itself
+  offers, the input type set again, the bitrate re-pinned — and it is reported as a failure
+  only if the renegotiation itself fails.
+- **The audio backend says what it is doing, and a start that produces nothing is refused.**
+  Every line the audio backend wrote was a success line, so a machine whose audio service did
+  not answer said nothing at all. The open is now bounded (five seconds) and its first block
+  is waited for (three), the source is announced *before* it is opened, and the recording
+  reports how many audio blocks the audio side handed the encoder and how many the encoder's
+  queue dropped.
+- **The audio device's own numbers are bounded.** The buffer length the endpoint reports was
+  handed to the audio engine unchecked; a device reporting an impossible one is now clamped
+  to something usable, or refused with a reason.
 
 ## [0.2.0] - 2026-10-20
 
