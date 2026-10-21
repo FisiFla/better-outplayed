@@ -265,6 +265,12 @@ pub struct RecorderOptions {
     /// The field does not exist outside this crate's own tests, so a front-end cannot set it.
     #[cfg(test)]
     pub fail_starts: FailStarts,
+    /// A test hook: the audio backends to start instead of the platform's (see
+    /// [`AudioBackendOverrides`]).
+    ///
+    /// The field does not exist outside this crate's own tests, so a front-end cannot set it.
+    #[cfg(test)]
+    pub audio_backends: AudioBackendOverrides,
 }
 
 /// A test hook: how many of the next recording starts fail, and why.
@@ -294,6 +300,60 @@ impl FailStarts {
         }
         *remaining -= 1;
         Some("the test made this start fail")
+    }
+}
+
+/// A test hook: the audio backends the recorder starts, instead of the platform's.
+///
+/// The audio path is the one that cannot be exercised off Windows: the WASAPI backends are
+/// `#[cfg(windows)]`. This puts a fake in their place, so the start's behaviour when a
+/// backend does not come up — the refusal, and the reason it names — is testable where the
+/// tests run.
+///
+/// The backends sit behind an `Arc<Mutex<..>>` because a backend is neither `Clone` nor
+/// `Debug`, and [`RecorderOptions`] derives both.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct AudioBackendOverrides {
+    game_audio: Arc<Mutex<Option<Box<dyn AudioBackend>>>>,
+    microphone: Arc<Mutex<Option<Box<dyn AudioBackend>>>>,
+}
+
+#[cfg(test)]
+impl AudioBackendOverrides {
+    /// The game-audio backend to start instead of the platform's.
+    pub fn game_audio(self, backend: Box<dyn AudioBackend>) -> Self {
+        *self.game_audio.lock().unwrap_or_else(|p| p.into_inner()) = Some(backend);
+        self
+    }
+
+    /// The microphone backend to start instead of the platform's.
+    pub fn microphone(self, backend: Box<dyn AudioBackend>) -> Self {
+        *self.microphone.lock().unwrap_or_else(|p| p.into_inner()) = Some(backend);
+        self
+    }
+
+    /// The game-audio backend, taken out of the hook.
+    fn take_game_audio(&self) -> Option<Box<dyn AudioBackend>> {
+        self.game_audio
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    /// The microphone backend, taken out of the hook.
+    fn take_microphone(&self) -> Option<Box<dyn AudioBackend>> {
+        self.microphone
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for AudioBackendOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AudioBackendOverrides")
     }
 }
 
@@ -685,6 +745,12 @@ impl Recorder {
     ///
     /// Nothing is captured before step 6, so segment numbering cannot miss footage, and the probe
     /// runs before the capture session exists, so a probe failure costs only a startup error.
+    ///
+    /// The two audio backends of step 6 are waited for: an open that does not come back within
+    /// [`AUDIO_OPEN_BUDGET`], or a backend that opens and then delivers no audio within
+    /// [`AUDIO_FIRST_BLOCK_BUDGET`], fails the recording here, with the reason named. A
+    /// recording that starts without the audio it was promised produces nothing, and says
+    /// nothing about why, which is the failure these two bounds exist to prevent.
     pub fn start(cfg: RecorderConfig) -> Result<Recorder> {
         Self::start_with_options(cfg, RecorderOptions::default())
     }
@@ -1257,6 +1323,13 @@ impl Prepared {
         } else {
             None
         };
+        // The test hook's microphone, in place of the platform's.
+        #[cfg(test)]
+        if mic.is_some() {
+            if let Some(fake) = self.opts.audio_backends.take_microphone() {
+                mic = Some(fake);
+            }
+        }
         let microphone = mic.is_some();
 
         // Only now create the capture backend: the rawvideo pipe is declared from its frame geometry
@@ -1281,6 +1354,11 @@ impl Prepared {
             cfg.encode.fps,
             game_audio,
         )?;
+        // The test hook's game-audio backend, in place of the platform's.
+        #[cfg(test)]
+        if let Some(fake) = self.opts.audio_backends.take_game_audio() {
+            audio = Some(fake);
+        }
         let native = capture.native_size();
 
         let mut encode_cfg =
@@ -1470,13 +1548,29 @@ impl Prepared {
 
         // Start the sources: microphone first (its failure is invisible in the picture), then the
         // display, then game audio if present. On failure everything started is stopped and the session row closed.
+        //
+        // The two audio backends are opened under a deadline and are waited for until they
+        // deliver their first block (see `open_audio_source`): an audio backend that does not
+        // come up is a recording that produces nothing, and the whole point of the wait is
+        // that this failure is reported at the start, with its reason, instead of surfacing
+        // minutes later as a dead audio writer thread.
         let started = (|| -> Result<()> {
-            if let Some(mic) = mic.as_mut() {
-                mic.start().context("starting the microphone")?;
+            if let Some(backend) = mic.take() {
+                mic = Some(open_audio_source(
+                    backend,
+                    "microphone",
+                    AUDIO_OPEN_BUDGET,
+                    AUDIO_FIRST_BLOCK_BUDGET,
+                )?);
             }
             capture.start().context("starting screen capture")?;
-            if let Some(audio) = audio.as_mut() {
-                audio.start().context("starting audio capture")?;
+            if let Some(backend) = audio.take() {
+                audio = Some(open_audio_source(
+                    backend,
+                    "game audio",
+                    AUDIO_OPEN_BUDGET,
+                    AUDIO_FIRST_BLOCK_BUDGET,
+                )?);
             }
             Ok(())
         })();
@@ -1535,6 +1629,8 @@ impl Prepared {
             configured_fps: rate.decision.configured(),
             effective_fps: encoder_fps,
             frames: 0,
+            audio_blocks: 0,
+            mic_blocks: 0,
             skipped: 0,
             capture_time: Duration::ZERO,
             discard_time: Duration::ZERO,
@@ -1754,6 +1850,114 @@ fn build_microphone(sources: Sources, device: &str) -> Result<Box<dyn AudioBacke
     }
 }
 
+/// How long an audio backend may take to open before the recording is refused.
+///
+/// The open is a call into the platform's audio service — on Windows a separate process — and
+/// nothing in the API bounds it: the call can wait for as long as that process takes to
+/// answer. A start that waits for ever is a run that says nothing, captures nothing and
+/// cannot be stopped, so the wait is bounded instead. Five seconds is far longer than a
+/// healthy open (milliseconds) and short enough that a stuck one is reported while the user
+/// is still watching.
+#[cfg(not(test))]
+const AUDIO_OPEN_BUDGET: Duration = Duration::from_secs(5);
+
+/// The same bound, shortened for the tests.
+///
+/// The mechanism is what the tests are about, and a test that waits five seconds to prove a
+/// refusal happens is a test nobody runs. The shipping value is the one above.
+#[cfg(test)]
+const AUDIO_OPEN_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long an audio backend may take to deliver its first block after it opened.
+///
+/// A backend that opened and then stays silent is a backend that is not really there: the
+/// recording would carry an audio track that never moves, and nothing in the pipeline would
+/// say so until a clip came out with no sound in it. The loopback and microphone timelines
+/// pad with silence, so a live backend has a block within a device period or two.
+#[cfg(not(test))]
+const AUDIO_FIRST_BLOCK_BUDGET: Duration = Duration::from_secs(3);
+
+/// The same bound, shortened for the tests; see [`AUDIO_OPEN_BUDGET`].
+#[cfg(test)]
+const AUDIO_FIRST_BLOCK_BUDGET: Duration = Duration::from_millis(500);
+
+/// What the audio side did during a run, in one sentence.
+///
+/// The encoder's own errors name the child (ffmpeg), and a child that never took its audio
+/// input is reported as a dead writer thread. This is the half the encoder cannot see: how
+/// many blocks the track produced and how many of them the encoder's queue threw away on
+/// the way to the child. A run whose blocks were all dropped never reached the child at
+/// all, and the two numbers say so where the child's exit status does not.
+fn audio_report(
+    audio_blocks: u64,
+    mic_blocks: u64,
+    dropped_audio: u64,
+    dropped_mic: u64,
+) -> String {
+    format!(
+        "the audio side handed the encoder {audio_blocks} game-audio blocks and {mic_blocks} \
+         microphone blocks; the encoder's queue dropped {dropped_audio} and {dropped_mic} of them"
+    )
+}
+
+/// Open an audio backend and wait for its first block, both under a deadline.
+///
+/// Two failures are told apart because they have different causes: an open that never returns
+/// is the platform's audio service not answering, and a backend that opened and then stays
+/// silent is an endpoint that is not really there. Both fail the recording, at the start,
+/// with the reason named — a recording that silently produces nothing is the failure this
+/// exists to prevent, and the alternative (waiting) is what it looks like from the outside.
+///
+/// The open runs on a thread of its own because nothing bounds it. The backend travels back
+/// with its result, so the thread that opened it owns it until the recording takes it, and a
+/// backend that opened too late is released on the thread that opened it.
+fn open_audio_source(
+    mut backend: Box<dyn AudioBackend>,
+    what: &str,
+    open_budget: Duration,
+    first_block_budget: Duration,
+) -> Result<Box<dyn AudioBackend>> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(format!("replayed-{}-open", what.replace(' ', "-")))
+        .spawn(move || {
+            let started = backend.start();
+            // The backend goes back with its result: the recording owns it on success, and
+            // this thread drops it on failure, which is where a COM apartment it took is
+            // given back.
+            let _ = tx.send((started, backend));
+        })
+        .with_context(|| format!("spawning the thread that opens the {what} backend"))?;
+    let (started, mut backend) = rx.recv_timeout(open_budget).map_err(|err| match err {
+        mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
+            "the {what} backend did not come up within {open_budget:?}: the platform's audio \
+             service did not answer the open. The recording is refused rather than started \
+             with an audio track that never moves"
+        ),
+        mpsc::RecvTimeoutError::Disconnected => {
+            anyhow::anyhow!("the thread that opened the {what} backend ended without opening it")
+        }
+    })?;
+    started.map_err(|err| err.context(format!("opening the {what} backend")))?;
+
+    // The first block: the proof that the backend is running and not merely open.
+    //
+    // The block is read here and not handed to the encoder, which costs the recording the
+    // first 10ms of the track. That is not a loss against the video: the audio timeline
+    // starts when the backend opens and the first video frame arrives a frame interval
+    // later, so dropping the first block moves the audio *closer* to the picture, not away
+    // from it.
+    match backend.next_buffer(first_block_budget) {
+        Ok(Some(_)) => Ok(backend),
+        Ok(None) => Err(anyhow::anyhow!(
+            "the {what} backend opened but delivered no audio within {first_block_budget:?}: \
+             the endpoint it was given is not delivering, so the recording would carry an \
+             audio track that never moves. The recording is refused rather than started that way"
+        )),
+        Err(err) => Err(err.context(format!("reading the first block from the {what} backend"))),
+    }
+}
+
 /// Log what the crash-recovery pass found, so a start is never silent about a previous run's footage.
 fn log_recovery(recovery: &session::Recovery) {
     if recovery.is_empty() {
@@ -1825,6 +2029,15 @@ struct Engine {
     rate: RateMeter,
     /// Video frames submitted to the encoder, including those the post-roll wait submitted (`frames=`).
     frames: u64,
+    /// Game-audio blocks the backend delivered and the recorder handed to the encoder.
+    ///
+    /// The one number that says whether the audio side is working at all: the encoder's own
+    /// report names the child, not the track, so a run whose blocks were all dropped on the
+    /// way to the child looks the same as a run whose audio never started unless this is
+    /// counted here.
+    audio_blocks: u64,
+    /// Microphone blocks, counted the same way.
+    mic_blocks: u64,
     /// Frames the backend offered that the pacer threw away without the readback
     /// ([`CaptureBackend::discard_pending`]). With `frames=` it accounts for everything the source produced.
     skipped: u64,
@@ -2314,8 +2527,8 @@ impl Engine {
 
         tracing::debug!(
             "frames={} segments={} bytes={} span={}ms evicted={} dropped={} dropped_audio={} \
-             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% discard={:.1}% \
-             pacer_sleep={:.1}% submit={:.1}% {}",
+             dropped_mic={} audio_blocks={} mic_blocks={} skipped={} fps={:.1}/{} configured={} \
+             capture={:.1}% discard={:.1}% pacer_sleep={:.1}% submit={:.1}% {}",
             self.frames,
             stats.segments,
             // Same buffered-bytes number the status publishes, so line and panel agree.
@@ -2327,6 +2540,11 @@ impl Engine {
             dropped,
             self.encoder.dropped_audio_blocks(),
             self.encoder.dropped_mic_audio_blocks(),
+            // What the audio side produced, next to what the encoder threw away: the pair says
+            // whether the track reached the child (`audio_blocks` grew, `dropped_audio` did not
+            // grow with it) or never left the queue.
+            self.audio_blocks,
+            self.mic_blocks,
             self.skipped,
             self.achieved,
             self.effective_fps,
@@ -2677,6 +2895,8 @@ impl Engine {
     fn account(&mut self, counts: PumpCounts) {
         self.frames += counts.submitted;
         self.skipped += counts.skipped;
+        self.audio_blocks += counts.audio_blocks;
+        self.mic_blocks += counts.mic_blocks;
         // Accumulated where every pump's counts pass: the steady-state loop and the post-roll wait.
         self.capture_time += counts.capture;
         self.discard_time += counts.discard;
@@ -2735,8 +2955,19 @@ impl Engine {
     /// Every step is attempted even if an earlier one failed, so a failure never leaves the display
     /// captured or ffmpeg writing.
     fn shutdown(&mut self) -> Result<()> {
+        // What the audio side produced, read before the flush: the encoder's report names
+        // the child, and the child's own report says nothing about the track it never took.
+        let audio = audio_report(
+            self.audio_blocks,
+            self.mic_blocks,
+            self.encoder.dropped_audio_blocks(),
+            self.encoder.dropped_mic_audio_blocks(),
+        );
         // The encoder first: its last segment must be closed before the ledger is scanned, or it is never indexed.
-        let flushed = self.encoder.finish().context("flushing the encoder");
+        let flushed = self
+            .encoder
+            .finish()
+            .with_context(|| format!("flushing the encoder ({audio})"));
         let scanned = if flushed.is_ok() {
             self.ledger
                 .scan()
@@ -2955,7 +3186,19 @@ impl Engine {
 
     /// Record a failure and let the loop end. Logged and kept in the status for front-ends that only poll `status()`.
     fn fail(&mut self, err: anyhow::Error) {
-        let message = format!("{err:#}");
+        // The recorder's own half of the report: what the audio side did. The encoder's
+        // errors name the child, and a child that never took its audio input is reported
+        // as a dead writer thread; these numbers say whether the track was ever produced
+        // and whether it ever left the queue on the way to the child.
+        let message = format!(
+            "{err:#} ({})",
+            audio_report(
+                self.audio_blocks,
+                self.mic_blocks,
+                self.encoder.dropped_audio_blocks(),
+                self.encoder.dropped_mic_audio_blocks(),
+            )
+        );
         tracing::error!("the recorder stopped: {message}");
         *self
             .status

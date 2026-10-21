@@ -6,7 +6,7 @@
 //! so everything after it still lines up with the video.
 
 use crate::audio_timeline::{AudioTimeline, Block, PacketSource};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 /// How often a lost source is reopened. Short enough that a headset swap loses well under a
@@ -30,6 +30,10 @@ pub(crate) trait SourceOpener {
     type Stream: PacketSource;
 
     /// Open the wanted source, returning it with its key (see [`SourceOpener::wanted`]).
+    ///
+    /// An implementation announces the attempt before it makes it: an open that hangs or
+    /// fails is otherwise a silence, and a silence with nothing in the log is the failure
+    /// this whole arrangement exists to prevent.
     fn open(&mut self) -> Result<(Self::Stream, String)>;
 
     /// A key for the source that should be open now (the default endpoint's id, a target
@@ -54,7 +58,12 @@ impl<O: SourceOpener> RecoveringSource<O> {
     /// Open the first stream. Failing here is fatal, unlike later: a recording that never had
     /// audio should say so at start.
     pub fn start(mut opener: O, timeline: AudioTimeline, now: Duration) -> Result<Self> {
-        let stream = opener.open()?;
+        // The error names the consequence, because the caller is about to refuse the
+        // recording and the user needs to know which step refused it: a platform error on
+        // its own ("CoCreateInstance(MMDeviceEnumerator)") does not say that.
+        let stream = opener
+            .open()
+            .context("opening the first audio source: the recording cannot start without it")?;
         Ok(Self {
             opener,
             stream: Some(stream),
@@ -354,5 +363,26 @@ mod tests {
             ms(0)
         )
         .is_err());
+    }
+
+    /// The refusal says what it refuses, not only what went wrong.
+    ///
+    /// The caller turns this error into "the recording did not start", and a user reading
+    /// that needs to know which step said no: a platform error on its own does not say.
+    #[test]
+    fn a_refused_first_open_says_the_recording_cannot_start_without_it() {
+        let err = match RecoveringSource::start(
+            opener(vec![None], "a"),
+            AudioTimeline::new(FORMAT, ms(0)),
+            ms(0),
+        ) {
+            Ok(_) => panic!("the opener refuses, so the source cannot start"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("the recording cannot start without it"),
+            "the refusal must name the consequence; got: {message}"
+        );
     }
 }

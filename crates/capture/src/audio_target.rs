@@ -38,6 +38,10 @@ pub(crate) struct GameAudioOpener<F> {
     find_game: Option<GameFinder>,
     /// A process whose activation failed, so it is not retried every check while it runs.
     refused_pid: Option<u32>,
+    /// Whether an attempt has already been announced. The first one of a session is a line the
+    /// user reads; the retries that follow a lost device are debug lines, because they arrive
+    /// twice a second for as long as the device stays away.
+    announced: bool,
 }
 
 impl<F: LoopbackFactory> GameAudioOpener<F> {
@@ -47,12 +51,27 @@ impl<F: LoopbackFactory> GameAudioOpener<F> {
             factory,
             find_game,
             refused_pid: None,
+            announced: false,
         }
     }
 
     fn target(&mut self) -> Option<u32> {
         let pid = (self.find_game.as_mut()?)()?;
         (Some(pid) != self.refused_pid).then_some(pid)
+    }
+
+    /// Say what is about to be opened, before it is opened.
+    ///
+    /// The line is the point of the exercise: an open that hangs or fails must be visible in
+    /// the log *while* it is being waited for, because a backend that never comes up is
+    /// otherwise a silence with nothing to explain it. `first_attempt` separates the one
+    /// attempt a user reads from the retries a lost device produces.
+    fn announce(&self, what: &str, first_attempt: bool) {
+        if first_attempt {
+            tracing::info!("game audio: opening the audio source: {what}");
+        } else {
+            tracing::debug!(source = what, "game audio: opening the audio source");
+        }
     }
 }
 
@@ -64,7 +83,16 @@ impl<F: LoopbackFactory> SourceOpener for GameAudioOpener<F> {
     type Stream = F::Stream;
 
     fn open(&mut self) -> Result<(F::Stream, String)> {
+        // The first attempt of a session is the one a user reads; the retries a lost device
+        // produces are debug lines. Which one this is is decided before the first attempt,
+        // because the attempt itself is what may never return.
+        let first_attempt = !self.announced;
+        self.announced = true;
         if let Some(pid) = self.target() {
+            self.announce(
+                &format!("the game process {pid} (process loopback)"),
+                first_attempt,
+            );
             match self.factory.open_process(pid) {
                 Ok(stream) => {
                     tracing::info!(
@@ -79,6 +107,10 @@ impl<F: LoopbackFactory> SourceOpener for GameAudioOpener<F> {
                 }
             }
         }
+        self.announce(
+            "everything the default output plays (endpoint loopback)",
+            first_attempt,
+        );
         let (stream, key) = self.factory.open_system()?;
         tracing::info!(
             per_app = self.find_game.is_some(),
@@ -126,6 +158,10 @@ mod tests {
     struct Fake {
         refuse_process: bool,
         opened: Vec<String>,
+        /// The log as it stood when the factory was asked to open: the proof that the
+        /// attempt was announced before it was made.
+        log_at_open: Vec<String>,
+        logs: Log,
     }
 
     impl LoopbackFactory for Fake {
@@ -134,15 +170,72 @@ mod tests {
             if self.refuse_process {
                 return Err(anyhow!("activation refused"));
             }
+            self.log_at_open = self.logs.lines();
             self.opened.push(process_key(pid));
             Ok(Tagged(2, true))
         }
         fn open_system(&mut self) -> Result<(Tagged, String)> {
+            self.log_at_open = self.logs.lines();
             self.opened.push("system".into());
             Ok((Tagged(1, true), "speakers".into()))
         }
         fn system_key(&mut self) -> Result<String> {
             Ok("speakers".into())
+        }
+    }
+
+    /// The log lines the events carried, in order.
+    ///
+    /// A subscriber of its own, because the claim under test is about *when* a line is
+    /// written: the fake factory records the log as it was at the moment it was asked to
+    /// open, so a line written only after the open succeeded would prove nothing.
+    ///
+    /// Only the levels a user reads are recorded: the debug lines are what a retry says,
+    /// and the point of one test is that a retry is not one of them.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<String>>>);
+
+    impl Log {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl tracing::Subscriber for Log {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut Message(&mut message));
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(message);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Takes the event's `message`, which is where the text of a `tracing::info!` lives.
+    struct Message<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Message<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
         }
     }
 
@@ -209,6 +302,68 @@ mod tests {
         let mut opener = GameAudioOpener::new(Fake::default(), None);
         assert_eq!(opener.open().unwrap().1, "system:speakers");
         assert_eq!(opener.wanted().unwrap(), "system:speakers");
+    }
+
+    /// The attempt is announced before it is made.
+    ///
+    /// The claim is about the order, not the wording: a line written after the open returned
+    /// says nothing about an open that never returns, which is the failure this guards. A
+    /// backend that hangs or fails is invisible in the log without it.
+    #[test]
+    fn the_source_is_announced_before_the_open_is_attempted() {
+        let logs = Log::default();
+        let mut opener = GameAudioOpener::new(
+            Fake {
+                logs: logs.clone(),
+                ..Fake::default()
+            },
+            None,
+        );
+        let subscriber = logs.clone();
+        let opened = tracing::subscriber::with_default(subscriber, || {
+            opener.open().expect("the fake opens")
+        });
+        assert_eq!(opened.1, "system:speakers");
+
+        let at_open = &opener.factory.log_at_open;
+        assert!(
+            at_open
+                .iter()
+                .any(|line| line.contains("opening the audio source")
+                    && line.contains("default output")),
+            "the attempt must be announced, and named, before it is made: the log when the open \
+             was attempted was {at_open:?}"
+        );
+    }
+
+    /// The retry that follows a lost device is not announced again at the level a user reads.
+    ///
+    /// The device comes and goes twice a second while it is away, and the warning that
+    /// reports the outage is the line to read; an announcement per retry would bury it.
+    #[test]
+    fn a_retry_after_a_lost_device_is_not_announced_again() {
+        let logs = Log::default();
+        let mut opener = GameAudioOpener::new(
+            Fake {
+                logs: logs.clone(),
+                ..Fake::default()
+            },
+            None,
+        );
+        let subscriber = logs.clone();
+        tracing::subscriber::with_default(subscriber, || {
+            opener.open().expect("the fake opens");
+            opener.open().expect("the fake opens again");
+        });
+        let announced = logs
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("opening the audio source"))
+            .count();
+        assert_eq!(
+            announced, 1,
+            "the second attempt is a retry, and the log says so once"
+        );
     }
 
     #[test]

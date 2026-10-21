@@ -421,6 +421,23 @@ mod wasapi_impl {
             if self.client.is_some() {
                 bail!("WASAPI microphone capture is already started");
             }
+            // The attempt, before it is made.
+            //
+            // The microphone is opened the same way the game audio is, and it fails the same
+            // way: a call into the audio service that never answers leaves nothing in the
+            // log but the absence of the line that says it started. This line is written
+            // first on purpose, and it names the endpoint being asked for.
+            tracing::info!(
+                endpoint = if self.device.is_empty() {
+                    "the default communications capture endpoint"
+                } else {
+                    self.device.as_str()
+                },
+                requested_sample_rate = TARGET.sample_rate,
+                requested_channels = TARGET.channels,
+                requested_sample_format = "s16",
+                "opening the WASAPI microphone backend"
+            );
             self.com_owned = init_com()?;
             match open_client(&self.device) {
                 Ok(client) => {
@@ -547,7 +564,10 @@ mod wasapi_impl {
 
     /// Open the default communications capture endpoint in shared mode and start it, asking the
     /// engine for the canonical 48kHz stereo s16le format whatever the device's own mix format is.
-    fn open_client(device_id: &str) -> Result<Client> {
+    ///
+    /// `wanted` is the endpoint id to open; empty is the default communications capture
+    /// endpoint.
+    fn open_client(wanted: &str) -> Result<Client> {
         // SAFETY: the CLSID is the documented one; `None` means no aggregation.
         let enumerator: IMMDeviceEnumerator = unsafe {
             CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)
@@ -556,7 +576,7 @@ mod wasapi_impl {
         // SAFETY: the enumerator is alive. eCapture is the data flow that has microphones (eRender would
         // be a speaker), and eCommunications is the role Windows gives the device the user talks into,
         // the one a game's voice chat selects. No loopback flag: this is the endpoint itself.
-        let device = if device_id.is_empty() {
+        let device = if wanted.is_empty() {
             unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications) }.context(
                 "IMMDeviceEnumerator::GetDefaultAudioEndpoint(eCapture, eCommunications): this \
                  machine has no default communications microphone. Plug in or enable a \
@@ -564,8 +584,14 @@ mod wasapi_impl {
                  Sound > Input",
             )?
         } else {
-            crate::audio_devices::windows_impl::device_by_id(&enumerator, device_id)?
+            crate::audio_devices::windows_impl::device_by_id(&enumerator, wanted)?
         };
+        // Which device it turned out to be: the log names it, because a machine with several
+        // input devices cannot be told which one was captured without it. The id is for the
+        // log, so a device whose id cannot be read is still a device: the failure is not
+        // the microphone's.
+        let endpoint = crate::wasapi::device_id(&device)
+            .unwrap_or_else(|e| format!("<the endpoint id could not be read: {e:#}>"));
         // SAFETY: IAudioClient is the capture endpoint's documented client interface.
         let audio: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
             .context("IMMDevice::Activate(IAudioClient)")?;
@@ -607,6 +633,18 @@ mod wasapi_impl {
         // labelled 48kHz stereo and the byte-count timeline would drift against the game track and the
         // video, so refusing is the fail-closed outcome. The error names both the requested and the
         // reported format, which together are the whole diagnosis.
+        //
+        // What is about to be asked for is logged first: the engine's own format next to the
+        // request, so a refusal names both and a reader can see which conversion was asked for.
+        tracing::debug!(
+            endpoint = endpoint,
+            native_sample_rate = native.sample_rate,
+            native_channels = native.channels,
+            native_sample_format = ?native.encoding,
+            requested_sample_rate = TARGET.sample_rate,
+            requested_channels = TARGET.channels,
+            "asking the audio engine to open the capture endpoint for the microphone"
+        );
         // SAFETY: the stream flags are documented shared-mode flags (see `STREAM_FLAGS`); the
         // periodicity argument must be 0 in shared mode, and `requested` stays alive on this stack
         // frame for the duration of the call.
@@ -638,7 +676,9 @@ mod wasapi_impl {
         // Which microphone was opened and whether the engine is converting for it: `converting = true`
         // plus audible 48kHz stereo audio in the microphone track is checkable without a debugger, and
         // `engine_upmixes_mono_to_stereo` says the device was mono and the matrixer duplicated it.
+        // The endpoint's id says which device it was.
         tracing::info!(
+            endpoint = endpoint,
             endpoint_data_flow = "eCapture",
             endpoint_role = "eCommunications",
             native_sample_rate = native.sample_rate,

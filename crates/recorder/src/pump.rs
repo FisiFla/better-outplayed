@@ -126,6 +126,14 @@ pub struct PumpCounts {
     /// Frames the backend offered that the pacer will not keep, discarded without a CPU copy
     /// ([`CaptureBackend::discard_pending`]).
     pub skipped: u64,
+    /// Game-audio blocks handed to the encoder.
+    ///
+    /// Counted because it is the one number that says whether the audio side is working at
+    /// all: a run whose blocks all sit in the encoder's queue, dropped, never reached the
+    /// child, and the encoder's own report names the child rather than the track.
+    pub audio_blocks: u64,
+    /// Microphone blocks handed to the encoder, counted the same way.
+    pub mic_blocks: u64,
     /// Time spent inside the capture backend (`next_frame` + `discard_pending`): the GPU readback,
     /// the largest per-frame cost, so it is measured.
     pub capture: Duration,
@@ -153,6 +161,8 @@ impl PumpCounts {
         PumpCounts {
             submitted: self.submitted + other.submitted,
             skipped: self.skipped + other.skipped,
+            audio_blocks: self.audio_blocks + other.audio_blocks,
+            mic_blocks: self.mic_blocks + other.mic_blocks,
             capture: self.capture + other.capture,
             discard: self.discard + other.discard,
             pacer_sleep: self.pacer_sleep + other.pacer_sleep,
@@ -248,12 +258,14 @@ pub fn pump_once_counted_with_mic(
     if let Some(audio) = audio {
         while let Some(block) = audio.next_buffer(Duration::ZERO)? {
             encoder.submit_audio(block)?;
+            counts.audio_blocks += 1;
         }
     }
     // Drained identically: a block left in the backend is a hole in the voice track.
     if let Some(mic) = mic {
         while let Some(block) = mic.next_buffer(Duration::ZERO)? {
             encoder.submit_mic_audio(block)?;
+            counts.mic_blocks += 1;
         }
     }
     counts.submit += before.elapsed();
@@ -534,6 +546,11 @@ mod tests {
         fn submit_audio(&mut self, _audio: AudioBuffer) -> anyhow::Result<()> {
             Ok(())
         }
+        /// The microphone input is accepted, so a pump can hand one over: the default
+        /// implementation refuses it, and a refused block is not a handed-over block.
+        fn submit_mic_audio(&mut self, _audio: AudioBuffer) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn finish(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -614,6 +631,8 @@ mod tests {
         let summed = PumpCounts {
             submitted: 2,
             skipped: 3,
+            audio_blocks: 4,
+            mic_blocks: 5,
             capture: spend,
             discard,
             pacer_sleep,
@@ -622,6 +641,8 @@ mod tests {
         .plus(PumpCounts {
             submitted: 5,
             skipped: 7,
+            audio_blocks: 6,
+            mic_blocks: 7,
             capture: spend,
             discard: Duration::from_millis(1),
             pacer_sleep: Duration::from_millis(2),
@@ -631,6 +652,8 @@ mod tests {
             (
                 summed.submitted,
                 summed.skipped,
+                summed.audio_blocks,
+                summed.mic_blocks,
                 summed.capture,
                 summed.discard,
                 summed.pacer_sleep,
@@ -639,12 +662,55 @@ mod tests {
             (
                 7,
                 10,
+                10,
+                12,
                 spend * 2,
                 discard + Duration::from_millis(1),
                 pacer_sleep + Duration::from_millis(2),
                 spend * 2
             ),
             "every field accumulates, timings included"
+        );
+    }
+
+    /// The audio blocks the pump handed to the encoder are counted.
+    ///
+    /// The count is what says whether the audio side is working: the encoder's own report
+    /// names the child, not the track, so a run whose blocks were all dropped on the way to
+    /// the child looks the same as a run whose audio never started unless this is counted.
+    #[test]
+    fn the_pump_counts_the_audio_blocks_it_handed_over() {
+        let mut capture = SlowCapture {
+            size: (8, 8),
+            spend: Duration::ZERO,
+        };
+        let mut audio = StubAudio::new(AudioFormat::default());
+        audio.start().expect("start the stub audio");
+        let mut mic = replayed_capture::StubMicrophone::new(AudioFormat::default(), 10);
+        mic.start().expect("start the stub microphone");
+        let mut encoder = CountingEncoder {
+            size: (8, 8),
+            fps: 30,
+            submitted: 0,
+        };
+        let (mut pacer, _) = pacer(30);
+
+        let counts = pump_once_counted_with_mic(
+            &mut pacer,
+            &mut capture,
+            Some(&mut audio),
+            Some(&mut mic),
+            &mut encoder,
+        )
+        .expect("one pump");
+
+        assert_eq!(
+            counts.audio_blocks, 1,
+            "the block the game-audio backend had due was handed over and counted"
+        );
+        assert_eq!(
+            counts.mic_blocks, 1,
+            "the block the microphone had due was handed over and counted"
         );
     }
 

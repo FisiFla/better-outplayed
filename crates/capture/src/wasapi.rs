@@ -234,6 +234,29 @@ impl AudioBackend for WasapiLoopback {
             }
             (GameAudioSource::System, _) => None,
         };
+        // The attempt, before it is made.
+        //
+        // Every other line about this backend says what happened; this one says what is
+        // being asked for, and it is written first on purpose. An open that hangs — the
+        // audio service is a separate process, and nothing in the API bounds the call —
+        // leaves nothing else in the log, and a recording that starts without an audio
+        // track is exactly the failure this line exists to make visible.
+        tracing::info!(
+            source = if find_game.is_some() {
+                "the game process (process loopback)"
+            } else {
+                "the whole default output (endpoint loopback)"
+            },
+            output_device = if self.output_device.is_empty() {
+                "the Windows default render endpoint"
+            } else {
+                self.output_device.as_str()
+            },
+            requested_sample_rate = TARGET.sample_rate,
+            requested_channels = TARGET.channels,
+            requested_sample_format = "s16",
+            "opening the WASAPI game-audio backend"
+        );
         let opened = WasapiFactory::new(&self.output_device).and_then(|factory| {
             let opener = GameAudioOpener::new(factory, find_game);
             RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now)
@@ -393,7 +416,7 @@ impl LoopbackFactory for WasapiFactory {
     fn open_system(&mut self) -> Result<(Client, String)> {
         let device = self.default_device()?;
         let id = device_id(&device)?;
-        Ok((open_client(&device)?, id))
+        Ok((open_client(&device, &id)?, id))
     }
 
     fn system_key(&mut self) -> Result<String> {
@@ -439,6 +462,10 @@ impl IAgileObject_Impl for ActivationDone_Impl {}
 
 /// Open process loopback on `pid` and its child processes and start it.
 fn open_process_client(pid: u32) -> Result<Client> {
+    // The attempt, before it is made: the activation is an asynchronous call into the audio
+    // service, and it is the one step of this backend that can wait (it has its own deadline,
+    // but a reader of the log needs to see that the wait started).
+    tracing::debug!(pid, "opening the WASAPI process loopback for the game");
     let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -506,7 +533,10 @@ fn open_process_client(pid: u32) -> Result<Client> {
 }
 
 /// The endpoint's id string, which tells one device from another across reopens.
-fn device_id(device: &IMMDevice) -> Result<String> {
+///
+/// `pub(crate)` so the microphone backend names its endpoint the same way: a machine with
+/// several input devices cannot be told which one was captured without it.
+pub(crate) fn device_id(device: &IMMDevice) -> Result<String> {
     // SAFETY: the device is alive; the returned string is CoTaskMemAlloc'd and freed right after
     // it is copied out.
     unsafe {
@@ -540,7 +570,10 @@ fn capture_call(what: &'static str) -> impl FnOnce(windows::core::Error) -> anyh
 
 /// Open `device` in loopback mode and start it, asking the engine for the canonical 48kHz stereo
 /// s16le format whatever the endpoint's own mix format is.
-fn open_client(device: &IMMDevice) -> Result<Client> {
+///
+/// `endpoint` is the endpoint's id, which names the device the log talks about: a machine with
+/// several output devices cannot be told which one was captured without it.
+fn open_client(device: &IMMDevice, endpoint: &str) -> Result<Client> {
     // SAFETY: IAudioClient is the render endpoint's documented client interface.
     let audio: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .context("IMMDevice::Activate(IAudioClient)")?;
@@ -566,6 +599,19 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
         10 * HNS_PER_MS
     };
 
+    // What the engine is about to be asked for, before it is asked: the endpoint's own format
+    // next to the request, so a refusal names both and a reader can see which conversion the
+    // engine is being asked to do.
+    tracing::debug!(
+        endpoint = endpoint,
+        native_sample_rate = native.sample_rate,
+        native_channels = native.channels,
+        native_sample_format = ?native.encoding,
+        requested_sample_rate = TARGET.sample_rate,
+        requested_channels = TARGET.channels,
+        "asking the audio engine to open the render endpoint for loopback capture"
+    );
+
     let client = start_stream(audio, buffer_duration, native.needs_conversion(), || {
         format!(
             "IAudioClient::Initialize(loopback, AUTOCONVERTPCM, requested {}Hz stereo \
@@ -578,8 +624,11 @@ fn open_client(device: &IMMDevice) -> Result<Client> {
     })?;
 
     // The endpoint's native format next to the requested one: `converting=true` plus audible 48kHz
-    // stereo audio in the clip shows the engine is converting, without a debugger.
+    // stereo audio in the clip shows the engine is converting, without a debugger. The endpoint's
+    // id says which device it was: a machine with several output devices cannot be told which
+    // one was captured without it.
     tracing::info!(
+        endpoint = endpoint,
         native_sample_rate = native.sample_rate,
         native_channels = native.channels,
         native_sample_format = ?native.encoding,

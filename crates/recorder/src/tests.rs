@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::pump::frame_bytes;
-use replayed_capture::{Frame, PixelFormat};
+use replayed_capture::{AudioBuffer, Frame, PixelFormat};
 use replayed_events::EventKind;
 
 /// The stub geometry: small and slow, so four seconds of real-time capture encodes quickly.
@@ -879,6 +879,7 @@ fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
         games: GamesSection::default(),
         game: None,
         fail_starts: FailStarts::default(),
+        audio_backends: AudioBackendOverrides::default(),
     }
 }
 
@@ -2448,4 +2449,196 @@ fn a_frame_is_sized_by_its_geometry_and_a_short_frame_is_refused() {
         texture: None,
     };
     guard_frame_size(&honest, (width, height)).expect("an honest frame is admitted");
+}
+
+// ---------------------------------------------------------------------------------------
+// The audio backends that do not come up
+// ---------------------------------------------------------------------------------------
+
+/// An audio backend whose open never returns.
+///
+/// The shape of a platform call that waits for ever: the Windows audio service is a separate
+/// process, and nothing in the API bounds the call into it.
+struct NeverOpens;
+
+impl AudioBackend for NeverOpens {
+    fn start(&mut self) -> anyhow::Result<()> {
+        // Far longer than the recording's own deadline, so the deadline is what ends the wait.
+        std::thread::sleep(Duration::from_secs(30));
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// An audio backend that opens and then says nothing.
+///
+/// The shape of an endpoint that is not really there: the open succeeds, and the stream
+/// never carries a sample.
+struct OpensAndDeliversNothing;
+
+impl AudioBackend for OpensAndDeliversNothing {
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// An audio backend that delivers two blocks, goes quiet, and then fails.
+///
+/// The shape of a device that goes away mid-run: the track started, and then the endpoint
+/// did. The first block is read by the start's own check, the second by the first pump, and
+/// the quiet call in between lets that pump finish, so the counters have something to say
+/// when the next one fails.
+struct FailsAfterTwoBlocks {
+    delivered: u32,
+}
+
+impl AudioBackend for FailsAfterTwoBlocks {
+    fn start(&mut self) -> anyhow::Result<()> {
+        self.delivered = 0;
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        self.delivered += 1;
+        match self.delivered {
+            1 | 2 => Ok(Some(a_block())),
+            3 => Ok(None),
+            _ => Err(anyhow::anyhow!("the audio endpoint went away")),
+        }
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// One 10ms block in the canonical format, which is what a backend hands over.
+fn a_block() -> AudioBuffer {
+    let format = AudioFormat::default();
+    AudioBuffer {
+        data: vec![0u8; format.bytes_per_10ms()],
+        frames: format.sample_rate as usize / 100,
+        pts: Duration::ZERO,
+        format,
+    }
+}
+
+/// A recording whose game-audio backend never comes up is refused, with the reason.
+///
+/// The failure this guards is the silent one: a run that captures video, produces no file
+/// and says nothing about the audio side that was never there. The refusal has to come at
+/// the start, because after it the run looks like a healthy one.
+#[test]
+fn a_game_audio_backend_that_never_opens_is_refused_at_start() {
+    let (_dir, app) = application_data_dir("game-audio-never-opens");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.audio_backends = opts.audio_backends.game_audio(Box::new(NeverOpens));
+    let err = match Recorder::start_with_options(stub_config(&app), opts) {
+        Ok(_) => panic!("a recording whose game audio never comes up must not start"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("did not come up"),
+        "the refusal must say the backend never came up; got: {message}"
+    );
+    assert!(
+        message.contains("game audio"),
+        "the refusal must name which backend; got: {message}"
+    );
+}
+
+/// A recording whose game-audio backend opens and then stays silent is refused.
+///
+/// The open succeeding is not the same as the endpoint being there: a default render
+/// endpoint that points at a device which is not present opens and then delivers nothing,
+/// and the recording it would produce is a file with no sound in it.
+#[test]
+fn a_game_audio_backend_that_opens_and_stays_silent_is_refused_at_start() {
+    let (_dir, app) = application_data_dir("game-audio-silent");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.audio_backends = opts
+        .audio_backends
+        .game_audio(Box::new(OpensAndDeliversNothing));
+    let err = match Recorder::start_with_options(stub_config(&app), opts) {
+        Ok(_) => panic!("a recording whose game audio delivers nothing must not start"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("delivered no audio"),
+        "the refusal must say the backend delivered nothing; got: {message}"
+    );
+}
+
+/// The microphone is waited for the same way the game audio is.
+///
+/// A microphone that never comes up is a recording with a voice track nothing feeds, which
+/// is the same failure as a game-audio track that is not there.
+#[test]
+fn a_microphone_that_never_opens_is_refused_at_start() {
+    let (_dir, app) = application_data_dir("microphone-never-opens");
+    let mut opts = options(RecordingMode::ReplayBuffer, true);
+    opts.audio_backends = opts.audio_backends.microphone(Box::new(NeverOpens));
+    let err = match Recorder::start_with_options(stub_config(&app), opts) {
+        Ok(_) => panic!("a recording whose microphone never comes up must not start"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("did not come up"),
+        "the refusal must say the backend never came up; got: {message}"
+    );
+    assert!(
+        message.contains("microphone"),
+        "the refusal must name which backend; got: {message}"
+    );
+}
+
+/// The report of a failed run says what the audio side did.
+///
+/// The encoder's own errors name the child, and a child that never took its audio input
+/// is reported as a dead writer thread; the numbers are what say whether the track was
+/// ever produced and whether it ever left the queue on the way to the child.
+#[test]
+fn a_failed_run_reports_what_the_audio_side_handed_over() {
+    let (_dir, app) = application_data_dir("audio-fails-mid-run");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.audio_backends = opts
+        .audio_backends
+        .game_audio(Box::new(FailsAfterTwoBlocks { delivered: 0 }));
+    let recorder = Recorder::start_with_options(stub_config(&app), opts)
+        .expect("the recording starts: the backend opens and delivers a block");
+
+    let status = wait_for(
+        &recorder,
+        Duration::from_secs(10),
+        "the run to fail",
+        |status| status.error.is_some(),
+    );
+    let error = status.error.expect("the run failed");
+    assert!(
+        error.contains("the audio endpoint went away"),
+        "the report must carry the failure itself; got: {error}"
+    );
+    assert!(
+        error.contains("1 game-audio blocks"),
+        "the report must say what the audio side handed to the encoder; got: {error}"
+    );
+    recorder.stop().ok();
 }
