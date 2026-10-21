@@ -201,6 +201,21 @@ fn capture_logs() -> Arc<Mutex<String>> {
     .clone()
 }
 
+/// Where the test's log is written, so that a process which dies of an access violation leaves
+/// behind the last thing it was doing.
+///
+/// `REPLAYED_TEST_LOG` names the file when the caller wants a known path — a CI job that
+/// uploads it, say. Otherwise the per-test temporary directory cargo provides is used, which
+/// exists for exactly this kind of scratch.
+fn log_file() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("REPLAYED_TEST_LOG") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    Some(
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("self_test_clip.log"),
+    )
+}
+
 /// `tracing_subscriber::fmt`'s writer: appends into the shared string.
 #[derive(Clone)]
 struct SinkWriter(Arc<Mutex<String>>);
@@ -214,8 +229,19 @@ impl Write for SinkWriter {
             .push_str(&text);
         // The sink is a string in this process, and a process that dies of an access violation
         // takes its memory with it: the last thing it logged would be lost with everything
-        // else. So the same lines go to stderr, which the test runner keeps whatever happens.
+        // else. So the same lines go to stderr, which the test runner keeps whatever happens,
+        // and to a file, which survives even the runner losing the child's output.
         eprint!("{text}");
+        if let Some(path) = log_file() {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = file.write_all(text.as_bytes());
+            }
+        }
         Ok(buf.len())
     }
 

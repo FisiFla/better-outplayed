@@ -346,7 +346,21 @@ jobs:
       - name: Install ffmpeg
         run: choco install ffmpeg -y --no-progress
       - name: Rust workspace tests
+        env:
+          # The self-test writes its log here as well as to its own buffer. A test binary
+          # that dies of an access violation takes its captured output with it, and the
+          # runner does not print a crashed child's output — so the last thing the test
+          # was doing would be lost with everything else. The file is uploaded below
+          # whatever happens.
+          REPLAYED_TEST_LOG: ${{ github.workspace }}\target\self_test_clip.log
         run: cargo test --workspace --features replayed-encoder/test-encoders
+      - name: Upload the self-test's log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: self-test-log
+          path: target/self_test_clip.log
+          if-no-files-found: ignore
       - name: Frontend build
         working-directory: apps/desktop
         run: |
