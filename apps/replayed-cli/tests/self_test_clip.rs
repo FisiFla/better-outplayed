@@ -207,10 +207,15 @@ struct SinkWriter(Arc<Mutex<String>>);
 
 impl Write for SinkWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
         self.0
             .lock()
             .expect("the log sink is not poisoned")
-            .push_str(&String::from_utf8_lossy(buf));
+            .push_str(&text);
+        // The sink is a string in this process, and a process that dies of an access violation
+        // takes its memory with it: the last thing it logged would be lost with everything
+        // else. So the same lines go to stderr, which the test runner keeps whatever happens.
+        eprint!("{text}");
         Ok(buf.len())
     }
 
