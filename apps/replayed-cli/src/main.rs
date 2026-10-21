@@ -30,6 +30,7 @@ fn main() -> Result<()> {
 
     match args.first().map(String::as_str) {
         Some("buffer") => replayed_cli::run_buffer(),
+        Some("displays") => replayed_cli::run_displays(),
         Some(other) => bail!("unknown subcommand: {other}\n\n{}", replayed_cli::help()),
         None => bail!("{}", replayed_cli::help()),
     }

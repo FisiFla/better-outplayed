@@ -79,6 +79,15 @@ replayed — Phase 1 headless replay buffer
 
 usage:
   replayed-cli buffer [OPTIONS]
+  replayed-cli displays
+
+subcommands:
+  displays
+        List the displays the capture can target, with the index `[capture] monitor`
+        takes for each, its current size and the refresh rate it runs at. The list
+        comes from the capture backend's own enumeration of the monitors, so the
+        index it prints is the index the capture uses; a list assembled elsewhere
+        can order the displays differently and then name a different screen.
 
 options:
   --mode <buffer|session>
@@ -213,6 +222,49 @@ fn parse_self_test_seconds(value: &str) -> Result<u64> {
 /// is never shorter than one full pre-roll plus post-roll. Pure, so a unit test pins the rule.
 pub fn self_test_need_ms(after_seconds: u64, pre_seconds: u64, post_seconds: u64) -> u64 {
     (after_seconds * 1000).max((pre_seconds + post_seconds) * 1000)
+}
+
+/// The `displays` subcommand: list the displays the capture can target.
+///
+/// The index printed here is the index `[capture] monitor` takes, because both come from the
+/// capture backend's own enumeration of the monitors. A display list assembled elsewhere — by a
+/// script, by the user, by another API — can order the displays differently, and then its
+/// "index 1" names a different screen than the capture's "index 1". That is not a hypothetical:
+/// it is how a measurement came to capture the wrong display and report a frame rate for it.
+///
+/// The command needs no configuration and starts no capture: it only asks the platform what is
+/// there.
+pub fn run_displays() -> Result<()> {
+    for line in describe_displays(&replayed_capture::displays()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The display list as lines of text, one per display.
+///
+/// A display the platform would not describe keeps its index and says so: the size and the
+/// refresh rate are reported as unknown rather than guessed, because a wrong number here is
+/// worse than no number — it would be copied into a configuration file.
+pub fn describe_displays(displays: &[replayed_capture::DisplayInfo]) -> Vec<String> {
+    if displays.is_empty() {
+        return vec!["no display could be described on this machine".to_string()];
+    }
+    displays
+        .iter()
+        .map(|display| {
+            let size = if display.width == 0 || display.height == 0 {
+                "size not reported".to_string()
+            } else {
+                format!("{}x{}", display.width, display.height)
+            };
+            let rate = match display.refresh_hz {
+                Some(hz) => format!("{hz} Hz"),
+                None => "refresh rate not reported".to_string(),
+            };
+            format!("index={} {} {}", display.index, size, rate)
+        })
+        .collect()
 }
 
 /// The `buffer` subcommand, as `main.rs` calls it: flags from the process's own arguments.
@@ -856,6 +908,12 @@ mod tests {
             help.contains("Nothing real is captured"),
             "the stub flag says what it costs"
         );
+        // And the display list is documented where a user looks for it.
+        assert!(help.contains("replayed-cli displays"));
+        assert!(
+            help.contains("index it prints is the index the capture uses"),
+            "the display list says why its order is trustworthy"
+        );
     }
 
     #[test]
@@ -865,5 +923,36 @@ mod tests {
         // Requested hold below it: a full pre-roll plus post-roll is the floor.
         assert_eq!(self_test_need_ms(2, 5, 3), 8_000);
         assert_eq!(self_test_need_ms(8, 5, 3), 8_000);
+    }
+
+    #[test]
+    fn the_display_list_names_the_index_the_capture_uses_and_says_what_it_does_not_know() {
+        // A display the platform described, and one it would not.
+        let lines = describe_displays(&[
+            replayed_capture::DisplayInfo {
+                index: 0,
+                width: 3840,
+                height: 2160,
+                refresh_hz: Some(120),
+            },
+            replayed_capture::DisplayInfo {
+                index: 1,
+                width: 0,
+                height: 0,
+                refresh_hz: None,
+            },
+        ]);
+        assert_eq!(lines[0], "index=0 3840x2160 120 Hz");
+        // A display the platform would not describe keeps its index and says so, rather than
+        // guessing a size: a wrong number here is copied into a configuration file.
+        assert_eq!(
+            lines[1],
+            "index=1 size not reported refresh rate not reported"
+        );
+        // And a machine with no display to describe says so, rather than printing nothing.
+        assert_eq!(
+            describe_displays(&[]),
+            vec!["no display could be described on this machine".to_string()]
+        );
     }
 }
