@@ -182,6 +182,30 @@ mod tests {
         assert!(!decided.decision.reduced());
     }
 
+    /// A rate the machine can sustain is not capped.
+    ///
+    /// The decision is `min(configured, measured)` and nothing else: a 120Hz display on a
+    /// machine that sustains 154fps is a 120fps recording, and a rate that was silently
+    /// capped would make the setting a lie.
+    #[test]
+    fn a_rate_the_machine_can_sustain_is_not_capped() {
+        let decided = decide_rate(120, true, Ok(measured(154.0, (3840, 2160)).unwrap()));
+        assert_eq!(
+            decided.decision.effective(),
+            120,
+            "a 120Hz display on a machine that sustains 154fps is a 120fps recording"
+        );
+        assert!(
+            !decided.decision.reduced(),
+            "the rate was not reduced, so the display's own rate is what the recorder runs at"
+        );
+        assert_eq!(
+            decided.decision.configured(),
+            120,
+            "the configured rate is still what is reported"
+        );
+    }
+
     /// A machine that keeps up gets the configured rate, unchanged.
     #[test]
     fn a_machine_that_keeps_up_runs_at_exactly_the_configured_rate() {

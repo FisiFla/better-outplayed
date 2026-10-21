@@ -446,7 +446,7 @@ impl RateMeter {
 mod tests {
     use super::*;
     use replayed_capture::stub::StubAudio;
-    use replayed_capture::{AudioFormat, PixelFormat};
+    use replayed_capture::{AudioBuffer, AudioFormat, PixelFormat};
     use replayed_encoder::{EncodeConfig, FfmpegEncoder, VideoCodec};
 
     /// A capture backend that spends a known time in `next_frame`, so `counts.capture` has a floor to check.
@@ -476,6 +476,75 @@ mod tests {
         }
         fn native_size(&self) -> (u32, u32) {
             self.size
+        }
+    }
+
+    /// A capture backend that has nothing on the first ask and a frame on the second.
+    ///
+    /// This is the shape of a frame that arrives after the wait's budget ran out, which at
+    /// 120fps is the ordinary case rather than a rare one: the interval is 8.3ms and the
+    /// budget is 5ms.
+    struct LateCapture {
+        size: (u32, u32),
+        asks: usize,
+    }
+
+    impl CaptureBackend for LateCapture {
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<Frame>> {
+            self.asks += 1;
+            if self.asks == 1 {
+                return Ok(None);
+            }
+            let (width, height) = self.size;
+            Ok(Some(Frame {
+                data: vec![0u8; frame_bytes(width, height)],
+                pts: Duration::ZERO,
+                width,
+                height,
+                format: PixelFormat::Bgra8,
+                texture: None,
+            }))
+        }
+        fn native_size(&self) -> (u32, u32) {
+            self.size
+        }
+    }
+
+    /// An encoder that counts what it was given and does nothing with it.
+    ///
+    /// The pump's questions are about pacing and attribution, not about the encode, and a
+    /// real ffmpeg child would make every one of them cost a process spawn.
+    struct CountingEncoder {
+        size: (u32, u32),
+        fps: u32,
+        submitted: u64,
+    }
+
+    impl Encoder for CountingEncoder {
+        fn submit_video(&mut self, _frame: Frame) -> anyhow::Result<()> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn submit_audio(&mut self, _audio: AudioBuffer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn active_encoder(&self) -> &'static str {
+            "counting"
+        }
+        fn source_size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn input_fps(&self) -> u32 {
+            self.fps
         }
     }
 
@@ -642,6 +711,66 @@ mod tests {
             (29..=31).contains(&admitted),
             "one second of 60fps capture must yield ~30 admitted frames, got {admitted}"
         );
+    }
+
+    /// The pacer admits the rate it is given, including the rates a display runs at.
+    ///
+    /// A 120Hz panel is worth recording at 120fps, and the pacer is what turns that number
+    /// into slots. The clock is simulated, as the other pacer tests do, so this asserts the
+    /// schedule and not the machine's speed.
+    #[test]
+    fn the_pacer_admits_a_hundred_and_twenty_frames_a_second() {
+        let (mut p, t0) = pacer(120);
+        let mut admitted = 0;
+        for i in 0..120u64 {
+            // Nanoseconds, not microseconds: the 120fps interval is 8,333,333.33ns, and a
+            // clock in whole microseconds drifts a third of a microsecond per frame, which
+            // by the hundred-and-nineteenth frame is a whole frame late.
+            if frame_arrived(&mut p, t0 + Duration::from_nanos(i * 1_000_000_000 / 120)) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 120,
+            "every one of the 120 slots in a second is admitted"
+        );
+    }
+
+    /// A frame that arrives after the wait's budget is not lost.
+    ///
+    /// The wait is bounded so the pump cannot stall on a backend that never delivers. At
+    /// 120fps the frame interval is 8.3ms and the budget is 5ms, so a frame that lands
+    /// late is the ordinary case rather than the rare one — and it must not be dropped. The
+    /// pacer stays due after a timed-out wait, so the next turn takes the frame instead of
+    /// skipping the slot.
+    #[test]
+    fn a_frame_that_arrives_after_the_wait_budget_is_taken_on_the_next_turn() {
+        let (mut p, _t0) = pacer(120);
+        let mut capture = LateCapture {
+            size: (8, 8),
+            asks: 0,
+        };
+        let mut encoder = CountingEncoder {
+            size: (8, 8),
+            fps: 120,
+            submitted: 0,
+        };
+
+        let first = pump_once_counted(&mut p, &mut capture, None, &mut encoder)
+            .expect("a pump whose frame has not arrived");
+        assert_eq!(first.submitted, 0, "there was no frame to take");
+        assert!(
+            p.is_due(Instant::now()),
+            "a timed-out wait must leave the slot due rather than skip it"
+        );
+
+        let second = pump_once_counted(&mut p, &mut capture, None, &mut encoder)
+            .expect("a pump whose frame has arrived");
+        assert_eq!(
+            second.submitted, 1,
+            "the frame that arrived late is taken, not skipped"
+        );
+        assert_eq!(encoder.submitted, 1, "and it reached the encoder");
     }
 
     #[test]
