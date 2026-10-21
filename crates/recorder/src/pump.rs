@@ -129,6 +129,19 @@ pub struct PumpCounts {
     /// Time spent inside the capture backend (`next_frame` + `discard_pending`): the GPU readback,
     /// the largest per-frame cost, so it is measured.
     pub capture: Duration,
+    /// Time spent draining the capture backend's frame pool — the frames the pacer will not keep.
+    ///
+    /// It is *inside* [`PumpCounts::capture`], but it is a different cost: no readback happens
+    /// here, only the pool is asked whether it has a frame and told to release it. Lumping the
+    /// two together made the status line's `capture=` share mean two different things at once,
+    /// which is how a 4K recording could spend three quarters of its wall clock in the capture
+    /// backend and nobody could say how much of it was the readback.
+    pub discard: Duration,
+    /// Time the pump spent waiting for the next frame to be due.
+    ///
+    /// It was in neither [`PumpCounts::capture`] nor [`PumpCounts::submit`], so a share of
+    /// every second was unattributed and the three visible shares did not add up.
+    pub pacer_sleep: Duration,
     /// Time spent inside the encoder's submit calls. Only video blocks in practice, on the bounded
     /// queue draining: this is backpressure (waiting for ffmpeg).
     pub submit: Duration,
@@ -141,6 +154,8 @@ impl PumpCounts {
             submitted: self.submitted + other.submitted,
             skipped: self.skipped + other.skipped,
             capture: self.capture + other.capture,
+            discard: self.discard + other.discard,
+            pacer_sleep: self.pacer_sleep + other.pacer_sleep,
             submit: self.submit + other.submit,
         }
     }
@@ -214,9 +229,19 @@ pub fn pump_once_counted_with_mic(
     } else {
         let before = Instant::now();
         counts.skipped += capture.discard_pending()? as u64;
-        counts.capture += before.elapsed();
+        let discarded = before.elapsed();
+        counts.capture += discarded;
+        // Measured on its own, so the status line can say how much of the capture backend's time
+        // was the pool drain rather than the readback.
+        counts.discard += discarded;
         // Measured from a fresh `now` because the discard took time; saturates to zero if already due.
+        let before = Instant::now();
         std::thread::sleep(pacer.time_until_due(Instant::now()).min(FRAME_POLL));
+        // The wait for the next slot is wall clock spent doing nothing. It was in neither
+        // `capture` nor `submit`, so the shares the status line printed did not add up to a
+        // second. This is the time the sleep actually took, not the time it asked for: a sleep
+        // overshoots by the scheduler's granularity, and the overshoot is part of the cost.
+        counts.pacer_sleep += before.elapsed();
     }
     let before = Instant::now();
     // `None`: no game audio was captured (`EncodeConfig::game_audio` false), nothing to drain.
@@ -513,16 +538,24 @@ mod tests {
             "the submit's wait is inside the pump as well"
         );
 
+        // The two new shares are given different values on each side, so an accumulator that
+        // dropped or replaced one of them would show up here rather than in the status line.
+        let discard = Duration::from_millis(5);
+        let pacer_sleep = Duration::from_millis(7);
         let summed = PumpCounts {
             submitted: 2,
             skipped: 3,
             capture: spend,
+            discard,
+            pacer_sleep,
             submit: spend,
         }
         .plus(PumpCounts {
             submitted: 5,
             skipped: 7,
             capture: spend,
+            discard: Duration::from_millis(1),
+            pacer_sleep: Duration::from_millis(2),
             submit: spend,
         });
         assert_eq!(
@@ -530,9 +563,18 @@ mod tests {
                 summed.submitted,
                 summed.skipped,
                 summed.capture,
+                summed.discard,
+                summed.pacer_sleep,
                 summed.submit
             ),
-            (7, 10, spend * 2, spend * 2),
+            (
+                7,
+                10,
+                spend * 2,
+                discard + Duration::from_millis(1),
+                pacer_sleep + Duration::from_millis(2),
+                spend * 2
+            ),
             "every field accumulates, timings included"
         );
     }

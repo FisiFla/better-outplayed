@@ -73,6 +73,54 @@ impl FpsDecision {
     }
 }
 
+/// The rate the pipeline will run at, and what to say about how it was arrived at.
+#[derive(Debug, Clone)]
+pub struct RateDecision {
+    /// The decision itself: what the pacer and the encoder child are told.
+    pub decision: FpsDecision,
+    /// Why the rate is not backed by a measurement, when it is not. `None` when the probe ran.
+    ///
+    /// A rate that was measured says something; a rate that was not says something else, and the
+    /// difference has to survive to the log, because "60fps because you asked for it" and "60fps
+    /// because the machine can sustain it" are not the same claim.
+    pub unmeasured: Option<String>,
+}
+
+/// Decide the rate, tolerating a probe that could not run.
+///
+/// A probe that fails is **not** a reason to refuse to record. The measurement is a benchmark of
+/// a separate encoder instance: the recording's own encoder is opened moments later, and if that
+/// one opens, the recording works whether or not the benchmark could run. So a failed probe costs
+/// the recording the *measured* rate, not the recording itself — the pipeline uses the configured
+/// rate, which is what the user asked for, and the log says the measurement did not happen.
+///
+/// This matters because the probe is a benchmark, and a benchmark is the part of the pipeline most
+/// likely to be wrong: it asks the machine to do something a real recording never does.
+pub fn decide_rate(
+    configured: u32,
+    adapt: bool,
+    measured: Result<ThroughputMeasurement, anyhow::Error>,
+) -> RateDecision {
+    match measured {
+        Ok(measurement) => RateDecision {
+            decision: FpsDecision::decide(configured, adapt, Some(measurement)),
+            unmeasured: None,
+        },
+        Err(err) => {
+            let reason = format!("{err:#}");
+            tracing::warn!(
+                "the sustainable encode rate could not be measured, so the recording will use the \
+                 configured {configured}fps and may drop frames if the encoder cannot keep up: \
+                 {reason}"
+            );
+            RateDecision {
+                decision: FpsDecision::decide(configured, adapt, None),
+                unmeasured: Some(reason),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +137,50 @@ mod tests {
     }
 
     const PROBE: Duration = Duration::from_millis(1500);
+
+    /// A probe that could not run costs the measurement, not the recording.
+    #[test]
+    fn a_probe_that_fails_does_not_stop_the_recording() {
+        let decided = decide_rate(
+            60,
+            true,
+            Err(anyhow::anyhow!("the encoder would not start")),
+        );
+        assert_eq!(
+            decided.decision.effective(),
+            60,
+            "the configured rate is what the pipeline runs at when nothing could be measured"
+        );
+        assert_eq!(
+            decided.unmeasured.as_deref(),
+            Some("the encoder would not start"),
+            "the reason the rate is not backed by a measurement is carried to the log"
+        );
+    }
+
+    /// A probe that ran leaves no reason to report: the number is the number.
+    #[test]
+    fn a_probe_that_ran_has_no_reason_to_report() {
+        let decided = decide_rate(60, true, Ok(measured(30.0, (1920, 1080)).unwrap()));
+        assert_eq!(
+            decided.decision.effective(),
+            30,
+            "the measurement still caps the rate"
+        );
+        assert!(
+            decided.unmeasured.is_none(),
+            "a measured rate needs no explanation"
+        );
+    }
+
+    /// A failed probe must not be able to *raise* the rate either: the effective rate is never
+    /// above what was asked for, whether or not anything was measured.
+    #[test]
+    fn a_failed_probe_never_raises_the_rate() {
+        let decided = decide_rate(30, true, Err(anyhow::anyhow!("no hardware encoder here")));
+        assert_eq!(decided.decision.effective(), 30);
+        assert!(!decided.decision.reduced());
+    }
 
     /// A machine that keeps up gets the configured rate, unchanged.
     #[test]

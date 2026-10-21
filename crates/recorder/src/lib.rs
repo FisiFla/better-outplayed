@@ -109,7 +109,7 @@ pub use config::{
     SessionStorageRules, StorageSection,
 };
 pub use event_driver::{GsiBinding, GsiGameInfo, GsiHandle};
-pub use fps::FpsDecision;
+pub use fps::{decide_rate, FpsDecision, RateDecision};
 pub use index::{
     cleanup_pass, clip_chapters, index_bookmark, index_clip, index_event, now_ms, open_clip_index,
     unix_millis, CleanupReport, BOOKMARK_KIND,
@@ -1293,21 +1293,29 @@ impl Prepared {
 
         // The rate decision. The probe measures the configuration that declares the configured rate,
         // and the rate it reports is what the whole pipeline then uses.
-        let decision = if cfg.encode.adapt_fps {
-            let measurement = measure(&encode_cfg).with_context(|| {
+        //
+        // A probe that fails is not a reason to refuse to record. The measurement is a benchmark
+        // of a *separate* encoder instance; the recording's own encoder is opened moments later,
+        // and if that one opens, the recording works whether or not the benchmark could run. So a
+        // failed probe costs the recording the measured rate, not the recording itself.
+        let rate = if cfg.encode.adapt_fps {
+            let measured = measure(&encode_cfg).with_context(|| {
                 format!(
                     "measuring the sustainable encode rate with {} at {}x{}",
                     encode_cfg.encoder_name(),
                     native.0,
                     native.1
                 )
-            })?;
-            FpsDecision::decide(cfg.encode.fps, true, Some(measurement))
+            });
+            decide_rate(cfg.encode.fps, true, measured)
         } else {
-            FpsDecision::decide(cfg.encode.fps, false, None)
+            RateDecision {
+                decision: FpsDecision::decide(cfg.encode.fps, false, None),
+                unmeasured: Some("encode.adapt_fps = false".to_string()),
+            }
         };
-        encode_cfg.fps = decision.effective();
-        log_rate_decision(&decision, encode_cfg.encoder_name(), native);
+        encode_cfg.fps = rate.decision.effective();
+        log_rate_decision(&rate, encode_cfg.encoder_name(), native);
 
         // The two modes build ledger and encoder in opposite, forced orders:
         // * a session's ring indexes files the encoder is about to write, and the encoder's start
@@ -1524,11 +1532,13 @@ impl Prepared {
             clock: CaptureClock::new(),
             status: Arc::clone(status),
             rate: RateMeter::new(RATE_WINDOW),
-            configured_fps: decision.configured(),
+            configured_fps: rate.decision.configured(),
             effective_fps: encoder_fps,
             frames: 0,
             skipped: 0,
             capture_time: Duration::ZERO,
+            discard_time: Duration::ZERO,
+            pacer_sleep_time: Duration::ZERO,
             submit_time: Duration::ZERO,
             pump_started: Instant::now(),
             achieved: 0.0,
@@ -1538,7 +1548,7 @@ impl Prepared {
             // The clips still being spliced, off the pump thread.
             pending_clips: Vec::new(),
         };
-        status.publish_recording(decision.configured(), encoder_fps, mic_port);
+        status.publish_recording(rate.decision.configured(), encoder_fps, mic_port);
         status.set_game(game);
         status.running.store(true, Ordering::SeqCst);
 
@@ -1831,6 +1841,13 @@ struct Engine {
     /// Time spent inside the capture backend, accumulated over the run
     /// ([`replayed_recorder::pump::PumpCounts::capture`]): the GPU readback cost, reported against wall clock.
     capture_time: Duration,
+    /// The part of [`Self::capture_time`] spent draining the capture pool rather than reading a
+    /// frame back. A separate number because the two are different costs, and only one of them
+    /// is the readback.
+    discard_time: Duration,
+    /// Time the pump spent waiting for the next frame to be due. Wall clock spent doing nothing,
+    /// which used to be in no share at all.
+    pacer_sleep_time: Duration,
     /// Time spent inside the encoder's submit, i.e. waiting for its bounded queue to drain.
     submit_time: Duration,
     /// When the pump's counters started, so the two above can be reported as a share of wall clock.
@@ -2297,7 +2314,8 @@ impl Engine {
 
         tracing::debug!(
             "frames={} segments={} bytes={} span={}ms evicted={} dropped={} dropped_audio={} \
-             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% submit={:.1}% {}",
+             dropped_mic={} skipped={} fps={:.1}/{} configured={} capture={:.1}% discard={:.1}% \
+             pacer_sleep={:.1}% submit={:.1}% {}",
             self.frames,
             stats.segments,
             // Same buffered-bytes number the status publishes, so line and panel agree.
@@ -2313,9 +2331,15 @@ impl Engine {
             self.achieved,
             self.effective_fps,
             self.configured_fps,
-            // Shares of wall clock since the first pump: `capture=` is readback and copy, `submit=` is waiting
-            // for ffmpeg, and the rest is audio drains, the tick and the loop.
+            // Shares of wall clock since the first pump. `capture=` is everything the pump spent
+            // inside the capture backend, of which `discard=` is the frame-pool drain (no readback
+            // happens there) and the capture backend's own `capture_split=` breaks the rest into
+            // waiting and copying. `pacer_sleep=` is the wait for the next frame to be due: wall
+            // clock spent doing nothing, which used to be in no share at all. `submit=` is the
+            // hand-off to the encoder. What is left is the audio drains, the tick and the loop.
             Self::share(self.capture_time, self.pump_started.elapsed()),
+            Self::share(self.discard_time, self.pump_started.elapsed()),
+            Self::share(self.pacer_sleep_time, self.pump_started.elapsed()),
             Self::share(self.submit_time, self.pump_started.elapsed()),
             split,
         );
@@ -2345,17 +2369,16 @@ impl Engine {
         // `dropped_since_last` stays non-zero until a warning is emitted, which also prevents one per log line.
         if dropped_since_last > 0 && warn_due && self.achieved > 0.0 {
             tracing::warn!(
-                "the encoder cannot sustain the {}fps it was told: only {:.1} frames per \
-                 second are reaching it, and its queue is dropping the rest ({} since the \
-                 last report, {dropped} in total) even though the pacer admits at most the \
-                 same {}fps. The recording's clock is still the wall clock, so a clip still \
-                 covers the seconds it says it does — but every dropped frame is a moment \
-                 the picture will hold the previous frame through. Lower encode.fps, or set \
-                 encode.output_size smaller.",
-                self.effective_fps,
+                "the encoder is taking {:.1} frames per second of the {}fps the pipeline is \
+                 offering it, so its queue is dropping the rest ({} since the last report, \
+                 {dropped} in total). The frames that do get through are fine — the \
+                 recording's clock is still the wall clock, so a clip still covers the \
+                 seconds it says it does — but every dropped frame is a moment the picture \
+                 will hold the previous frame through. Feed the encoder slower \
+                 (encode.fps) or make each frame cheaper (encode.output_size).",
                 self.achieved,
+                self.effective_fps,
                 dropped_since_last,
-                self.effective_fps
             );
             self.last_drop_warning = Some(Instant::now());
             self.last_warned_dropped = dropped;
@@ -2656,6 +2679,8 @@ impl Engine {
         self.skipped += counts.skipped;
         // Accumulated where every pump's counts pass: the steady-state loop and the post-roll wait.
         self.capture_time += counts.capture;
+        self.discard_time += counts.discard;
+        self.pacer_sleep_time += counts.pacer_sleep;
         self.submit_time += counts.submit;
         // Where the recording stands on the media timeline, published for the callers that stamp
         // an event with the moment it happened (see `Recorder::media_now_ms`).
@@ -2983,10 +3008,15 @@ fn resolve_encoder(
 ///   (dropped frames hold the previous picture).
 /// * Not reduced (`INFO`): one short line showing the measurement happened.
 /// * Not measured (`INFO`): adaptation is off; the absence of a measurement is itself a decision.
-fn log_rate_decision(decision: &FpsDecision, encoder: &str, native: (u32, u32)) {
+fn log_rate_decision(rate: &RateDecision, encoder: &str, native: (u32, u32)) {
+    let decision = &rate.decision;
     let Some(m) = decision.measurement() else {
+        let reason = rate
+            .unmeasured
+            .as_deref()
+            .unwrap_or("for a reason that was not recorded");
         tracing::info!(
-            "encode rate: not measured (encode.adapt_fps = false), so capture runs at the \
+            "encode rate: not measured ({reason}), so capture runs at the \
              configured {}fps at {}x{} whatever this machine can sustain: the encoder's queue \
              will drop any frame it cannot take, so the picture can hold frames the machine \
              could not encode. The media timeline is unaffected — it is the frames' arrival \
