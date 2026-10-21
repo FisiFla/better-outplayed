@@ -101,6 +101,69 @@ pub(crate) const TARGET: AudioFormat = AudioFormat {
 /// Bytes per captured frame: two channels of 16-bit PCM. Every packet is already in this format.
 const BYTES_PER_FRAME: usize = TARGET.channels as usize * 2;
 
+/// The thread that holds a COM apartment, as a message about it needs to say.
+///
+/// A COM apartment belongs to the thread that initialised it: an object created in one may
+/// only be used, and only released, on that thread. The recorder runs every audio backend on
+/// a thread of its own for exactly this reason, and this is the record of which thread that
+/// is.
+pub(crate) struct ApartmentOwner {
+    id: std::thread::ThreadId,
+    name: Option<String>,
+}
+
+impl ApartmentOwner {
+    /// The calling thread, which is about to take the apartment.
+    pub(crate) fn here() -> Self {
+        let current = std::thread::current();
+        Self {
+            id: current.id(),
+            name: current.name().map(str::to_owned),
+        }
+    }
+
+    /// Whether the calling thread is the one this names.
+    pub(crate) fn is_here(&self) -> bool {
+        self.id == std::thread::current().id()
+    }
+}
+
+impl std::fmt::Display for ApartmentOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{name} ({:?})", self.id),
+            None => write!(f, "{:?}", self.id),
+        }
+    }
+}
+
+/// Refuse a use of a COM object from a thread that did not take its apartment.
+///
+/// The Windows audio objects are not free-threaded: they live in the apartment of the thread
+/// that opened them, and a call from another thread is an access violation rather than an
+/// error the caller can read. This turns that into a message naming both threads, which is
+/// the difference between a crash and a diagnosis.
+///
+/// `owner` is `None` for a backend that has not been started: it has no apartment and no
+/// objects, so there is nothing to be wrong about.
+pub(crate) fn check_apartment(
+    what: &str,
+    owner: Option<&ApartmentOwner>,
+    object: &str,
+) -> Result<()> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    if owner.is_here() {
+        return Ok(());
+    }
+    let here = ApartmentOwner::here();
+    bail!(
+        "the {object} was opened on thread {owner} and is being {what} from thread {here}: a COM \
+         apartment belongs to the thread that initialised it, and the object lives in it"
+    )
+}
+
 /// 100-nanosecond units per millisecond, for `IAudioClient::Initialize`.
 const HNS_PER_MS: i64 = 10_000;
 
@@ -133,6 +196,11 @@ pub struct WasapiLoopback {
     watched_generation: u64,
     /// Whether this thread's COM apartment was taken by us and must be given back.
     com_owned: bool,
+    /// The thread that took the apartment, once the backend is started.
+    ///
+    /// The audio objects live in that thread's apartment, so they may only be used there. The
+    /// recorder gives every backend a thread of its own; this is the check that says so.
+    apartment: Option<ApartmentOwner>,
     /// Diagnostic for the reported `AUTOCONVERTPCM`-delivers-silence failure (see
     /// [`ConvertedSilenceWatch`]). Armed when the endpoint needed conversion; it only logs.
     silence_watch: ConvertedSilenceWatch,
@@ -199,17 +267,37 @@ impl WasapiLoopback {
             source: None,
             watched_generation: 0,
             com_owned: false,
+            // Set by `start`, on the thread that opens the backend.
+            apartment: None,
             // Disarmed until `start` learns whether the endpoint needed conversion.
             silence_watch: ConvertedSilenceWatch::new(false),
         })
     }
 
     fn release_com(&mut self) {
-        if self.com_owned {
-            // SAFETY: `start` took the apartment on this thread.
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-            self.com_owned = false;
+        if !self.com_owned {
+            return;
         }
+        if let Some(owner) = &self.apartment {
+            if !owner.is_here() {
+                // The apartment belongs to the thread that took it, and `CoUninitialize` has
+                // to run there: giving it back here would uninitialise another thread's
+                // apartment, which is the very thing this check exists to catch. The leak is
+                // the lesser fault, and it is named.
+                tracing::error!(
+                    opened_on = %owner,
+                    released_from = %ApartmentOwner::here(),
+                    "the WASAPI loopback backend's COM apartment is not being given back: it \
+                     belongs to the thread that opened it, and a thread cannot give another \
+                     thread's apartment back"
+                );
+                self.com_owned = false;
+                return;
+            }
+        }
+        // SAFETY: `start` took the apartment on this thread.
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+        self.com_owned = false;
     }
 }
 
@@ -219,6 +307,10 @@ impl AudioBackend for WasapiLoopback {
             bail!("WASAPI loopback capture is already started");
         }
         self.com_owned = init_com()?;
+        // The apartment is this thread's from here on, and so are the objects it holds: the
+        // backend is opened, read from and stopped on one thread, and this is the record of
+        // which one.
+        self.apartment = Some(ApartmentOwner::here());
         // Frame 0 is the moment capture began, so a session that opens on silence still starts its
         // audio alongside the video.
         let now = clock_base().elapsed();
@@ -278,6 +370,14 @@ impl AudioBackend for WasapiLoopback {
     /// Returns the next whole 10ms block, or `Ok(None)` when nothing is due within `timeout`. A zero
     /// timeout is a non-blocking "is anything due?" check, how the CLI drains audio without starving video.
     fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
+        // The read is a COM call into the audio service, from the thread that owns the
+        // apartment the objects live in. A read from anywhere else is an access violation,
+        // so it is refused here, where it can be named.
+        check_apartment(
+            "read from",
+            self.apartment.as_ref(),
+            "WASAPI loopback capture",
+        )?;
         let Self {
             source,
             silence_watch,

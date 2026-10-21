@@ -272,7 +272,10 @@ mod wasapi_impl {
     // Shared with the loopback backend rather than copied: the same three questions asked of a
     // different endpoint, which keeps the log lines comparable and the published format identical.
     use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
-    use crate::wasapi::{native_format, qpc_anchor, requested_format, MixFormatGuard, TARGET};
+    use crate::wasapi::{
+        check_apartment, native_format, qpc_anchor, requested_format, ApartmentOwner,
+        MixFormatGuard, TARGET,
+    };
     use anyhow::{bail, Context, Result};
     use std::time::{Duration, Instant};
     use windows::core::IUnknown;
@@ -335,6 +338,11 @@ mod wasapi_impl {
         timeline: AudioTimeline,
         /// Whether this thread's COM apartment was taken by us and must be given back.
         com_owned: bool,
+        /// The thread that took the apartment, once the backend is started.
+        ///
+        /// The audio objects live in that thread's apartment, so they may only be used there.
+        /// The recorder gives every backend a thread of its own; this is the check that says so.
+        apartment: Option<ApartmentOwner>,
         /// Diagnostic for a microphone delivering only silence (see [`ConvertedSilenceWatch`]). Armed
         /// when the endpoint needed engine conversion; it only logs.
         silence_watch: ConvertedSilenceWatch,
@@ -401,6 +409,8 @@ mod wasapi_impl {
                 client: None,
                 timeline: AudioTimeline::new(TARGET, Duration::ZERO),
                 com_owned: false,
+                // Set by `start`, on the thread that opens the backend.
+                apartment: None,
                 // Disarmed until `start` learns whether the endpoint needed conversion.
                 silence_watch: ConvertedSilenceWatch::new(false),
                 last_state_check: Instant::now(),
@@ -408,11 +418,29 @@ mod wasapi_impl {
         }
 
         fn release_com(&mut self) {
-            if self.com_owned {
-                // SAFETY: `start` took the apartment on this thread.
-                unsafe { windows::Win32::System::Com::CoUninitialize() };
-                self.com_owned = false;
+            if !self.com_owned {
+                return;
             }
+            if let Some(owner) = &self.apartment {
+                if !owner.is_here() {
+                    // The apartment belongs to the thread that took it, and `CoUninitialize`
+                    // has to run there: giving it back here would uninitialise another
+                    // thread's apartment, which is the very thing this check exists to catch.
+                    // The leak is the lesser fault, and it is named.
+                    tracing::error!(
+                        opened_on = %owner,
+                        released_from = %ApartmentOwner::here(),
+                        "the WASAPI microphone's COM apartment is not being given back: it \
+                         belongs to the thread that opened it, and a thread cannot give another \
+                         thread's apartment back"
+                    );
+                    self.com_owned = false;
+                    return;
+                }
+            }
+            // SAFETY: `start` took the apartment on this thread.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+            self.com_owned = false;
         }
     }
 
@@ -439,6 +467,10 @@ mod wasapi_impl {
                 "opening the WASAPI microphone backend"
             );
             self.com_owned = init_com()?;
+            // The apartment is this thread's from here on, and so are the objects it holds: the
+            // backend is opened, read from and stopped on one thread, and this is the record of
+            // which one.
+            self.apartment = Some(ApartmentOwner::here());
             match open_client(&self.device) {
                 Ok(client) => {
                     self.timeline = AudioTimeline::new(TARGET, client.anchor);
@@ -460,6 +492,14 @@ mod wasapi_impl {
         /// timeout is a non-blocking "is anything due?" check, how the recorder drains the microphone
         /// without starving the video.
         fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
+            // The read is a COM call into the audio service, from the thread that owns the
+            // apartment the objects live in. A read from anywhere else is an access violation,
+            // so it is refused here, where it can be named.
+            check_apartment(
+                "read from",
+                self.apartment.as_ref(),
+                "WASAPI microphone capture",
+            )?;
             let Self {
                 client,
                 timeline,

@@ -125,7 +125,7 @@ use memory_ring::MemoryRing;
 use replayed_capture::platform::{default_video_backend, game_audio_backend};
 use replayed_capture::stub::{StubAudio, StubCapture, StubConfig};
 use replayed_capture::wasapi_mic::{StubMicrophone, MICROPHONE_FORMAT};
-use replayed_capture::{AudioBackend, AudioFormat, CaptureBackend};
+use replayed_capture::{AudioBackend, AudioBuffer, AudioFormat, CaptureBackend};
 use replayed_encoder::probe::select_vendor;
 use replayed_encoder::{
     EncodeConfig, Encoder, FfmpegEncoder, MicAudioSpec, ThroughputMeasurement, Vendor, VideoCodec,
@@ -1900,6 +1900,261 @@ fn audio_report(
     )
 }
 
+/// What the recorder asks the thread that owns an audio backend to do.
+enum WorkerRequest {
+    /// Read the next block, waiting at most `timeout` for one to arrive.
+    Read {
+        timeout: Duration,
+        reply: mpsc::SyncSender<Result<Option<AudioBuffer>>>,
+    },
+    /// Stop the backend and end the thread.
+    Stop { reply: mpsc::SyncSender<Result<()>> },
+}
+
+/// The thread that owns an audio backend.
+///
+/// The backend is opened here, read from here and stopped here, and nowhere else. That is not a
+/// style choice: a COM apartment belongs to the thread that initialised it, and the Windows
+/// audio backends take theirs in `start` and give it back in `stop`. An object used from
+/// another thread is an access violation on Windows, not an error the caller can handle, so
+/// the whole backend lives on one thread and the recorder talks to it over channels.
+///
+/// The open is reported on a channel of its own, apart from the reads: the open is the step
+/// that can hang (it is a call into the platform's audio service) and the recorder has to be
+/// able to give up on it without giving up on the backend.
+fn audio_worker(
+    mut backend: Box<dyn AudioBackend>,
+    requests: Receiver<WorkerRequest>,
+    opened: mpsc::SyncSender<Result<()>>,
+) {
+    // The open, on the thread that owns the backend: this is where the platform's COM
+    // apartment is taken, and it has to be the thread that later gives it back.
+    if let Err(err) = backend.start() {
+        let _ = opened.send(Err(err));
+        // The backend never came up: release it here, where its apartment was taken.
+        let _ = backend.stop();
+        return;
+    }
+    if opened.send(Ok(())).is_err() {
+        // The recorder gave up while the backend was opening, so nothing will read the
+        // blocks: the backend is stopped here rather than left running for nobody.
+        let _ = backend.stop();
+        return;
+    }
+    while let Ok(request) = requests.recv() {
+        match request {
+            WorkerRequest::Read { timeout, reply } => {
+                let block = backend.next_buffer(timeout);
+                let _ = reply.send(block);
+            }
+            WorkerRequest::Stop { reply } => {
+                let stopped = backend.stop();
+                let _ = reply.send(stopped);
+                break;
+            }
+        }
+    }
+    // The backend is dropped here, on the thread that owns it: a backend dropped anywhere
+    // else would give its COM apartment back on the wrong thread.
+    drop(backend);
+}
+
+/// How much longer than a backend's own budget the recorder waits for its answer.
+///
+/// The budget is what the backend is given to find a block; the margin is for the channel
+/// round trip around it, and for a machine busy enough that the answer is late.
+const WORKER_REPLY_MARGIN: Duration = Duration::from_millis(250);
+
+/// How long the recorder waits for the thread that owns an audio backend to answer a read the
+/// pump asked for.
+///
+/// The pump asks with a zero timeout and expects the answer at once, and usually gets it: the
+/// backend's own read is a poll. It is not always quick, though: a backend that lost its
+/// device reopens the stream inside that call, and the reopen is a call into the platform's
+/// audio service that nothing bounds. The wait is therefore generous — the pump waits for the
+/// backend, as it did when the backend was called in place — and a backend that still does not
+/// answer fails the recording with a reason rather than hanging it.
+const WORKER_PUMP_REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the recorder waits for the thread that owns an audio backend to stop it.
+///
+/// The stop is a call into the platform's audio service, like the open, so it is bounded: a
+/// stop that never returns would leave the recording's shutdown waiting for a call nobody
+/// can interrupt.
+const WORKER_STOP_BUDGET: Duration = Duration::from_secs(5);
+
+/// An audio backend that runs on a thread of its own.
+///
+/// The recorder's handle on the thread above: reads and the stop are forwarded to it, and the
+/// open's result is waited for apart from them, so the recorder can bound the open.
+struct WorkerAudio {
+    /// The backend's name, for the messages that name it ("game audio", "microphone").
+    what: &'static str,
+    /// The requests to the thread that owns the backend; `None` once it has been stopped.
+    requests: Option<Sender<WorkerRequest>>,
+    /// The thread that owns the backend; joined once it has stopped.
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WorkerAudio {
+    /// Start the thread that owns `backend` and open the backend on it.
+    ///
+    /// The returned receiver carries the open's result: `Ok(())` once the backend is open, and
+    /// the platform's error when it is not.
+    fn spawn(
+        backend: Box<dyn AudioBackend>,
+        what: &'static str,
+    ) -> Result<(Self, mpsc::Receiver<Result<()>>)> {
+        let (requests, inbox) = mpsc::channel();
+        let (opened, opening) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name(format!("replayed-{}-worker", what.replace(' ', "-")))
+            .spawn(move || audio_worker(backend, inbox, opened))
+            .with_context(|| format!("spawning the thread that owns the {what} backend"))?;
+        Ok((
+            Self {
+                what,
+                requests: Some(requests),
+                thread: Some(thread),
+            },
+            opening,
+        ))
+    }
+
+    /// Wait for the backend's open, at most `budget` long.
+    ///
+    /// The failures are told apart because they have different causes: the open that never
+    /// returns is the platform's audio service not answering, the open that failed is the
+    /// platform's own error (which names the call that failed), and the thread that died is
+    /// neither.
+    fn await_open(&self, opening: &mpsc::Receiver<Result<()>>, budget: Duration) -> Result<()> {
+        match opening.recv_timeout(budget) {
+            Ok(Ok(())) => Ok(()),
+            // The open failed: the platform's error, with the step that failed named.
+            Ok(Err(err)) => Err(err.context(format!("opening the {} backend", self.what))),
+            Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "the {} backend did not come up within {budget:?}: the platform's audio service \
+                 did not answer the open. The recording is refused rather than started with an \
+                 audio track that never moves",
+                self.what
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the thread that opened the {} backend ended without opening it",
+                self.what
+            )),
+        }
+    }
+
+    /// Ask the thread that owns the backend for its next block.
+    ///
+    /// `budget` is what the backend is given to find one; `wait` is how long the recorder waits
+    /// for the answer, because the answer travels through a channel and the thread that owns
+    /// the backend may be busy inside the platform.
+    ///
+    /// The two ways of getting nothing are told apart, because they are different faults: a
+    /// backend that answers "nothing" has produced no block within its budget (an endpoint
+    /// that is not really there), and a backend that does not answer at all has a thread that
+    /// is stuck (a call into the audio service that never returns).
+    fn read(&self, budget: Duration, wait: Duration) -> Result<Option<AudioBuffer>> {
+        let requests = self
+            .requests
+            .as_ref()
+            .context("the audio backend has been stopped")?;
+        let (reply, answer) = mpsc::sync_channel(1);
+        requests
+            .send(WorkerRequest::Read {
+                timeout: budget,
+                reply,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("the thread that owns the {} backend is gone", self.what)
+            })?;
+        match answer.recv_timeout(wait) {
+            Ok(block) => block,
+            Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "the {} backend did not answer within {wait:?}: the thread that owns it is stuck \
+                 inside the platform's audio service, and a recording that waits for it captures \
+                 nothing",
+                self.what
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the thread that owns the {} backend ended before it delivered a block",
+                self.what
+            )),
+        }
+    }
+}
+
+impl AudioBackend for WorkerAudio {
+    /// The backend is opened on the thread that owns it, before this handle exists.
+    ///
+    /// There is nothing to start here: the open already happened, on the thread that will read
+    /// from and stop the backend, which is the only thread that may.
+    fn start(&mut self) -> Result<()> {
+        bail!(
+            "the {} backend is opened on the thread that owns it, and has already been opened",
+            self.what
+        );
+    }
+
+    /// The next block, or `None` when nothing is due.
+    ///
+    /// The pump asks with a zero timeout — "is anything due?" — and the answer comes from the
+    /// thread that owns the backend. The wait is generous because the backend may be reopening
+    /// a lost device inside that call, and the open is a call into the platform's audio
+    /// service that nothing bounds; a backend that still does not answer fails the recording
+    /// with a reason rather than hanging it.
+    fn next_buffer(&mut self, timeout: Duration) -> Result<Option<AudioBuffer>> {
+        self.read(timeout, timeout.saturating_add(WORKER_PUMP_REPLY_WAIT))
+            .map_err(|err| err.context(format!("reading a block from the {} backend", self.what)))
+    }
+
+    /// Stop the backend on the thread that owns it, and wait for it to be released.
+    ///
+    /// The stop is a COM call into the platform's audio service, so it happens where the
+    /// backend's apartment is: on its own thread. The thread is joined afterwards, so the
+    /// apartment is given back before this returns.
+    fn stop(&mut self) -> Result<()> {
+        let Some(requests) = self.requests.take() else {
+            // Already stopped: the backend is gone and its apartment given back.
+            return Ok(());
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        requests.send(WorkerRequest::Stop { reply }).map_err(|_| {
+            anyhow::anyhow!("the thread that owns the {} backend is gone", self.what)
+        })?;
+        let stopped = match answer.recv_timeout(WORKER_STOP_BUDGET) {
+            Ok(stopped) => stopped,
+            Err(RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "the {} backend did not stop within {WORKER_STOP_BUDGET:?}: the platform's audio \
+                 service did not answer the stop",
+                self.what
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the thread that owns the {} backend ended before it stopped",
+                self.what
+            )),
+        };
+        // The thread has answered, so it is about to end: joining it here means the backend
+        // is released — and its COM apartment given back — before this returns.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        stopped
+    }
+}
+
+impl Drop for WorkerAudio {
+    fn drop(&mut self) {
+        // The request channel goes first: a worker that is waiting for work ends, and releases
+        // the backend on its own thread, which is where its COM apartment is given back. A
+        // worker that is stuck inside the platform (an open that never returns) is left to
+        // finish on its own: joining it would make this drop wait for a call nobody can
+        // interrupt.
+        self.requests.take();
+    }
+}
+
 /// Open an audio backend and wait for its first block, both under a deadline.
 ///
 /// Two failures are told apart because they have different causes: an open that never returns
@@ -1908,37 +2163,19 @@ fn audio_report(
 /// with the reason named — a recording that silently produces nothing is the failure this
 /// exists to prevent, and the alternative (waiting) is what it looks like from the outside.
 ///
-/// The open runs on a thread of its own because nothing bounds it. The backend travels back
-/// with its result, so the thread that opened it owns it until the recording takes it, and a
-/// backend that opened too late is released on the thread that opened it.
+/// The backend runs on a thread of its own for its whole life, because a COM apartment belongs
+/// to the thread that initialised it: the thread that opens the backend is the thread that
+/// reads from it and the thread that stops it. The open is bounded from here, though it runs
+/// there: nothing bounds a call into the platform's audio service, and a start that waits for
+/// ever says nothing and captures nothing.
 fn open_audio_source(
-    mut backend: Box<dyn AudioBackend>,
-    what: &str,
+    backend: Box<dyn AudioBackend>,
+    what: &'static str,
     open_budget: Duration,
     first_block_budget: Duration,
 ) -> Result<Box<dyn AudioBackend>> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name(format!("replayed-{}-open", what.replace(' ', "-")))
-        .spawn(move || {
-            let started = backend.start();
-            // The backend goes back with its result: the recording owns it on success, and
-            // this thread drops it on failure, which is where a COM apartment it took is
-            // given back.
-            let _ = tx.send((started, backend));
-        })
-        .with_context(|| format!("spawning the thread that opens the {what} backend"))?;
-    let (started, mut backend) = rx.recv_timeout(open_budget).map_err(|err| match err {
-        mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
-            "the {what} backend did not come up within {open_budget:?}: the platform's audio \
-             service did not answer the open. The recording is refused rather than started \
-             with an audio track that never moves"
-        ),
-        mpsc::RecvTimeoutError::Disconnected => {
-            anyhow::anyhow!("the thread that opened the {what} backend ended without opening it")
-        }
-    })?;
-    started.map_err(|err| err.context(format!("opening the {what} backend")))?;
+    let (worker, opening) = WorkerAudio::spawn(backend, what)?;
+    worker.await_open(&opening, open_budget)?;
 
     // The first block: the proof that the backend is running and not merely open.
     //
@@ -1947,8 +2184,8 @@ fn open_audio_source(
     // starts when the backend opens and the first video frame arrives a frame interval
     // later, so dropping the first block moves the audio *closer* to the picture, not away
     // from it.
-    match backend.next_buffer(first_block_budget) {
-        Ok(Some(_)) => Ok(backend),
+    match worker.read(first_block_budget, first_block_budget + WORKER_REPLY_MARGIN) {
+        Ok(Some(_)) => Ok(Box::new(worker)),
         Ok(None) => Err(anyhow::anyhow!(
             "the {what} backend opened but delivered no audio within {first_block_budget:?}: \
              the endpoint it was given is not delivering, so the recording would carry an \

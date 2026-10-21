@@ -2455,6 +2455,130 @@ fn a_frame_is_sized_by_its_geometry_and_a_short_frame_is_refused() {
 // The audio backends that do not come up
 // ---------------------------------------------------------------------------------------
 
+/// An audio backend that records the thread every one of its calls ran on.
+///
+/// The Windows backends take a COM apartment when they are opened and give it back when they
+/// are stopped, and a COM apartment belongs to the thread that initialised it: an object used
+/// from another thread is an access violation there, not an error the caller can handle. This
+/// records what the recorder does with the threads it is given, so the rule can be checked
+/// where the tests run rather than only on the Windows runner.
+struct RecordsItsThreads {
+    /// The calls, in order, with the thread each ran on.
+    calls: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>,
+    /// How many blocks have been handed over. One, so a pump that drains the backend sees it
+    /// empty afterwards: a backend that always answers would keep the pump's drain loop
+    /// running for ever.
+    delivered: u32,
+}
+
+impl RecordsItsThreads {
+    fn record(&self, what: &'static str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((what, std::thread::current().id()));
+    }
+}
+
+impl AudioBackend for RecordsItsThreads {
+    fn start(&mut self) -> anyhow::Result<()> {
+        self.record("start");
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        self.record("next_buffer");
+        self.delivered += 1;
+        Ok((self.delivered == 1).then(a_block))
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        self.record("stop");
+        Ok(())
+    }
+}
+
+impl Drop for RecordsItsThreads {
+    fn drop(&mut self) {
+        self.record("drop");
+    }
+}
+
+/// Every audio backend runs on a thread of its own, and every call it takes stays on it.
+///
+/// A COM apartment belongs to the thread that initialised it, and the Windows audio backends
+/// take theirs when they are opened and give them back when they are stopped. A backend that
+/// is opened on one thread and read from another is an access violation on Windows, which is
+/// what the Windows CI runner saw: the open ran on a thread of its own and the reads and the
+/// release ran on the recorder's.
+///
+/// The microphone and the game audio are told apart here, because they are two backends and
+/// each has an apartment of its own: they must not share a thread either.
+#[test]
+fn every_audio_backend_runs_on_a_thread_of_its_own() {
+    let (_dir, app) = application_data_dir("audio-one-thread");
+    let game_calls: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let mic_calls: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let mut opts = options(RecordingMode::ReplayBuffer, true);
+    opts.audio_backends = opts
+        .audio_backends
+        .game_audio(Box::new(RecordsItsThreads {
+            calls: Arc::clone(&game_calls),
+            delivered: 0,
+        }))
+        .microphone(Box::new(RecordsItsThreads {
+            calls: Arc::clone(&mic_calls),
+            delivered: 0,
+        }));
+    let recorder = Recorder::start_with_options(stub_config(&app), opts)
+        .expect("the recording starts: both backends open and deliver a block");
+    let _ = recorder.stop();
+
+    let game = game_calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mic = mic_calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    for (what, calls) in [("game audio", &game), ("microphone", &mic)] {
+        let names: Vec<&str> = calls.iter().map(|(name, _)| *name).collect();
+        let trace: Vec<String> = calls
+            .iter()
+            .map(|(name, id)| format!("{name} on {id:?}"))
+            .collect();
+        assert!(
+            calls.iter().any(|(name, _)| *name == "start"),
+            "the {what} backend was opened: {names:?}"
+        );
+        assert!(
+            calls.iter().any(|(name, _)| *name == "next_buffer"),
+            "the {what} backend was read from: {names:?}"
+        );
+        assert!(
+            calls.iter().any(|(name, _)| *name == "stop"),
+            "the {what} backend was stopped: {names:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].1 == pair[1].1),
+            "every call on the {what} backend ran on one thread: {trace:?}"
+        );
+    }
+    // Neither backend lives on the recorder's own thread: that thread has no apartment of its
+    // own, and it is not the one that opened them.
+    let recorder_thread = std::thread::current().id();
+    assert!(
+        game.iter().all(|(_, id)| *id != recorder_thread),
+        "the game audio backend never ran on the recorder's thread"
+    );
+    assert!(
+        mic.iter().all(|(_, id)| *id != recorder_thread),
+        "the microphone never ran on the recorder's thread"
+    );
+    // And the two backends do not share a thread: each apartment is the backend's own.
+    assert_ne!(
+        game[0].1, mic[0].1,
+        "the game audio and the microphone run on threads of their own"
+    );
+}
+
 /// An audio backend whose open never returns.
 ///
 /// The shape of a platform call that waits for ever: the Windows audio service is a separate
@@ -2527,6 +2651,27 @@ impl AudioBackend for FailsAfterTwoBlocks {
     }
 }
 
+/// An audio backend that opens and then never answers.
+///
+/// The shape of a thread stuck inside the platform: the open returns, and the read does not.
+struct OpensAndHangs;
+
+impl AudioBackend for OpensAndHangs {
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        // Far longer than the recording's own deadline, so the deadline is what ends the wait.
+        std::thread::sleep(Duration::from_secs(30));
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// One 10ms block in the canonical format, which is what a backend hands over.
 fn a_block() -> AudioBuffer {
     let format = AudioFormat::default();
@@ -2583,6 +2728,31 @@ fn a_game_audio_backend_that_opens_and_stays_silent_is_refused_at_start() {
     assert!(
         message.contains("delivered no audio"),
         "the refusal must say the backend delivered nothing; got: {message}"
+    );
+}
+
+/// A recording whose game-audio backend opens and then hangs is refused at start.
+///
+/// The wait for the first block is bounded like the open is: a backend that opens and then
+/// never answers is a thread stuck inside the platform's audio service, and a start that waits
+/// for it says nothing and captures nothing.
+#[test]
+fn a_game_audio_backend_that_opens_and_hangs_is_refused_at_start() {
+    let (_dir, app) = application_data_dir("game-audio-hangs");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.audio_backends = opts.audio_backends.game_audio(Box::new(OpensAndHangs));
+    let err = match Recorder::start_with_options(stub_config(&app), opts) {
+        Ok(_) => panic!("a recording whose game audio never answers must not start"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("did not answer"),
+        "the refusal must say the backend did not answer; got: {message}"
+    );
+    assert!(
+        message.contains("game audio"),
+        "the refusal must name which backend; got: {message}"
     );
 }
 
