@@ -2605,3 +2605,121 @@ The backends also now **refuse** the two illegal moves instead of crashing: a re
 **Not verified:** the `#[cfg(windows)]` half is type-checked and has never been executed. The Windows CI run is what proves it, and what it must show is `self_test_clip` exiting 0, the log going "opening the WASAPI game-audio backend" → "WASAPI loopback capture started on the default render endpoint" → the clip written, and the new guard **not** appearing. The microphone path is not covered by that test and still needs `[mic] enabled = true` on Windows.
 
 **One related imbalance was found and left alone.** `crates/capture/src/wgc.rs` takes its apartment in `start_session` and releases it in `stop()` on the pump thread. It does not crash, because the WGC frame pool is created free-threaded and is therefore agile — but it is the same shape, and it is in the capture backend's domain rather than the recorder's.
+
+## 33. The access violation on a headless runner (2026-10-21)
+
+### What CI showed
+
+Run `39664799844` (head `16706bc`), and the run before it, `39652883107` (head `b4b8695`), both
+failed the same way. The `windows` job's "Rust workspace tests" step:
+
+```
+Running tests\self_test_clip.rs (target\debug\deps\self_test_clip-c70df306bbf69315.exe)
+error: test failed, to rerun pass `-p replayed-cli --test self_test_clip`
+  process didn't exit successfully: `…\self_test_clip-….exe` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+```
+
+About 2.5 seconds in. Every other CLI test passed — `clip_index`, `discard_readback`,
+`frame_size_mismatch`, `post_roll` — and the last green Windows run was `39639920503`, at head
+`3f82958`. The desktop shell's suite, the encoder's, the recorder's: all green.
+
+`0xc0000005` is a **hard fault**, not an assertion: the process was killed by the OS, and a
+hard fault takes the test binary with it. That is why the run's own log had to be made to
+survive it — a crashed child's captured output is not printed by libtest, and the in-memory sink
+the test used died with the process. The `SinkWriter` now also writes to a file
+(`REPLAYED_TEST_LOG`, or `CARGO_TARGET_TMPDIR/self_test_clip.log`), the `windows` job sets
+`REPLAYED_TEST_LOG` to a path in the workspace and uploads it with `if: always()`, and the
+uploaded artifact is where the next paragraph comes from.
+
+### Where the fault is
+
+The uploaded log's **last line** is the "announce before the open" line of the whole-output
+endpoint path that §30 added:
+
+```
+INFO opening the WASAPI game-audio backend source="the game process (process loopback)" output_device="the Windows default render endpoint" requested_sample_rate=48000 requested_channels=2 requested_sample_format="s16"
+INFO game audio: opening the audio source: everything the default output plays (endpoint loopback)
+```
+
+The next line would have been `WASAPI loopback capture started on the default render endpoint`.
+So the fault is **inside the whole-endpoint open**: `GetDefaultAudioEndpoint` → `GetId` →
+`GetMixFormat` → `GetDevicePeriod` → `IAudioClient::Initialize` → `SetEventHandle` → `GetService`
+→ `Start`.
+
+**The same test passes on real hardware.** On the Windows box, in Session 1, it ran the whole
+path in 16.46 s and produced a clip: the box has a game process, so `GameAudioOpener::open`
+takes the **per-application** path (`process loopback`), which never touches the default render
+endpoint at all. The CI runner has no game, so it goes straight to the endpoint path — and the
+runner's default render endpoint is a **headless, virtual device**. Its display is 1024×768, the
+virtual one Session 0 shows.
+
+### The test was not doing what its own documentation said
+
+`apps/replayed-cli/tests/self_test_clip.rs` drives the real command in process with the real
+ffmpeg encoder and the real ring. Its **module doc** says it does that "over the synthetic
+capture/audio sources"; an inline comment says "the real sources are used: this test is about
+the shipping path". The two contradict each other, and the code followed the second — so the
+real WASAPI and WGC backends were pulled into a test that was written to be about the trigger
+path. The test also already carried the right instinct in a comment — *"A headless CI runner
+has no audio render endpoint … skip loudly rather than fake a device"* — but the runner **has**
+an endpoint, so the skip never fired and the process died instead.
+
+### What was done about it
+
+**1. The device's own numbers are bounded** (`crates/capture/src/lib.rs`,
+`crates/capture/src/wasapi.rs`).
+
+`GetDevicePeriod` reports the endpoint's default and minimum device periods, and the default
+period was handed straight to `IAudioClient::Initialize` as the buffer duration with nothing
+checking it. The rules now live in the crate's root — where they can be tested on a machine
+that has no audio device at all, which is the machine that gets them wrong — and the Windows
+backend calls them:
+
+- a default period above `MAX_BUFFER_HNS` (100 ms) is **clamped** to it, and the clamp is
+  logged with both numbers: the engine would otherwise allocate a buffer to match, and the
+  capture would then wait that long for every block;
+- a default period **below** the minimum period is raised to it, because the engine requires
+  a buffer of at least one minimum period or it will not signal the event at all;
+- a **minimum** period above the cap is a device this capture cannot use, and it is **refused
+  with a reason** rather than believed.
+
+Five tests, all host-side, covering each of those rules.
+
+**2. The test drives the sources its own documentation says it drives**, and the real path
+stays available to a person.
+
+The main test now uses the **synthetic** capture and audio sources; the real ffmpeg encoder and
+the real ring stay real, and every one of the test's seventeen assertions still holds on that
+path (the clip exists, its duration is inside the window, the codecs are h264/aac, the audio is
+48 kHz stereo, and all six log-line substrings are present). The **real** capture path moved to
+a second test in the same file, gated on `REPLAYED_REAL_SOURCES=1`, which prints that it was
+not requested when the variable is absent. That run carries the hazard in its own comment: on a
+machine whose default render endpoint is a virtual device, the whole-endpoint open can fault
+hard and take the test binary down with it — which is exactly what the CI runner did, and why
+that run is opt-in.
+
+**3. The CI builds the CLI with its own feature flag.** `stub_sources` is refused unless the
+`replayed-cli` package is built with `replayed-cli/test-encoders`, which is a *different*
+feature from the `replayed-encoder/test-encoders` the suite already used. Without it the
+synthetic sources cannot be selected and the test would fall back to the platform's — the real
+ones on a Windows runner. The feature is now on every `--features` list in the workflow, with
+a comment saying why it is there.
+
+### What was NOT verified
+
+- **The fault itself was not reproduced.** It needs a Windows machine whose default render
+  endpoint is a virtual device; the box's endpoint does not fault, and macOS has no WASAPI at
+  all. The localisation is from the CI run's own uploaded log — the last line is the announce,
+  the next line is missing — and from the box's passing run of the same test on the other
+  branch of the code.
+- **The bound is a defence, not a proven fix.** It closes the one unbounded device-supplied
+  number that reaches the audio engine, and it is the right thing to do regardless, but the
+  fault may be inside the engine rather than in the number. The bound was **not** shown to
+  prevent the access violation; what prevents it is the test no longer opening the endpoint on
+  a machine that has no business opening it.
+- **The real path on a headless machine is still broken.** It is avoided in CI, not fixed. A
+  user on a machine with no real sound card who runs the real-source path may still fault.
+- **The microphone path is still not covered by the Windows test** — the CLI's config has no
+  microphone, so the microphone's own open has never run in CI. It needs `[mic] enabled = true`.
+- The 72-hour soak, the `silence_detector` check, and an update performed end to end are all
+  still not done, as §29 and §30 recorded.
