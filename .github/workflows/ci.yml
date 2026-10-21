@@ -212,7 +212,7 @@ jobs:
           cargo check
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
-          --features replayed-encoder/test-encoders,replayed-cli/test-encoders
+          --features replayed-encoder/test-encoders
           --tests
           --target x86_64-pc-windows-msvc
 
@@ -304,7 +304,7 @@ jobs:
           cargo clippy
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
-          --features replayed-encoder/test-encoders,replayed-cli/test-encoders
+          --features replayed-encoder/test-encoders
           --all-targets
           --target x86_64-pc-windows-msvc
           -- -D warnings
