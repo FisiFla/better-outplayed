@@ -2398,9 +2398,30 @@ failed. The clock is in nanoseconds now.
 
 ### What was NOT verified
 
-- **The machine went offline before the `FrameArrived` change could be measured.** The code is
-  in, the tests pass, and the arithmetic says the 79% should go — but **the 37.7 → 60+ fps
-  claim is unproven on hardware**, and it is stated here as a prediction, not a result.
+- **The `FrameArrived` change has still not been measured, and the attempt that was made failed
+  for a reason that is not yet explained.** The machine came back, and the measurement was run
+  twice. The first attempt failed in the *script*: it ran the capture over SSH, which lands in
+  **Session 0** — the virtual 1024×768 display, where the Windows Graphics Capture service does
+  not exist at all (`0x80070424`, `ERROR_SERVICE_DOES_NOT_EXIST`). A capture, a window
+  enumeration or a drawing must run in **Session 1**, which means a scheduled task with `/IT`; the
+  earlier working harness did that and the rewritten one had dropped the step. The corrected run
+  did run in Session 1, and it got as far as the frame path — **40.8 fps, `capture_wait=77.4%`,
+  the frame arrival arriving as it should** — and then **produced nothing at all**: the audio
+  backend never started, so no fragment was ever completed (`segments=0 bytes=0 span=0ms` for the
+  whole run), the encoder's audio writer thread stopped, and ffmpeg never took its audio input.
+  That is issue **#77**, and it is undiagnosed: the box's display topology had changed (the
+  capture ran at **2560×1080, not 4K**, so the rate is not comparable with the 37.7 fps
+  baseline), its set of audio devices had changed, and the throughput probe failed in the same
+  run (issue **#76**). So **the 37.7 → 60+ fps claim is still unproven on hardware**, and it is
+  stated here as a prediction, not a result.
+- **The fail-soft probe fix worked on its first real test.** The probe could not measure on that
+  machine (issue #76), and the recording **carried on** at the configured rate with a warning
+  naming the reason, instead of aborting. Before `f28cf42` the same failure would have stopped
+  the recording before it began.
+- **Nothing of the user's was lost to the retention pass.** The library the test runs had been
+  emptied, and the app's own log shows six session deletions at 09:13 that morning — the user
+  tidying by hand. The retention and cleanup passes logged **nothing**: no eviction, no cap, no
+  "too old". The separate `H:\Outplayed` library, which this project never touched, is intact.
 - The **Windows display enumeration never ran** — the refresh rate is type-checked for the
   Windows target and unit-tested against synthetic modes, and nothing on a real 120 Hz panel has
   read `EnumDisplaySettingsW`. Whether it reports 120, and whether it reports 0 or 1 for an
