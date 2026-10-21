@@ -2539,3 +2539,42 @@ refusals, the counters and the reports — is verified by execution.
 - **The ffmpeg child never dialling its audio input is still undiagnosed.** The encoder's
   diagnostics are a ten-second connect deadline and an exit status with an empty stderr.
 - **The 120 Hz capability is still proven in the schedule, not in a capture.**
+
+## 31. The deadlock the argument list revealed (2026-10-21)
+
+The encoder's failure report now says whether the ffmpeg child was **killed** or **exited**, and prints
+the argument list it was given (commit `b4b8695`). That turned "it failed silently" into a diagnosis.
+The child it described:
+
+```
+-hide_banner -loglevel error -nostdin -f h264 -use_wallclock_as_timestamps 1 -i pipe:0
+-f s16le -ar 48000 -ac 2 -i tcp://127.0.0.1:56126 -c:v copy -c:a aac -b:a 192k
+-f mp4 -movflags empty_moov+frag_keyframe+default_base_moof pipe:1
+```
+
+**ffmpeg opens its inputs in the order they are declared, and the raw h264 demuxer blocks probing the
+first one**: it cannot probe the stream until it has seen a keyframe carrying the sequence header. So
+ffmpeg sat in the video input's probe, and **the audio input was never opened** — while the recorder's
+audio writer waited ten seconds for a connection that could not happen. The child was still running
+when the deadline fired and had to be killed, which is why its stderr was empty and its exit code
+uninformative.
+
+**And the probe could not finish, because there is no sequence-header handling in the encoder at all.**
+`crates/encoder/src/mft.rs` and `crates/encoder/src/ffmpeg.rs` contain no `codec_data`, no
+`extradata`, no `MPEG4_SAMPLE_SIZE`, no SPS/PPS: the Media Foundation encoder's output is written to
+the child's stdin raw, and the sequence header lives in the output *type*, not in band. The raw h264
+demuxer has nothing to probe with.
+
+**Why it is intermittent, and why it fires hardest where it is least visible.** The run that produced a
+real clip had the display changing constantly, so keyframes arrived quickly. The failing runs capture a
+display that barely changes — 3 to 4 fps — and the keyframe that would let ffmpeg probe arrives far
+later than the ten-second audio deadline. It is a race between the encoder's keyframe interval and the
+audio connect deadline, and a quiet display loses it.
+
+Two fixes, both needed: **open the audio input first**, so the connection cannot be blocked by the
+video probe; and **prepend the sequence header** from the MFT's output type to the bitstream written to
+stdin, the way ffmpeg's own `h264_mp4toannexb` and OBS do. The first stops the deadlock; the second
+stops the starvation. Filed as **#78**.
+
+**Not verified:** the fix. The diagnosis is from the argument list, the code and the timing; the fix
+has not been written, and the deadlock has not been observed to end.
