@@ -2990,3 +2990,52 @@ to print the first few capture intervals on the box.
   probe cannot measure on the box, `0x8000FFFF`); the 19.4 s sparse-media observation on a still
   display is still unexplained; the code-signing certificate is still the one open Tier-0 item.
 
+### The proof: the same kind of display, before and after
+Two runs of a **still display** - the same kind of source, at the same delivery rate, on different
+builds:
+
+| | before | after |
+|---|---|---|
+| frames / span | 179 over 18.597 s | 360 over 39.275 s |
+| mean delta | 104.5 ms | 109.4 ms |
+| median delta | 19.9 ms | 108.4 ms |
+| **stdev** | **195.9 ms** | **9.06 ms** |
+| min to max | 15.5 to **1016.6 ms** | 33.7 to 132.6 ms |
+| intervals outside 2x the median | - | **1 of 359** |
+
+**The spread fell by a factor of 21 and the one-second freezes are gone.** Before, the recording
+showed 20 ms intervals punctuated by one-second gaps - the judder's exact signature, and the
+signature of ffmpeg stamping a burst's frames with the same reading time. After, the recording
+shows the source's own delivery rate, evenly, which is what a still display at that rate looks
+like when it is recorded faithfully.
+
+A 4K run with a moving pattern on the primary was also healthy: 1560 frames over 36.3 s, exit 0,
+`dropped=3`, `dropped_audio=0`. Its intervals mirror the source's irregular delivery (the
+pattern's 16 ms timer interleaved with longer gaps), which is the correct behaviour - the recording
+reproduces the source instead of inventing its own - but it is **not** comparable with the
+pre-fix game clip, because the source is different. **The pre-fix and post-fix game clip is the
+comparison that is still owed.**
+
+### A test whose premise was wrong
+The CI's first run of the fix failed on a timing test that asserted every wait must overshoot by
+under 2 ms - a claim about the machine as much as the code, and false: on a loaded runner the spin
+lost the CPU for 4 ms. Its stated premise was also wrong. "A wait that is a millisecond out is a
+millisecond of judder" is false, because the schedule is an **envelope** - a frame written late
+shifts the slots of the frames after it and the *intervals* stay the capture's own. The judder came
+from the intervals being wrong, and the fix for that was the capture times, not this wait's
+precision. The test now asserts what is the code's: the **median** overshoot over nine waits is
+sub-2 ms, and **no** single wait may overshoot by a whole frame interval, because that would mean
+the stream can fall a frame behind the picture.
+
+### What was NOT verified
+- **The game clip has not been re-recorded.** The controlled pair is a still display; the user's
+  own 4K game recording is the comparison that would close the question, and the game was not
+  running for the runs after the fix.
+- **Nobody has watched a clip** - not the old one, not the new ones.
+- The **microphone path** is still not exercised by any test on Windows.
+- The **readback** path's timestamps are quantised to 1/60 s by the rawvideo demuxer's own grid
+  (its container timebase is 1/15360). That is a pre-existing property of that path.
+- The pacing costs about 1 ms of spinning per frame - roughly 6% of a core at 60 fps - and that
+  was not measured on the recording machine.
+- **#79 stays open**: the throughput probe still cannot measure on this machine.
+- The 19.4 s sparse-media observation on a still display is still unexplained.
