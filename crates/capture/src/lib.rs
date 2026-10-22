@@ -193,7 +193,15 @@ pub enum GpuTexture {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub data: Vec<u8>,
-    /// Monotonic, from the same clock as `AudioBuffer::pts`.
+    /// When the frame was captured, on the same clock as [`AudioBuffer::pts`].
+    ///
+    /// **The frame's capture time, not the moment it was asked for.** The two differ by however
+    /// long the frame waited in the capture pool, and that wait is not the same for every frame:
+    /// a frame that waited a long time was on the screen earlier than a frame that did not. The
+    /// video's timeline is built from these times, so a frame that is stamped with the moment it
+    /// was asked for is stamped with the wrong time.
+    ///
+    /// Monotonic, and on the clock the audio is on, so the two can be compared.
     pub pts: Duration,
     pub width: u32,
     pub height: u32,
@@ -210,6 +218,127 @@ impl Frame {
     /// is a bug.
     pub fn has_pixels(&self) -> bool {
         !self.data.is_empty()
+    }
+}
+
+/// The capture's clock, and the capture pool's presentation times on it.
+///
+/// Windows Graphics Capture stamps every frame with the moment the compositor presented it, in
+/// **100-nanosecond units**. That is the frame's real capture time — the moment the pool was asked
+/// for it is later, by however long the frame waited in the pool — and it is the only clock that
+/// says when the picture was on the screen.
+///
+/// The unit was measured on the box rather than assumed, because a unit that is wrong by a factor
+/// of a hundred is invisible from a host: the capture backend is Windows-only, and the
+/// multiplication is a single line. Measured on the box, against the wall clock, a frame
+/// interval of 16.67 ms arrives as a difference of 166,666 in the raw stamp — which is 16.67 ms
+/// in units of 100 ns, and 0.17 ms if the stamp were read as nanoseconds. The stamp is in
+/// 100-nanosecond units.
+///
+/// The intervals are the pool's own, because they are the picture's own: the wall clock says when
+/// the pipeline *asked* for a frame, and how long the frame then waited in the pool is not the same
+/// for every frame. The *epoch* is the wall clock's, because that is the clock the audio is on, and
+/// because the pool's first stamp is not a safe anchor: a capture that starts while the pipeline is
+/// still warming up gets a first frame the pool has been holding for seconds, and anchoring on it
+/// puts a hole of that size at the head of the recording. So the intervals are checked against the
+/// wall clock and a stamp that disagrees with it by more than a factor of two is refused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureClock {
+    /// The last frame's place on both clocks.
+    last: Option<FrameStamp>,
+    /// How many frames the pool's stamp and the wall clock disagreed about.
+    ///
+    /// Counted rather than logged one by one: a wrong unit disagrees on *every* frame, and a log
+    /// line per frame would bury the recording it was meant to explain.
+    disagreements: u64,
+}
+
+/// One frame's place on the pipeline's clock and on the pool's.
+#[derive(Debug, Clone, Copy)]
+struct FrameStamp {
+    /// The frame's time on the pipeline's clock.
+    at: Duration,
+    /// The pool's stamp for it.
+    stamp: Duration,
+    /// The wall clock when the frame was taken.
+    now: Duration,
+}
+
+impl CaptureClock {
+    /// A clock that has not seen a frame yet.
+    pub fn new() -> Self {
+        Self {
+            last: None,
+            disagreements: 0,
+        }
+    }
+
+    /// The pipeline time of a frame the pool stamped at `stamp`, taken at `now`.
+    ///
+    /// `stamp` is `None` when the pool did not give one, which is a failure of the capture
+    /// backend rather than of the clock: the moment the frame was taken is then the best there is.
+    /// The pool's continuity ends with it — the next stamped frame anchors itself again, rather
+    /// than measuring an interval across a frame whose own time is a guess.
+    pub fn at(&mut self, stamp: Option<Duration>, now: Duration) -> Duration {
+        let Some(stamp) = stamp else {
+            self.last = None;
+            return now;
+        };
+        let Some(last) = self.last else {
+            // The first frame anchors the epoch on the wall clock: the pipeline's clock is the
+            // audio's clock, and the pool's stamp for this frame may be seconds old.
+            self.last = Some(FrameStamp {
+                at: now,
+                stamp,
+                now,
+            });
+            return now;
+        };
+        // The two clocks say how long the frame before this one was on the screen. The pool's
+        // answer is the exact one; the wall clock's is the pipeline's own jitter on top of it.
+        let pool = stamp.saturating_sub(last.stamp);
+        let wall = now.saturating_sub(last.now);
+        let interval = if agree(pool, wall) {
+            pool
+        } else {
+            self.disagreements = self.disagreements.saturating_add(1);
+            // The first few are logged outright, because they are the ones that say what went
+            // wrong; after that only every thousandth, so a stamp that is wrong on every frame
+            // cannot bury the recording.
+            if self.disagreements <= 3 || self.disagreements.is_multiple_of(1000) {
+                tracing::warn!(
+                    pool_ms = pool.as_secs_f64() * 1000.0,
+                    wall_ms = wall.as_secs_f64() * 1000.0,
+                    disagreements = self.disagreements,
+                    "the capture pool's presentation stamp and the wall clock disagree about how \
+                     long the frame before this one was on the screen, by more than a factor of \
+                     two; the wall clock is used for this frame instead"
+                );
+            }
+            wall
+        };
+        let at = last.at.saturating_add(interval);
+        self.last = Some(FrameStamp { at, stamp, now });
+        at
+    }
+}
+
+/// Whether the pool's stamp and the wall clock say the same thing about an interval.
+///
+/// A factor of two, and not a tolerance in milliseconds: the two clocks are the same clock seen
+/// through two latencies — the pool's and the pipeline's — so they differ by the jitter of the
+/// pipeline asking, which is a few milliseconds and not an order of magnitude. A factor of two is
+/// what a wrong unit looks like (a hundred), and what a frame the pool held for a second looks
+/// like.
+fn agree(pool: Duration, wall: Duration) -> bool {
+    let pool = pool.as_nanos();
+    let wall = wall.as_nanos();
+    match (pool, wall) {
+        // Both say "no time passed": the two frames are the same instant, and they agree.
+        (0, 0) => true,
+        // One says "no time passed" and the other does not: they do not agree.
+        (0, _) | (_, 0) => false,
+        _ => pool.saturating_mul(2) >= wall && wall.saturating_mul(2) >= pool,
     }
 }
 
@@ -743,6 +872,151 @@ mod tests {
         assert!(!is_silent_block(&[0, 0, 1, 0]));
         assert!(!is_silent_block(&[0xFF, 0xFF, 0, 0]));
         assert!(!is_silent_block(&[0, 0, 0, 0x80]));
+    }
+
+    // --- The capture clock ---
+
+    /// The frames' capture times are the pool's own stamps, moved onto the pipeline's clock.
+    ///
+    /// The intervals are the pool's: a frame captured 16.7ms after the one before it says so, and
+    /// the video's timeline is built on that.
+    #[test]
+    fn the_frames_intervals_are_the_capture_pools_own() {
+        let mut clock = CaptureClock::new();
+        // The first frame: its stamp and the moment it was taken.
+        let first = clock.at(
+            Some(Duration::from_millis(1_000)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            first,
+            Duration::from_millis(10),
+            "the first frame is the origin"
+        );
+        // The next one, 17ms later in the pool's time.
+        let second = clock.at(
+            Some(Duration::from_millis(1_017)),
+            Duration::from_millis(28),
+        );
+        assert_eq!(
+            second - first,
+            Duration::from_millis(17),
+            "the interval between two frames is the pool's own, not the delay in taking them",
+        );
+    }
+
+    /// A frame with no stamp falls back to the moment it was taken.
+    ///
+    /// The pool does not always give one, and a frame whose time is the moment it was asked for is
+    /// better than a frame whose time is a guess.
+    #[test]
+    fn a_frame_without_a_stamp_is_timed_by_when_it_was_taken() {
+        let mut clock = CaptureClock::new();
+        clock.at(Some(Duration::from_secs(1_000)), Duration::from_millis(10));
+        let unstamped = clock.at(None, Duration::from_millis(28));
+        assert_eq!(
+            unstamped,
+            Duration::from_millis(28),
+            "the moment it was taken is the best there is"
+        );
+    }
+
+    /// A pool that never stamps its frames leaves the capture on the times it took them.
+    #[test]
+    fn a_pool_that_never_stamps_leaves_the_capture_where_it_was() {
+        let mut clock = CaptureClock::new();
+        let first = clock.at(None, Duration::from_millis(10));
+        let second = clock.at(None, Duration::from_millis(28));
+        assert_eq!(first, Duration::from_millis(10));
+        assert_eq!(second, Duration::from_millis(28));
+    }
+
+    /// The first frame the pool hands over may be one it has been holding for seconds.
+    ///
+    /// The capture starts while the pipeline is still coming up, and the pool's first frame is
+    /// whatever was on the screen then. Anchoring the timeline on that frame's stamp puts a hole
+    /// of that size at the head of the recording — and a hole at the head is not a hole in the
+    /// picture, it is a hole in the *schedule*: the writer waits for it, the encoder's queue
+    /// overflows while it waits, and the recording collapses to a fraction of its rate.
+    ///
+    /// Measured on the box: the first frame's stamp was 2.6 seconds older than the second's while
+    /// the wall clock said the two were 29 ms apart.
+    #[test]
+    fn a_stale_first_frame_cannot_put_a_hole_at_the_head_of_the_recording() {
+        let mut clock = CaptureClock::new();
+        // The first frame: the pool's stamp is 2.6 seconds old.
+        let first = clock.at(
+            Some(Duration::from_millis(21_190_077)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(first, Duration::from_millis(10));
+        // The second, 29 ms later in the wall clock but 2.6 seconds later in the pool's stamp.
+        let second = clock.at(
+            Some(Duration::from_millis(21_192_702)),
+            Duration::from_millis(39),
+        );
+        assert_eq!(
+            second - first,
+            Duration::from_millis(29),
+            "the two clocks disagree by a factor of ninety, so the wall clock is used and the \\
+             hole is not in the recording",
+        );
+        // And the frame after that is timed by the pool again.
+        let third = clock.at(
+            Some(Duration::from_millis(21_192_735)),
+            Duration::from_millis(72),
+        );
+        assert_eq!(
+            third - second,
+            Duration::from_millis(33),
+            "the pool's stamps are trusted again once they agree with the wall clock",
+        );
+    }
+
+    /// A stamp in the wrong unit is refused, not obeyed.
+    ///
+    /// The unit of the pool's stamp is not documented where it is used, and the conversion is a
+    /// single multiplication: a unit that is wrong by a factor of a hundred cannot be seen from a
+    /// host, because the capture backend is Windows-only. So the intervals are checked against
+    /// the wall clock, and a stamp that disagrees by more than a factor of two is refused.
+    ///
+    /// The failure this prevents is the one the reverted attempt made: the conversion multiplied
+    /// by 100 where the platform counted in nanoseconds, and the intervals came out a hundred
+    /// times too large.
+    #[test]
+    fn a_stamp_in_the_wrong_unit_is_refused() {
+        let mut clock = CaptureClock::new();
+        // The first frame, stamped as the platform gives it.
+        clock.at(
+            Some(Duration::from_millis(1_000)),
+            Duration::from_millis(10),
+        );
+        // The second, 17ms later in the wall clock but 1.7 seconds later in the stamp: the stamp
+        // is in nanoseconds where it was read as 100-nanosecond units.
+        let second = clock.at(
+            Some(Duration::from_millis(1_017_000)),
+            Duration::from_millis(27),
+        );
+        assert_eq!(
+            second - Duration::from_millis(10),
+            Duration::from_millis(17),
+            "the wall clock's interval is used, so a wrong unit cannot stretch the recording",
+        );
+    }
+
+    /// The two clocks have to agree to within a factor of two, and no further.
+    #[test]
+    fn the_clocks_agree_within_a_factor_of_two() {
+        assert!(agree(Duration::from_millis(16), Duration::from_millis(17)));
+        assert!(agree(Duration::from_millis(16), Duration::from_millis(30)));
+        assert!(agree(Duration::from_millis(0), Duration::from_millis(0)));
+        assert!(!agree(Duration::from_millis(16), Duration::from_millis(33)));
+        assert!(!agree(
+            Duration::from_millis(2_600),
+            Duration::from_millis(29)
+        ));
+        assert!(!agree(Duration::from_millis(0), Duration::from_millis(29)));
+        assert!(!agree(Duration::from_millis(29), Duration::from_millis(0)));
     }
 
     #[test]
