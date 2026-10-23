@@ -3147,8 +3147,19 @@ Ran on the host, all green: `cargo fmt --all --check`; workspace clippy `-D warn
 `cargo test` and clippy; `svelte-check` (0 errors, 0 warnings), `vitest` (298), the production
 build, and `npm audit` (0 vulnerabilities).
 
-Not verified: the Windows runner (native clippy, the tests with a real GPU, the NSIS bundle), and
-nothing here was exercised on the box. The lockfile changes are compile-level only; `fs4`'s Windows
-lock is still `LockFileEx`, and the log-lock test that proves a second holder is told so passes on
-macOS, not on Windows.
+The Windows runner then took the same commit (CI run 39988449545, all five jobs green): the native
+`x86_64-pc-windows-msvc` clippy over the whole workspace — the store, the recorder and the CLI
+included — the desktop crate's `cargo test` (so the log-lock tests ran against `LockFileEx`, not
+just the Unix lock), the dependency audit, and both bundles, the NSIS installer among them. That is
+the pairing the macOS host could not give: `fs4`'s Windows lock is exercised by an assertion, and
+the WASAPI/WGC code is linted against the `windows 0.62` that was deliberately kept.
+
+Pushing the ignore rules also had the effect they were written for: Dependabot's own update run
+re-read `.github/dependabot.yml` and closed #84 and #85 by itself, on the pair it had split.
+
+Still not verified: nothing here was exercised on the box — the recording path, the capture session
+and the app as a user runs it were not touched by this change, and the ledger's other open items
+(the game clip not re-recorded since §35, 120 fps on the zero-copy path, the 72-hour soak, the
+code-signing certificate) are unchanged.
+
 
