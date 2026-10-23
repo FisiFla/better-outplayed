@@ -38,7 +38,7 @@ tempfile = "3"
 # need a C toolchain, which breaks the macOS -> x86_64-pc-windows-msvc `cargo check`); tests
 # sign with pure-Rust p256 through rcgen's `RemoteKeyPair`.
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std", "arithmetic"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std", "arithmetic"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # The test leaf must be RSA: macOS Security.framework (native-tls `Identity::from_pkcs8`)
 # cannot import an EC PKCS#8 key.

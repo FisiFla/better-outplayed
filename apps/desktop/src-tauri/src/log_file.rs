@@ -45,7 +45,13 @@ impl RotatingFile {
             .create(true)
             .append(true)
             .open(&path)?;
-        let locked = fs4::fs_std::FileExt::try_lock_exclusive(&file)?;
+        let locked = match <File as fs4::FileExt>::try_lock(&file) {
+            Ok(()) => true,
+            // `WouldBlock` is the "somebody else holds it" answer the caller asks about; any other
+            // error is a real failure to open the lock and is propagated.
+            Err(fs4::TryLockError::WouldBlock) => false,
+            Err(fs4::TryLockError::Error(error)) => return Err(error),
+        };
         let mut this = Self::from_file(file, path, max_bytes, keep)?;
         this.locked = locked;
         Ok((this, locked))
@@ -95,7 +101,7 @@ impl RotatingFile {
         // The lock belonged to the handle that was just renamed away, so the new file takes it
         // again: a file nobody holds is a file another process may take.
         if self.locked {
-            self.locked = fs4::fs_std::FileExt::try_lock_exclusive(&self.file).unwrap_or(false);
+            self.locked = <File as fs4::FileExt>::try_lock(&self.file).is_ok();
         }
         self.written = 0;
         Ok(())

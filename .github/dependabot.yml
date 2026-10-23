@@ -3,9 +3,23 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly }
+    # `windows` and `windows-core` are released as a pair and must move together: the crate
+    # depends on an exact `windows-core` major, so bumping either alone puts two incompatible
+    # copies in the tree (`struct Box is private`, `Interface` not satisfied). The 0.62 -> 0.100
+    # jump is a rewrite of the COM interop in the capture path, done deliberately, not weekly.
+    ignore:
+      - dependency-name: windows
+        update-types: ["version-update:semver-major"]
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: cargo
     directory: /apps/desktop/src-tauri
     schedule: { interval: weekly }
+    ignore:
+      - dependency-name: windows
+        update-types: ["version-update:semver-major"]
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /apps/desktop
     schedule: { interval: weekly }

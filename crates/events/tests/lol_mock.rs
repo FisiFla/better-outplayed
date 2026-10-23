@@ -33,6 +33,7 @@ use std::time::Duration;
 /// rcgen through its `SigningKey` trait.
 mod tls {
     use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
+    use rand_core::RngCore;
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
         KeyUsagePurpose, PublicKeyData, SanType, SerialNumber, SignatureAlgorithm,
@@ -48,12 +49,18 @@ mod tls {
 
     impl Key {
         fn new() -> Self {
-            let sk = SigningKey::random(&mut rand_core::OsRng);
-            let public = sk
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec();
+            // `p256` 0.14 draws from `rand_core` 0.10, which carries no OS generator, while the
+            // workspace still pins 0.6 for `rsa`. So entropy comes from the 0.6 generator and the
+            // scalar is built from the bytes; a draw outside the curve order (or zero) is refused
+            // and simply repeats.
+            let mut bytes = [0u8; 32];
+            let sk = loop {
+                rand_core::OsRng.fill_bytes(&mut bytes);
+                if let Ok(sk) = SigningKey::from_slice(&bytes) {
+                    break sk;
+                }
+            };
+            let public = sk.verifying_key().to_sec1_point(false).as_bytes().to_vec();
             Self { sk, public }
         }
     }

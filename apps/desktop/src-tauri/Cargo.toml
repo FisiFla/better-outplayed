@@ -57,7 +57,7 @@ tauri-plugin-notification = "2"
 # public key pinned in the same file, before it installs anything.
 tauri-plugin-updater = "2"
 drag = "2.1.1"
-fs4 = { version = "0.13", features = ["sync"] }
+fs4 = { version = "1.1", features = ["sync"] }
 
 # The Windows version for the diagnostics report. `RtlGetVersion` is the only call that does not
 # lie about it: `GetVersionEx` reports 6.2 to an application with no manifest.
@@ -81,7 +81,7 @@ tempfile = "3"
 minisign-verify = "0.3"
 # The encoding the pinned key and every signature are written in, decoded in the test the
 # same way the plugin decodes them.
-base64 = "0.22"
+base64 = "0.23"
 # The integration test drives a **real** recording (a real encoder child, a real ring, a
 # real splice and a real index row) through the tray's and the hotkey's trigger path. It
 # needs the engine's synthetic capture source (so that no test opens a capture session on

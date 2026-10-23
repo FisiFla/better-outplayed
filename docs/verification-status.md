@@ -3087,3 +3087,68 @@ bounded jump for an unbounded drift, which is the bug §35 exists to prevent.
 Nothing in the fix changed: the measurements there were taken on real hardware, on the box, with
 ffprobe, and the frame intervals are what they say. What was wrong was the *test suite's* claim
 that those properties can be certified on a shared runner at sub-millisecond precision.
+
+## 37. Twelve dependency pull requests, landed as one commit (2026-10-23)
+
+### Why one commit and not twelve merges
+Each Dependabot pull request carries its own `Cargo.lock` / `package-lock.json` hunk. Merge one and
+every other branch is behind an edited lockfile; GitHub then calls them conflicted, each needs a
+`@dependabot rebase`, and the CI minutes and wall clock multiply by twelve for a set of patch
+bumps. The bumps are independent of each other, so they were applied together on `main` and the
+pull requests closed as superseded. Same result, one verification pass, no bot branches.
+
+| dependency | from → to | what it needed |
+|---|---|---|
+| `@tauri-apps/plugin-dialog` | 2.8.2 → 2.8.3 | lockfile only |
+| `@tauri-apps/cli` | 2.12.2 → 2.12.3 | lockfile only |
+| `svelte-check` | 4.7.6 → 4.7.7 | lockfile only |
+| `vitest` | 5.0.4 → 5.0.5 | lockfile only |
+| `zip` | 9.0.4 → 9.0.5 | lockfile only (transitive) |
+| `libc` | 0.2.190 → 0.2.191 | lockfile only (transitive) |
+| `Swatinem/rust-cache` | v2.9.2 → v2.9.3 | the pinned SHA, in five places |
+| `base64` | 0.22 → 0.23 | compiles unchanged; `tauri-plugin-updater` keeps its own 0.22 |
+| `fs4` | 0.13 → 1.1 | the trait moved, and the call site with it |
+| `p256` | 0.13 → 0.14 | the test's key generation, see below |
+| `windows-core` | 0.62 → 0.100 | **held**, see below |
+
+### `fs4` 1.x: one trait, and `try_lock` is the exclusive one
+`fs4::fs_std::FileExt` is gone; there is one `fs4::FileExt` for both `File` and `AsyncFile`, and the
+exclusive acquisition is now plain `try_lock` (`try_lock_shared` is the other one). The return type
+changed shape too: 0.13 answered `io::Result<bool>` with `Ok(false)` for "somebody else holds it",
+1.x answers `Result<(), TryLockError>` with `WouldBlock` for that case — so "false" and "a real I/O
+error" are no longer the same channel. The call site keeps them apart: `WouldBlock` is `false`,
+`TryLockError::Error` propagates. **`File::try_lock` also exists in `std` as of 1.89, and an
+inherent method wins over a trait one**, so the call is written `<File as fs4::FileExt>::try_lock`
+— without the qualified form the std method resolves and the code silently stops using `fs4`, while
+`fs4` stays in the dependency graph anyway for `available_space` / `total_space` in `health.rs`.
+
+### `p256` 0.14: the random key, without a second `rand_core` in the workspace
+0.14 draws from `rand_core` 0.10, which does not carry an `OsRng` at all, while the workspace pins
+0.6 for `rsa` — and bumping the workspace copy would break `RsaPrivateKey::new`. The mock's EC key
+therefore draws 32 bytes from the 0.6 generator and builds the scalar with `SigningKey::from_slice`,
+repeating on the (astronomically rare) draw the curve refuses. `to_encoded_point` became
+`to_sec1_point`. The test still proves what it proved: the relaxed client accepts the throwaway
+chain and a verifying client refuses it.
+
+### `windows-core` 0.100 is held on purpose
+`windows` 0.62.2 depends on `windows-core` 0.62. Dependabot split the pair, and either half alone
+puts two incompatible copies of `windows-core` in the tree (`struct Box is private`,
+`IActivateAudioInterfaceCompletionHandler: windows_core::Interface` not satisfied). The 0.62 → 0.100
+jump is a rewrite of the WASAPI/WGC COM interop in the capture path — unsafe code that nothing
+currently requires to move, with no driver beyond the version number. It is therefore deferred
+rather than half-done, and `.github/dependabot.yml` ignores `windows` and `windows-core` **major**
+updates in both cargo directories so the split cannot reopen the two red pull requests every week.
+Minor and patch updates are still proposed.
+
+### Verified, and not
+Ran on the host, all green: `cargo fmt --all --check`; workspace clippy `-D warnings`; the
+`x86_64-pc-windows-msvc` clippy over the cross-checkable crates; `cargo test --workspace
+--features replayed-encoder/test-encoders,replayed-cli/test-encoders`; the desktop crate's own
+`cargo test` and clippy; `svelte-check` (0 errors, 0 warnings), `vitest` (298), the production
+build, and `npm audit` (0 vulnerabilities).
+
+Not verified: the Windows runner (native clippy, the tests with a real GPU, the NSIS bundle), and
+nothing here was exercised on the box. The lockfile changes are compile-level only; `fs4`'s Windows
+lock is still `LockFileEx`, and the log-lock test that proves a second holder is told so passes on
+macOS, not on Windows.
+
