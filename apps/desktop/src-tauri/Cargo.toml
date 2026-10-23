@@ -57,7 +57,7 @@ tauri-plugin-notification = "2"
 # public key pinned in the same file, before it installs anything.
 tauri-plugin-updater = "2"
 drag = "2.1.1"
-fs4 = { version = "0.13", features = ["sync"] }
+fs4 = { version = "1.1", features = ["sync"] }
 
 # The Windows version for the diagnostics report. `RtlGetVersion` is the only call that does not
 # lie about it: `GetVersionEx` reports 6.2 to an application with no manifest.
