@@ -3039,3 +3039,51 @@ the stream can fall a frame behind the picture.
   was not measured on the recording machine.
 - **#79 stays open**: the throughput probe still cannot measure on this machine.
 - The 19.4 s sparse-media observation on a still display is still unexplained.
+
+## 36. The timing tests asserted the runner, and CI said so (2026-10-23)
+
+### The symptom
+Nine of twelve Dependabot pull requests went red at once — including one that only bumps
+`Swatinem/rust-cache` and touches no Rust at all. That is not a dependency problem. It was this
+repository's own timing tests, added with the choppy-clip fix, failing on a loaded shared runner:
+**my regression, found by the bot rather than by me.**
+
+### The three assertions, and what they measured
+| assertion | bound | measured on CI |
+|---|---|---|
+| the wait's median overshoot (16 ms wait) | < 2 ms | **4.165 ms** |
+| the median written interval | 17.4 ms ± 1 ms | **16.32 ms** |
+| frames of a burst sharing a timestamp | none of 116 | **5–6**, then **26** |
+
+Each is a fact about the machine, not the code. No implementation of "wake up at time T"
+survives being descheduled, and a three-core runner running the whole workspace in parallel
+deschedules constantly. A writer that is starved does not compress the intervals, it *crowds*
+them — it writes a run of frames back to back while it catches up — and how far behind it falls
+varies five-fold between runner instances for the same code (5–6 of 116, then 26 of 116).
+
+### The rule this settles
+**Assert the timing the code decides; report the timing the machine decides.**
+- Asserted: the schedule's arithmetic (pure, no clock); the wait never returning before its
+  deadline; the spin's own accuracy, measured with a deadline inside `SPIN_WINDOW` so the thread
+  only has to hold the CPU for 400 µs; and the median interval against a **real encoder**, end to
+  end.
+- Reported, not asserted: how many intervals a run of frames crowds. A bound loose enough for a
+  starved runner is no tighter than the defect it is meant to catch.
+
+**The discriminating numbers, with the defect reintroduced:** the median written interval becomes
+**750 ns** against 17.4 ms in the unit test, and **33.333 ms** against 16.667 ms in the
+integration test — four orders of magnitude and a whole burst's worth, against bounds that now
+tolerate a loaded machine by four times.
+
+### The bound that remains, and it is real
+On a starved machine the writer catches up by writing frames close together, so a run of frames
+shares a timestamp and the picture can jump by that much. It is bounded: the frames' *span* is
+still the capture's own, the audio is byte-counted and unaffected, and the writer recovers. On
+the box the pacing had 19.6% of the wall clock to sleep in and never crowded a frame. The
+alternative — holding the schedule and letting the stream fall behind the audio — trades a
+bounded jump for an unbounded drift, which is the bug §35 exists to prevent.
+
+### What this says about the rest of §35
+Nothing in the fix changed: the measurements there were taken on real hardware, on the box, with
+ffprobe, and the frame intervals are what they say. What was wrong was the *test suite's* claim
+that those properties can be certified on a shared runner at sub-millisecond precision.
