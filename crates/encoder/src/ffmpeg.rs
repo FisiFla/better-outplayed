@@ -1662,8 +1662,15 @@ mod tests {
         let mut deltas: Vec<Duration> = writes.windows(2).map(|w| w[1] - w[0]).collect();
         deltas.sort();
         let median = deltas[deltas.len() / 2];
+        // The tolerance is a quarter of the interval, and it is that wide because the assertion is
+        // about *how* the frames are timed, not about the precision of the machine. A defective
+        // writer does not compress the intervals, it erases them: every frame of a burst is
+        // written at the instant the burst arrived, which puts the median at nothing at all. A
+        // busy machine takes the writer off its schedule and lets it catch up, which compresses
+        // the intervals it writes — measured on a loaded CI runner, a 17.4ms interval came back
+        // as 16.3ms — and that is the machine, not the defect.
         assert!(
-            median.abs_diff(INTERVAL) < Duration::from_millis(1),
+            median.abs_diff(INTERVAL) < INTERVAL / 4,
             "the frames must be written one capture interval ({INTERVAL:?}) apart, not as they \
              arrive: the median interval was {median:?} ({deltas:?})",
         );

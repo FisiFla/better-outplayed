@@ -851,18 +851,28 @@ fn the_video_is_timed_by_the_capture_times_and_not_by_when_the_child_read_the_fr
          median interval of {median:.3}ms and a mean of {mean:.3}ms",
         times.len(),
     );
+    // The tolerance is 1.5ms rather than a hair: a busy machine can take the writer off its
+    // schedule and let it catch up, which compresses the intervals (a loaded CI runner returned
+    // 16.3ms for a 17.4ms interval). The defect is nowhere near that boundary — it leaves the
+    // median at nothing, or at a whole burst's worth.
     assert!(
-        (median - capture_ms_f64).abs() < 0.5,
+        (median - capture_ms_f64).abs() < 1.5,
         "the frame intervals must be the capture's ({capture_ms_f64:.3}ms), not the bursts': the \
          median was {median:.3}ms",
     );
     // And the frames of a burst must not share a timestamp: the judder itself, stated as the
     // property the user sees.
+    //
+    // The bound is a fifth of the frames, not zero. A defect that writes a burst as it arrives
+    // puts *every* frame of every burst in the same instant — half of them or more, since bursts
+    // arrive in pairs — while a loaded machine lets a writer fall a few frames behind and write
+    // them close together: measured on a loaded CI runner, five or six of 116. Zero is a claim
+    // about the runner's scheduler; a fifth still tells the two apart by four times over.
     let shared = rest.iter().filter(|d| **d < capture_ms_f64 / 2.0).count();
     assert!(
-        shared * 50 <= rest.len(),
-        "no two frames may share a timestamp: {shared} of {} did (the shortest interval was \
-         {:.3}ms)",
+        shared * 5 <= rest.len(),
+        "the frames of a burst must not share a timestamp: {shared} of {} did (the shortest \
+         interval was {:.3}ms), which is a burst written as it arrived",
         rest.len(),
         rest.iter().cloned().fold(f64::MAX, f64::min),
     );
